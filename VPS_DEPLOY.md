@@ -29,6 +29,15 @@ Check startup:
 .venv/bin/python -c "import main; app = main.build_application(); print('build ok')"
 ```
 
+Autoposting is configured in `.env`:
+
+```text
+AUTOPOST_ENABLED=true
+BOT_TIMEZONE=Europe/Moscow
+AUTOPOST_TIMES=10:00,20:00
+AUTOPOST_TASKS=post,viral
+```
+
 ## systemd Service
 
 Create `/etc/systemd/system/naz-ai-bot.service`:
