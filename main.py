@@ -99,6 +99,8 @@ BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
 
 AUTOPOST_ENABLED = env_bool("AUTOPOST_ENABLED", True)
+AUTOPOST_TIMES = os.getenv("AUTOPOST_TIMES", "10:00,20:00").strip()
+AUTOPOST_TASKS = os.getenv("AUTOPOST_TASKS", "post,viral").strip()
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
 ADMIN_ONLY_CONTENT = env_bool("ADMIN_ONLY_CONTENT", True)
 
@@ -516,7 +518,11 @@ async def generate_answer(user_id: int, user_text: str, task: str | None = None,
     return result
 
 
-async def generate_content(user_id: int, topic: str, task: str) -> str:
+def is_warning_response(text: str) -> bool:
+    return (text or "").lstrip().startswith("⚠️")
+
+
+async def generate_content(user_id: int, topic: str, task: str, *, save_generated: bool = True) -> str:
     task_title = ACTION_TITLES.get(task, task)
     user_text = (
         f"Тема: {topic}\n\n"
@@ -525,7 +531,7 @@ async def generate_content(user_id: int, topic: str, task: str) -> str:
         "без противоречий и без успешного успеха."
     )
     result = await generate_answer(user_id, user_text, task=task, source_topic=topic)
-    if not result.startswith("⚠️"):
+    if save_generated and not is_warning_response(result):
         memory.save_generated_post(
             user_id=user_id,
             expert_mode=get_user_expert_mode(user_id),
@@ -823,7 +829,7 @@ async def content_command(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
 
     try:
         result = await generate_content(user_id, topic, task)
-        await reply_long(update, result, CONTENT_KEYBOARD)
+        await reply_long(update, result, ANGLE_KEYBOARD if is_angle_engine_message(result) else CONTENT_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("content_command failed")
         await reply_long(update, f"⚠️ Не смог сгенерировать материал. Причина: {exc}", CONTENT_KEYBOARD)
@@ -861,7 +867,11 @@ async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await send_typing(update)
 
     try:
-        post_text = await generate_content(user_id, topic, "post")
+        post_text = await generate_content(user_id, topic, "post", save_generated=False)
+        if is_warning_response(post_text):
+            await reply_long(update, post_text, ANGLE_KEYBOARD if is_angle_engine_message(post_text) else CONTENT_KEYBOARD)
+            return
+
         await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
         images, image_prompt = await generate_two_images_for_post(user_id, topic, post_text)
         await send_post_with_images(context.bot, update.effective_chat.id, post_text, images)
@@ -919,7 +929,11 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await reply_long(update, f"🚀 Собираю публикацию в канал по теме:\n{topic}")
 
     try:
-        post_text = await generate_content(update.effective_user.id, topic, "post")
+        post_text = await generate_content(update.effective_user.id, topic, "post", save_generated=False)
+        if is_warning_response(post_text):
+            await reply_long(update, post_text, ANGLE_KEYBOARD if is_angle_engine_message(post_text) else MAIN_KEYBOARD)
+            return
+
         images, _ = await generate_two_images_for_post(update.effective_user.id, topic, post_text)
         await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
         memory.save_generated_post(
@@ -1123,9 +1137,10 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         msg = (
             "📢 Автопостинг\n\n"
             f"Статус: {'включён' if AUTOPOST_ENABLED else 'выключен'}\n"
-            f"Время: 10:00 и 20:00, timezone: {BOT_TIMEZONE}\n"
+            f"Время: {AUTOPOST_TIMES or 'не задано'}, timezone: {BOT_TIMEZONE}\n"
+            f"Форматы: {', '.join(get_autopost_tasks())}\n"
             f"Канал: {CHANNEL_ID or 'не задан'}\n\n"
-            "В этой версии расписание задаётся через .env. Команды включения/выключения можно добавить следующим этапом."
+            "Расписание задаётся через .env: AUTOPOST_TIMES=10:00,20:00 и AUTOPOST_TASKS=post,viral."
         )
         await update.message.reply_text(msg, reply_markup=CONTROL_KEYBOARD)
         return True
@@ -1243,6 +1258,13 @@ AUTOPOST_TOPICS = [
 ]
 
 
+def get_autopost_tasks() -> List[str]:
+    allowed = {"post", "viral"}
+    tasks = [item.strip() for item in AUTOPOST_TASKS.split(",") if item.strip()]
+    tasks = [task for task in tasks if task in allowed]
+    return tasks or ["post"]
+
+
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHANNEL_ID:
         logger.warning("AUTOPOST skipped: CHANNEL_ID empty")
@@ -1256,16 +1278,17 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     topics = AUTOPOST_TOPICS[:]
     random.shuffle(topics)
+    task = random.choice(get_autopost_tasks())
     topic = topics[0]
-    logger.info("AUTOPOST started")
+    logger.info("AUTOPOST started | task=%s", task)
 
     try:
         post_text = ""
         for candidate_topic in topics:
             topic = candidate_topic
             logger.info("AUTOPOST candidate topic=%s", topic)
-            post_text = await generate_content(admin_user_id, topic, "post")
-            if not post_text.startswith("⚠️"):
+            post_text = await generate_content(admin_user_id, topic, task, save_generated=False)
+            if not is_warning_response(post_text):
                 break
         else:
             logger.warning("AUTOPOST skipped: all topics blocked by smart filter")
@@ -1276,7 +1299,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         memory.save_generated_post(
             user_id=admin_user_id,
             expert_mode=get_user_expert_mode(admin_user_id),
-            task="autopost",
+            task=f"autopost:{task}",
             topic=topic,
             content=post_text,
             image_count=len(images),
@@ -1297,9 +1320,33 @@ def setup_autoposting(application: Application) -> None:
         return
 
     tz = ZoneInfo(BOT_TIMEZONE)
-    application.job_queue.run_daily(auto_post_job, time=time(hour=10, minute=0, tzinfo=tz), name="naz_autopost_10")
-    application.job_queue.run_daily(auto_post_job, time=time(hour=20, minute=0, tzinfo=tz), name="naz_autopost_20")
-    logger.info("Autoposting scheduled at 10:00 and 20:00 %s", BOT_TIMEZONE)
+    scheduled = []
+    for raw_time in AUTOPOST_TIMES.split(","):
+        raw_time = raw_time.strip()
+        if not raw_time:
+            continue
+        try:
+            hour_text, minute_text = raw_time.split(":", maxsplit=1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+            if hour not in range(24) or minute not in range(60):
+                raise ValueError
+        except ValueError:
+            logger.warning("Invalid AUTOPOST_TIMES value skipped: %s", raw_time)
+            continue
+
+        application.job_queue.run_daily(
+            auto_post_job,
+            time=time(hour=hour, minute=minute, tzinfo=tz),
+            name=f"naz_autopost_{hour:02d}_{minute:02d}",
+        )
+        scheduled.append(f"{hour:02d}:{minute:02d}")
+
+    if not scheduled:
+        logger.warning("Autoposting enabled, but AUTOPOST_TIMES has no valid times")
+        return
+
+    logger.info("Autoposting scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
 
 
 # -----------------------------------------------------------------------------

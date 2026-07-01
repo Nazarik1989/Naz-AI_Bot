@@ -78,9 +78,12 @@ Enabled by default:
 ```text
 AUTOPOST_ENABLED=true
 BOT_TIMEZONE=Europe/Moscow
+AUTOPOST_TIMES=10:00,20:00
+AUTOPOST_TASKS=post,viral
 ```
 
-The bot schedules posts at 10:00 and 20:00 in `BOT_TIMEZONE`.
+The bot schedules posts at the comma-separated `AUTOPOST_TIMES` values in
+`BOT_TIMEZONE`. `AUTOPOST_TASKS` can contain `post` and `viral`.
 
 ## VPS
 
