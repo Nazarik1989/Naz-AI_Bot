@@ -122,6 +122,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("Naz_AI_Bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # -----------------------------------------------------------------------------
 # Menu buttons
