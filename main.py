@@ -29,7 +29,7 @@ load_dotenv()
 from openai import OpenAI
 from telegram import InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -396,16 +396,30 @@ async def reply_long(update: Update, text: str, keyboard: ReplyKeyboardMarkup | 
         return
     chunks = split_telegram_text(text)
     for i, chunk in enumerate(chunks):
-        await update.message.reply_text(
-            chunk,
-            reply_markup=keyboard if i == len(chunks) - 1 else None,
-            disable_web_page_preview=True,
-        )
+        try:
+            await update.message.reply_text(
+                chunk,
+                reply_markup=keyboard if i == len(chunks) - 1 else None,
+                disable_web_page_preview=True,
+            )
+        except (TimedOut, NetworkError) as exc:
+            logger.warning("Telegram reply timed out/skipped: %s", exc)
+            return
+        except TelegramError as exc:
+            logger.warning("Telegram reply failed/skipped: %s", exc)
+            return
 
 
 async def send_long_to_chat(bot, chat_id: str | int, text: str) -> None:
     for chunk in split_telegram_text(text):
-        await bot.send_message(chat_id=chat_id, text=chunk, disable_web_page_preview=True)
+        for attempt in range(2):
+            try:
+                await bot.send_message(chat_id=chat_id, text=chunk, disable_web_page_preview=True)
+                break
+            except (TimedOut, NetworkError):
+                if attempt == 1:
+                    raise
+                await asyncio.sleep(2)
 
 
 def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
@@ -1456,7 +1470,15 @@ def build_application() -> Application:
     validate_config()
     memory.init_db()
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .connect_timeout(20)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(20)
+        .build()
+    )
 
     # Core commands
     application.add_handler(CommandHandler("start", start_command))
