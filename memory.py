@@ -1,0 +1,452 @@
+"""SQLite memory layer for Naz_AI_Bot v2.4.
+
+Stores:
+- old-compatible fields: expert_mode, memory_enabled
+- new JSON state: expert, voice, goal, recent_topics, content_count, banned_topics, best_posts
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional
+
+from controller import normalize_state
+from prompts import (
+    DEFAULT_CONTENT_GOAL,
+    DEFAULT_EXPERT_MODE,
+    DEFAULT_VOICE_PROFILE,
+    EXPERT_MODES,
+    GOALS,
+    VOICE_PROFILES,
+)
+
+DB_PATH = os.getenv("DB_PATH", "naz_ai_bot.sqlite3")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@contextmanager
+def db() -> Iterable[sqlite3.Connection]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return [row["name"] for row in rows]
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    if column not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def default_state() -> Dict:
+    return normalize_state(
+        {
+            "mode": "hybrid",
+            "expert": DEFAULT_EXPERT_MODE,
+            "expert_mode": DEFAULT_EXPERT_MODE,
+            "voice": DEFAULT_VOICE_PROFILE,
+            "voice_profile": DEFAULT_VOICE_PROFILE,
+            "goal": DEFAULT_CONTENT_GOAL,
+            "content_goal": DEFAULT_CONTENT_GOAL,
+            "recent_topics": [],
+            "content_count": 0,
+            "banned_topics": [],
+            "best_posts": [],
+            "rejected_topics": [],
+            "last_blocked_topic": "",
+            "suggested_angles": [],
+            "selected_angle_index": 0,
+            "angle_generation_round": 0,
+            "angle_engine_version": "v2.4",
+            "quality_profile": "naz_clean_v24",
+            "content_rules_version": "v2.4",
+            "memory_enabled": True,
+        }
+    )
+
+
+def init_db() -> None:
+    """Create and migrate all required tables. Safe on every startup."""
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_state (
+                user_id INTEGER PRIMARY KEY,
+                expert_mode TEXT NOT NULL DEFAULT 'copywriter',
+                memory_enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(conn, "user_state", "state_json", "TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generated_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                expert_mode TEXT NOT NULL,
+                task TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                content TEXT NOT NULL,
+                image_count INTEGER NOT NULL DEFAULT 0,
+                published_to_channel INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_user_created ON chat_history(user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_user_created ON memory_items(user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON generated_posts(created_at)")
+
+
+def _decode_state_json(raw: Optional[str]) -> Dict:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def load_state(user_id: int) -> Dict:
+    """Load JSON state, creating defaults when missing."""
+    init_db()
+    now = utc_now()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM user_state WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None:
+            state = default_state()
+            conn.execute(
+                """
+                INSERT INTO user_state(user_id, expert_mode, memory_enabled, state_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, state["expert_mode"], int(state["memory_enabled"]), json.dumps(state, ensure_ascii=False), now, now),
+            )
+            return state
+
+        state_json = _decode_state_json(row["state_json"] if "state_json" in row.keys() else None)
+        merged = default_state()
+        merged.update(state_json)
+        merged["expert_mode"] = row["expert_mode"] or merged.get("expert_mode") or DEFAULT_EXPERT_MODE
+        merged["expert"] = merged.get("expert") or merged["expert_mode"]
+        merged["memory_enabled"] = bool(row["memory_enabled"])
+        return normalize_state(merged)
+
+
+def save_state(user_id: int, state: Dict) -> None:
+    state = normalize_state(state)
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_state(user_id, expert_mode, memory_enabled, state_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                expert_mode = excluded.expert_mode,
+                memory_enabled = excluded.memory_enabled,
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_id,
+                state["expert_mode"],
+                int(state["memory_enabled"]),
+                json.dumps(state, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+
+
+def set_expert_mode(user_id: int, expert_mode: str) -> Dict:
+    state = load_state(user_id)
+    if expert_mode not in EXPERT_MODES:
+        expert_mode = DEFAULT_EXPERT_MODE
+    state["expert"] = expert_mode
+    state["expert_mode"] = expert_mode
+    save_state(user_id, state)
+    return state
+
+
+def set_voice_profile(user_id: int, voice_profile: str) -> Dict:
+    state = load_state(user_id)
+    if voice_profile not in VOICE_PROFILES:
+        voice_profile = DEFAULT_VOICE_PROFILE
+    state["voice"] = voice_profile
+    state["voice_profile"] = voice_profile
+    save_state(user_id, state)
+    return state
+
+
+def set_content_goal(user_id: int, goal: str) -> Dict:
+    state = load_state(user_id)
+    if goal not in GOALS:
+        goal = DEFAULT_CONTENT_GOAL
+    state["goal"] = goal
+    state["content_goal"] = goal
+    save_state(user_id, state)
+    return state
+
+
+def set_memory_enabled(user_id: int, enabled: bool) -> Dict:
+    state = load_state(user_id)
+    state["memory_enabled"] = enabled
+    save_state(user_id, state)
+    return state
+
+
+def save_message(user_id: int, role: str, content: str) -> None:
+    if role not in {"user", "assistant"} or not content:
+        return
+    state = load_state(user_id)
+    if not state.get("memory_enabled", True):
+        return
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO chat_history(user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, role, content[:8000], utc_now()),
+        )
+        conn.execute(
+            """
+            DELETE FROM chat_history
+            WHERE user_id = ?
+              AND id NOT IN (
+                SELECT id FROM chat_history
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 40
+              )
+            """,
+            (user_id, user_id),
+        )
+
+
+def get_history(user_id: int, limit: int = 10) -> List[Dict[str, str]]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+
+
+def add_memory_item(user_id: int, kind: str, content: str, title: Optional[str] = None) -> None:
+    if not content:
+        return
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO memory_items(user_id, kind, title, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, kind, title, content[:8000], utc_now()),
+        )
+
+
+def get_memory_context(user_id: int, limit: int = 8) -> str:
+    state = load_state(user_id)
+    if not state.get("memory_enabled", True):
+        return "Память отключена для этого пользователя."
+
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT kind, title, content, created_at FROM memory_items WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+
+    lines = [
+        f"expert: {state['expert_mode']}",
+        f"voice: {state['voice_profile']}",
+        f"goal: {state['content_goal']}",
+        f"recent_topics: {state.get('recent_topics', [])[-10:]}",
+        f"content_count: {state.get('content_count', 0)}",
+        f"quality_profile: {state.get('quality_profile', 'naz_clean_v24')}",
+        f"content_rules_version: {state.get('content_rules_version', 'v2.4')}",
+        f"angle_engine: {state.get('angle_engine_version', 'v2.4')}",
+        f"last_blocked_topic: {state.get('last_blocked_topic', '')}",
+        f"suggested_angles: {[a.get('title') for a in state.get('suggested_angles', []) if isinstance(a, dict)]}",
+    ]
+
+    if rows:
+        lines.append("memory_items:")
+        for row in rows:
+            title = f" — {row['title']}" if row["title"] else ""
+            lines.append(f"[{row['kind']}{title}] {row['content'][:600]}")
+    else:
+        lines.append("memory_items: пока нет сохранённых заметок.")
+
+    return "\n".join(lines)
+
+
+def save_generated_post(
+    *,
+    user_id: int,
+    expert_mode: str,
+    task: str,
+    topic: str,
+    content: str,
+    image_count: int = 0,
+    published_to_channel: bool = False,
+) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO generated_posts(user_id, expert_mode, task, topic, content, image_count, published_to_channel, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                expert_mode,
+                task,
+                topic[:1000],
+                content[:12000],
+                image_count,
+                int(published_to_channel),
+                utc_now(),
+            ),
+        )
+
+
+def format_memory(user_id: int, limit: int = 10) -> str:
+    state = load_state(user_id)
+    with db() as conn:
+        memories = conn.execute(
+            "SELECT kind, title, content, created_at FROM memory_items WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        posts = conn.execute(
+            "SELECT task, topic, created_at FROM generated_posts WHERE user_id = ? ORDER BY id DESC LIMIT 5",
+            (user_id,),
+        ).fetchall()
+
+    lines = [
+        "🧠 Память Naz",
+        "",
+        f"Expert: {state['expert_mode']}",
+        f"Voice: {state['voice_profile']}",
+        f"Goal: {state['content_goal']}",
+        f"Mode: {state.get('mode', 'hybrid')}",
+        f"Content count: {state.get('content_count', 0)}",
+        f"Quality: {state.get('quality_profile', 'naz_clean_v24')} / {state.get('content_rules_version', 'v2.4')}",
+        f"Angle Engine: {state.get('angle_engine_version', 'v2.4')}",
+        f"Память: {'включена' if state['memory_enabled'] else 'выключена'}",
+        "",
+    ]
+
+    recent = state.get("recent_topics") or []
+    if recent:
+        lines.append("Последние темы:")
+        for topic in recent[-10:]:
+            lines.append(f"• {str(topic)[:180]}")
+        lines.append("")
+
+    angles = state.get("suggested_angles") or []
+    if angles:
+        selected_index = int(state.get("selected_angle_index", 0) or 0)
+        lines.append("Углы последнего повтора:")
+        for idx, angle in enumerate(angles[:5], start=1):
+            if isinstance(angle, dict):
+                mark = "→" if idx - 1 == selected_index else "•"
+                lines.append(f"{mark} {idx}. {angle.get('emoji', '')} {angle.get('title', 'Угол')}: {angle.get('hook', '')[:140]}")
+        lines.append("")
+
+    if memories:
+        lines.append("Последние заметки:")
+        for row in memories:
+            title = f" — {row['title']}" if row["title"] else ""
+            lines.append(f"• {row['kind']}{title}: {row['content'][:250]}")
+    else:
+        lines.append("Заметок памяти пока нет.")
+
+    if posts:
+        lines.extend(["", "Последние генерации:"])
+        for row in posts:
+            lines.append(f"• {row['task']}: {row['topic'][:120]}")
+
+    return "\n".join(lines)
+
+
+def clear_user_memory(user_id: int) -> None:
+    state = load_state(user_id)
+    state["recent_topics"] = []
+    state["best_posts"] = []
+    state["rejected_topics"] = []
+    state["last_blocked_topic"] = ""
+    state["suggested_angles"] = []
+    state["selected_angle_index"] = 0
+    state["angle_generation_round"] = 0
+    state["content_count"] = 0
+    save_state(user_id, state)
+    with db() as conn:
+        conn.execute("DELETE FROM chat_history WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM memory_items WHERE user_id = ?", (user_id,))
+
+
+def clear_recent_topics(user_id: int) -> Dict:
+    """Clear only anti-duplicate content memory, without deleting chat/memory notes."""
+    state = load_state(user_id)
+    state["recent_topics"] = []
+    state["rejected_topics"] = []
+    state["last_blocked_topic"] = ""
+    state["suggested_angles"] = []
+    state["selected_angle_index"] = 0
+    state["angle_generation_round"] = 0
+    save_state(user_id, state)
+    return state
+
+
+def get_stats() -> str:
+    with db() as conn:
+        users = conn.execute("SELECT COUNT(*) AS c FROM user_state").fetchone()["c"]
+        messages = conn.execute("SELECT COUNT(*) AS c FROM chat_history").fetchone()["c"]
+        memories = conn.execute("SELECT COUNT(*) AS c FROM memory_items").fetchone()["c"]
+        posts = conn.execute("SELECT COUNT(*) AS c FROM generated_posts").fetchone()["c"]
+        published = conn.execute("SELECT COUNT(*) AS c FROM generated_posts WHERE published_to_channel = 1").fetchone()["c"]
+
+    return (
+        "📈 Статистика Naz\n\n"
+        f"Пользователей: {users}\n"
+        f"Сообщений в истории: {messages}\n"
+        f"Заметок памяти: {memories}\n"
+        f"Сгенерировано материалов: {posts}\n"
+        f"Опубликовано в канал: {published}"
+    )
