@@ -375,11 +375,19 @@ CONTENT_TASK_PROMPTS: Dict[str, str] = {
 Запрещено повторять старый пост теми же словами.
 """.strip(),
     "image_prompt": """
-Сделай короткий английский prompt для генерации изображения.
-Требования: no text, no letters, no logo, no watermark.
-Стиль: cinematic editorial, modern, high detail, realistic lighting.
-Изображение должно передавать смысл поста, а не быть случайной абстракцией.
-Верни только prompt на английском без пояснений.
+Сделай английский prompt для генерации изображения к готовому Telegram-посту.
+Не пересказывай тему абстрактно. Вытащи из поста конкретную визуальную сцену.
+
+В prompt должны быть:
+- главный объект или герой;
+- место/ситуация;
+- конфликт или напряжение из поста;
+- настроение;
+- визуальная метафора;
+- стиль: cinematic editorial, realistic lighting, high detail.
+
+Запрещено: text, letters, words, logo, watermark, UI captions, charts with labels.
+Верни только один prompt на английском без пояснений.
 """.strip(),
 }
 

@@ -102,6 +102,7 @@ AUTOPOST_ENABLED = env_bool("AUTOPOST_ENABLED", True)
 AUTOPOST_TIMES = os.getenv("AUTOPOST_TIMES", "10:00,20:00").strip()
 AUTOPOST_TASKS = os.getenv("AUTOPOST_TASKS", "post,viral").strip()
 REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", True)
+CHANNEL_IMAGE_COUNT = max(1, min(env_int("CHANNEL_IMAGE_COUNT", 1), 2))
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
 ADMIN_ONLY_CONTENT = env_bool("ADMIN_ONLY_CONTENT", True)
 
@@ -616,7 +617,11 @@ async def build_image_prompt(user_id: int, topic: str, post_text: str, variant: 
     user_text = (
         f"Тема: {topic}\n\n"
         f"Текст поста:\n{post_text[:2500]}\n\n"
-        f"Сделай prompt для изображения. Вариант #{variant}."
+        f"Сделай prompt для изображения. Вариант #{variant}.\n\n"
+        "Сначала мысленно выдели из поста: главную сцену, конфликт, эмоцию, объект/героя, место и визуальную метафору. "
+        "Верни только готовый английский image prompt, без пояснений. "
+        "Картинка должна быть про конкретную сцену поста, а не абстрактно про AI. "
+        "Не добавляй текст, буквы, логотипы, интерфейсные надписи или watermark."
     )
     prompt = await generate_answer(user_id, user_text, task="image_prompt")
     return prompt.strip().strip('"')
@@ -682,17 +687,22 @@ async def fallback_image_bytes() -> Optional[bytes]:
     return None
 
 
-async def generate_two_images_for_post(user_id: int, topic: str, post_text: str) -> Tuple[List[bytes], str]:
+async def generate_images_for_post(user_id: int, topic: str, post_text: str, count: int = 1) -> Tuple[List[bytes], str]:
+    count = max(1, min(int(count), 2))
     image_prompt = await build_image_prompt(user_id, topic, post_text, variant=1)
     images: List[bytes] = []
 
     # Последовательно, чтобы не ловить лишние rate limits на HF.
-    for variant in (1, 2):
+    for variant in range(1, count + 1):
         img = await generate_image_bytes(image_prompt, variant=variant)
         if img:
             images.append(img)
 
     return images, image_prompt
+
+
+async def generate_two_images_for_post(user_id: int, topic: str, post_text: str) -> Tuple[List[bytes], str]:
+    return await generate_images_for_post(user_id, topic, post_text, count=2)
 
 
 async def send_post_with_images(bot, chat_id: int | str, post_text: str, images: List[bytes]) -> None:
@@ -959,7 +969,7 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await reply_long(update, post_text, ANGLE_KEYBOARD if is_angle_engine_message(post_text) else MAIN_KEYBOARD)
             return
 
-        images, _ = await generate_two_images_for_post(update.effective_user.id, topic, post_text)
+        images, _ = await generate_images_for_post(update.effective_user.id, topic, post_text, count=CHANNEL_IMAGE_COUNT)
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
             await reply_long(update, "⚠️ Пост готов, но картинки не собрались. В канал без изображения не публикую.", MAIN_KEYBOARD)
             return
@@ -1390,7 +1400,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("AUTOPOST skipped: all topics blocked by smart filter")
             return
 
-        images, image_prompt = await generate_two_images_for_post(admin_user_id, topic, post_text)
+        images, image_prompt = await generate_images_for_post(admin_user_id, topic, post_text, count=CHANNEL_IMAGE_COUNT)
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
             logger.warning("AUTOPOST skipped: images are required but none were generated")
             return
