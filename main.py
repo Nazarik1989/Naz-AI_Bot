@@ -88,6 +88,7 @@ def env_float(name: str, default: float) -> float:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini").strip()
+CONTENT_MODEL_NAME = os.getenv("CONTENT_MODEL_NAME", MODEL_NAME).strip()
 
 ADMIN_ID = env_int("ADMIN_ID", 0)
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
@@ -117,6 +118,16 @@ TASK_MAX_TOKENS = {
     "hooks": 650,
     "plan": 900,
     "image_prompt": 180,
+}
+
+CONTENT_MODEL_TASKS = {
+    "post",
+    "viral",
+    "angle_post",
+    "script",
+    "plan",
+    "hooks",
+    "image_prompt",
 }
 
 # In-memory fast state. Persistent truth is SQLite.
@@ -472,15 +483,20 @@ def ensure_openai_client() -> OpenAI:
     return openai_client
 
 
-async def call_gpt(messages: List[Dict[str, str]], max_tokens: int = MAX_TOKENS, temperature: float = TEMPERATURE) -> str:
+async def call_gpt(
+    messages: List[Dict[str, str]],
+    max_tokens: int = MAX_TOKENS,
+    temperature: float = TEMPERATURE,
+    model: str | None = None,
+) -> str:
     """Call OpenRouter using OpenAI-compatible SDK in a thread."""
 
     def _request() -> str:
         client = ensure_openai_client()
         response = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=model or MODEL_NAME,
             messages=messages,
-            max_tokens=max_tokens,
+            max_tokens=max(16, max_tokens),
             temperature=temperature,
         )
         content = response.choices[0].message.content if response.choices else ""
@@ -501,6 +517,12 @@ def task_max_tokens(task: str | None) -> int:
     if not task:
         return MAX_TOKENS
     return min(MAX_TOKENS, TASK_MAX_TOKENS.get(task, MAX_TOKENS))
+
+
+def task_model(task: str | None) -> str:
+    if task in CONTENT_MODEL_TASKS:
+        return CONTENT_MODEL_NAME
+    return MODEL_NAME
 
 
 # -----------------------------------------------------------------------------
@@ -539,7 +561,7 @@ async def generate_answer(user_id: int, user_text: str, task: str | None = None,
         task=task,
     )
 
-    result = await call_gpt(messages, max_tokens=task_max_tokens(task))
+    result = await call_gpt(messages, max_tokens=task_max_tokens(task), model=task_model(task))
 
     updated_state = naz_controller.update_memory_after_output(
         controlled_state,
@@ -656,7 +678,12 @@ async def build_image_prompt(user_id: int, topic: str, post_text: str, variant: 
             ),
         },
     ]
-    prompt = await call_gpt(messages, max_tokens=TASK_MAX_TOKENS["image_prompt"], temperature=0.55)
+    prompt = await call_gpt(
+        messages,
+        max_tokens=TASK_MAX_TOKENS["image_prompt"],
+        temperature=0.55,
+        model=CONTENT_MODEL_NAME,
+    )
     return prompt.strip().strip('"')
 
     user_text = (
