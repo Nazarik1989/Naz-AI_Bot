@@ -101,6 +101,7 @@ APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
 AUTOPOST_ENABLED = env_bool("AUTOPOST_ENABLED", True)
 AUTOPOST_TIMES = os.getenv("AUTOPOST_TIMES", "10:00,20:00").strip()
 AUTOPOST_TASKS = os.getenv("AUTOPOST_TASKS", "post,viral").strip()
+REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", True)
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
 ADMIN_ONLY_CONTENT = env_bool("ADMIN_ONLY_CONTENT", True)
 
@@ -509,7 +510,7 @@ async def generate_answer(user_id: int, user_text: str, task: str | None = None,
 
     controlled_state = control["state"]
     expert_mode = controlled_state.get("expert_mode", DEFAULT_EXPERT_MODE)
-    history = memory.get_history(user_id, limit=10) if task is None else []
+    history = memory.get_history(user_id, limit=20) if task is None else []
     memory_context = build_user_memory_context(user_id)
 
     messages = build_messages(
@@ -537,7 +538,14 @@ def is_warning_response(text: str) -> bool:
     return (text or "").lstrip().startswith("⚠️")
 
 
-async def generate_content(user_id: int, topic: str, task: str, *, save_generated: bool = True) -> str:
+async def generate_content(
+    user_id: int,
+    topic: str,
+    task: str,
+    *,
+    save_generated: bool = True,
+    extra_instruction: str = "",
+) -> str:
     task_title = ACTION_TITLES.get(task, task)
     user_text = (
         f"Тема: {topic}\n\n"
@@ -545,6 +553,8 @@ async def generate_content(user_id: int, topic: str, task: str, *, save_generate
         "Текст должен быть чистым: без служебных заголовков вроде ### Хук, без выдуманной статистики, "
         "без противоречий и без успешного успеха."
     )
+    if extra_instruction:
+        user_text += f"\n\nДополнительная режиссура:\n{extra_instruction.strip()}"
     result = await generate_answer(user_id, user_text, task=task, source_topic=topic)
     if save_generated and not is_warning_response(result):
         memory.save_generated_post(
@@ -950,6 +960,9 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         images, _ = await generate_two_images_for_post(update.effective_user.id, topic, post_text)
+        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            await reply_long(update, "⚠️ Пост готов, но картинки не собрались. В канал без изображения не публикую.", MAIN_KEYBOARD)
+            return
         await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
         memory.save_generated_post(
             user_id=update.effective_user.id,
@@ -1246,11 +1259,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if await handle_pending_action(update, context, text):
         return
 
-    # Default chat through persistent expert mode.
+    # Default chat through persistent expert mode and SQLite history.
     await send_typing(update)
     try:
-        memory.save_message(user_id, "user", text)
         answer = await generate_answer(user_id, text)
+        memory.save_message(user_id, "user", text)
         memory.save_message(user_id, "assistant", answer)
         await reply_long(update, answer, ANGLE_KEYBOARD if is_angle_engine_message(answer) else MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
@@ -1270,6 +1283,56 @@ AUTOPOST_TOPICS = [
     "Контент-система вместо случайных постов",
     "AI-агенты: что реально можно автоматизировать уже сейчас",
     "Ошибки при запуске первого AI-бота",
+    "Почему AI-проект ломается не из-за модели, а из-за процесса",
+    "Как не утонуть в промптах, когда нужен рабочий результат",
+    "Что должно быть у Telegram-бота, чтобы он не был игрушкой",
+    "Как память меняет поведение AI-ассистента в диалоге",
+    "Почему автопостинг без редакторской логики быстро становится шумом",
+    "Как проверить AI-систему перед запуском на VPS",
+    "Где заканчивается генератор текста и начинается контент-система",
+    "Почему картинки к постам должны быть частью сценария, а не украшением",
+    "Как маленький баг в интеграции ломает весь пользовательский опыт",
+    "Что предпринимателю важно понимать перед внедрением AI-бота",
+]
+
+
+AUTOPOST_PROFILES: List[Dict[str, str]] = [
+    {
+        "name": "Техно-хулиган",
+        "voice": "дерзкий инженерный голос, живо, с ощущением сборки на ходу",
+        "angle": "конфликт: хотели магию, получили систему, которую надо довести",
+        "format": "короткий Telegram-пост с сильным хуком и спокойным выводом",
+    },
+    {
+        "name": "Упрямый инженер",
+        "voice": "спокойно, точно, без шума, как человек, который чинит до результата",
+        "angle": "диагностика: где именно ломается процесс и какой следующий шаг",
+        "format": "практический пост с 3-5 наблюдениями без списочной канцелярщины",
+    },
+    {
+        "name": "Архитектор хаоса",
+        "voice": "иронично и системно, через бардак к структуре",
+        "angle": "система: почему хаос перестаёт быть хаосом, когда его разложили по слоям",
+        "format": "мини-история с конфликтом, поворотом и выводом",
+    },
+    {
+        "name": "Добрый подонок",
+        "voice": "жёстко, но полезно; неприятная правда без токсичности",
+        "angle": "антипаттерн: что люди делают не так и почему это дорого обходится",
+        "format": "провокационный пост без кликбейта и фальшивых цифр",
+    },
+    {
+        "name": "Ремесленник",
+        "voice": "собранно, аккуратно, с уважением к качеству",
+        "angle": "качество: что отличает рабочий инструмент от красивого демо",
+        "format": "плотный редакторский пост без лишней пыли",
+    },
+    {
+        "name": "Дожиматель",
+        "voice": "сфокусированно и прямо, меньше украшений, больше результата",
+        "angle": "дожим: что сделать последним шагом, чтобы оно реально заработало",
+        "format": "энергичный пост с финалом про доведение до результата",
+    },
 ]
 
 
@@ -1278,6 +1341,17 @@ def get_autopost_tasks() -> List[str]:
     tasks = [item.strip() for item in AUTOPOST_TASKS.split(",") if item.strip()]
     tasks = [task for task in tasks if task in allowed]
     return tasks or ["post"]
+
+
+def format_autopost_profile(profile: Dict[str, str]) -> str:
+    return (
+        f"Профиль выпуска: {profile['name']}.\n"
+        f"Голос: {profile['voice']}.\n"
+        f"Угол: {profile['angle']}.\n"
+        f"Формат: {profile['format']}.\n"
+        "Не повторяй структуру предыдущих постов. Меняй заход, ритм, сцену и финальный вывод. "
+        "Пост должен ощущаться как отдельный выпуск рубрики Naz, а не как шаблон."
+    )
 
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1294,15 +1368,22 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     topics = AUTOPOST_TOPICS[:]
     random.shuffle(topics)
     task = random.choice(get_autopost_tasks())
+    profile = random.choice(AUTOPOST_PROFILES)
     topic = topics[0]
-    logger.info("AUTOPOST started | task=%s", task)
+    logger.info("AUTOPOST started | task=%s | profile=%s", task, profile["name"])
 
     try:
         post_text = ""
         for candidate_topic in topics:
             topic = candidate_topic
             logger.info("AUTOPOST candidate topic=%s", topic)
-            post_text = await generate_content(admin_user_id, topic, task, save_generated=False)
+            post_text = await generate_content(
+                admin_user_id,
+                topic,
+                task,
+                save_generated=False,
+                extra_instruction=format_autopost_profile(profile),
+            )
             if not is_warning_response(post_text):
                 break
         else:
@@ -1310,12 +1391,15 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         images, image_prompt = await generate_two_images_for_post(admin_user_id, topic, post_text)
+        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            logger.warning("AUTOPOST skipped: images are required but none were generated")
+            return
         await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
         memory.save_generated_post(
             user_id=admin_user_id,
             expert_mode=get_user_expert_mode(admin_user_id),
-            task=f"autopost:{task}",
-            topic=topic,
+            task=f"autopost:{task}:{profile['name']}",
+            topic=f"{topic} | {profile['name']}",
             content=post_text,
             image_count=len(images),
             published_to_channel=True,
