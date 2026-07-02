@@ -109,6 +109,16 @@ ADMIN_ONLY_CONTENT = env_bool("ADMIN_ONLY_CONTENT", True)
 MAX_TOKENS = env_int("MAX_TOKENS", 900)
 TEMPERATURE = env_float("TEMPERATURE", 0.8)
 
+TASK_MAX_TOKENS = {
+    "post": 430,
+    "viral": 420,
+    "angle_post": 430,
+    "script": 620,
+    "hooks": 650,
+    "plan": 900,
+    "image_prompt": 180,
+}
+
 # In-memory fast state. Persistent truth is SQLite.
 USER_MODES: Dict[int, str] = {}
 USER_PENDING_ACTIONS: Dict[int, str] = {}
@@ -487,6 +497,12 @@ async def call_gpt(messages: List[Dict[str, str]], max_tokens: int = MAX_TOKENS,
     return result
 
 
+def task_max_tokens(task: str | None) -> int:
+    if not task:
+        return MAX_TOKENS
+    return min(MAX_TOKENS, TASK_MAX_TOKENS.get(task, MAX_TOKENS))
+
+
 # -----------------------------------------------------------------------------
 # Prompted generation
 # -----------------------------------------------------------------------------
@@ -523,7 +539,7 @@ async def generate_answer(user_id: int, user_text: str, task: str | None = None,
         task=task,
     )
 
-    result = await call_gpt(messages)
+    result = await call_gpt(messages, max_tokens=task_max_tokens(task))
 
     updated_state = naz_controller.update_memory_after_output(
         controlled_state,
@@ -556,6 +572,11 @@ async def generate_content(
     )
     if extra_instruction:
         user_text += f"\n\nДополнительная режиссура:\n{extra_instruction.strip()}"
+    user_text += (
+        "\n\nHARD LENGTH LIMIT: keep the final answer compact for Telegram. "
+        "For post/viral/angle_post use 700-1100 characters unless the user explicitly asks longer. "
+        "No long lists, no essay mode, no repeated endings."
+    )
     result = await generate_answer(user_id, user_text, task=task, source_topic=topic)
     if save_generated and not is_warning_response(result):
         memory.save_generated_post(
@@ -614,6 +635,30 @@ async def generate_selected_angle_content(user_id: int) -> str:
 
 
 async def build_image_prompt(user_id: int, topic: str, post_text: str, variant: int = 1) -> str:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You create image-generation prompts for Telegram channel posts. "
+                "Return only one concise English prompt, 60-110 words. "
+                "Describe a concrete scene from the post, not abstract AI symbolism. "
+                "No text, letters, logos, watermarks, UI captions, charts, or interface screenshots."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Topic: {topic}\n"
+                f"Variant: {variant}\n\n"
+                f"Post text:\n{post_text[:1800]}\n\n"
+                "Extract the main scene, conflict, mood, subject, setting, and visual metaphor. "
+                "Style: cinematic editorial, realistic lighting, high detail, expressive but not stock-photo."
+            ),
+        },
+    ]
+    prompt = await call_gpt(messages, max_tokens=TASK_MAX_TOKENS["image_prompt"], temperature=0.55)
+    return prompt.strip().strip('"')
+
     user_text = (
         f"Тема: {topic}\n\n"
         f"Текст поста:\n{post_text[:2500]}\n\n"
@@ -642,7 +687,7 @@ async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]
         logger.warning("HF_TOKEN is empty. Image generation skipped.")
         return await fallback_image_bytes() if ALLOW_IMAGE_FALLBACK else None
 
-    endpoint = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+    endpoint = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Accept": "image/png",
