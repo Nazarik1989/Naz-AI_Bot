@@ -963,6 +963,7 @@ def latest_agent_content_dir(date_hint: str = "") -> Optional[Path]:
         candidate = AGENT_CONTENT_INBOX / date_hint.strip()
         if candidate.exists() and candidate.is_dir():
             return candidate
+        return None
     if not AGENT_CONTENT_INBOX.exists():
         return None
     dirs = [path for path in AGENT_CONTENT_INBOX.iterdir() if path.is_dir()]
@@ -1042,7 +1043,10 @@ async def generate_agent_content_package(user_id: int, date_hint: str = "", focu
         user_text=(
             f"{risk_line}\n\n"
             f"{context}\n\n"
-            "Собери редакторский пакет. Не публикуй сырьё напрямую. Если риски есть, усили safety note и пометь как черновик."
+            "Собери редакторский пакет. Не публикуй сырьё напрямую. "
+            "Выбери один конкретный эпизод из материалов и преврати его в экспертный инсайт. "
+            "Не делай отчёт о дне. Не повторяй одну мысль в Telegram-посте, hooks и комментарии. "
+            "Если риски есть, усили safety note и пометь как черновик."
         ),
         memory_context=build_user_memory_context(user_id),
         history=[],
@@ -1939,7 +1943,7 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"Время: {AUTOPOST_TIMES or 'не задано'}, timezone: {BOT_TIMEZONE}\n"
             f"Форматы: {', '.join(get_autopost_tasks())}\n"
             f"Канал: {CHANNEL_ID or 'не задан'}\n\n"
-            "Расписание задаётся через .env: AUTOPOST_TIMES=10:00,20:00 и AUTOPOST_TASKS=post,viral."
+            "Расписание задаётся через .env: AUTOPOST_TIMES=09:30,13:30,17:30,21:30 и AUTOPOST_TASKS=post,viral."
         )
         await update.message.reply_text(msg, reply_markup=CONTROL_KEYBOARD)
         return True
