@@ -967,7 +967,7 @@ def latest_agent_content_dir(date_hint: str = "") -> Optional[Path]:
     if not AGENT_CONTENT_INBOX.exists():
         return None
     dirs = [path for path in AGENT_CONTENT_INBOX.iterdir() if path.is_dir()]
-    return sorted(dirs, key=lambda path: path.name)[-1] if dirs else None
+    return random.choice(dirs) if dirs else None
 
 
 def read_limited_text(path: Path, limit: int = 6000) -> str:
@@ -2362,7 +2362,7 @@ def help_commands_text() -> str:
         "/scan_sources рубрика — черновик интерпретации\n"
         "/publish_source рубрика — опубликовать интерпретацию источника\n\n"
         "Content-agent:\n"
-        "/agent_content [YYYY-MM-DD] [фокус] — редакторский пакет из inbox\n"
+        "/agent_content [YYYY-MM-DD] [фокус] — редакторский пакет из inbox; без даты берёт случайный день\n"
         "/publish_agent_content [YYYY-MM-DD] [фокус] — опубликовать безопасный Telegram-пост\n\n"
         "Админ:\n"
         "/stats — статистика"
