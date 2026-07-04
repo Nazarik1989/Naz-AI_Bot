@@ -12,6 +12,7 @@ __pycache__/
 *.sqlite3-*
 *.db
 *.log
+naz_stories.md
 
 *.zip
 *_backup*.py

@@ -18,6 +18,7 @@ import os
 import random
 from datetime import time
 from io import BytesIO
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -98,10 +99,12 @@ HF_MODEL = os.getenv("HF_MODEL", "black-forest-labs/FLUX.1-schnell").strip()
 
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
+NAZ_STORIES_FILE = Path(os.getenv("NAZ_STORIES_FILE", "naz_stories.md").strip())
 
 AUTOPOST_ENABLED = env_bool("AUTOPOST_ENABLED", True)
 AUTOPOST_TIMES = os.getenv("AUTOPOST_TIMES", "10:00,20:00").strip()
 AUTOPOST_TASKS = os.getenv("AUTOPOST_TASKS", "post,viral").strip()
+AUTOPOST_INSIGHT_CHANCE = max(0.0, min(env_float("AUTOPOST_INSIGHT_CHANCE", 0.35), 1.0))
 REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", True)
 CHANNEL_IMAGE_COUNT = max(1, min(env_int("CHANNEL_IMAGE_COUNT", 1), 2))
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
@@ -118,6 +121,7 @@ TASK_MAX_TOKENS = {
     "hooks": 650,
     "plan": 900,
     "image_prompt": 180,
+    "insight": 430,
 }
 
 CONTENT_MODEL_TASKS = {
@@ -128,6 +132,7 @@ CONTENT_MODEL_TASKS = {
     "plan",
     "hooks",
     "image_prompt",
+    "insight",
 }
 
 # In-memory fast state. Persistent truth is SQLite.
@@ -268,6 +273,7 @@ ACTION_TITLES = {
     "hooks": "заголовки/хуки",
     "image_only": "картинку",
     "angle_post": "пост по выбранному углу",
+    "insight": "Naz Stories insight",
 }
 
 
@@ -605,6 +611,88 @@ async def generate_content(
             user_id=user_id,
             expert_mode=get_user_expert_mode(user_id),
             task=task,
+            topic=topic,
+            content=result,
+            image_count=0,
+            published_to_channel=False,
+        )
+    return result
+
+
+def read_naz_stories() -> str:
+    try:
+        return NAZ_STORIES_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read %s: %s", NAZ_STORIES_FILE, exc)
+        return ""
+
+
+def split_story_blocks(text: str) -> List[str]:
+    paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
+    blocks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    for paragraph in paragraphs:
+        if paragraph.startswith("```"):
+            continue
+        clean = paragraph.strip()
+        if not clean:
+            continue
+        if current and current_len + len(clean) > 2200:
+            blocks.append("\n\n".join(current))
+            current = []
+            current_len = 0
+        current.append(clean)
+        current_len += len(clean)
+
+    if current:
+        blocks.append("\n\n".join(current))
+
+    return [block for block in blocks if len(block) > 250]
+
+
+def pick_story_excerpt(query: str = "") -> str:
+    blocks = split_story_blocks(read_naz_stories())
+    if not blocks:
+        return ""
+
+    words = [word.lower() for word in query.split() if len(word) > 3]
+    if words:
+        scored = []
+        for block in blocks:
+            lowered = block.lower()
+            score = sum(lowered.count(word) for word in words)
+            if score:
+                scored.append((score, block))
+        if scored:
+            scored.sort(key=lambda item: item[0], reverse=True)
+            return random.choice([block for _, block in scored[:4]])
+
+    return random.choice(blocks)
+
+
+async def generate_story_insight(user_id: int, topic_hint: str = "", *, save_generated: bool = True) -> str:
+    excerpt = pick_story_excerpt(topic_hint)
+    if not excerpt:
+        return "⚠️ Не нашёл naz_stories.md. Закинь файл в папку проекта или задай NAZ_STORIES_FILE в .env."
+
+    topic = topic_hint or "инсайт из личного опыта запуска Naz_AI_Bot"
+    user_text = (
+        f"Тема/фокус: {topic}\n\n"
+        f"Сырьё из naz_stories.md:\n{excerpt[:2400]}\n\n"
+        "Сделай не пересказ, а отдельный инсайт в стиле рубрики Prompt Or Die. "
+        "Пиши как вывод из опыта: конкретно, живо, инженерно, без дневникового тона."
+    )
+    result = await generate_answer(user_id, user_text, task="insight", source_topic=f"Naz Stories | {topic}")
+
+    if save_generated and not is_warning_response(result):
+        memory.save_generated_post(
+            user_id=user_id,
+            expert_mode=get_user_expert_mode(user_id),
+            task="insight",
             topic=topic,
             content=result,
             image_count=0,
@@ -960,6 +1048,66 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def hooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await content_command(update, context, "hooks")
+
+
+async def insight_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    user_id = update.effective_user.id
+    if ADMIN_ONLY_CONTENT and not is_admin(user_id):
+        await update.message.reply_text("🔒 Рубрика инсайтов сейчас доступна только админу.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    topic = extract_topic(update, context, default="")
+    await send_typing(update)
+
+    try:
+        result = await generate_story_insight(user_id, topic)
+        await reply_long(update, result, CONTENT_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("insight failed")
+        await reply_long(update, f"⚠️ Инсайт не собрался. Причина: {exc}", CONTENT_KEYBOARD)
+
+
+async def publish_insight_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Публикация в канал доступна только админу.", MAIN_KEYBOARD)
+        return
+    if not CHANNEL_ID:
+        await reply_long(update, "⚠️ CHANNEL_ID не задан в .env/Replit Secrets.", MAIN_KEYBOARD)
+        return
+
+    topic = extract_topic(update, context, default="")
+    await reply_long(update, "🚀 Собираю рубрику из naz_stories.md и публикую в канал.")
+
+    try:
+        post_text = await generate_story_insight(update.effective_user.id, topic, save_generated=False)
+        if is_warning_response(post_text):
+            await reply_long(update, post_text, MAIN_KEYBOARD)
+            return
+
+        image_topic = topic or "инженерный инсайт из опыта запуска AI-бота"
+        images, _ = await generate_images_for_post(update.effective_user.id, image_topic, post_text, count=CHANNEL_IMAGE_COUNT)
+        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            await reply_long(update, "⚠️ Инсайт готов, но картинка не собралась. В канал без изображения не публикую.", MAIN_KEYBOARD)
+            return
+
+        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+        memory.save_generated_post(
+            user_id=update.effective_user.id,
+            expert_mode=get_user_expert_mode(update.effective_user.id),
+            task="publish_insight",
+            topic=topic or "Naz Stories",
+            content=post_text,
+            image_count=len(images),
+            published_to_channel=True,
+        )
+        await reply_long(update, "✅ Инсайт опубликован в канал.", MAIN_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("publish_insight failed")
+        await reply_long(update, f"⚠️ Не смог опубликовать инсайт. Причина: {exc}", MAIN_KEYBOARD)
 
 
 async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1449,28 +1597,36 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     topics = AUTOPOST_TOPICS[:]
     random.shuffle(topics)
-    task = random.choice(get_autopost_tasks())
+    use_story_insight = bool(read_naz_stories()) and random.random() < AUTOPOST_INSIGHT_CHANCE
+    task = "insight" if use_story_insight else random.choice(get_autopost_tasks())
     profile = random.choice(AUTOPOST_PROFILES)
-    topic = topics[0]
+    topic = "инсайт из опыта запуска Naz_AI_Bot" if use_story_insight else topics[0]
     logger.info("AUTOPOST started | task=%s | profile=%s", task, profile["name"])
 
     try:
         post_text = ""
-        for candidate_topic in topics:
-            topic = candidate_topic
-            logger.info("AUTOPOST candidate topic=%s", topic)
-            post_text = await generate_content(
-                admin_user_id,
-                topic,
-                task,
-                save_generated=False,
-                extra_instruction=format_autopost_profile(profile),
-            )
-            if not is_warning_response(post_text):
-                break
+        if use_story_insight:
+            logger.info("AUTOPOST story insight from %s", NAZ_STORIES_FILE)
+            post_text = await generate_story_insight(admin_user_id, topic, save_generated=False)
+            if is_warning_response(post_text):
+                logger.warning("AUTOPOST story insight skipped by smart filter")
+                return
         else:
-            logger.warning("AUTOPOST skipped: all topics blocked by smart filter")
-            return
+            for candidate_topic in topics:
+                topic = candidate_topic
+                logger.info("AUTOPOST candidate topic=%s", topic)
+                post_text = await generate_content(
+                    admin_user_id,
+                    topic,
+                    task,
+                    save_generated=False,
+                    extra_instruction=format_autopost_profile(profile),
+                )
+                if not is_warning_response(post_text):
+                    break
+            else:
+                logger.warning("AUTOPOST skipped: all topics blocked by smart filter")
+                return
 
         images, image_prompt = await generate_images_for_post(admin_user_id, topic, post_text, count=CHANNEL_IMAGE_COUNT)
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
@@ -1665,9 +1821,11 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("script", script_command))
     application.add_handler(CommandHandler("plan", plan_command))
     application.add_handler(CommandHandler("hooks", hooks_command))
+    application.add_handler(CommandHandler("insight", insight_command))
     application.add_handler(CommandHandler("imagepost", imagepost_command))
     application.add_handler(CommandHandler("image", image_only_command))
     application.add_handler(CommandHandler("publish", publish_command))
+    application.add_handler(CommandHandler("publish_insight", publish_insight_command))
 
     # Text router must be after commands.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

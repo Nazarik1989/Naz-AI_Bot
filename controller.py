@@ -21,7 +21,7 @@ from prompts import (
 )
 
 VALID_GOALS = set(GOALS.keys())
-CONTENT_TASKS = {"post", "viral", "script", "plan", "hooks", "imagepost", "publish", "autopost", "angle_post"}
+CONTENT_TASKS = {"post", "viral", "script", "plan", "hooks", "imagepost", "publish", "autopost", "angle_post", "insight"}
 ANGLE_ENGINE_VERSION = "v2.4"
 
 CONTENT_WORDS = (
