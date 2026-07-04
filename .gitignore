@@ -13,6 +13,8 @@ __pycache__/
 *.db
 *.log
 naz_stories.md
+monitored_sources.json
+.source_seen.json
 
 *.zip
 *_backup*.py

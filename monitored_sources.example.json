@@ -1,0 +1,37 @@
+[
+  {
+    "name": "OpenAI News",
+    "type": "news",
+    "url": "https://openai.com/news/rss.xml",
+    "rubric": "AI-находка дня",
+    "enabled": true
+  },
+  {
+    "name": "GitHub Changelog",
+    "type": "github",
+    "url": "https://github.blog/changelog/feed/",
+    "rubric": "GitHub/релизы",
+    "enabled": true
+  },
+  {
+    "name": "YouTube channel example",
+    "type": "youtube",
+    "url": "https://www.youtube.com/feeds/videos.xml?channel_id=CHANNEL_ID_HERE",
+    "rubric": "Разбор чужого кейса",
+    "enabled": false
+  },
+  {
+    "name": "Telegram RSS bridge example",
+    "type": "telegram",
+    "url": "https://example.com/rss/telegram-channel.xml",
+    "rubric": "Prompt or Die",
+    "enabled": false
+  },
+  {
+    "name": "X/Twitter RSS bridge example",
+    "type": "twitter",
+    "url": "https://example.com/rss/x-account.xml",
+    "rubric": "Ошибка недели",
+    "enabled": false
+  }
+]

@@ -13,10 +13,15 @@ Telegram AI Content OS:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import random
+import re
+import xml.etree.ElementTree as ET
 from datetime import time
+from html import unescape
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -100,11 +105,15 @@ HF_MODEL = os.getenv("HF_MODEL", "black-forest-labs/FLUX.1-schnell").strip()
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
 NAZ_STORIES_FILE = Path(os.getenv("NAZ_STORIES_FILE", "naz_stories.md").strip())
+MONITORED_SOURCES_FILE = Path(os.getenv("MONITORED_SOURCES_FILE", "monitored_sources.json").strip())
+SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip())
 
 AUTOPOST_ENABLED = env_bool("AUTOPOST_ENABLED", True)
 AUTOPOST_TIMES = os.getenv("AUTOPOST_TIMES", "10:00,20:00").strip()
 AUTOPOST_TASKS = os.getenv("AUTOPOST_TASKS", "post,viral").strip()
 AUTOPOST_INSIGHT_CHANCE = max(0.0, min(env_float("AUTOPOST_INSIGHT_CHANCE", 0.35), 1.0))
+SOURCE_MONITOR_ENABLED = env_bool("SOURCE_MONITOR_ENABLED", False)
+SOURCE_MONITOR_TIMES = os.getenv("SOURCE_MONITOR_TIMES", "12:00,18:00").strip()
 REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", True)
 CHANNEL_IMAGE_COUNT = max(1, min(env_int("CHANNEL_IMAGE_COUNT", 1), 2))
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
@@ -122,6 +131,7 @@ TASK_MAX_TOKENS = {
     "plan": 900,
     "image_prompt": 180,
     "insight": 430,
+    "source_interpretation": 520,
 }
 
 CONTENT_MODEL_TASKS = {
@@ -133,6 +143,7 @@ CONTENT_MODEL_TASKS = {
     "hooks",
     "image_prompt",
     "insight",
+    "source_interpretation",
 }
 
 # In-memory fast state. Persistent truth is SQLite.
@@ -701,6 +712,224 @@ async def generate_story_insight(user_id: int, topic_hint: str = "", *, save_gen
     return result
 
 
+SOURCE_RUBRICS = [
+    "AI-находка дня",
+    "Разбор чужого кейса",
+    "Инженерный дневник",
+    "Prompt or Die",
+    "Ботостройка",
+    "Ошибка недели",
+    "GitHub/релизы",
+]
+
+
+def read_json_file(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read JSON %s: %s", path, exc)
+        return default
+
+
+def write_json_file(path: Path, data) -> None:
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not write JSON %s: %s", path, exc)
+
+
+def load_monitored_sources() -> List[Dict[str, str]]:
+    raw = read_json_file(MONITORED_SOURCES_FILE, [])
+    if not isinstance(raw, list):
+        return []
+
+    sources: List[Dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        if not url:
+            continue
+        enabled = item.get("enabled", True)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
+        sources.append(
+            {
+                "name": str(item.get("name") or url).strip(),
+                "type": str(item.get("type") or "rss").strip(),
+                "url": url,
+                "rubric": str(item.get("rubric") or "AI-находка дня").strip(),
+                "enabled": bool(enabled),
+            }
+        )
+    return sources
+
+
+def load_seen_sources() -> Dict[str, str]:
+    raw = read_json_file(SOURCE_SEEN_FILE, {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def source_item_key(item: Dict[str, str]) -> str:
+    base = item.get("link") or f"{item.get('source_url', '')}|{item.get('title', '')}"
+    return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
+def mark_source_seen(item: Dict[str, str]) -> None:
+    seen = load_seen_sources()
+    seen[source_item_key(item)] = item.get("title", "")[:240]
+    if len(seen) > 500:
+        seen = dict(list(seen.items())[-500:])
+    write_json_file(SOURCE_SEEN_FILE, seen)
+
+
+def clean_feed_text(value: str) -> str:
+    value = re.sub(r"<[^>]+>", " ", value or "")
+    value = unescape(value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:1200]
+
+
+def tag_name(tag: str) -> str:
+    return tag.rsplit("}", maxsplit=1)[-1].lower()
+
+
+def first_text(node: ET.Element, names: List[str]) -> str:
+    wanted = {name.split(":")[-1].lower() for name in names}
+    for child in list(node):
+        if tag_name(child.tag) in wanted and child.text:
+            return clean_feed_text(child.text)
+    return ""
+
+
+def first_link(node: ET.Element, names: List[str]) -> str:
+    wanted = {name.split(":")[-1].lower() for name in names}
+    for found in list(node):
+        if tag_name(found.tag) not in wanted:
+            continue
+        href = found.attrib.get("href")
+        if href:
+            return href.strip()
+        if found.text:
+            return clean_feed_text(found.text)
+    return ""
+
+
+def parse_feed_entries(xml_text: str, source: Dict[str, str]) -> List[Dict[str, str]]:
+    root = ET.fromstring(xml_text)
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "media": "http://search.yahoo.com/mrss/",
+        "dc": "http://purl.org/dc/elements/1.1/",
+    }
+    entries = root.findall(".//item") or root.findall(".//atom:entry", ns)
+    parsed: List[Dict[str, str]] = []
+
+    for entry in entries[:20]:
+        title = first_text(entry, ["title", "atom:title"])
+        link = first_link(entry, ["link", "atom:link"])
+        published = first_text(entry, ["pubDate", "published", "updated", "atom:published", "atom:updated"])
+        summary = first_text(entry, ["description", "summary", "content", "atom:summary", "atom:content"])
+        if not title:
+            continue
+        parsed.append(
+            {
+                "source_name": source["name"],
+                "source_type": source["type"],
+                "source_url": source["url"],
+                "rubric": source["rubric"],
+                "title": title,
+                "link": link or source["url"],
+                "published": published,
+                "summary": summary,
+            }
+        )
+    return parsed
+
+
+async def fetch_source_entries(source: Dict[str, str]) -> List[Dict[str, str]]:
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+            response = await client.get(source["url"], headers={"User-Agent": "Naz_AI_Bot/2.4"})
+        response.raise_for_status()
+        return parse_feed_entries(response.text, source)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Source fetch failed | %s | %s", source.get("name"), exc)
+        return []
+
+
+async def get_source_candidates(query: str = "", *, include_seen: bool = False) -> List[Dict[str, str]]:
+    sources = [source for source in load_monitored_sources() if source.get("enabled")]
+    if query:
+        needle = query.lower()
+        sources = [
+            source
+            for source in sources
+            if needle in source.get("name", "").lower()
+            or needle in source.get("type", "").lower()
+            or needle in source.get("rubric", "").lower()
+        ] or sources
+
+    seen = load_seen_sources()
+    candidates: List[Dict[str, str]] = []
+    for source in sources:
+        for item in await fetch_source_entries(source):
+            if include_seen or source_item_key(item) not in seen:
+                candidates.append(item)
+    return candidates
+
+
+def format_source_item(item: Dict[str, str]) -> str:
+    return (
+        f"{item.get('rubric', 'AI-находка дня')} | {item.get('source_name', '')}\n"
+        f"{item.get('title', '')}\n"
+        f"{item.get('published', '')}\n"
+        f"{item.get('link', '')}"
+    ).strip()
+
+
+async def generate_source_interpretation(user_id: int, item: Dict[str, str], *, save_generated: bool = True) -> str:
+    source_context = (
+        f"Рубрика: {item.get('rubric', 'AI-находка дня')}\n"
+        f"Тип источника: {item.get('source_type', 'rss')}\n"
+        f"Источник: {item.get('source_name', '')}\n"
+        f"Заголовок: {item.get('title', '')}\n"
+        f"Дата: {item.get('published', '')}\n"
+        f"Ссылка: {item.get('link', '')}\n\n"
+        f"Краткое описание/summary:\n{item.get('summary', '')[:1200]}"
+    )
+    messages = build_messages(
+        state=memory.load_state(user_id),
+        expert_mode=get_user_expert_mode(user_id),
+        user_text=(
+            f"{source_context}\n\n"
+            "Сделай интерпретацию Naz. Не репость. Объясни, что здесь важно для AI-ботов, контента, автоматизации или инженерной сборки."
+        ),
+        memory_context=build_user_memory_context(user_id),
+        history=[],
+        task="source_interpretation",
+    )
+    result = await call_gpt(
+        messages,
+        max_tokens=TASK_MAX_TOKENS["source_interpretation"],
+        model=CONTENT_MODEL_NAME,
+    )
+
+    if save_generated:
+        memory.save_generated_post(
+            user_id=user_id,
+            expert_mode=get_user_expert_mode(user_id),
+            task="source_interpretation",
+            topic=item.get("title", ""),
+            content=result,
+            image_count=0,
+            published_to_channel=False,
+        )
+    return result
+
+
 def is_angle_engine_message(text: str) -> bool:
     return text.startswith("⚠️ Эта тема") or "Разворачиваем тему через новый угол" in text
 
@@ -1108,6 +1337,103 @@ async def publish_insight_command(update: Update, context: ContextTypes.DEFAULT_
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_insight failed")
         await reply_long(update, f"⚠️ Не смог опубликовать инсайт. Причина: {exc}", MAIN_KEYBOARD)
+
+
+async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Источники доступны только админу.", MAIN_KEYBOARD)
+        return
+
+    sources = load_monitored_sources()
+    if not sources:
+        await reply_long(
+            update,
+            "⚠️ Источники пока не заданы. Создай monitored_sources.json рядом с ботом. Пример есть в monitored_sources.example.json.",
+            CONTROL_KEYBOARD,
+        )
+        return
+
+    lines = [
+        "🛰 Источники мониторинга",
+        f"Файл: {MONITORED_SOURCES_FILE}",
+        f"Автомониторинг: {'включён' if SOURCE_MONITOR_ENABLED else 'выключен'}",
+        f"Время: {SOURCE_MONITOR_TIMES}",
+        "",
+    ]
+    for idx, source in enumerate(sources, start=1):
+        status = "on" if source.get("enabled") else "off"
+        lines.append(f"{idx}. [{status}] {source['rubric']} | {source['type']} | {source['name']}")
+    lines.append("\nРубрики: " + ", ".join(SOURCE_RUBRICS))
+    await reply_long(update, "\n".join(lines), CONTROL_KEYBOARD)
+
+
+async def scan_sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Скан источников доступен только админу.", MAIN_KEYBOARD)
+        return
+
+    query = extract_topic(update, context, default="")
+    await send_typing(update)
+
+    try:
+        candidates = await get_source_candidates(query, include_seen=False)
+        if not candidates:
+            await reply_long(update, "⚠️ Свежих источников не нашёл. Проверь /sources или добавь RSS/Atom URL.", CONTROL_KEYBOARD)
+            return
+
+        item = random.choice(candidates[:8])
+        post_text = await generate_source_interpretation(update.effective_user.id, item, save_generated=False)
+        await reply_long(update, f"{post_text}\n\n---\nЧерновик из:\n{format_source_item(item)}", CONTENT_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("scan_sources failed")
+        await reply_long(update, f"⚠️ Не смог собрать интерпретацию источника. Причина: {exc}", CONTROL_KEYBOARD)
+
+
+async def publish_source_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Публикация источников доступна только админу.", MAIN_KEYBOARD)
+        return
+    if not CHANNEL_ID:
+        await reply_long(update, "⚠️ CHANNEL_ID не задан в .env/Replit Secrets.", MAIN_KEYBOARD)
+        return
+
+    query = extract_topic(update, context, default="")
+    await reply_long(update, "🚀 Ищу свежий источник, делаю интерпретацию Naz и готовлю публикацию.")
+
+    try:
+        candidates = await get_source_candidates(query, include_seen=False)
+        if not candidates:
+            await reply_long(update, "⚠️ Свежих источников не нашёл. Ничего не публикую.", MAIN_KEYBOARD)
+            return
+
+        item = random.choice(candidates[:8])
+        post_text = await generate_source_interpretation(update.effective_user.id, item, save_generated=False)
+        images, _ = await generate_images_for_post(update.effective_user.id, item.get("title", ""), post_text, count=CHANNEL_IMAGE_COUNT)
+        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            await reply_long(update, "⚠️ Пост по источнику готов, но картинка не собралась. В канал без изображения не публикую.", MAIN_KEYBOARD)
+            return
+
+        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+        mark_source_seen(item)
+        memory.save_generated_post(
+            user_id=update.effective_user.id,
+            expert_mode=get_user_expert_mode(update.effective_user.id),
+            task="publish_source",
+            topic=item.get("title", ""),
+            content=post_text,
+            image_count=len(images),
+            published_to_channel=True,
+        )
+        await reply_long(update, f"✅ Опубликовано по источнику:\n{format_source_item(item)}", MAIN_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("publish_source failed")
+        await reply_long(update, f"⚠️ Не смог опубликовать источник. Причина: {exc}", MAIN_KEYBOARD)
 
 
 async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1648,6 +1974,46 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Последний уровень защиты: бот не должен падать из-за автопоста.
 
 
+async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CHANNEL_ID:
+        logger.warning("SOURCE_MONITOR skipped: CHANNEL_ID empty")
+        return
+    if not load_monitored_sources():
+        logger.warning("SOURCE_MONITOR skipped: no monitored sources")
+        return
+
+    admin_user_id = ADMIN_ID or 0
+    logger.info("SOURCE_MONITOR started")
+
+    try:
+        candidates = await get_source_candidates(include_seen=False)
+        if not candidates:
+            logger.info("SOURCE_MONITOR skipped: no fresh candidates")
+            return
+
+        item = random.choice(candidates[:10])
+        post_text = await generate_source_interpretation(admin_user_id, item, save_generated=False)
+        images, image_prompt = await generate_images_for_post(admin_user_id, item.get("title", ""), post_text, count=CHANNEL_IMAGE_COUNT)
+        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            logger.warning("SOURCE_MONITOR skipped: images are required but none were generated")
+            return
+
+        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+        mark_source_seen(item)
+        memory.save_generated_post(
+            user_id=admin_user_id,
+            expert_mode=get_user_expert_mode(admin_user_id),
+            task=f"source_monitor:{item.get('rubric', '')}",
+            topic=item.get("title", ""),
+            content=post_text,
+            image_count=len(images),
+            published_to_channel=True,
+        )
+        logger.info("SOURCE_MONITOR done | %s | images=%s | prompt=%s", item.get("title", ""), len(images), image_prompt)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("SOURCE_MONITOR failed: %s", exc)
+
+
 def setup_autoposting(application: Application) -> None:
     if not AUTOPOST_ENABLED:
         logger.info("Autoposting disabled")
@@ -1684,6 +2050,43 @@ def setup_autoposting(application: Application) -> None:
         return
 
     logger.info("Autoposting scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
+
+
+def setup_source_monitoring(application: Application) -> None:
+    if not SOURCE_MONITOR_ENABLED:
+        logger.info("Source monitoring disabled")
+        return
+    if not application.job_queue:
+        logger.warning("JobQueue is not available. Install python-telegram-bot[job-queue].")
+        return
+
+    tz = ZoneInfo(BOT_TIMEZONE)
+    scheduled = []
+    for raw_time in SOURCE_MONITOR_TIMES.split(","):
+        raw_time = raw_time.strip()
+        if not raw_time:
+            continue
+        try:
+            hour_text, minute_text = raw_time.split(":", maxsplit=1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+            if hour not in range(24) or minute not in range(60):
+                raise ValueError
+        except ValueError:
+            logger.warning("Invalid SOURCE_MONITOR_TIMES value skipped: %s", raw_time)
+            continue
+
+        application.job_queue.run_daily(
+            source_monitor_job,
+            time(hour=hour, minute=minute, tzinfo=tz),
+            name=f"naz_source_monitor_{hour:02d}_{minute:02d}",
+        )
+        scheduled.append(f"{hour:02d}:{minute:02d}")
+
+    if scheduled:
+        logger.info("Source monitoring scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
+    else:
+        logger.warning("Source monitoring enabled, but SOURCE_MONITOR_TIMES has no valid times")
 
 
 # -----------------------------------------------------------------------------
@@ -1735,6 +2138,10 @@ def help_commands_text() -> str:
         "/imagepost тема — пост + 2 картинки\n"
         "/image тема — одна картинка\n"
         "/publish тема — сгенерировать и отправить в канал\n\n"
+        "Источники:\n"
+        "/sources — список источников\n"
+        "/scan_sources рубрика — черновик интерпретации\n"
+        "/publish_source рубрика — опубликовать интерпретацию источника\n\n"
         "Админ:\n"
         "/stats — статистика"
     )
@@ -1814,6 +2221,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("memory", memory_command))
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("sources", sources_command))
+    application.add_handler(CommandHandler("scan_sources", scan_sources_command))
+    application.add_handler(CommandHandler("publish_source", publish_source_command))
 
     # Content commands
     application.add_handler(CommandHandler("post", post_command))
@@ -1832,6 +2242,7 @@ def build_application() -> Application:
     application.add_error_handler(error_handler)
 
     setup_autoposting(application)
+    setup_source_monitoring(application)
     return application
 
 
