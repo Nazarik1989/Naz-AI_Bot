@@ -1031,21 +1031,74 @@ def collect_agent_materials(date_hint: str = "", focus: str = "") -> Tuple[str, 
     return context, risks, date_text
 
 
+AGENT_EDITOR_LANES = [
+    {
+        "name": "неочевидный урок",
+        "instruction": "Начни с сильного вывода, затем покажи один эпизод как доказательство. Тон спокойный, уверенный, без лишней драмы.",
+        "avoid": "не начинай с хронологии и не используй каркас 'всё работало, а потом'",
+    },
+    {
+        "name": "маленькая поломка",
+        "instruction": "Покажи маленький сбой как полезный симптом системы. Тон живой, чуть ироничный, но без технарского перегруза.",
+        "avoid": "не перечисляй компоненты подряд и не превращай пост в лог работ",
+    },
+    {
+        "name": "анти-совет",
+        "instruction": "Начни с того, как обычно делают неправильно, а потом покажи нормальную логику через эпизод из материалов.",
+        "avoid": "не морализируй и не делай универсальные лозунги",
+    },
+    {
+        "name": "перевод с инженерного",
+        "instruction": "Возьми технический эпизод и переведи его на язык пользы: что это меняет для человека, бизнеса, контента или рутины.",
+        "avoid": "не убирай инженерность полностью, просто объясняй её простыми словами",
+    },
+    {
+        "name": "тихая правда",
+        "instruction": "Сделай короткую наблюдательную заметку: меньше сюжета, больше точного смысла и спокойной честности.",
+        "avoid": "не повторяй слова 'агент', 'демо', 'инструмент' чаще одного раза каждое",
+    },
+    {
+        "name": "практический вывод",
+        "instruction": "Собери пост вокруг применимого правила: как не наступить на такую же проблему в AI, ботах, контенте или автоматизации.",
+        "avoid": "не делай чек-лист и не пиши сухо",
+    },
+]
+
+
+def format_recent_agent_posts(user_id: int) -> str:
+    posts = memory.get_recent_generated_posts(user_id, task="agent_content_editor", limit=3)
+    if not posts:
+        return "Последние редакторские посты: нет."
+    lines = ["Последние редакторские посты, от которых нужно отличаться:"]
+    for post in posts:
+        text = extract_telegram_post_from_package(post.get("content", "")) or post.get("content", "")
+        compact = re.sub(r"\s+", " ", text).strip()
+        lines.append(f"- {compact[:360]}")
+    return "\n".join(lines)
+
+
 async def generate_agent_content_package(user_id: int, date_hint: str = "", focus: str = "", *, save_generated: bool = True) -> Tuple[str, List[str], str]:
     context, risks, date_text = collect_agent_materials(date_hint, focus)
     if not context:
         return "⚠️ Не нашёл материалы content-agent в content_inbox/agent_content/.", risks, date_text
 
     risk_line = "Предварительные риски: " + (", ".join(risks) if risks else "не найдены")
+    lane = random.choice(AGENT_EDITOR_LANES)
+    recent_posts = format_recent_agent_posts(user_id)
     messages = build_messages(
         state=memory.load_state(user_id),
         expert_mode=get_user_expert_mode(user_id),
         user_text=(
             f"{risk_line}\n\n"
             f"{context}\n\n"
+            f"Редакторская подача на этот раз: {lane['name']}.\n"
+            f"Как писать: {lane['instruction']}\n"
+            f"Чего избегать: {lane['avoid']}\n\n"
+            f"{recent_posts}\n\n"
             "Собери редакторский пакет. Не публикуй сырьё напрямую. "
             "Выбери один конкретный эпизод из материалов и преврати его в экспертный инсайт. "
             "Не делай отчёт о дне. Не повторяй одну мысль в Telegram-посте, hooks и комментарии. "
+            "Не копируй ритм, первую фразу и связки из последних редакторских постов. "
             "Если риски есть, усили safety note и пометь как черновик."
         ),
         memory_context=build_user_memory_context(user_id),

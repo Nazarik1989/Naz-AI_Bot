@@ -12,7 +12,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from controller import normalize_state
 from prompts import (
@@ -344,6 +344,20 @@ def save_generated_post(
                 utc_now(),
             ),
         )
+
+
+def get_recent_generated_posts(user_id: int, task: str = "", limit: int = 3) -> List[Dict[str, str]]:
+    query = "SELECT task, topic, content, created_at FROM generated_posts WHERE user_id = ?"
+    params: List[Any] = [user_id]
+    if task:
+        query += " AND task = ?"
+        params.append(task)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with db() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
 
 
 def format_memory(user_id: int, limit: int = 10) -> str:
