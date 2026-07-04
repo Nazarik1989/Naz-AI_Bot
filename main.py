@@ -107,6 +107,7 @@ APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
 NAZ_STORIES_FILE = Path(os.getenv("NAZ_STORIES_FILE", "naz_stories.md").strip())
 MONITORED_SOURCES_FILE = Path(os.getenv("MONITORED_SOURCES_FILE", "monitored_sources.json").strip())
 SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip())
+AGENT_CONTENT_INBOX = Path(os.getenv("AGENT_CONTENT_INBOX", "content_inbox/agent_content").strip())
 
 AUTOPOST_ENABLED = env_bool("AUTOPOST_ENABLED", True)
 AUTOPOST_TIMES = os.getenv("AUTOPOST_TIMES", "10:00,20:00").strip()
@@ -132,6 +133,7 @@ TASK_MAX_TOKENS = {
     "image_prompt": 180,
     "insight": 430,
     "source_interpretation": 520,
+    "agent_content_editor": 950,
 }
 
 CONTENT_MODEL_TASKS = {
@@ -144,6 +146,7 @@ CONTENT_MODEL_TASKS = {
     "image_prompt",
     "insight",
     "source_interpretation",
+    "agent_content_editor",
 }
 
 # In-memory fast state. Persistent truth is SQLite.
@@ -930,6 +933,145 @@ async def generate_source_interpretation(user_id: int, item: Dict[str, str], *, 
     return result
 
 
+SENSITIVE_PATTERNS = [
+    ("telegram bot token", re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{25,}\b")),
+    ("openai/openrouter key", re.compile(r"\b(?:sk-or-v1|sk-proj|sk)-[A-Za-z0-9_-]{16,}\b")),
+    ("huggingface token", re.compile(r"\bhf_[A-Za-z0-9]{20,}\b")),
+    ("secret env name", re.compile(r"\b(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CLIENT_SECRET)\b", re.I)),
+    ("ssh/ip detail", re.compile(r"\b(?:ssh\s+\S+@|(?:\d{1,3}\.){3}\d{1,3})\b", re.I)),
+    ("internal url", re.compile(r"\b(?:https?://)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)[^\s]*", re.I)),
+]
+
+
+def detect_content_risks(text: str) -> List[str]:
+    found: List[str] = []
+    for label, pattern in SENSITIVE_PATTERNS:
+        if pattern.search(text):
+            found.append(label)
+    return found
+
+
+def redact_sensitive_text(text: str) -> str:
+    redacted = text
+    for _, pattern in SENSITIVE_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def latest_agent_content_dir(date_hint: str = "") -> Optional[Path]:
+    if date_hint:
+        candidate = AGENT_CONTENT_INBOX / date_hint.strip()
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    if not AGENT_CONTENT_INBOX.exists():
+        return None
+    dirs = [path for path in AGENT_CONTENT_INBOX.iterdir() if path.is_dir()]
+    return sorted(dirs, key=lambda path: path.name)[-1] if dirs else None
+
+
+def read_limited_text(path: Path, limit: int = 6000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limit].strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read agent content file %s: %s", path, exc)
+        return ""
+
+
+def load_agent_manifest(day_dir: Path) -> Dict:
+    manifest = read_json_file(day_dir / "manifest.json", {})
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def agent_file(day_dir: Path, names: List[str]) -> Optional[Path]:
+    for name in names:
+        path = day_dir / name
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def collect_agent_materials(date_hint: str = "", focus: str = "") -> Tuple[str, List[str], str]:
+    day_dir = latest_agent_content_dir(date_hint)
+    if not day_dir:
+        return "", ["agent inbox missing"], ""
+
+    manifest = load_agent_manifest(day_dir)
+    date_text = str(manifest.get("date") or day_dir.name)
+    files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
+
+    today_pick = agent_file(day_dir, [f"{date_text}-today-pick.md", *[str(item) for item in files if "today-pick" in str(item)]])
+    live = agent_file(day_dir, ["live-chronicle.md", *[str(item) for item in files if "live-chronicle" in str(item)]])
+    pack = agent_file(day_dir, [f"{date_text}-content-pack.md", *[str(item) for item in files if str(item).endswith("content-pack.md")]])
+    notes = agent_file(day_dir, [f"{date_text}.md", *[str(item) for item in files if str(item).endswith(".md") and str(item) == f"{date_text}.md"]])
+    pack_json = agent_file(day_dir, [f"{date_text}-content-pack.json", *[str(item) for item in files if str(item).endswith(".json") and "content-pack" in str(item)]])
+
+    parts = [
+        ("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)[:2500]),
+    ]
+    for label, path, limit in [
+        ("today-pick.md", today_pick, 7000),
+        ("live-chronicle.md", live, 3500),
+        ("content-pack.md", pack, 5000),
+        ("manual-notes.md", notes, 2500),
+        ("content-pack.json", pack_json, 3500),
+    ]:
+        if path:
+            parts.append((label, read_limited_text(path, limit)))
+
+    raw = "\n\n".join(f"### {label}\n{text}" for label, text in parts if text)
+    risks = detect_content_risks(raw)
+    safe_raw = redact_sensitive_text(raw)
+    context = (
+        f"Дата: {date_text}\n"
+        f"Папка: {day_dir.name}\n"
+        f"Фокус пользователя: {focus or 'не задан'}\n\n"
+        f"{safe_raw[:14000]}"
+    )
+    return context, risks, date_text
+
+
+async def generate_agent_content_package(user_id: int, date_hint: str = "", focus: str = "", *, save_generated: bool = True) -> Tuple[str, List[str], str]:
+    context, risks, date_text = collect_agent_materials(date_hint, focus)
+    if not context:
+        return "⚠️ Не нашёл материалы content-agent в content_inbox/agent_content/.", risks, date_text
+
+    risk_line = "Предварительные риски: " + (", ".join(risks) if risks else "не найдены")
+    messages = build_messages(
+        state=memory.load_state(user_id),
+        expert_mode=get_user_expert_mode(user_id),
+        user_text=(
+            f"{risk_line}\n\n"
+            f"{context}\n\n"
+            "Собери редакторский пакет. Не публикуй сырьё напрямую. Если риски есть, усили safety note и пометь как черновик."
+        ),
+        memory_context=build_user_memory_context(user_id),
+        history=[],
+        task="agent_content_editor",
+    )
+    result = await call_gpt(
+        messages,
+        max_tokens=TASK_MAX_TOKENS["agent_content_editor"],
+        model=CONTENT_MODEL_NAME,
+    )
+
+    if save_generated:
+        memory.save_generated_post(
+            user_id=user_id,
+            expert_mode=get_user_expert_mode(user_id),
+            task="agent_content_editor",
+            topic=f"content-agent {date_text}",
+            content=result,
+            image_count=0,
+            published_to_channel=False,
+        )
+    return result, risks, date_text
+
+
+def extract_telegram_post_from_package(package: str) -> str:
+    match = re.search(r"##\s*Telegram-пост\s*(.*?)(?=\n##\s|\Z)", package, re.S | re.I)
+    return match.group(1).strip() if match else ""
+
+
 def is_angle_engine_message(text: str) -> bool:
     return text.startswith("⚠️ Эта тема") or "Разворачиваем тему через новый угол" in text
 
@@ -1434,6 +1576,79 @@ async def publish_source_command(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_source failed")
         await reply_long(update, f"⚠️ Не смог опубликовать источник. Причина: {exc}", MAIN_KEYBOARD)
+
+
+def parse_agent_content_args(context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
+    args = context.args or []
+    date_hint = ""
+    focus_words = args[:]
+    if args and re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[0]):
+        date_hint = args[0]
+        focus_words = args[1:]
+    return date_hint, " ".join(focus_words).strip()
+
+
+async def agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Content inbox доступен только админу.", MAIN_KEYBOARD)
+        return
+
+    date_hint, focus = parse_agent_content_args(context)
+    await send_typing(update)
+
+    try:
+        package, risks, date_text = await generate_agent_content_package(update.effective_user.id, date_hint, focus)
+        prefix = f"📥 content-agent: {date_text or 'latest'}"
+        if risks:
+            prefix += "\n⚠️ Риски найдены: " + ", ".join(risks)
+        await reply_long(update, f"{prefix}\n\n{package}", CONTENT_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("agent_content failed")
+        await reply_long(update, f"⚠️ Не смог собрать редакторский пакет. Причина: {exc}", CONTROL_KEYBOARD)
+
+
+async def publish_agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Публикация content-agent доступна только админу.", MAIN_KEYBOARD)
+        return
+    if not CHANNEL_ID:
+        await reply_long(update, "⚠️ CHANNEL_ID не задан в .env/Replit Secrets.", MAIN_KEYBOARD)
+        return
+
+    date_hint, focus = parse_agent_content_args(context)
+    await reply_long(update, "🚀 Читаю content-agent inbox, собираю редакторский пакет и проверяю риски.")
+
+    try:
+        package, risks, date_text = await generate_agent_content_package(update.effective_user.id, date_hint, focus, save_generated=False)
+        post_text = extract_telegram_post_from_package(package)
+        if risks or not post_text or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in package.upper():
+            reason = ", ".join(risks) if risks else "не смог уверенно выделить Telegram-пост или safety note запретил автопубликацию"
+            await reply_long(update, f"⚠️ Не публикую автоматически: {reason}\n\n{package}", MAIN_KEYBOARD)
+            return
+
+        images, _ = await generate_images_for_post(update.effective_user.id, focus or f"content-agent {date_text}", post_text, count=CHANNEL_IMAGE_COUNT)
+        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            await reply_long(update, "⚠️ Пост готов, но картинка не собралась. В канал без изображения не публикую.", MAIN_KEYBOARD)
+            return
+
+        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+        memory.save_generated_post(
+            user_id=update.effective_user.id,
+            expert_mode=get_user_expert_mode(update.effective_user.id),
+            task="publish_agent_content",
+            topic=f"content-agent {date_text}",
+            content=post_text,
+            image_count=len(images),
+            published_to_channel=True,
+        )
+        await reply_long(update, f"✅ Опубликовано из content-agent inbox за {date_text}.", MAIN_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("publish_agent_content failed")
+        await reply_long(update, f"⚠️ Не смог опубликовать content-agent материал. Причина: {exc}", MAIN_KEYBOARD)
 
 
 async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2142,6 +2357,9 @@ def help_commands_text() -> str:
         "/sources — список источников\n"
         "/scan_sources рубрика — черновик интерпретации\n"
         "/publish_source рубрика — опубликовать интерпретацию источника\n\n"
+        "Content-agent:\n"
+        "/agent_content [YYYY-MM-DD] [фокус] — редакторский пакет из inbox\n"
+        "/publish_agent_content [YYYY-MM-DD] [фокус] — опубликовать безопасный Telegram-пост\n\n"
         "Админ:\n"
         "/stats — статистика"
     )
@@ -2224,6 +2442,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("sources", sources_command))
     application.add_handler(CommandHandler("scan_sources", scan_sources_command))
     application.add_handler(CommandHandler("publish_source", publish_source_command))
+    application.add_handler(CommandHandler("agent_content", agent_content_command))
+    application.add_handler(CommandHandler("publish_agent_content", publish_agent_content_command))
 
     # Content commands
     application.add_handler(CommandHandler("post", post_command))

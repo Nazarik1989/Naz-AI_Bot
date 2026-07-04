@@ -33,6 +33,7 @@ CONTENT_TASKS = {
     "angle_post",
     "insight",
     "source_interpretation",
+    "agent_content_editor",
 }
 ANGLE_ENGINE_VERSION = "v2.4"
 
