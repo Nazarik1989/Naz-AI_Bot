@@ -88,3 +88,21 @@ The bot schedules posts at the comma-separated `AUTOPOST_TIMES` values in
 ## VPS
 
 See `VPS_DEPLOY.md`.
+
+## One-command Deploy
+
+From PowerShell:
+
+```powershell
+.\deploy.ps1 -Message "Your commit message"
+```
+
+The script:
+
+- commits and pushes code to GitHub;
+- copies private runtime files to VPS: `.env`, `naz_stories.md`, `monitored_sources.json`, `content_inbox/agent_content`;
+- runs `git pull --ff-only` on VPS;
+- checks Python compilation;
+- restarts `naz-ai-bot.service`.
+
+Private files are ignored by git and are copied directly to VPS.
