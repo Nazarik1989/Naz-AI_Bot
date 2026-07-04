@@ -2182,6 +2182,39 @@ def format_autopost_profile(profile: Dict[str, str]) -> str:
     )
 
 
+AUTOPOST_TEXT_ATTEMPTS = 3
+AUTOPOST_IMAGE_ATTEMPTS = 2
+
+
+async def notify_admin(bot, text: str) -> None:
+    if not ADMIN_ID:
+        return
+    try:
+        await send_long_to_chat(bot, ADMIN_ID, text)
+    except TelegramError as exc:
+        logger.warning("Admin notification failed: %s", exc)
+
+
+async def generate_images_with_retries(
+    user_id: int,
+    topic: str,
+    post_text: str,
+    *,
+    count: int,
+    attempts: int = AUTOPOST_IMAGE_ATTEMPTS,
+) -> Tuple[List[bytes], str]:
+    last_prompt = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        images, image_prompt = await generate_images_for_post(user_id, topic, post_text, count=count)
+        last_prompt = image_prompt
+        if images or not REQUIRE_IMAGES_FOR_CHANNEL_POSTS:
+            return images, image_prompt
+        logger.warning("Image generation retry %s/%s failed for topic=%s", attempt, attempts, topic)
+        if attempt < attempts:
+            await asyncio.sleep(3)
+    return [], last_prompt
+
+
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHANNEL_ID:
         logger.warning("AUTOPOST skipped: CHANNEL_ID empty")
@@ -2193,56 +2226,81 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if get_user_expert_mode(admin_user_id) not in EXPERT_MODES:
             set_user_expert_mode(admin_user_id, DEFAULT_EXPERT_MODE)
 
-    topics = AUTOPOST_TOPICS[:]
-    random.shuffle(topics)
-    use_story_insight = bool(read_naz_stories()) and random.random() < AUTOPOST_INSIGHT_CHANCE
-    task = "insight" if use_story_insight else random.choice(get_autopost_tasks())
-    profile = random.choice(AUTOPOST_PROFILES)
-    topic = "инсайт из опыта запуска Naz_AI_Bot" if use_story_insight else topics[0]
-    logger.info("AUTOPOST started | task=%s | profile=%s", task, profile["name"])
+    logger.info("AUTOPOST started")
 
+    failure_reasons: List[str] = []
     try:
-        post_text = ""
-        if use_story_insight:
-            logger.info("AUTOPOST story insight from %s", NAZ_STORIES_FILE)
-            post_text = await generate_story_insight(admin_user_id, topic, save_generated=False)
-            if is_warning_response(post_text):
-                logger.warning("AUTOPOST story insight skipped by smart filter")
-                return
-        else:
-            for candidate_topic in topics:
-                topic = candidate_topic
-                logger.info("AUTOPOST candidate topic=%s", topic)
-                post_text = await generate_content(
-                    admin_user_id,
-                    topic,
-                    task,
-                    save_generated=False,
-                    extra_instruction=format_autopost_profile(profile),
-                )
-                if not is_warning_response(post_text):
-                    break
-            else:
-                logger.warning("AUTOPOST skipped: all topics blocked by smart filter")
-                return
+        for text_attempt in range(1, AUTOPOST_TEXT_ATTEMPTS + 1):
+            topics = AUTOPOST_TOPICS[:]
+            random.shuffle(topics)
+            use_story_insight = bool(read_naz_stories()) and random.random() < AUTOPOST_INSIGHT_CHANCE
+            task = "insight" if use_story_insight else random.choice(get_autopost_tasks())
+            profile = random.choice(AUTOPOST_PROFILES)
+            topic = "инсайт из опыта запуска Naz_AI_Bot" if use_story_insight else topics[0]
+            post_text = ""
 
-        images, image_prompt = await generate_images_for_post(admin_user_id, topic, post_text, count=CHANNEL_IMAGE_COUNT)
-        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            logger.warning("AUTOPOST skipped: images are required but none were generated")
+            logger.info("AUTOPOST attempt %s/%s | task=%s | profile=%s", text_attempt, AUTOPOST_TEXT_ATTEMPTS, task, profile["name"])
+            if use_story_insight:
+                logger.info("AUTOPOST story insight from %s", NAZ_STORIES_FILE)
+                post_text = await generate_story_insight(admin_user_id, topic, save_generated=False)
+                if is_warning_response(post_text):
+                    reason = "story insight blocked by smart filter"
+                    logger.warning("AUTOPOST retry: %s", reason)
+                    failure_reasons.append(reason)
+                    continue
+            else:
+                for candidate_topic in topics:
+                    topic = candidate_topic
+                    logger.info("AUTOPOST candidate topic=%s", topic)
+                    post_text = await generate_content(
+                        admin_user_id,
+                        topic,
+                        task,
+                        save_generated=False,
+                        extra_instruction=format_autopost_profile(profile),
+                    )
+                    if not is_warning_response(post_text):
+                        break
+                else:
+                    reason = "all topics blocked by smart filter"
+                    logger.warning("AUTOPOST retry: %s", reason)
+                    failure_reasons.append(reason)
+                    continue
+
+            images, image_prompt = await generate_images_with_retries(
+                admin_user_id,
+                topic,
+                post_text,
+                count=CHANNEL_IMAGE_COUNT,
+            )
+            if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+                reason = f"images required but not generated for topic: {topic}"
+                logger.warning("AUTOPOST retry: %s", reason)
+                failure_reasons.append(reason)
+                continue
+
+            await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+            memory.save_generated_post(
+                user_id=admin_user_id,
+                expert_mode=get_user_expert_mode(admin_user_id),
+                task=f"autopost:{task}:{profile['name']}",
+                topic=f"{topic} | {profile['name']}",
+                content=post_text,
+                image_count=len(images),
+                published_to_channel=True,
+            )
+            logger.info("AUTOPOST done | attempt=%s | images=%s | prompt=%s", text_attempt, len(images), image_prompt)
             return
-        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
-        memory.save_generated_post(
-            user_id=admin_user_id,
-            expert_mode=get_user_expert_mode(admin_user_id),
-            task=f"autopost:{task}:{profile['name']}",
-            topic=f"{topic} | {profile['name']}",
-            content=post_text,
-            image_count=len(images),
-            published_to_channel=True,
+
+        logger.warning("AUTOPOST skipped after retries: %s", "; ".join(failure_reasons[-5:]))
+        await notify_admin(
+            context.bot,
+            "⚠️ Автопостинг пропустил слот после нескольких попыток.\n\n"
+            + "\n".join(f"- {reason}" for reason in failure_reasons[-5:]),
         )
-        logger.info("AUTOPOST done | images=%s | prompt=%s", len(images), image_prompt)
     except Exception as exc:  # noqa: BLE001
         logger.exception("AUTOPOST failed: %s", exc)
+        await notify_admin(context.bot, f"⚠️ AUTOPOST failed: {type(exc).__name__}: {exc}")
         # Последний уровень защиты: бот не должен падать из-за автопоста.
 
 
@@ -2257,33 +2315,50 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     admin_user_id = ADMIN_ID or 0
     logger.info("SOURCE_MONITOR started")
 
+    failure_reasons: List[str] = []
     try:
         candidates = await get_source_candidates(include_seen=False)
         if not candidates:
             logger.info("SOURCE_MONITOR skipped: no fresh candidates")
             return
 
-        item = random.choice(candidates[:10])
-        post_text = await generate_source_interpretation(admin_user_id, item, save_generated=False)
-        images, image_prompt = await generate_images_for_post(admin_user_id, item.get("title", ""), post_text, count=CHANNEL_IMAGE_COUNT)
-        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            logger.warning("SOURCE_MONITOR skipped: images are required but none were generated")
+        for item in candidates[:AUTOPOST_TEXT_ATTEMPTS]:
+            post_text = await generate_source_interpretation(admin_user_id, item, save_generated=False)
+            images, image_prompt = await generate_images_with_retries(
+                admin_user_id,
+                item.get("title", ""),
+                post_text,
+                count=CHANNEL_IMAGE_COUNT,
+            )
+            if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+                reason = f"source image failed: {item.get('title', '')}"
+                logger.warning("SOURCE_MONITOR retry: %s", reason)
+                failure_reasons.append(reason)
+                continue
+
+            await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+            mark_source_seen(item)
+            memory.save_generated_post(
+                user_id=admin_user_id,
+                expert_mode=get_user_expert_mode(admin_user_id),
+                task=f"source_monitor:{item.get('rubric', '')}",
+                topic=item.get("title", ""),
+                content=post_text,
+                image_count=len(images),
+                published_to_channel=True,
+            )
+            logger.info("SOURCE_MONITOR done | %s | images=%s | prompt=%s", item.get("title", ""), len(images), image_prompt)
             return
 
-        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
-        mark_source_seen(item)
-        memory.save_generated_post(
-            user_id=admin_user_id,
-            expert_mode=get_user_expert_mode(admin_user_id),
-            task=f"source_monitor:{item.get('rubric', '')}",
-            topic=item.get("title", ""),
-            content=post_text,
-            image_count=len(images),
-            published_to_channel=True,
+        logger.warning("SOURCE_MONITOR skipped after retries: %s", "; ".join(failure_reasons[-5:]))
+        await notify_admin(
+            context.bot,
+            "⚠️ Мониторинг источников пропустил слот после нескольких попыток.\n\n"
+            + "\n".join(f"- {reason}" for reason in failure_reasons[-5:]),
         )
-        logger.info("SOURCE_MONITOR done | %s | images=%s | prompt=%s", item.get("title", ""), len(images), image_prompt)
     except Exception as exc:  # noqa: BLE001
         logger.exception("SOURCE_MONITOR failed: %s", exc)
+        await notify_admin(context.bot, f"⚠️ SOURCE_MONITOR failed: {type(exc).__name__}: {exc}")
 
 
 def setup_autoposting(application: Application) -> None:
