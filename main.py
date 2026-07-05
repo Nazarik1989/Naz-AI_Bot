@@ -118,6 +118,8 @@ SOURCE_MONITOR_TIMES = os.getenv("SOURCE_MONITOR_TIMES", "12:00,18:00").strip()
 AGENT_CONTENT_SYNC_ENABLED = env_bool("AGENT_CONTENT_SYNC_ENABLED", True)
 AGENT_CONTENT_SYNC_TIMES = os.getenv("AGENT_CONTENT_SYNC_TIMES", "23:57").strip()
 AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
+AGENT_CONTENT_RANDOM_SYNC = env_bool("AGENT_CONTENT_RANDOM_SYNC", True)
+AGENT_CONTENT_REUSE_SEEN = env_bool("AGENT_CONTENT_REUSE_SEEN", True)
 AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_content_seen.json").strip())
 REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", True)
 CHANNEL_IMAGE_COUNT = max(1, min(env_int("CHANNEL_IMAGE_COUNT", 1), 2))
@@ -974,6 +976,23 @@ def latest_agent_content_dir(date_hint: str = "") -> Optional[Path]:
     return random.choice(dirs) if dirs else None
 
 
+def list_agent_content_dirs() -> List[Path]:
+    if not AGENT_CONTENT_INBOX.exists():
+        return []
+    return [path for path in AGENT_CONTENT_INBOX.iterdir() if path.is_dir()]
+
+
+def choose_agent_content_date_for_sync() -> str:
+    dirs = list_agent_content_dirs()
+    if not dirs:
+        return current_bot_date()
+
+    seen = load_agent_content_seen()
+    changed = [path for path in dirs if seen.get(path.name) != agent_manifest_hash(path)]
+    pool = changed or dirs
+    return random.choice(pool).name
+
+
 def read_limited_text(path: Path, limit: int = 6000) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")[:limit].strip()
@@ -1051,38 +1070,121 @@ def collect_agent_materials(date_hint: str = "", focus: str = "") -> Tuple[str, 
     return context, risks, date_text
 
 
-AGENT_EDITOR_LANES = [
+AGENT_CONTENT_LENSES = [
     {
-        "name": "неочевидный урок",
-        "instruction": "Начни с сильного вывода, затем покажи один эпизод как доказательство. Тон спокойный, уверенный, без лишней драмы.",
-        "avoid": "не начинай с хронологии и не используй каркас 'всё работало, а потом'",
+        "name": "системный инсайт",
+        "instruction": "Покажи, какой элемент системы держит результат: память, контроль, проверка, доставка, контекст, порядок.",
     },
     {
-        "name": "маленькая поломка",
-        "instruction": "Покажи маленький сбой как полезный симптом системы. Тон живой, чуть ироничный, но без технарского перегруза.",
-        "avoid": "не перечисляй компоненты подряд и не превращай пост в лог работ",
+        "name": "цена мелочи",
+        "instruction": "Возьми маленькую настройку, привычку или проверку и покажи, почему без неё проект начинает ехать боком.",
     },
     {
-        "name": "анти-совет",
-        "instruction": "Начни с того, как обычно делают неправильно, а потом покажи нормальную логику через эпизод из материалов.",
-        "avoid": "не морализируй и не делай универсальные лозунги",
+        "name": "ошибка как симптом",
+        "instruction": "Не просто расскажи про баг, а покажи, какую слабость процесса он вскрыл.",
     },
     {
         "name": "перевод с инженерного",
-        "instruction": "Возьми технический эпизод и переведи его на язык пользы: что это меняет для человека, бизнеса, контента или рутины.",
-        "avoid": "не убирай инженерность полностью, просто объясняй её простыми словами",
+        "instruction": "Переведи технический эпизод на язык пользы: что стало проще, надёжнее, понятнее или спокойнее.",
     },
     {
-        "name": "тихая правда",
-        "instruction": "Сделай короткую наблюдательную заметку: меньше сюжета, больше точного смысла и спокойной честности.",
-        "avoid": "не повторяй слова 'агент', 'демо', 'инструмент' чаще одного раза каждое",
+        "name": "путь разработчика",
+        "instruction": "Покажи раннюю или незаметную часть пути: как человек учится строить не игрушку, а рабочий контур.",
     },
     {
-        "name": "практический вывод",
-        "instruction": "Собери пост вокруг применимого правила: как не наступить на такую же проблему в AI, ботах, контенте или автоматизации.",
-        "avoid": "не делай чек-лист и не пиши сухо",
+        "name": "контент из рутины",
+        "instruction": "Покажи, как обычный рабочий диалог превращается в материал, если вытащить из него конфликт и вывод.",
     },
 ]
+
+
+AGENT_CONTENT_TONES = [
+    {
+        "name": "спокойный инженер",
+        "instruction": "Точно, собранно, без шума. Сила в ясности и наблюдении.",
+    },
+    {
+        "name": "ироничный Naz",
+        "instruction": "Живо, с лёгкой усмешкой над рабочим абсурдом, но без превращения поста в шутку ради шутки.",
+    },
+    {
+        "name": "серьёзный разбор",
+        "instruction": "Глубже обычного: причина, последствие, влияние на проект, вывод для тех, кто строит систему.",
+    },
+    {
+        "name": "ремесленная философия",
+        "instruction": "Немного философии о внимании, качестве и доведении, но всегда через конкретную деталь.",
+    },
+    {
+        "name": "мемас с пользой",
+        "instruction": "Легко, узнаваемо, можно смешно. Но финал обязан давать практический смысл.",
+    },
+]
+
+
+AGENT_CONTENT_FORMS = [
+    {
+        "name": "неочевидный урок",
+        "instruction": "Начни с вывода, потом покажи эпизод как доказательство.",
+    },
+    {
+        "name": "маленькая история",
+        "instruction": "Короткий сюжет: ситуация, сбой/находка, что стало понятно.",
+    },
+    {
+        "name": "анти-совет",
+        "instruction": "Сначала покажи, как обычно делают неправильно, потом нормальную логику.",
+    },
+    {
+        "name": "контраст",
+        "instruction": "Построй на противопоставлении: выглядит как X, на деле это Y.",
+    },
+    {
+        "name": "правило из практики",
+        "instruction": "Собери пост вокруг одного правила, которое можно применить в работе.",
+    },
+]
+
+
+AGENT_CONTENT_DEPTHS = [
+    {
+        "name": "быстрая заметка",
+        "instruction": "650-800 знаков, один ясный вывод, без разгона.",
+    },
+    {
+        "name": "пост-инсайт",
+        "instruction": "750-1000 знаков, эпизод плюс смысл для проекта.",
+    },
+    {
+        "name": "глубокий разбор",
+        "instruction": "900-1150 знаков, больше причинно-следственной связи, меньше украшений.",
+    },
+]
+
+
+AGENT_CONTENT_GLOBAL_AVOID = (
+    "Не начинай с хронологии. Не используй каркас 'всё работало, а потом' чаще одного раза. "
+    "Не повторяй связки 'агент уже / Telegram уже / сессия уже'. "
+    "Не делай отчёт, чек-лист или техническую документацию. "
+    "Не убирай инженерность полностью: объясняй её простыми словами через пользу."
+)
+
+
+def choose_agent_editor_profile() -> Dict[str, str]:
+    lens = random.choice(AGENT_CONTENT_LENSES)
+    tone = random.choice(AGENT_CONTENT_TONES)
+    form = random.choice(AGENT_CONTENT_FORMS)
+    depth = random.choice(AGENT_CONTENT_DEPTHS)
+    return {
+        "name": f"{lens['name']} / {tone['name']} / {form['name']} / {depth['name']}",
+        "instruction": (
+            f"Линза: {lens['instruction']}\n"
+            f"Тон: {tone['instruction']}\n"
+            f"Форма: {form['instruction']}\n"
+            f"Глубина: {depth['instruction']}"
+        ),
+        "avoid": AGENT_CONTENT_GLOBAL_AVOID,
+    }
 
 
 def format_recent_agent_posts(user_id: int) -> str:
@@ -1103,7 +1205,7 @@ async def generate_agent_content_package(user_id: int, date_hint: str = "", focu
         return "⚠️ Не нашёл материалы content-agent в content_inbox/agent_content/.", risks, date_text
 
     risk_line = "Предварительные риски: " + (", ".join(risks) if risks else "не найдены")
-    lane = random.choice(AGENT_EDITOR_LANES)
+    lane = choose_agent_editor_profile()
     recent_posts = format_recent_agent_posts(user_id)
     messages = build_messages(
         state=memory.load_state(user_id),
@@ -1116,7 +1218,11 @@ async def generate_agent_content_package(user_id: int, date_hint: str = "", focu
             f"Чего избегать: {lane['avoid']}\n\n"
             f"{recent_posts}\n\n"
             "Собери редакторский пакет. Не публикуй сырьё напрямую. "
+            "Относись к inbox как к банку материалов, а не как к хронологическому дневнику. "
+            "Сегодня можно взять свежий сложный инсайт, завтра почти очевидную мелочь из начала пути. "
             "Выбери один конкретный эпизод из материалов и преврати его в экспертный инсайт. "
+            "Покажи, почему этот момент важен для разработки и как он влияет на работу проекта. "
+            "Иногда можно добавить немного философии, иногда лёгкий мемный угол, если он помогает смыслу. "
             "Не делай отчёт о дне. Не повторяй одну мысль в Telegram-посте, hooks и комментарии. "
             "Не копируй ритм, первую фразу и связки из последних редакторских постов. "
             "Если риски есть, усили safety note и пометь как черновик."
@@ -1823,7 +1929,7 @@ async def sync_agent_content_command(update: Update, context: ContextTypes.DEFAU
         return
 
     date_hint, _ = parse_agent_content_args(context)
-    date_text = date_hint or current_bot_date()
+    date_text = date_hint or choose_agent_content_date_for_sync()
     await reply_long(update, f"📥 Проверяю Agent Content за {date_text}...")
     result = await process_agent_content_date(
         context.bot,
@@ -2494,14 +2600,14 @@ async def agent_content_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("AGENT_CONTENT_SYNC skipped: ADMIN_ID empty")
         return
 
-    date_text = current_bot_date()
-    logger.info("AGENT_CONTENT_SYNC started | date=%s", date_text)
+    date_text = choose_agent_content_date_for_sync() if AGENT_CONTENT_RANDOM_SYNC else current_bot_date()
+    logger.info("AGENT_CONTENT_SYNC started | date=%s | random=%s", date_text, AGENT_CONTENT_RANDOM_SYNC)
     try:
         result = await process_agent_content_date(
             context.bot,
             admin_user_id,
             date_text,
-            force=False,
+            force=AGENT_CONTENT_REUSE_SEEN,
             publish=AGENT_CONTENT_AUTO_PUBLISH,
         )
         logger.info("AGENT_CONTENT_SYNC done | %s", result)
