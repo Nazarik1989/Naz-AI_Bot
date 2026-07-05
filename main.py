@@ -20,7 +20,7 @@ import os
 import random
 import re
 import xml.etree.ElementTree as ET
-from datetime import time
+from datetime import datetime, time
 from html import unescape
 from io import BytesIO
 from pathlib import Path
@@ -115,6 +115,10 @@ AUTOPOST_TASKS = os.getenv("AUTOPOST_TASKS", "post,viral").strip()
 AUTOPOST_INSIGHT_CHANCE = max(0.0, min(env_float("AUTOPOST_INSIGHT_CHANCE", 0.35), 1.0))
 SOURCE_MONITOR_ENABLED = env_bool("SOURCE_MONITOR_ENABLED", False)
 SOURCE_MONITOR_TIMES = os.getenv("SOURCE_MONITOR_TIMES", "12:00,18:00").strip()
+AGENT_CONTENT_SYNC_ENABLED = env_bool("AGENT_CONTENT_SYNC_ENABLED", True)
+AGENT_CONTENT_SYNC_TIMES = os.getenv("AGENT_CONTENT_SYNC_TIMES", "23:57").strip()
+AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
+AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_content_seen.json").strip())
 REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", True)
 CHANNEL_IMAGE_COUNT = max(1, min(env_int("CHANNEL_IMAGE_COUNT", 1), 2))
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
@@ -983,6 +987,15 @@ def load_agent_manifest(day_dir: Path) -> Dict:
     return manifest if isinstance(manifest, dict) else {}
 
 
+def agent_manifest_hash(day_dir: Path) -> str:
+    manifest_path = day_dir / "manifest.json"
+    try:
+        raw = manifest_path.read_bytes()
+    except FileNotFoundError:
+        raw = day_dir.name.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
 def agent_file(day_dir: Path, names: List[str]) -> Optional[Path]:
     for name in names:
         path = day_dir / name
@@ -1005,6 +1018,11 @@ def collect_agent_materials(date_hint: str = "", focus: str = "") -> Tuple[str, 
     pack = agent_file(day_dir, [f"{date_text}-content-pack.md", *[str(item) for item in files if str(item).endswith("content-pack.md")]])
     notes = agent_file(day_dir, [f"{date_text}.md", *[str(item) for item in files if str(item).endswith(".md") and str(item) == f"{date_text}.md"]])
     pack_json = agent_file(day_dir, [f"{date_text}-content-pack.json", *[str(item) for item in files if str(item).endswith(".json") and "content-pack" in str(item)]])
+    codex_files = [
+        day_dir / str(item)
+        for item in files
+        if str(item).endswith(".md") and "-codex-" in str(item) and (day_dir / str(item)).is_file()
+    ][:3]
 
     parts = [
         ("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)[:2500]),
@@ -1018,6 +1036,8 @@ def collect_agent_materials(date_hint: str = "", focus: str = "") -> Tuple[str, 
     ]:
         if path:
             parts.append((label, read_limited_text(path, limit)))
+    for codex_file in codex_files:
+        parts.append((f"codex-memory:{codex_file.name}", read_limited_text(codex_file, 3000)))
 
     raw = "\n\n".join(f"### {label}\n{text}" for label, text in parts if text)
     risks = detect_content_risks(raw)
@@ -1127,6 +1147,11 @@ async def generate_agent_content_package(user_id: int, date_hint: str = "", focu
 def extract_telegram_post_from_package(package: str) -> str:
     match = re.search(r"##\s*Telegram-пост\s*(.*?)(?=\n##\s|\Z)", package, re.S | re.I)
     return match.group(1).strip() if match else ""
+
+
+def extract_safety_note(package: str) -> str:
+    match = re.search(r"##\s*Safety note\s*(.*?)(?=\n##\s|\Z)", package, re.S | re.I)
+    return match.group(1).strip() if match else package[-1000:]
 
 
 def is_angle_engine_message(text: str) -> bool:
@@ -1706,6 +1731,108 @@ async def publish_agent_content_command(update: Update, context: ContextTypes.DE
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_agent_content failed")
         await reply_long(update, f"⚠️ Не смог опубликовать content-agent материал. Причина: {exc}", MAIN_KEYBOARD)
+
+
+def load_agent_content_seen() -> Dict[str, str]:
+    raw = read_json_file(AGENT_CONTENT_STATE_FILE, {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def mark_agent_content_seen(date_text: str, manifest_hash: str) -> None:
+    seen = load_agent_content_seen()
+    seen[date_text] = manifest_hash
+    if len(seen) > 120:
+        seen = dict(list(seen.items())[-120:])
+    write_json_file(AGENT_CONTENT_STATE_FILE, seen)
+
+
+def current_bot_date() -> str:
+    return datetime.now(ZoneInfo(BOT_TIMEZONE)).date().isoformat()
+
+
+async def process_agent_content_date(
+    bot,
+    user_id: int,
+    date_text: str,
+    *,
+    force: bool = False,
+    publish: bool = False,
+) -> str:
+    day_dir = latest_agent_content_dir(date_text)
+    if not day_dir:
+        return f"⚠️ Agent Content: нет папки за {date_text}."
+
+    manifest_hash = agent_manifest_hash(day_dir)
+    seen = load_agent_content_seen()
+    if not force and seen.get(date_text) == manifest_hash:
+        return f"ℹ️ Agent Content {date_text}: manifest не изменился, пропускаю."
+
+    package, risks, resolved_date = await generate_agent_content_package(
+        user_id,
+        date_text,
+        "ежедневный импорт content-agent",
+        save_generated=True,
+    )
+
+    if publish:
+        post_text = extract_telegram_post_from_package(package)
+        safety_text = extract_safety_note(package)
+        blocked = risks or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in safety_text.upper() or not post_text
+        if blocked:
+            await notify_admin(
+                bot,
+                f"⚠️ Agent Content {resolved_date}: импорт сделал, но автопубликацию остановил safety.\n\n{package[:2500]}",
+            )
+            mark_agent_content_seen(resolved_date, manifest_hash)
+            return f"⚠️ Agent Content {resolved_date}: draft only, safety blocked publish."
+
+        images, _ = await generate_images_with_retries(user_id, f"content-agent {resolved_date}", post_text, count=CHANNEL_IMAGE_COUNT)
+        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            await notify_admin(bot, f"⚠️ Agent Content {resolved_date}: текст готов, но картинки не собрались. Публикацию пропустил.")
+            mark_agent_content_seen(resolved_date, manifest_hash)
+            return f"⚠️ Agent Content {resolved_date}: images failed."
+
+        await send_post_with_images(bot, CHANNEL_ID, post_text, images)
+        memory.save_generated_post(
+            user_id=user_id,
+            expert_mode=get_user_expert_mode(user_id),
+            task="agent_content_auto_publish",
+            topic=f"content-agent {resolved_date}",
+            content=post_text,
+            image_count=len(images),
+            published_to_channel=True,
+        )
+        mark_agent_content_seen(resolved_date, manifest_hash)
+        return f"✅ Agent Content {resolved_date}: imported and published."
+
+    await notify_admin(
+        bot,
+        f"📥 Agent Content {resolved_date}: новый/изменённый пакет импортирован.\n\n"
+        f"{package[:3200]}\n\n"
+        f"Для публикации: /publish_agent_content {resolved_date}",
+    )
+    mark_agent_content_seen(resolved_date, manifest_hash)
+    return f"✅ Agent Content {resolved_date}: imported draft."
+
+
+async def sync_agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Импорт content-agent доступен только админу.", MAIN_KEYBOARD)
+        return
+
+    date_hint, _ = parse_agent_content_args(context)
+    date_text = date_hint or current_bot_date()
+    await reply_long(update, f"📥 Проверяю Agent Content за {date_text}...")
+    result = await process_agent_content_date(
+        context.bot,
+        update.effective_user.id,
+        date_text,
+        force=True,
+        publish=AGENT_CONTENT_AUTO_PUBLISH,
+    )
+    await reply_long(update, result, MAIN_KEYBOARD)
 
 
 async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2361,6 +2488,28 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await notify_admin(context.bot, f"⚠️ SOURCE_MONITOR failed: {type(exc).__name__}: {exc}")
 
 
+async def agent_content_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    admin_user_id = ADMIN_ID or 0
+    if not admin_user_id:
+        logger.warning("AGENT_CONTENT_SYNC skipped: ADMIN_ID empty")
+        return
+
+    date_text = current_bot_date()
+    logger.info("AGENT_CONTENT_SYNC started | date=%s", date_text)
+    try:
+        result = await process_agent_content_date(
+            context.bot,
+            admin_user_id,
+            date_text,
+            force=False,
+            publish=AGENT_CONTENT_AUTO_PUBLISH,
+        )
+        logger.info("AGENT_CONTENT_SYNC done | %s", result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("AGENT_CONTENT_SYNC failed: %s", exc)
+        await notify_admin(context.bot, f"⚠️ AGENT_CONTENT_SYNC failed: {type(exc).__name__}: {exc}")
+
+
 def setup_autoposting(application: Application) -> None:
     if not AUTOPOST_ENABLED:
         logger.info("Autoposting disabled")
@@ -2436,6 +2585,43 @@ def setup_source_monitoring(application: Application) -> None:
         logger.warning("Source monitoring enabled, but SOURCE_MONITOR_TIMES has no valid times")
 
 
+def setup_agent_content_sync(application: Application) -> None:
+    if not AGENT_CONTENT_SYNC_ENABLED:
+        logger.info("Agent content sync disabled")
+        return
+    if not application.job_queue:
+        logger.warning("JobQueue is not available. Install python-telegram-bot[job-queue].")
+        return
+
+    tz = ZoneInfo(BOT_TIMEZONE)
+    scheduled = []
+    for raw_time in AGENT_CONTENT_SYNC_TIMES.split(","):
+        raw_time = raw_time.strip()
+        if not raw_time:
+            continue
+        try:
+            hour_text, minute_text = raw_time.split(":", maxsplit=1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+            if hour not in range(24) or minute not in range(60):
+                raise ValueError
+        except ValueError:
+            logger.warning("Invalid AGENT_CONTENT_SYNC_TIMES value skipped: %s", raw_time)
+            continue
+
+        application.job_queue.run_daily(
+            agent_content_sync_job,
+            time=time(hour=hour, minute=minute, tzinfo=tz),
+            name=f"naz_agent_content_sync_{hour:02d}_{minute:02d}",
+        )
+        scheduled.append(f"{hour:02d}:{minute:02d}")
+
+    if scheduled:
+        logger.info("Agent content sync scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
+    else:
+        logger.warning("Agent content sync enabled, but AGENT_CONTENT_SYNC_TIMES has no valid times")
+
+
 # -----------------------------------------------------------------------------
 # Help texts
 # -----------------------------------------------------------------------------
@@ -2491,6 +2677,7 @@ def help_commands_text() -> str:
         "/publish_source рубрика — опубликовать интерпретацию источника\n\n"
         "Content-agent:\n"
         "/agent_content [YYYY-MM-DD] [фокус] — редакторский пакет из inbox; без даты берёт случайный день\n"
+        "/sync_agent_content [YYYY-MM-DD] — срочно перечитать папку дня и импортировать draft\n"
         "/publish_agent_content [YYYY-MM-DD] [фокус] — опубликовать безопасный Telegram-пост\n\n"
         "Админ:\n"
         "/stats — статистика"
@@ -2575,6 +2762,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("scan_sources", scan_sources_command))
     application.add_handler(CommandHandler("publish_source", publish_source_command))
     application.add_handler(CommandHandler("agent_content", agent_content_command))
+    application.add_handler(CommandHandler("sync_agent_content", sync_agent_content_command))
     application.add_handler(CommandHandler("publish_agent_content", publish_agent_content_command))
 
     # Content commands
@@ -2595,6 +2783,7 @@ def build_application() -> Application:
 
     setup_autoposting(application)
     setup_source_monitoring(application)
+    setup_agent_content_sync(application)
     return application
 
 

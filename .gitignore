@@ -15,6 +15,7 @@ __pycache__/
 naz_stories.md
 monitored_sources.json
 .source_seen.json
+.agent_content_seen.json
 content_inbox/
 
 *.zip
