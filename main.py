@@ -140,7 +140,6 @@ TASK_MAX_TOKENS = {
     "insight": 430,
     "source_interpretation": 520,
     "agent_content_editor": 950,
-    "void_crosspost": 760,
 }
 
 CONTENT_MODEL_TASKS = {
@@ -154,7 +153,6 @@ CONTENT_MODEL_TASKS = {
     "insight",
     "source_interpretation",
     "agent_content_editor",
-    "void_crosspost",
 }
 
 # In-memory fast state. Persistent truth is SQLite.
@@ -1262,86 +1260,6 @@ def extract_safety_note(package: str) -> str:
     return match.group(1).strip() if match else package[-1000:]
 
 
-VOID_CROSSPOST_FRAMES = [
-    "Void сказал",
-    "Перевод с Void на человеческий",
-    "Спор двух ботов",
-]
-
-
-VOID_OPENERS = [
-    "Мне тут Void сказал:",
-    "Void тут принёс мысль:",
-    "Из тёмного угла прилетело:",
-    "Void сформулировал это так:",
-    "Мне понравилось, как Void ударил в эту точку:",
-    "Void опять говорит странно, но по делу:",
-]
-
-
-NAZ_BRIDGES = [
-    "А я бы добавил вот что.",
-    "Перевожу на рабочий язык.",
-    "Naz-ремарка после Void.",
-    "А теперь человеческая часть.",
-    "Если вытащить отсюда пользу, получается так.",
-    "И вот где это касается AI, ботов и контента.",
-]
-
-
-def extract_void_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    direct = " ".join(context.args).strip() if context.args else ""
-    if direct:
-        return direct
-    if update.message and update.message.reply_to_message:
-        replied = update.message.reply_to_message
-        return (replied.text or replied.caption or "").strip()
-    return ""
-
-
-async def generate_void_crosspost(user_id: int, void_text: str, *, save_generated: bool = True) -> Tuple[str, List[str]]:
-    risks = detect_content_risks(void_text)
-    safe_void_text = redact_sensitive_text(void_text)
-    frame = random.choice(VOID_CROSSPOST_FRAMES)
-    opener = random.choice(VOID_OPENERS)
-    bridge = random.choice(NAZ_BRIDGES)
-    recent_posts = memory.get_recent_generated_posts(user_id, task="void_crosspost", limit=3)
-    recent_preview = "\n".join(
-        f"- {re.sub(r'\\s+', ' ', item.get('content', '')).strip()[:300]}"
-        for item in recent_posts
-    ) or "нет"
-
-    messages = build_messages(
-        state=memory.load_state(user_id),
-        expert_mode=get_user_expert_mode(user_id),
-        user_text=(
-            f"Предварительные риски: {', '.join(risks) if risks else 'не найдены'}\n\n"
-            f"Формат выпуска: {frame}\n"
-            f"Вводная к Void: {opener}\n"
-            f"Переход к комментарию Naz: {bridge}\n"
-            f"Последние void-кросспосты, чтобы не повторять заход:\n{recent_preview}\n\n"
-            f"Пост Void:\n{safe_void_text[:3500]}\n\n"
-            "Собери готовый кросспост. Вводные фразы можно адаптировать, но не повторяй механически. "
-            "Сохрани чужой голос Void отдельно от комментария Naz. Комментарий Naz должен быть прикладным и живым."
-        ),
-        memory_context=build_user_memory_context(user_id),
-        history=[],
-        task="void_crosspost",
-    )
-    result = await call_gpt(messages, max_tokens=TASK_MAX_TOKENS["void_crosspost"], model=CONTENT_MODEL_NAME)
-    if save_generated and not is_warning_response(result):
-        memory.save_generated_post(
-            user_id=user_id,
-            expert_mode=get_user_expert_mode(user_id),
-            task="void_crosspost",
-            topic=frame,
-            content=result,
-            image_count=0,
-            published_to_channel=False,
-        )
-    return result, risks
-
-
 def is_angle_engine_message(text: str) -> bool:
     return text.startswith("⚠️ Эта тема") or "Разворачиваем тему через новый угол" in text
 
@@ -2122,74 +2040,6 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await reply_long(update, f"⚠️ Не смог опубликовать. Причина: {exc}", MAIN_KEYBOARD)
 
 
-async def void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if ADMIN_ONLY_CONTENT and not is_admin(update.effective_user.id):
-        await reply_long(update, "🔒 Void-кросспостинг доступен только админу.", MAIN_KEYBOARD)
-        return
-
-    void_text = extract_void_text(update, context)
-    if not void_text:
-        await reply_long(update, "Пришли так: /void текст Void\nИли ответь /void на сообщение Void.", MAIN_KEYBOARD)
-        return
-
-    await send_typing(update)
-    try:
-        post_text, risks = await generate_void_crosspost(update.effective_user.id, void_text)
-        prefix = "🕳 Void → Naz draft"
-        if risks:
-            prefix += "\n⚠️ Риски найдены: " + ", ".join(risks)
-        await reply_long(update, f"{prefix}\n\n{post_text}", CONTENT_KEYBOARD)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("void crosspost failed")
-        await reply_long(update, f"⚠️ Не смог собрать Void-кросспост. Причина: {exc}", MAIN_KEYBOARD)
-
-
-async def publish_void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if not is_admin(update.effective_user.id):
-        await reply_long(update, "🔒 Публикация Void-кросспоста доступна только админу.", MAIN_KEYBOARD)
-        return
-    if not CHANNEL_ID:
-        await reply_long(update, "⚠️ CHANNEL_ID не задан в .env/Replit Secrets.", MAIN_KEYBOARD)
-        return
-
-    void_text = extract_void_text(update, context)
-    if not void_text:
-        await reply_long(update, "Пришли так: /publish_void текст Void\nИли ответь /publish_void на сообщение Void.", MAIN_KEYBOARD)
-        return
-
-    await reply_long(update, "🕳 Собираю Void → Naz кросспост и проверяю safety.")
-    try:
-        post_text, risks = await generate_void_crosspost(update.effective_user.id, void_text, save_generated=False)
-        if risks or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in post_text.upper():
-            reason = ", ".join(risks) if risks else "модель пометила материал как рискованный"
-            await reply_long(update, f"⚠️ Не публикую Void-кросспост: {reason}\n\n{post_text}", MAIN_KEYBOARD)
-            return
-
-        images, _ = await generate_images_with_retries(update.effective_user.id, "Void Entity crosspost", post_text, count=CHANNEL_IMAGE_COUNT)
-        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            await reply_long(update, "⚠️ Кросспост готов, но картинка не собралась. В канал без изображения не публикую.", MAIN_KEYBOARD)
-            return
-
-        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
-        memory.save_generated_post(
-            user_id=update.effective_user.id,
-            expert_mode=get_user_expert_mode(update.effective_user.id),
-            task="publish_void",
-            topic="Void Entity crosspost",
-            content=post_text,
-            image_count=len(images),
-            published_to_channel=True,
-        )
-        await reply_long(update, "✅ Void-кросспост опубликован в канал.", MAIN_KEYBOARD)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("publish_void failed")
-        await reply_long(update, f"⚠️ Не смог опубликовать Void-кросспост. Причина: {exc}", MAIN_KEYBOARD)
-
-
 # -----------------------------------------------------------------------------
 # Button handling
 # -----------------------------------------------------------------------------
@@ -2927,9 +2777,6 @@ def help_commands_text() -> str:
         "/imagepost тема — пост + 2 картинки\n"
         "/image тема — одна картинка\n"
         "/publish тема — сгенерировать и отправить в канал\n\n"
-        "Void-кросспостинг:\n"
-        "/void текст или reply — черновик Void → Naz\n"
-        "/publish_void текст или reply — опубликовать Void → Naz в канал\n\n"
         "Источники:\n"
         "/sources — список источников\n"
         "/scan_sources рубрика — черновик интерпретации\n"
@@ -3035,8 +2882,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("image", image_only_command))
     application.add_handler(CommandHandler("publish", publish_command))
     application.add_handler(CommandHandler("publish_insight", publish_insight_command))
-    application.add_handler(CommandHandler("void", void_command))
-    application.add_handler(CommandHandler("publish_void", publish_void_command))
 
     # Text router must be after commands.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
