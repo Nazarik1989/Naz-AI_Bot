@@ -566,6 +566,23 @@ def build_user_memory_context(user_id: int) -> str:
         return "Память временно недоступна."
 
 
+def build_chat_messages(user_text: str, memory_context: str) -> List[Dict[str, str]]:
+    system = (
+        "Ты Naz_AI_Bot, живой AI-помощник Назара. Это обычный диалог, не пост для канала. "
+        "Отвечай коротко: обычно 2-6 предложений. Если пользователь просит подробно, можно больше. "
+        "Не превращай простые реплики в эссе, манифест или контент-пост. "
+        "Стиль: дружелюбно, честно, чуть иронично, по делу. "
+        "Если уместно, задай один короткий уточняющий вопрос. "
+        "Не раскрывай приватные данные, токены, ключи, внутренние URL и технические секреты."
+    )
+    if memory_context:
+        system += "\n\nКраткий контекст памяти, если он реально помогает ответу:\n" + memory_context[:1200]
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_text},
+    ]
+
+
 async def generate_answer(user_id: int, user_text: str, task: str | None = None, source_topic: str | None = None) -> str:
     """Generate answer through Controller → State → Prompt Builder → GPT."""
     state = memory.load_state(user_id)
@@ -577,17 +594,19 @@ async def generate_answer(user_id: int, user_text: str, task: str | None = None,
 
     controlled_state = control["state"]
     expert_mode = controlled_state.get("expert_mode", DEFAULT_EXPERT_MODE)
-    history = memory.get_history(user_id, limit=20) if task is None else []
     memory_context = build_user_memory_context(user_id)
 
-    messages = build_messages(
-        state=controlled_state,
-        expert_mode=expert_mode,
-        user_text=control["gpt_input"],
-        memory_context=memory_context,
-        history=history,
-        task=task,
-    )
+    if task is None:
+        messages = build_chat_messages(user_text, memory_context)
+    else:
+        messages = build_messages(
+            state=controlled_state,
+            expert_mode=expert_mode,
+            user_text=control["gpt_input"],
+            memory_context=memory_context,
+            history=[],
+            task=task,
+        )
 
     result = await call_gpt(messages, max_tokens=task_max_tokens(task), model=task_model(task))
 
