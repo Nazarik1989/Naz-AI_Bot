@@ -121,6 +121,10 @@ AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
 AGENT_CONTENT_RANDOM_SYNC = env_bool("AGENT_CONTENT_RANDOM_SYNC", True)
 AGENT_CONTENT_REUSE_SEEN = env_bool("AGENT_CONTENT_REUSE_SEEN", True)
 AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_content_seen.json").strip())
+CROSSPOST_EXCHANGE_ENABLED = env_bool("CROSSPOST_EXCHANGE_ENABLED", True)
+CROSSPOST_EXCHANGE_AUTO_PUBLISH = env_bool("CROSSPOST_EXCHANGE_AUTO_PUBLISH", True)
+CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
+CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, env_int("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", 300))
 REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", True)
 CHANNEL_IMAGE_COUNT = max(1, min(env_int("CHANNEL_IMAGE_COUNT", 1), 2))
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
@@ -1805,6 +1809,7 @@ async def publish_insight_command(update: Update, context: ContextTypes.DEFAULT_
             image_count=len(images),
             published_to_channel=True,
         )
+        queue_naz_post_for_void(post_text, source="publish_insight", topic=topic or "Naz Stories")
         await reply_long(update, "✅ Инсайт опубликован в канал.", MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_insight failed")
@@ -1902,6 +1907,7 @@ async def publish_source_command(update: Update, context: ContextTypes.DEFAULT_T
             image_count=len(images),
             published_to_channel=True,
         )
+        queue_naz_post_for_void(post_text, source="publish_source", topic=item.get("title", ""))
         await reply_long(update, f"✅ Опубликовано по источнику:\n{format_source_item(item)}", MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_source failed")
@@ -1975,6 +1981,7 @@ async def publish_agent_content_command(update: Update, context: ContextTypes.DE
             image_count=len(images),
             published_to_channel=True,
         )
+        queue_naz_post_for_void(post_text, source="publish_agent_content", topic=f"content-agent {date_text}")
         await reply_long(update, f"✅ Опубликовано из content-agent inbox за {date_text}.", MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_agent_content failed")
@@ -2050,6 +2057,7 @@ async def process_agent_content_date(
             image_count=len(images),
             published_to_channel=True,
         )
+        queue_naz_post_for_void(post_text, source="agent_content_auto_publish", topic=f"content-agent {resolved_date}")
         mark_agent_content_seen(resolved_date, manifest_hash)
         return f"✅ Agent Content {resolved_date}: imported and published."
 
@@ -2176,6 +2184,7 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             image_count=len(images),
             published_to_channel=True,
         )
+        queue_naz_post_for_void(post_text, source="publish", topic=topic)
         await reply_long(update, "✅ Опубликовано в канал.", MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish failed")
@@ -2248,6 +2257,123 @@ async def publish_void_command(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_void failed")
         await reply_long(update, f"⚠️ Не смог опубликовать Void-кросспост. Причина: {exc}", MAIN_KEYBOARD)
+
+
+# -----------------------------------------------------------------------------
+# Bot-to-bot file exchange
+# -----------------------------------------------------------------------------
+
+
+def exchange_dir(direction: str, box: str = "inbox") -> Path:
+    return CROSSPOST_EXCHANGE_DIR / direction / box
+
+
+def ensure_exchange_dirs() -> None:
+    for direction in ("void_to_naz", "naz_to_void"):
+        for box in ("inbox", "processed", "failed"):
+            exchange_dir(direction, box).mkdir(parents=True, exist_ok=True)
+
+
+def exchange_payload_id(source: str, text: str) -> str:
+    raw = f"{source}|{datetime.now(ZoneInfo(BOT_TIMEZONE)).isoformat()}|{text[:500]}"
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def write_exchange_payload(direction: str, payload: Dict[str, str]) -> Optional[Path]:
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        return None
+    ensure_exchange_dirs()
+    payload_id = payload.get("id") or exchange_payload_id(payload.get("source", "naz"), payload.get("text", ""))
+    payload["id"] = payload_id
+    payload["created_at"] = payload.get("created_at") or datetime.now(ZoneInfo(BOT_TIMEZONE)).isoformat()
+    target = exchange_dir(direction, "inbox") / f"{payload_id}.json"
+    temp = target.with_suffix(".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, target)
+    logger.info("Exchange queued | direction=%s | file=%s", direction, target)
+    return target
+
+
+def move_exchange_file(path: Path, direction: str, box: str) -> None:
+    target_dir = exchange_dir(direction, box)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / path.name
+    if target.exists():
+        target = target_dir / f"{path.stem}-{int(datetime.now().timestamp())}{path.suffix}"
+    os.replace(path, target)
+
+
+def queue_naz_post_for_void(post_text: str, *, source: str, topic: str = "") -> None:
+    if not post_text or len(post_text.strip()) < 40:
+        return
+    if source.startswith("void_crosspost") or source in {"publish_void", "exchange_void_to_naz"}:
+        return
+    write_exchange_payload(
+        "naz_to_void",
+        {
+            "source": "naz_ai_bot",
+            "source_event": source,
+            "topic": topic,
+            "text": redact_sensitive_text(post_text.strip())[:6000],
+            "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
+        },
+    )
+
+
+async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        return
+    if not CHANNEL_ID:
+        logger.warning("Exchange skipped: CHANNEL_ID empty")
+        return
+
+    ensure_exchange_dirs()
+    admin_user_id = ADMIN_ID or 0
+    for path in sorted(exchange_dir("void_to_naz", "inbox").glob("*.json"))[:3]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("source") == "naz_ai_bot":
+                move_exchange_file(path, "void_to_naz", "processed")
+                continue
+            void_text = str(payload.get("text") or payload.get("post") or "").strip()
+            if len(void_text) < 40:
+                raise ValueError("empty or too short Void payload")
+
+            post_text, risks = await generate_void_crosspost(admin_user_id, void_text, save_generated=False)
+            if risks or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in post_text.upper():
+                raise ValueError(", ".join(risks) if risks else "model marked payload as risky")
+
+            if payload.get("publish_mode", "auto") != "auto" or not CROSSPOST_EXCHANGE_AUTO_PUBLISH:
+                await notify_admin(context.bot, f"🕳 Void → Naz draft\n\n{post_text}")
+                move_exchange_file(path, "void_to_naz", "processed")
+                continue
+
+            images, _ = await generate_images_with_retries(admin_user_id, "Void Entity crosspost", post_text, count=CHANNEL_IMAGE_COUNT)
+            if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+                raise ValueError("images required but not generated")
+
+            await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+            memory.save_generated_post(
+                user_id=admin_user_id,
+                expert_mode=get_user_expert_mode(admin_user_id),
+                task="exchange_void_to_naz",
+                topic=str(payload.get("topic") or "Void Entity crosspost"),
+                content=post_text,
+                image_count=len(images),
+                published_to_channel=True,
+            )
+            move_exchange_file(path, "void_to_naz", "processed")
+            logger.info("Exchange published | void_to_naz | file=%s", path.name)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Exchange void_to_naz failed | file=%s | %s", path.name, exc)
+            try:
+                move_exchange_file(path, "void_to_naz", "failed")
+            except Exception:
+                logger.exception("Exchange failed file move failed | file=%s", path)
+
+
+async def crosspost_exchange_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await process_void_to_naz_exchange(context)
 
 
 # -----------------------------------------------------------------------------
@@ -2751,6 +2877,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 image_count=len(images),
                 published_to_channel=True,
             )
+            queue_naz_post_for_void(post_text, source=f"autopost:{task}:{profile['name']}", topic=f"{topic} | {profile['name']}")
             logger.info("AUTOPOST done | attempt=%s | images=%s | prompt=%s", text_attempt, len(images), image_prompt)
             return
 
@@ -2809,6 +2936,7 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 image_count=len(images),
                 published_to_channel=True,
             )
+            queue_naz_post_for_void(post_text, source=f"source_monitor:{item.get('rubric', '')}", topic=item.get("title", ""))
             logger.info("SOURCE_MONITOR done | %s | images=%s | prompt=%s", item.get("title", ""), len(images), image_prompt)
             return
 
@@ -2955,6 +3083,29 @@ def setup_agent_content_sync(application: Application) -> None:
         logger.info("Agent content sync scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
     else:
         logger.warning("Agent content sync enabled, but AGENT_CONTENT_SYNC_TIMES has no valid times")
+
+
+def setup_crosspost_exchange(application: Application) -> None:
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        logger.info("Crosspost exchange disabled")
+        return
+    if not application.job_queue:
+        logger.warning("JobQueue is not available. Crosspost exchange disabled.")
+        return
+
+    ensure_exchange_dirs()
+    application.job_queue.run_repeating(
+        crosspost_exchange_job,
+        interval=CROSSPOST_EXCHANGE_INTERVAL_SECONDS,
+        first=30,
+        name="naz_crosspost_exchange",
+    )
+    logger.info(
+        "Crosspost exchange enabled | dir=%s | interval=%ss | auto_publish=%s",
+        CROSSPOST_EXCHANGE_DIR,
+        CROSSPOST_EXCHANGE_INTERVAL_SECONDS,
+        CROSSPOST_EXCHANGE_AUTO_PUBLISH,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -3124,6 +3275,7 @@ def build_application() -> Application:
     setup_autoposting(application)
     setup_source_monitoring(application)
     setup_agent_content_sync(application)
+    setup_crosspost_exchange(application)
     return application
 
 
