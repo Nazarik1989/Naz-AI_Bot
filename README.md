@@ -21,11 +21,12 @@ The project combines Telegram, large language models and automation workflows to
 ## Features
 
 - AI content generation
-- Prompt generation
-- Content ideation
-- Telegram integration
-- Automated workflows
-- AI-assisted publishing
+- Prompt engineering workflows
+- Persistent memory system
+- Automated Telegram publishing
+- Cross-posting integration
+- VPS deployment
+- Custom AI personas
 
 ## Architecture
 
