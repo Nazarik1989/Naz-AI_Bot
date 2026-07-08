@@ -125,6 +125,7 @@ CROSSPOST_EXCHANGE_ENABLED = env_bool("CROSSPOST_EXCHANGE_ENABLED", True)
 CROSSPOST_EXCHANGE_AUTO_PUBLISH = env_bool("CROSSPOST_EXCHANGE_AUTO_PUBLISH", True)
 CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
 CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, env_int("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", 300))
+CROSSPOST_EXCHANGE_MAX_PER_RUN = max(1, min(env_int("CROSSPOST_EXCHANGE_MAX_PER_RUN", 1), 5))
 REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", True)
 CHANNEL_IMAGE_COUNT = max(1, min(env_int("CHANNEL_IMAGE_COUNT", 1), 2))
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
@@ -2329,7 +2330,7 @@ async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> No
 
     ensure_exchange_dirs()
     admin_user_id = ADMIN_ID or 0
-    for path in sorted(exchange_dir("void_to_naz", "inbox").glob("*.json"))[:3]:
+    for path in sorted(exchange_dir("void_to_naz", "inbox").glob("*.json"))[:CROSSPOST_EXCHANGE_MAX_PER_RUN]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if payload.get("source") == "naz_ai_bot":
