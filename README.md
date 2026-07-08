@@ -30,18 +30,19 @@ The project combines Telegram, large language models and automation workflows to
 
 ## Architecture
 
-     text
+```text
 Telegram User
       ↓
     NAZ AI
       ↓
-Memory System
+ Memory System
       ↓
-OpenRouter API
+ OpenRouter API
       ↓
-Content Generation
+ Content Generation
       ↓
-Publishing Workflow
+ Publishing Workflow
+```
 
 ## Tech Stack
 
