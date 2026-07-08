@@ -8,6 +8,16 @@ NAZ AI is an AI-powered assistant designed to generate content, prompts and idea
 
 The project combines Telegram, large language models and automation workflows to streamline content creation and publishing.
 
+## Screenshots
+
+### Main Interface
+
+![Main Interface](Снимок%20экрана%20(861).png)
+
+### Content Generation
+
+![Content Generation](Снимок%20экрана%20(862).png)
+
 ## Features
 
 - AI content generation
@@ -16,6 +26,21 @@ The project combines Telegram, large language models and automation workflows to
 - Telegram integration
 - Automated workflows
 - AI-assisted publishing
+
+## Architecture
+
+     text
+Telegram User
+      ↓
+    NAZ AI
+      ↓
+Memory System
+      ↓
+OpenRouter API
+      ↓
+Content Generation
+      ↓
+Publishing Workflow
 
 ## Tech Stack
 
