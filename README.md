@@ -16,7 +16,7 @@ The project combines Telegram, large language models and automation workflows to
 
 ### Content Generation
 
-![Content Generation](Снимок%20экрана%20(862).png)
+![Content Generation](Снимок%20экрана%20(865).png)
 
 ## Features
 
