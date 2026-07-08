@@ -185,6 +185,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BTN_AI = "🧠 AI"
 BTN_CONTENT = "🚀 Контент"
+BTN_LINKS = "🔗 Связи"
 BTN_CONTROL = "📊 Центр управления"
 BTN_HELP = "ℹ️ Помощь"
 BTN_BACK = "🔙 Назад"
@@ -229,6 +230,10 @@ BTN_STATS = "📈 Статистика"
 BTN_MEMORY = "🧠 Память"
 BTN_AUTOPOST = "📢 Автопостинг"
 BTN_SETTINGS = "⚙️ Настройки"
+
+BTN_CROSSPOST_STATUS = "🔄 Статус обмена"
+BTN_VOID_DRAFT = "🕳 Void → Naz draft"
+BTN_VOID_PUBLISH = "📣 Void → Naz в канал"
 
 # Angle Engine v2.4
 BTN_ANGLE_1 = "1️⃣ Угол 1"
@@ -312,7 +317,7 @@ def make_keyboard(rows: List[List[str]]) -> ReplyKeyboardMarkup:
     )
 
 
-MAIN_KEYBOARD = make_keyboard([[BTN_AI, BTN_CONTENT], [BTN_CONTROL, BTN_HELP]])
+MAIN_KEYBOARD = make_keyboard([[BTN_AI, BTN_CONTENT], [BTN_LINKS, BTN_CONTROL], [BTN_HELP]])
 AI_KEYBOARD = make_keyboard([[BTN_EXPERT_MENU], [BTN_VOICE_MENU, BTN_GOAL_MENU], [BTN_BACK]])
 EXPERT_KEYBOARD = make_keyboard([
     [BTN_COPYWRITER, BTN_MARKETER],
@@ -335,6 +340,7 @@ GOAL_KEYBOARD = make_keyboard([
 ])
 CONTENT_KEYBOARD = make_keyboard([[BTN_POST, BTN_VIRAL], [BTN_REELS, BTN_PLAN], [BTN_HOOKS, BTN_IMAGE], [BTN_BACK]])
 CONTROL_KEYBOARD = make_keyboard([[BTN_STATS, BTN_MEMORY], [BTN_AUTOPOST, BTN_SETTINGS], [BTN_BACK]])
+CROSSPOST_KEYBOARD = make_keyboard([[BTN_CROSSPOST_STATUS], [BTN_VOID_DRAFT, BTN_VOID_PUBLISH], [BTN_BACK]])
 ANGLE_KEYBOARD = make_keyboard([
     [BTN_ANGLE_1, BTN_ANGLE_2],
     [BTN_ANGLE_3, BTN_ANGLE_4],
@@ -1347,7 +1353,7 @@ VOID_OPENERS = [
 NAZ_BRIDGES = [
     "А я бы добавил вот что.",
     "Перевожу на рабочий язык.",
-    "Naz-ремарка после Void.",
+    "Моя ремарка после Void.",
     "А теперь человеческая часть.",
     "Если вытащить отсюда пользу, получается так.",
     "И вот где это касается AI, ботов и контента.",
@@ -1387,7 +1393,10 @@ async def generate_void_crosspost(user_id: int, void_text: str, *, save_generate
             f"Последние void-кросспосты, чтобы не повторять заход:\n{recent_preview}\n\n"
             f"Пост Void:\n{safe_void_text[:3500]}\n\n"
             "Собери готовый кросспост. Вводные фразы можно адаптировать, но не повторяй механически. "
-            "Сохрани чужой голос Void отдельно от комментария Naz. Комментарий Naz должен быть прикладным и живым."
+            "Сохрани чужой голос Void отдельно от моего комментария. "
+            "Мой комментарий пиши от первого лица: 'я вижу', 'я бы добавил', 'для меня тут важно'. "
+            "Не пиши 'Naz думает', 'Naz считает', 'комментарий Naz' и не говори обо мне в третьем лице. "
+            "Комментарий должен быть прикладным, живым и понятным обычному человеку."
         ),
         memory_context=build_user_memory_context(user_id),
         history=[],
@@ -2304,6 +2313,36 @@ def move_exchange_file(path: Path, direction: str, box: str) -> None:
     os.replace(path, target)
 
 
+def exchange_file_count(direction: str, box: str) -> int:
+    path = exchange_dir(direction, box)
+    if not path.exists():
+        return 0
+    return sum(1 for item in path.glob("*.json") if item.is_file())
+
+
+def exchange_status_text() -> str:
+    ensure_exchange_dirs()
+    return (
+        "🔗 Связь Naz ↔ Void\n\n"
+        f"Статус: {'включена' if CROSSPOST_EXCHANGE_ENABLED else 'выключена'}\n"
+        f"Автопубликация: {'включена' if CROSSPOST_EXCHANGE_AUTO_PUBLISH else 'draft-режим'}\n"
+        f"Папка: {CROSSPOST_EXCHANGE_DIR}\n"
+        f"Интервал: {CROSSPOST_EXCHANGE_INTERVAL_SECONDS} сек\n"
+        f"За проход: {CROSSPOST_EXCHANGE_MAX_PER_RUN}\n\n"
+        "Void → Naz:\n"
+        f"• ждёт: {exchange_file_count('void_to_naz', 'inbox')}\n"
+        f"• обработано: {exchange_file_count('void_to_naz', 'processed')}\n"
+        f"• ошибки: {exchange_file_count('void_to_naz', 'failed')}\n\n"
+        "Naz → Void:\n"
+        f"• ждёт: {exchange_file_count('naz_to_void', 'inbox')}\n"
+        f"• обработано: {exchange_file_count('naz_to_void', 'processed')}\n"
+        f"• ошибки: {exchange_file_count('naz_to_void', 'failed')}\n\n"
+        "Ручные команды:\n"
+        "/void текст — собрать черновик Void → Naz\n"
+        "/publish_void текст — опубликовать Void → Naz"
+    )
+
+
 def queue_naz_post_for_void(post_text: str, *, source: str, topic: str = "") -> None:
     if not post_text or len(post_text.strip()) < 40:
         return
@@ -2425,6 +2464,13 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await update.message.reply_text("🔒 Раздел контента сейчас доступен только админу.", reply_markup=MAIN_KEYBOARD)
             return True
         await update.message.reply_text("🚀 Выбери, что собрать:", reply_markup=CONTENT_KEYBOARD)
+        return True
+
+    if text == BTN_LINKS:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Связи между ботами доступны только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        await update.message.reply_text(exchange_status_text(), reply_markup=CROSSPOST_KEYBOARD)
         return True
 
     if text == BTN_CONTROL:
@@ -2589,6 +2635,29 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         return True
 
+    if text == BTN_CROSSPOST_STATUS:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Статус обмена доступен только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        await update.message.reply_text(exchange_status_text(), reply_markup=CROSSPOST_KEYBOARD)
+        return True
+
+    if text == BTN_VOID_DRAFT:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Void-кросспостинг доступен только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        USER_PENDING_ACTIONS[user_id] = "void_draft"
+        await update.message.reply_text("Пришли текст Void. Я соберу Naz-черновик с моим комментарием.", reply_markup=CROSSPOST_KEYBOARD)
+        return True
+
+    if text == BTN_VOID_PUBLISH:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Публикация Void-кросспоста доступна только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        USER_PENDING_ACTIONS[user_id] = "void_publish"
+        await update.message.reply_text("Пришли текст Void. Я соберу кросспост и отправлю в канал.", reply_markup=CROSSPOST_KEYBOARD)
+        return True
+
     if text == BTN_HELP_CAPABILITIES:
         await update.message.reply_text(help_capabilities_text(), reply_markup=HELP_KEYBOARD)
         return True
@@ -2617,6 +2686,46 @@ async def handle_pending_action(update: Update, context: ContextTypes.DEFAULT_TY
     if not topic:
         await update.message.reply_text("Тема пустая. Напиши тему ещё раз.", reply_markup=CONTENT_KEYBOARD)
         return True
+
+    if action in {"void_draft", "void_publish"}:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Void-кросспостинг доступен только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        await send_typing(update)
+        try:
+            if action == "void_draft":
+                post_text, risks = await generate_void_crosspost(user_id, topic)
+                prefix = "🕳 Void → Naz draft"
+                if risks:
+                    prefix += "\n⚠️ Риски: " + ", ".join(risks)
+                await reply_long(update, f"{prefix}\n\n{post_text}", CROSSPOST_KEYBOARD)
+                return True
+
+            if not CHANNEL_ID:
+                await update.message.reply_text("⚠️ CHANNEL_ID не задан, публиковать некуда.", reply_markup=CROSSPOST_KEYBOARD)
+                return True
+            post_text, risks = await generate_void_crosspost(user_id, topic, save_generated=False)
+            blocked, reason = should_block_publication(post_text, risks)
+            if blocked:
+                await reply_long(update, f"⚠️ Не публикую Void-кросспост: {reason}\n\n{post_text}", CROSSPOST_KEYBOARD)
+                return True
+            images, _ = await generate_images_with_retries(user_id, "Void Entity crosspost", post_text, count=CHANNEL_IMAGE_COUNT)
+            await publish_to_channel(context.bot, post_text, images=images)
+            memory.save_generated_post(
+                user_id=user_id,
+                expert_mode=get_user_expert_mode(user_id),
+                task="publish_void",
+                topic="Void Entity crosspost",
+                content=post_text,
+                image_count=len(images),
+                published_to_channel=True,
+            )
+            await update.message.reply_text("✅ Void-кросспост опубликован в канал.", reply_markup=CROSSPOST_KEYBOARD)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("void pending action failed")
+            await update.message.reply_text(f"⚠️ Не смог выполнить Void-кросспост. Причина: {exc}", reply_markup=CROSSPOST_KEYBOARD)
+            return True
 
     await send_typing(update)
     try:
@@ -3134,7 +3243,11 @@ def help_capabilities_text() -> str:
         "• статистика\n"
         "• автопостинг в канал\n"
         "• защита админ-функций\n"
-        "• Angle Engine: новые углы вместо повторов"
+        "• Angle Engine: новые углы вместо повторов\n\n"
+        "🔗 Связи:\n"
+        "• обмен постами Naz ↔ Void через локальные очереди\n"
+        "• статус входящих/исходящих кросспостов\n"
+        "• ручной Void → Naz draft/publish"
     )
 
 
@@ -3161,6 +3274,9 @@ def help_commands_text() -> str:
         "Void-кросспостинг:\n"
         "/void текст или reply — черновик Void → Naz\n"
         "/publish_void текст или reply — опубликовать Void → Naz в канал\n\n"
+        "Связь Naz ↔ Void:\n"
+        "Кнопка 🔗 Связи показывает очереди обмена и быстрые действия.\n"
+        "Автообмен идёт через папки, без Telegram-пинг-понга.\n\n"
         "Источники:\n"
         "/sources — список источников\n"
         "/scan_sources рубрика — черновик интерпретации\n"
