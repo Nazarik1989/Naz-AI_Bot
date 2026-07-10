@@ -16,6 +16,7 @@ naz_stories.md
 monitored_sources.json
 .source_seen.json
 .agent_content_seen.json
+.visual_archive_seen.json
 content_inbox/
 
 *.zip
@@ -27,3 +28,7 @@ v*_patch/
 .ruff_cache/
 .idea/
 .vscode/
+
+# Local visual archive and generated derivatives. Never commit source media.
+images/
+images_curated/

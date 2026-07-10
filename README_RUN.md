@@ -123,6 +123,21 @@ Files placed in `FALLBACK_IMAGE_DIR` take priority over the generated card.
 Naz randomly selects a JPG, PNG, or WebP from that directory and center-crops
 it to 1024x1024. The avatar card is used only when the directory is empty.
 
+Image-first publishing is a separate, review-gated path:
+
+```text
+VISUAL_ARCHIVE_ENABLED=false
+VISUAL_ARCHIVE_ROOT=images_curated
+VISUAL_ARCHIVE_MANIFEST=images_curated/catalog/publication_candidates.json
+VISUAL_ARCHIVE_STATE_FILE=.visual_archive_seen.json
+VISUAL_ARCHIVE_REQUIRE_APPROVED=true
+```
+
+When enabled, Naz selects an approved unused visual first, writes a post around
+its OCR meaning and rubric, preserves the original aspect ratio, then records
+the image ID in a separate seen-state file. It falls back to the normal
+topic-first autopost loop when no eligible visual is available.
+
 ## Naz VK
 
 VK is configured as a separate Naz-owned contour. It can target the shared VK

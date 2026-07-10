@@ -48,6 +48,7 @@ from telegram.ext import (
 
 import memory
 import controller as naz_controller
+import visual_archive
 from prompts import (
     CONTENT_TASK_PROMPTS,
     DEFAULT_CONTENT_GOAL,
@@ -111,6 +112,13 @@ BFL_IMAGE_HEIGHT = max(512, min(env_int("BFL_IMAGE_HEIGHT", 1024), 2048))
 BFL_POLL_INTERVAL_SECONDS = max(0.5, min(env_float("BFL_POLL_INTERVAL_SECONDS", 1.0), 5.0))
 BFL_TIMEOUT_SECONDS = max(30, min(env_int("BFL_TIMEOUT_SECONDS", 150), 300))
 FALLBACK_IMAGE_DIR = Path(os.getenv("FALLBACK_IMAGE_DIR", "assets/fallback_images").strip())
+VISUAL_ARCHIVE_ENABLED = env_bool("VISUAL_ARCHIVE_ENABLED", False)
+VISUAL_ARCHIVE_ROOT = Path(os.getenv("VISUAL_ARCHIVE_ROOT", "images_curated").strip())
+VISUAL_ARCHIVE_MANIFEST = Path(
+    os.getenv("VISUAL_ARCHIVE_MANIFEST", "images_curated/catalog/publication_candidates.json").strip()
+)
+VISUAL_ARCHIVE_STATE_FILE = Path(os.getenv("VISUAL_ARCHIVE_STATE_FILE", ".visual_archive_seen.json").strip())
+VISUAL_ARCHIVE_REQUIRE_APPROVED = env_bool("VISUAL_ARCHIVE_REQUIRE_APPROVED", True)
 
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
@@ -3400,6 +3408,75 @@ async def generate_images_with_retries(
     return [], last_prompt
 
 
+def curated_visual_bytes(path: Path) -> bytes:
+    """Prepare an existing curated visual for Telegram without forcing a square crop."""
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=92, optimize=True)
+        return output.getvalue()
+
+
+async def try_visual_archive_autopost(
+    context: ContextTypes.DEFAULT_TYPE,
+    admin_user_id: int,
+    slot: str,
+) -> bool:
+    if not VISUAL_ARCHIVE_ENABLED:
+        return False
+    candidate = visual_archive.choose_candidate(
+        VISUAL_ARCHIVE_MANIFEST,
+        VISUAL_ARCHIVE_STATE_FILE,
+        VISUAL_ARCHIVE_ROOT,
+        require_approved=VISUAL_ARCHIVE_REQUIRE_APPROVED,
+    )
+    if not candidate:
+        logger.info("VISUAL_ARCHIVE has no eligible unused candidates")
+        return False
+
+    candidate_id = str(candidate["id"])
+    image_path = visual_archive.preferred_image_path(VISUAL_ARCHIVE_ROOT, candidate)
+    topic = visual_archive.visual_topic(candidate)
+    try:
+        post_text = await generate_content(
+            admin_user_id,
+            topic,
+            "post",
+            save_generated=False,
+            extra_instruction=(
+                "Это image-first публикация. Сначала прочитай смысл визуала, затем напиши самостоятельный Naz-пост вокруг него. "
+                "Не переписывай текст с картинки дословно, не упоминай OCR и не описывай изображение как каталог. "
+                f"Рубрика архива: {candidate.get('rubric', 'visual_archive')}. Слот: {slot or 'manual'}."
+            ),
+        )
+        if is_warning_response(post_text):
+            logger.warning("VISUAL_ARCHIVE candidate blocked | id=%s", candidate_id)
+            return False
+        image_bytes = curated_visual_bytes(image_path)
+        await send_post_with_images(context.bot, CHANNEL_ID, post_text, [image_bytes])
+        memory.save_generated_post(
+            user_id=admin_user_id,
+            expert_mode=get_user_expert_mode(admin_user_id),
+            task=f"visual_archive:{candidate.get('rubric', 'visual_archive')}",
+            topic=topic[:1000],
+            content=post_text,
+            image_count=1,
+            published_to_channel=True,
+        )
+        queue_naz_post_for_void(
+            post_text,
+            source=f"visual_archive:{candidate.get('rubric', 'visual_archive')}",
+            topic=topic[:1000],
+        )
+        visual_archive.mark_used(VISUAL_ARCHIVE_STATE_FILE, candidate_id)
+        logger.info("VISUAL_ARCHIVE published | id=%s | file=%s", candidate_id, image_path)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("VISUAL_ARCHIVE failed | id=%s | error=%s", candidate_id, exc)
+        return False
+
+
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHANNEL_ID:
         logger.warning("AUTOPOST skipped: CHANNEL_ID empty")
@@ -3414,6 +3491,9 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     job_data = context.job.data if context.job else {}
     slot = str(job_data.get("slot", "")) if isinstance(job_data, dict) else ""
     logger.info("NAZ_TELEGRAM_AUTO_LOOP started | slot=%s", slot or "manual")
+
+    if await try_visual_archive_autopost(context, admin_user_id, slot):
+        return
 
     failure_reasons: List[str] = []
     try:
