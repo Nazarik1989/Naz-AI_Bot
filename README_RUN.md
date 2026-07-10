@@ -73,17 +73,60 @@ HF_TOKEN=Hugging Face token
 
 ## Autoposting
 
+Naz Telegram autoposting is owned by this project. VOID should not generate
+Naz channel autoposts or share a scheduler with Naz.
+
 Enabled by default:
 
 ```text
 AUTOPOST_ENABLED=true
+NAZ_TELEGRAM_AUTO_ON=true
 BOT_TIMEZONE=Europe/Moscow
-AUTOPOST_TIMES=10:00,20:00
-AUTOPOST_TASKS=post,viral
+NAZ_TELEGRAM_AUTO_TIMES=09:30,13:30,17:30,21:30
+NAZ_TELEGRAM_AUTO_TASKS=post,viral
 ```
 
-The bot schedules posts at the comma-separated `AUTOPOST_TIMES` values in
-`BOT_TIMEZONE`. `AUTOPOST_TASKS` can contain `post` and `viral`.
+The bot schedules posts at the comma-separated `NAZ_TELEGRAM_AUTO_TIMES`
+values in `BOT_TIMEZONE`. Each slot selects a Naz rubric from the in-repo
+rubric schedule, then writes only finished Naz posts to `naz_to_void` exchange
+for adaptation.
+
+Legacy `AUTOPOST_ENABLED`, `AUTOPOST_TIMES`, `AUTOPOST_TASKS`, and `CHANNEL_ID`
+still work as fallbacks, but new Naz deployments should prefer the
+`NAZ_TELEGRAM_*` variables.
+
+## Naz VK
+
+VK is configured as a separate Naz-owned contour. It can target the shared VK
+public, but payloads, browser profile, helper mode, schedule, and rubrics belong
+to this repo:
+
+```text
+NAZ_VK_ENABLED=false
+NAZ_VK_PUBLIC_ID=
+NAZ_VK_AUTO_ON=false
+NAZ_VK_AUTO_TIMES=11:20,16:40,20:20
+NAZ_VK_PAYLOAD_DIR=content_inbox/naz_vk_payloads
+NAZ_VK_BROWSER_PROFILE_DIR=.browser_profiles/naz_vk
+NAZ_VK_HELPER_MODE=naz
+```
+
+The current code registers the Naz VK configuration and creates the payload /
+profile directories when enabled. A concrete VK browser helper can consume this
+config without moving VK scheduling into VOID.
+
+## Cross-posting
+
+Naz and VOID exchange posts only through file queues under
+`CROSSPOST_EXCHANGE_DIR`:
+
+```text
+void_to_naz/inbox
+naz_to_void/inbox
+```
+
+The exchange contract is adaptation-only: one project can bring material to the
+other, but neither project owns the other's scheduler.
 
 ## VPS
 

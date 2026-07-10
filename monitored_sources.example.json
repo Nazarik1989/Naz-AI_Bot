@@ -3,28 +3,28 @@
     "name": "OpenAI News",
     "type": "news",
     "url": "https://openai.com/news/rss.xml",
-    "rubric": "AI-находка дня",
+    "rubric": "AI без магии",
     "enabled": true
   },
   {
     "name": "GitHub Changelog",
     "type": "github",
     "url": "https://github.blog/changelog/feed/",
-    "rubric": "GitHub/релизы",
+    "rubric": "Баг, который стал системой",
     "enabled": true
   },
   {
     "name": "YouTube channel example",
     "type": "youtube",
     "url": "https://www.youtube.com/feeds/videos.xml?channel_id=CHANNEL_ID_HERE",
-    "rubric": "Разбор чужого кейса",
+    "rubric": "Naz Dev Log",
     "enabled": false
   },
   {
     "name": "Telegram RSS bridge example",
     "type": "telegram",
     "url": "https://example.com/rss/telegram-channel.xml",
-    "rubric": "Prompt or Die",
+    "rubric": "Утренний дожим",
     "enabled": false
   },
   {

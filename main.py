@@ -97,7 +97,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini").strip()
 CONTENT_MODEL_NAME = os.getenv("CONTENT_MODEL_NAME", MODEL_NAME).strip()
 
 ADMIN_ID = env_int("ADMIN_ID", 0)
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = os.getenv("NAZ_TELEGRAM_CHANNEL_ID", os.getenv("CHANNEL_ID", "")).strip()
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_MODEL = os.getenv("HF_MODEL", "black-forest-labs/FLUX.1-schnell").strip()
@@ -109,12 +109,19 @@ MONITORED_SOURCES_FILE = Path(os.getenv("MONITORED_SOURCES_FILE", "monitored_sou
 SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip())
 AGENT_CONTENT_INBOX = Path(os.getenv("AGENT_CONTENT_INBOX", "content_inbox/agent_content").strip())
 
-AUTOPOST_ENABLED = env_bool("AUTOPOST_ENABLED", True)
-AUTOPOST_TIMES = os.getenv("AUTOPOST_TIMES", "10:00,20:00").strip()
-AUTOPOST_TASKS = os.getenv("AUTOPOST_TASKS", "post,viral").strip()
+AUTOPOST_ENABLED = env_bool("NAZ_TELEGRAM_AUTO_ON", env_bool("AUTOPOST_ENABLED", True))
+AUTOPOST_TIMES = os.getenv("NAZ_TELEGRAM_AUTO_TIMES", os.getenv("AUTOPOST_TIMES", "09:30,13:30,17:30,21:30")).strip()
+AUTOPOST_TASKS = os.getenv("NAZ_TELEGRAM_AUTO_TASKS", os.getenv("AUTOPOST_TASKS", "post,viral")).strip()
 AUTOPOST_INSIGHT_CHANCE = max(0.0, min(env_float("AUTOPOST_INSIGHT_CHANCE", 0.35), 1.0))
 SOURCE_MONITOR_ENABLED = env_bool("SOURCE_MONITOR_ENABLED", False)
 SOURCE_MONITOR_TIMES = os.getenv("SOURCE_MONITOR_TIMES", "12:00,18:00").strip()
+NAZ_VK_ENABLED = env_bool("NAZ_VK_ENABLED", False)
+NAZ_VK_PUBLIC_ID = os.getenv("NAZ_VK_PUBLIC_ID", "").strip()
+NAZ_VK_AUTO_ON = env_bool("NAZ_VK_AUTO_ON", False)
+NAZ_VK_AUTO_TIMES = os.getenv("NAZ_VK_AUTO_TIMES", "11:20,16:40,20:20").strip()
+NAZ_VK_PAYLOAD_DIR = Path(os.getenv("NAZ_VK_PAYLOAD_DIR", "content_inbox/naz_vk_payloads").strip())
+NAZ_VK_BROWSER_PROFILE_DIR = Path(os.getenv("NAZ_VK_BROWSER_PROFILE_DIR", ".browser_profiles/naz_vk").strip())
+NAZ_VK_HELPER_MODE = os.getenv("NAZ_VK_HELPER_MODE", "naz").strip()
 AGENT_CONTENT_SYNC_ENABLED = env_bool("AGENT_CONTENT_SYNC_ENABLED", True)
 AGENT_CONTENT_SYNC_TIMES = os.getenv("AGENT_CONTENT_SYNC_TIMES", "23:57").strip()
 AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
@@ -165,6 +172,7 @@ CONTENT_MODEL_TASKS = {
 # In-memory fast state. Persistent truth is SQLite.
 USER_MODES: Dict[int, str] = {}
 USER_PENDING_ACTIONS: Dict[int, str] = {}
+AUTOPOST_SKIP_ALERTS: Dict[str, str] = {}
 
 openai_client: Optional[OpenAI] = None
 
@@ -594,7 +602,12 @@ def build_chat_messages(user_text: str, memory_context: str) -> List[Dict[str, s
     ]
 
 
-async def generate_answer(user_id: int, user_text: str, task: str | None = None, source_topic: str | None = None) -> str:
+async def generate_answer(
+    user_id: int,
+    user_text: str,
+    task: str | None = None,
+    source_topic: str | None = None,
+) -> str:
     """Generate answer through Controller → State → Prompt Builder → GPT."""
     state = memory.load_state(user_id)
     control = naz_controller.controller(user_text, state, task=task, source_topic=source_topic)
@@ -1062,7 +1075,9 @@ def choose_agent_content_date_for_sync() -> str:
 
     seen = load_agent_content_seen()
     changed = [path for path in dirs if seen.get(path.name) != agent_manifest_hash(path)]
-    pool = changed or dirs
+    pool = changed or (dirs if AGENT_CONTENT_REUSE_SEEN else [])
+    if not pool:
+        return current_bot_date()
     return random.choice(pool).name
 
 
@@ -2356,6 +2371,7 @@ def queue_naz_post_for_void(post_text: str, *, source: str, topic: str = "") -> 
             "topic": topic,
             "text": redact_sensitive_text(post_text.strip())[:6000],
             "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
+            "exchange_contract": "adapt_only_no_shared_scheduler",
         },
     )
 
@@ -2856,6 +2872,223 @@ AUTOPOST_PROFILES: List[Dict[str, str]] = [
 ]
 
 
+NAZ_TELEGRAM_RUBRICS: List[Dict[str, object]] = [
+    {
+        "name": "Утренний дожим",
+        "slots": ["09:30"],
+        "task": "post",
+        "topics": [
+            "Что сегодня можно упростить в AI-системе, пока она не начала шуметь",
+            "Один маленький дожим в боте, который экономит день",
+            "Почему утро в проекте лучше начинать не с вдохновения, а с проверки контура",
+            "Как понять, что бот уже почти работает, но ему не хватает одного скучного шага",
+            "Почему рабочий день лучше спасает маленькая проверка, а не большой план",
+            "Что проверить в автопостинге до того, как он начнёт писать в канал",
+            "Как один лог может заменить час тревоги",
+            "Почему кнопка 'работает' ещё не значит, что система готова",
+            "Зачем AI-проекту утренний чек без героизма",
+            "Как не перепутать прогресс с красивым ответом модели",
+            "Почему иногда лучший апгрейд — убрать лишний автоматизм",
+            "Как маленькая настройка расписания меняет настроение всего канала",
+        ],
+        "profile": {
+            "name": "Дожиматель",
+            "voice": "сфокусированно и прямо, меньше украшений, больше результата",
+            "angle": "один практический шаг, который превращает хаос в управляемый процесс",
+            "format": "короткий рабочий пост: симптом, действие, результат",
+            "avoid": "не обещать чудес и не превращать пост в чеклист ради чеклиста",
+        },
+    },
+    {
+        "name": "AI без магии",
+        "slots": ["13:30"],
+        "task": "post",
+        "topics": [
+            "Почему нейросети — это не магия, а рабочий инструмент",
+            "Как предпринимателю начать использовать AI без хаоса",
+            "Где заканчивается генератор текста и начинается контент-система",
+            "Почему хороший AI-помощник начинается не с модели, а с понятной задачи",
+            "Как объяснить AI-проект человеку, который не хочет слушать про токены",
+            "Почему промпт не спасает процесс, если никто не проверяет результат",
+            "Что на самом деле покупает человек, когда просит 'сделайте мне AI-бота'",
+            "Почему AI без редактора быстро превращается в шумную машинку",
+            "Как отличить полезную автоматизацию от красивой игрушки",
+            "Почему бизнесу чаще нужен не агент, а нормальная граница ответственности",
+            "Что должно быть в AI-системе до первой публичной кнопки",
+            "Как говорить про AI без хайпа и без страха",
+        ],
+        "profile": {
+            "name": "Очевидная мелочь",
+            "voice": "спокойно и человечно, как будто объясняешь важную вещь без умничанья",
+            "angle": "простая деталь, которую все пропускают, а потом из-за неё ломается проект",
+            "format": "заметка на один инсайт: мелочь, последствия, зачем это помнить",
+            "avoid": "не уходить в мотивацию и не продавать AI как волшебную кнопку",
+        },
+    },
+    {
+        "name": "Баг, который стал системой",
+        "slots": ["17:30"],
+        "task": "viral",
+        "topics": [
+            "Как маленький баг в интеграции ломает весь пользовательский опыт",
+            "Почему AI-проект ломается не из-за модели, а из-за процесса",
+            "Что должно быть у Telegram-бота, чтобы он не был игрушкой",
+            "Почему одинаковая ошибка в двух ботах не всегда значит один виноватый commit",
+            "Как баг становится инструкцией, если перестать сразу чинить всё подряд",
+            "Почему 'оно вчера работало' — плохая диагностика, но хороший хук",
+            "Как Telegram polling превращает локальный дубль в странную аварию",
+            "Почему ошибка доставки страшнее ошибки генерации",
+            "Что делать, когда бот молчит, но сервисы по отдельности живые",
+            "Почему rollback иногда лечит совесть, но не систему",
+            "Как понять, что проблема живёт не в коде, а между сервисами",
+            "Почему самый полезный баг — тот, после которого появляется проверка",
+        ],
+        "profile": {
+            "name": "Build in public",
+            "voice": "честно, живо, без героизма; как рабочая заметка после реального дожима",
+            "angle": "что сломалось, как искали причину, какой вывод остался после починки",
+            "format": "мини-история: симптом, ложная версия, настоящая причина, урок",
+            "avoid": "не раскрывать секреты, IP, токены, внутренние URL и клиентские детали",
+        },
+    },
+    {
+        "name": "Naz после смены",
+        "slots": ["21:30"],
+        "task": "post",
+        "topics": [
+            "Как память меняет поведение AI-ассистента в диалоге",
+            "Почему автопостинг без редакторской логики быстро становится шумом",
+            "Философия контроля: почему AI-системе нужны границы",
+            "Почему ботам тоже нужен вечерний разбор полётов",
+            "Как отличить живой стиль от набора любимых фраз",
+            "Почему канал устаёт не от частоты постов, а от одинакового дыхания",
+            "Что значит 'контроль' в системе, которая умеет писать сама",
+            "Почему иногда надо не добавлять рубрику, а дать старой рубрике новый темп",
+            "Как память помогает не повторять себя, если ей правильно пользоваться",
+            "Почему хороший автопостинг должен уметь молчать",
+            "Как не превратить AI-канал в аккуратное бубнение",
+            "Зачем системе отдельный голос для ночных выводов",
+        ],
+        "profile": {
+            "name": "Философия без тумана",
+            "voice": "чуть глубже и тише, но всё равно понятно обычному человеку",
+            "angle": "маленькая философская мысль из разработки: про память, контроль, доверие или шум",
+            "format": "короткая заметка без списков: наблюдение, поворот, человеческий вывод",
+            "avoid": "не уходить в абстрактный мотивационный туман",
+        },
+    },
+]
+
+
+NAZ_VK_RUBRICS: List[Dict[str, str]] = [
+    {
+        "name": "Naz Dev Log",
+        "angle": "короткая рабочая заметка о сборке, баге, проверке или дожиме AI-системы",
+        "format": "плотный VK-пост без Telegram-обрывистости: контекст, вывод, прикладной смысл",
+    },
+    {
+        "name": "AI без успешного успеха",
+        "angle": "практический разбор AI-инструмента или привычки без хайпа",
+        "format": "объяснить человеческим языком, где польза, где ловушка, что делать дальше",
+    },
+    {
+        "name": "Ошибка недели",
+        "angle": "одна ошибка в боте, контенте или интеграции и нормальный вывод после неё",
+        "format": "сцена, сбой, причина, дожим, вывод",
+    },
+]
+
+
+def select_naz_telegram_rubric(slot: str = "") -> Dict[str, object]:
+    matching = [
+        rubric for rubric in NAZ_TELEGRAM_RUBRICS
+        if slot and slot in [str(item) for item in rubric.get("slots", [])]
+    ]
+    return random.choice(matching or NAZ_TELEGRAM_RUBRICS)
+
+
+AUTOPOST_EDITORIAL_DIRECTIONS: List[Dict[str, str]] = [
+    {
+        "name": "Мини-сцена",
+        "shape": "начни с маленькой узнаваемой сцены, потом покажи, какой системный вывод за ней спрятан",
+        "rhythm": "короткие фразы, живой поворот, без списка",
+        "avoid": "не начинать с тезиса и не заканчивать одинаковым 'дожали'",
+    },
+    {
+        "name": "Анти-совет",
+        "shape": "начни с вредного подхода, который хочется сделать на автомате, затем разверни в нормальную практику",
+        "rhythm": "чуть резче, но без токсичности; один конфликт, один вывод",
+        "avoid": "не делать кликбейт и не морализировать",
+    },
+    {
+        "name": "Тихая философия",
+        "shape": "вытащи спокойное наблюдение из конкретной рабочей детали",
+        "rhythm": "медленнее, глубже, меньше технических слов",
+        "avoid": "не уходить в туман и общие слова про будущее",
+    },
+    {
+        "name": "Разбор ошибки",
+        "shape": "покажи симптом, ложную причину, настоящую причину и маленький вывод",
+        "rhythm": "плотно и ясно, как заметка после диагностики",
+        "avoid": "не пересказывать длинную хронологию",
+    },
+    {
+        "name": "Почти мем",
+        "shape": "начни с нелепости разработки или контента, но быстро выведи к пользе",
+        "rhythm": "иронично, легче, с одной смешной деталью",
+        "avoid": "не превращать в стендап",
+    },
+    {
+        "name": "Письмо себе",
+        "shape": "напиши как короткую записку человеку, который завтра снова полезет чинить систему",
+        "rhythm": "лично, тепло, без поучения",
+        "avoid": "не делать мотивационный пост",
+    },
+    {
+        "name": "Один вопрос",
+        "shape": "пост строится вокруг одного вопроса, который меняет взгляд на задачу",
+        "rhythm": "вопрос, две-три проверки, вывод",
+        "avoid": "не превращать в FAQ",
+    },
+]
+
+
+def recent_autopost_topic_text(user_id: int, limit: int = 12) -> str:
+    posts = memory.get_recent_generated_posts(user_id, limit=limit)
+    chunks = []
+    for item in posts:
+        topic = str(item.get("topic") or "")
+        task = str(item.get("task") or "")
+        if "autopost" in task or "source_monitor" in task or "agent_content" in task:
+            chunks.append(topic)
+    state = memory.load_state(user_id)
+    chunks.extend(str(topic) for topic in (state.get("recent_topics") or [])[-12:])
+    return "\n".join(chunks)
+
+
+def is_fresh_autopost_topic(topic: str, recent_text: str) -> bool:
+    fingerprint = naz_controller.topic_fingerprint(topic)
+    recent_lines = [line.strip() for line in recent_text.splitlines() if line.strip()]
+    return not any(naz_controller.is_similar_topic(fingerprint, line) for line in recent_lines)
+
+
+def select_autopost_topics(user_id: int, rubric: Dict[str, object], limit: int = 7) -> List[str]:
+    topics = [str(item) for item in rubric.get("topics", AUTOPOST_TOPICS) if str(item).strip()]
+    random.shuffle(topics)
+    recent_text = recent_autopost_topic_text(user_id)
+    fresh = [topic for topic in topics if is_fresh_autopost_topic(topic, recent_text)]
+    return (fresh or topics)[:limit]
+
+
+def format_autopost_direction(direction: Dict[str, str]) -> str:
+    return (
+        f"Редакторская форма выпуска: {direction['name']}.\n"
+        f"Композиция: {direction['shape']}.\n"
+        f"Ритм: {direction['rhythm']}.\n"
+        f"Отдельно избегать: {direction['avoid']}.\n"
+    )
+
+
 def get_autopost_tasks() -> List[str]:
     allowed = {"post", "viral"}
     tasks = [item.strip() for item in AUTOPOST_TASKS.split(",") if item.strip()]
@@ -2889,6 +3122,32 @@ async def notify_admin(bot, text: str) -> None:
         logger.warning("Admin notification failed: %s", exc)
 
 
+def unique_recent_reasons(reasons: List[str], limit: int = 5) -> List[str]:
+    unique: List[str] = []
+    for reason in reasons:
+        if reason and reason not in unique:
+            unique.append(reason)
+    return unique[-limit:]
+
+
+async def notify_autopost_skip_once(bot, reasons: List[str]) -> None:
+    unique_reasons = unique_recent_reasons(reasons)
+    signature = hashlib.sha256("\n".join(unique_reasons).encode("utf-8")).hexdigest()[:16]
+    date_key = current_bot_date()
+    if AUTOPOST_SKIP_ALERTS.get(date_key) == signature:
+        logger.info("AUTOPOST skip alert suppressed: duplicate failure signature for %s", date_key)
+        return
+    AUTOPOST_SKIP_ALERTS[date_key] = signature
+    if len(AUTOPOST_SKIP_ALERTS) > 10:
+        for key in sorted(AUTOPOST_SKIP_ALERTS)[:-10]:
+            AUTOPOST_SKIP_ALERTS.pop(key, None)
+    await notify_admin(
+        bot,
+        "⚠️ Автопостинг пропустил слот после нескольких попыток.\n\n"
+        + "\n".join(f"- {reason}" for reason in unique_reasons),
+    )
+
+
 async def generate_images_with_retries(
     user_id: int,
     topic: str,
@@ -2920,20 +3179,35 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if get_user_expert_mode(admin_user_id) not in EXPERT_MODES:
             set_user_expert_mode(admin_user_id, DEFAULT_EXPERT_MODE)
 
-    logger.info("AUTOPOST started")
+    job_data = context.job.data if context.job else {}
+    slot = str(job_data.get("slot", "")) if isinstance(job_data, dict) else ""
+    logger.info("NAZ_TELEGRAM_AUTO_LOOP started | slot=%s", slot or "manual")
 
     failure_reasons: List[str] = []
     try:
         for text_attempt in range(1, AUTOPOST_TEXT_ATTEMPTS + 1):
-            topics = AUTOPOST_TOPICS[:]
-            random.shuffle(topics)
+            rubric = select_naz_telegram_rubric(slot)
+            topics = select_autopost_topics(admin_user_id, rubric, limit=7)
             use_story_insight = bool(read_naz_stories()) and random.random() < AUTOPOST_INSIGHT_CHANCE
-            task = "insight" if use_story_insight else random.choice(get_autopost_tasks())
-            profile = random.choice(AUTOPOST_PROFILES)
+            rubric_task = str(rubric.get("task", "")).strip()
+            task = "insight" if use_story_insight else (rubric_task if rubric_task in get_autopost_tasks() else random.choice(get_autopost_tasks()))
+            profile = rubric.get("profile")
+            if not isinstance(profile, dict):
+                profile = random.choice(AUTOPOST_PROFILES)
+            direction = random.choice(AUTOPOST_EDITORIAL_DIRECTIONS)
             topic = "инсайт из опыта запуска Naz_AI_Bot" if use_story_insight else topics[0]
             post_text = ""
 
-            logger.info("AUTOPOST attempt %s/%s | task=%s | profile=%s", text_attempt, AUTOPOST_TEXT_ATTEMPTS, task, profile["name"])
+            logger.info(
+                "NAZ_TELEGRAM_AUTO_LOOP attempt %s/%s | slot=%s | rubric=%s | task=%s | profile=%s | direction=%s",
+                text_attempt,
+                AUTOPOST_TEXT_ATTEMPTS,
+                slot or "manual",
+                rubric["name"],
+                task,
+                profile["name"],
+                direction["name"],
+            )
             if use_story_insight:
                 logger.info("AUTOPOST story insight from %s", NAZ_STORIES_FILE)
                 post_text = await generate_story_insight(admin_user_id, topic, save_generated=False)
@@ -2955,7 +3229,12 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         topic,
                         task,
                         save_generated=False,
-                        extra_instruction=format_autopost_profile(profile),
+                        extra_instruction=(
+                            f"Рубрика Naz: {rubric['name']}.\n"
+                            f"Слот расписания Naz Telegram: {slot or 'ручной запуск'}.\n"
+                            + format_autopost_direction(direction)
+                            + format_autopost_profile(profile)
+                        ),
                     )
                     if not is_warning_response(post_text):
                         break
@@ -2981,22 +3260,22 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             memory.save_generated_post(
                 user_id=admin_user_id,
                 expert_mode=get_user_expert_mode(admin_user_id),
-                task=f"autopost:{task}:{profile['name']}",
-                topic=f"{topic} | {profile['name']}",
+                task=f"naz_telegram_autopost:{task}:{rubric['name']}:{profile['name']}",
+                topic=f"{topic} | {rubric['name']} | {profile['name']}",
                 content=post_text,
                 image_count=len(images),
                 published_to_channel=True,
             )
-            queue_naz_post_for_void(post_text, source=f"autopost:{task}:{profile['name']}", topic=f"{topic} | {profile['name']}")
+            queue_naz_post_for_void(
+                post_text,
+                source=f"naz_telegram_autopost:{task}:{rubric['name']}:{profile['name']}",
+                topic=f"{topic} | {rubric['name']} | {profile['name']}",
+            )
             logger.info("AUTOPOST done | attempt=%s | images=%s | prompt=%s", text_attempt, len(images), image_prompt)
             return
 
         logger.warning("AUTOPOST skipped after retries: %s", "; ".join(failure_reasons[-5:]))
-        await notify_admin(
-            context.bot,
-            "⚠️ Автопостинг пропустил слот после нескольких попыток.\n\n"
-            + "\n".join(f"- {reason}" for reason in failure_reasons[-5:]),
-        )
+        await notify_autopost_skip_once(context.bot, failure_reasons)
     except Exception as exc:  # noqa: BLE001
         logger.exception("AUTOPOST failed: %s", exc)
         await notify_admin(context.bot, f"⚠️ AUTOPOST failed: {type(exc).__name__}: {exc}")
@@ -3074,7 +3353,7 @@ async def agent_content_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             context.bot,
             admin_user_id,
             date_text,
-            force=AGENT_CONTENT_REUSE_SEEN,
+            force=False,
             publish=AGENT_CONTENT_AUTO_PUBLISH,
         )
         logger.info("AGENT_CONTENT_SYNC done | %s", result)
@@ -3111,6 +3390,7 @@ def setup_autoposting(application: Application) -> None:
             auto_post_job,
             time=time(hour=hour, minute=minute, tzinfo=tz),
             name=f"naz_autopost_{hour:02d}_{minute:02d}",
+            data={"slot": f"{hour:02d}:{minute:02d}", "owner": "naz_telegram"},
         )
         scheduled.append(f"{hour:02d}:{minute:02d}")
 
@@ -3119,6 +3399,32 @@ def setup_autoposting(application: Application) -> None:
         return
 
     logger.info("Autoposting scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
+
+
+def setup_naz_vk_schedule(application: Application) -> None:
+    if not NAZ_VK_ENABLED:
+        logger.info("Naz VK disabled")
+        return
+    if not NAZ_VK_AUTO_ON:
+        logger.info("Naz VK schedule disabled")
+        return
+    if not NAZ_VK_PUBLIC_ID:
+        logger.warning("Naz VK schedule enabled, but NAZ_VK_PUBLIC_ID is empty")
+        return
+
+    NAZ_VK_PAYLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    NAZ_VK_BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    rubrics = ", ".join(rubric["name"] for rubric in NAZ_VK_RUBRICS)
+    logger.info(
+        "Naz VK schedule configured | public=%s | times=%s | helper=%s | payload_dir=%s | profile_dir=%s | rubrics=%s",
+        NAZ_VK_PUBLIC_ID,
+        NAZ_VK_AUTO_TIMES,
+        NAZ_VK_HELPER_MODE,
+        NAZ_VK_PAYLOAD_DIR,
+        NAZ_VK_BROWSER_PROFILE_DIR,
+        rubrics,
+    )
+    logger.info("Naz VK publisher is not registered yet: payload/browser helper integration must consume this Naz-owned config.")
 
 
 def setup_source_monitoring(application: Application) -> None:
@@ -3390,6 +3696,7 @@ def build_application() -> Application:
     application.add_error_handler(error_handler)
 
     setup_autoposting(application)
+    setup_naz_vk_schedule(application)
     setup_source_monitoring(application)
     setup_agent_content_sync(application)
     setup_crosspost_exchange(application)
