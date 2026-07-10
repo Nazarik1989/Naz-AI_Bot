@@ -43,8 +43,10 @@ def main() -> None:
     if not args.edited.exists():
         raise SystemExit(f"edited file not found: {args.edited}")
 
+    edited_path = args.edited.resolve()
+    curated_root = args.curated_root.resolve()
     edited_record = {
-        "path": args.edited.relative_to(args.curated_root).as_posix(),
+        "path": edited_path.relative_to(curated_root).as_posix(),
         "sha256": sha256(args.edited),
         "edit": "remove_embedded_text_preserve_scene",
         "original_sha256_verified": True,
