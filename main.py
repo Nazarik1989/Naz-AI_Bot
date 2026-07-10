@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 load_dotenv()
 
@@ -110,6 +110,7 @@ BFL_IMAGE_WIDTH = max(512, min(env_int("BFL_IMAGE_WIDTH", 1024), 2048))
 BFL_IMAGE_HEIGHT = max(512, min(env_int("BFL_IMAGE_HEIGHT", 1024), 2048))
 BFL_POLL_INTERVAL_SECONDS = max(0.5, min(env_float("BFL_POLL_INTERVAL_SECONDS", 1.0), 5.0))
 BFL_TIMEOUT_SECONDS = max(30, min(env_int("BFL_TIMEOUT_SECONDS", 150), 300))
+FALLBACK_IMAGE_DIR = Path(os.getenv("FALLBACK_IMAGE_DIR", "assets/fallback_images").strip())
 
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
@@ -1746,6 +1747,24 @@ async def fallback_image_bytes() -> Optional[bytes]:
     """Build a local Naz-branded card when every remote image provider fails."""
     try:
         size = 1024
+        if FALLBACK_IMAGE_DIR.exists():
+            candidates = [
+                path for path in FALLBACK_IMAGE_DIR.iterdir()
+                if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+            ]
+            if candidates:
+                source = random.choice(candidates)
+                with Image.open(source) as library_image:
+                    prepared = ImageOps.fit(
+                        library_image.convert("RGB"),
+                        (size, size),
+                        method=Image.Resampling.LANCZOS,
+                    )
+                    output = BytesIO()
+                    prepared.save(output, format="JPEG", quality=92, optimize=True)
+                logger.info("Local fallback image selected | file=%s", source.name)
+                return output.getvalue()
+
         accent_options = [(112, 255, 190), (159, 122, 234), (255, 184, 92)]
         accent = random.choice(accent_options)
         image = Image.new("RGB", (size, size), (8, 10, 18))

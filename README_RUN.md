@@ -106,6 +106,7 @@ BFL_API_KEY=...
 BFL_MODEL=flux-2-pro
 BFL_IMAGE_WIDTH=1024
 BFL_IMAGE_HEIGHT=1024
+FALLBACK_IMAGE_DIR=assets/fallback_images
 HF_TOKEN=...
 ALLOW_IMAGE_FALLBACK=true
 ```
@@ -117,6 +118,10 @@ credits become available again, no code change is required. If both remote
 providers fail, Pillow renders a square branded fallback locally; no random
 stock-photo service is used. The card reuses the current Naz bot and
 `@PromptOrDie` Telegram avatars when they are available.
+
+Files placed in `FALLBACK_IMAGE_DIR` take priority over the generated card.
+Naz randomly selects a JPG, PNG, or WebP from that directory and center-crops
+it to 1024x1024. The avatar card is used only when the directory is empty.
 
 ## Naz VK
 
