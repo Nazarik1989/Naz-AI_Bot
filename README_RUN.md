@@ -95,6 +95,26 @@ Legacy `AUTOPOST_ENABLED`, `AUTOPOST_TIMES`, `AUTOPOST_TASKS`, and `CHANNEL_ID`
 still work as fallbacks, but new Naz deployments should prefer the
 `NAZ_TELEGRAM_*` variables.
 
+## Images
+
+The default image chain uses the official pinned FLUX.2 Pro endpoint first,
+then Hugging Face, then the generic image fallback:
+
+```text
+IMAGE_PROVIDER=bfl
+BFL_API_KEY=...
+BFL_MODEL=flux-2-pro
+BFL_IMAGE_WIDTH=1024
+BFL_IMAGE_HEIGHT=1024
+HF_TOKEN=...
+ALLOW_IMAGE_FALLBACK=true
+```
+
+The BFL API is asynchronous. Naz submits a generation request, polls the
+returned `polling_url`, and downloads the signed result immediately. If BFL is
+unavailable or has no balance, Hugging Face is tried automatically. When HF
+credits become available again, no code change is required.
+
 ## Naz VK
 
 VK is configured as a separate Naz-owned contour. It can target the shared VK

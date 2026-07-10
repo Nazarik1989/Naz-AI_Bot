@@ -101,6 +101,14 @@ CHANNEL_ID = os.getenv("NAZ_TELEGRAM_CHANNEL_ID", os.getenv("CHANNEL_ID", "")).s
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_MODEL = os.getenv("HF_MODEL", "black-forest-labs/FLUX.1-schnell").strip()
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "bfl").strip().lower()
+BFL_API_KEY = os.getenv("BFL_API_KEY", "").strip()
+BFL_MODEL = os.getenv("BFL_MODEL", "flux-2-pro").strip().lower()
+BFL_API_BASE = os.getenv("BFL_API_BASE", "https://api.bfl.ai/v1").strip().rstrip("/")
+BFL_IMAGE_WIDTH = max(512, min(env_int("BFL_IMAGE_WIDTH", 1024), 2048))
+BFL_IMAGE_HEIGHT = max(512, min(env_int("BFL_IMAGE_HEIGHT", 1024), 2048))
+BFL_POLL_INTERVAL_SECONDS = max(0.5, min(env_float("BFL_POLL_INTERVAL_SECONDS", 1.0), 5.0))
+BFL_TIMEOUT_SECONDS = max(30, min(env_int("BFL_TIMEOUT_SECONDS", 150), 300))
 
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
@@ -1522,15 +1530,79 @@ async def build_image_prompt(user_id: int, topic: str, post_text: str, variant: 
 # -----------------------------------------------------------------------------
 
 
-async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
-    """Generate one image through Hugging Face.
+async def generate_bfl_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
+    """Generate one image through the official asynchronous BFL API."""
+    if not BFL_API_KEY:
+        logger.warning("BFL_API_KEY is empty. BFL image generation skipped.")
+        return None
 
-    Returns bytes on success, None on failure. The bot must not crash because
-    image generation is an external dependency.
-    """
+    model = BFL_MODEL if re.fullmatch(r"flux-[a-z0-9-]+", BFL_MODEL) else "flux-2-pro"
+    endpoint = f"{BFL_API_BASE}/{model}"
+    headers = {
+        "accept": "application/json",
+        "x-key": BFL_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "prompt": f"{prompt}\nComposition variation: {variant}.",
+        "width": BFL_IMAGE_WIDTH,
+        "height": BFL_IMAGE_HEIGHT,
+        "output_format": "jpeg",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = await client.post(endpoint, headers=headers, json=payload)
+            if response.status_code != 200:
+                logger.error("BFL submit error %s | %s", response.status_code, response.text[:500])
+                return None
+
+            data = response.json()
+            polling_url = str(data.get("polling_url") or "")
+            if not polling_url.startswith("https://"):
+                logger.error("BFL response has no valid polling_url | %s", str(data)[:500])
+                return None
+
+            deadline = asyncio.get_running_loop().time() + BFL_TIMEOUT_SECONDS
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(BFL_POLL_INTERVAL_SECONDS)
+                poll_response = await client.get(
+                    polling_url,
+                    headers={"accept": "application/json", "x-key": BFL_API_KEY},
+                )
+                if poll_response.status_code != 200:
+                    logger.error("BFL poll error %s | %s", poll_response.status_code, poll_response.text[:500])
+                    return None
+
+                result = poll_response.json()
+                status = str(result.get("status") or "")
+                if status == "Ready":
+                    sample_url = str((result.get("result") or {}).get("sample") or "")
+                    if not sample_url.startswith("https://"):
+                        logger.error("BFL result has no valid sample URL | %s", str(result)[:500])
+                        return None
+                    image_response = await client.get(sample_url)
+                    content_type = image_response.headers.get("content-type", "")
+                    if image_response.status_code == 200 and image_response.content and content_type.startswith("image/"):
+                        logger.info("BFL image ready | model=%s | variant=%s", model, variant)
+                        return image_response.content
+                    logger.error("BFL image download error %s | %s", image_response.status_code, image_response.text[:300])
+                    return None
+                if status in {"Error", "Failed"}:
+                    logger.error("BFL generation failed | %s", str(result)[:500])
+                    return None
+
+            logger.error("BFL generation timed out after %ss", BFL_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("BFL image request failed: %s", exc)
+    return None
+
+
+async def generate_hf_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
+    """Generate one image through Hugging Face when its credits are available."""
     if not HF_TOKEN:
-        logger.warning("HF_TOKEN is empty. Image generation skipped.")
-        return await fallback_image_bytes() if ALLOW_IMAGE_FALLBACK else None
+        logger.warning("HF_TOKEN is empty. Hugging Face image generation skipped.")
+        return None
 
     endpoint = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
     headers = {
@@ -1560,6 +1632,21 @@ async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]
         logger.error("HF image error %s | %s", response.status_code, response.text[:500])
     except Exception as exc:  # noqa: BLE001
         logger.exception("HF image request failed: %s", exc)
+    return None
+
+
+async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
+    """Generate through the preferred provider, then try the configured backup."""
+    providers = {
+        "bfl": (generate_bfl_image_bytes, generate_hf_image_bytes),
+        "huggingface": (generate_hf_image_bytes, generate_bfl_image_bytes),
+        "hf": (generate_hf_image_bytes, generate_bfl_image_bytes),
+    }.get(IMAGE_PROVIDER, (generate_bfl_image_bytes, generate_hf_image_bytes))
+
+    for provider in providers:
+        image = await provider(prompt, variant=variant)
+        if image:
+            return image
 
     return await fallback_image_bytes() if ALLOW_IMAGE_FALLBACK else None
 
@@ -1582,7 +1669,7 @@ async def generate_images_for_post(user_id: int, topic: str, post_text: str, cou
     image_prompt = await build_image_prompt(user_id, topic, post_text, variant=1)
     images: List[bytes] = []
 
-    # Последовательно, чтобы не ловить лишние rate limits на HF.
+    # Последовательно, чтобы не ловить лишние rate limits у image providers.
     for variant in range(1, count + 1):
         img = await generate_image_bytes(image_prompt, variant=variant)
         if img:
