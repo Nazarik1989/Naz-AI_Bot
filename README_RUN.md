@@ -98,7 +98,7 @@ still work as fallbacks, but new Naz deployments should prefer the
 ## Images
 
 The default image chain uses the official pinned FLUX.2 Pro endpoint first,
-then Hugging Face, then the generic image fallback:
+then Hugging Face, then a local Naz-branded card:
 
 ```text
 IMAGE_PROVIDER=bfl
@@ -113,7 +113,10 @@ ALLOW_IMAGE_FALLBACK=true
 The BFL API is asynchronous. Naz submits a generation request, polls the
 returned `polling_url`, and downloads the signed result immediately. If BFL is
 unavailable or has no balance, Hugging Face is tried automatically. When HF
-credits become available again, no code change is required.
+credits become available again, no code change is required. If both remote
+providers fail, Pillow renders a square branded fallback locally; no random
+stock-photo service is used. The card reuses the current Naz bot and
+`@PromptOrDie` Telegram avatars when they are available.
 
 ## Naz VK
 

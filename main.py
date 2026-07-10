@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
 
@@ -181,6 +182,7 @@ CONTENT_MODEL_TASKS = {
 USER_MODES: Dict[int, str] = {}
 USER_PENDING_ACTIONS: Dict[int, str] = {}
 AUTOPOST_SKIP_ALERTS: Dict[str, str] = {}
+FALLBACK_AVATAR_CACHE: Dict[str, bytes] = {}
 
 openai_client: Optional[OpenAI] = None
 
@@ -1651,16 +1653,140 @@ async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]
     return await fallback_image_bytes() if ALLOW_IMAGE_FALLBACK else None
 
 
-async def fallback_image_bytes() -> Optional[bytes]:
-    """Fallback picture to prove Telegram delivery path still works."""
+def load_brand_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+async def telegram_avatar_bytes(chat_id: str) -> Optional[bytes]:
+    """Fetch and cache a Telegram chat avatar without exposing the bot token."""
+    if not BOT_TOKEN or not chat_id:
+        return None
+    if chat_id in FALLBACK_AVATAR_CACHE:
+        return FALLBACK_AVATAR_CACHE[chat_id]
+
+    api_base = f"https://api.telegram.org/bot{BOT_TOKEN}"
     try:
-        seed = random.randint(1000, 999999)
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            response = await client.get(f"https://picsum.photos/seed/naz-{seed}/1024/1024")
-        if response.status_code == 200 and response.content:
-            return response.content
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            chat_response = await client.get(f"{api_base}/getChat", params={"chat_id": chat_id})
+            chat_data = chat_response.json() if chat_response.status_code == 200 else {}
+            photo = (chat_data.get("result") or {}).get("photo") or {}
+            file_id = str(photo.get("big_file_id") or photo.get("small_file_id") or "")
+            if not file_id:
+                return None
+
+            file_response = await client.get(f"{api_base}/getFile", params={"file_id": file_id})
+            file_data = file_response.json() if file_response.status_code == 200 else {}
+            file_path = str((file_data.get("result") or {}).get("file_path") or "")
+            if not file_path:
+                return None
+
+            avatar_response = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
+            if avatar_response.status_code == 200 and avatar_response.content:
+                FALLBACK_AVATAR_CACHE[chat_id] = avatar_response.content
+                return avatar_response.content
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Fallback image failed: %s", exc)
+        logger.warning("Telegram avatar unavailable for %s: %s", chat_id, exc)
+    return None
+
+
+async def brand_avatar_sources() -> List[Tuple[str, Optional[bytes]]]:
+    bot_chat_id = ""
+    if BOT_TOKEN:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe")
+            data = response.json() if response.status_code == 200 else {}
+            username = str((data.get("result") or {}).get("username") or "")
+            bot_chat_id = f"@{username}" if username else ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Telegram bot profile unavailable for fallback card: %s", exc)
+
+    return [
+        ("NAZ AI BOT", await telegram_avatar_bytes(bot_chat_id)),
+        ("@PromptOrDie", await telegram_avatar_bytes(CHANNEL_ID or "@PromptOrDie")),
+    ]
+
+
+def paste_round_avatar(
+    image: Image.Image,
+    avatar_bytes: Optional[bytes],
+    box: Tuple[int, int, int, int],
+    accent: Tuple[int, int, int],
+) -> None:
+    x1, y1, x2, y2 = box
+    avatar_size = x2 - x1
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.ellipse((x1 - 8, y1 - 8, x2 + 8, y2 + 8), fill=(*accent, 220))
+    draw.ellipse((x1, y1, x2, y2), fill=(24, 28, 42, 255))
+    if not avatar_bytes:
+        return
+    try:
+        avatar = Image.open(BytesIO(avatar_bytes)).convert("RGB")
+        side = min(avatar.width, avatar.height)
+        left = (avatar.width - side) // 2
+        top = (avatar.height - side) // 2
+        avatar = avatar.crop((left, top, left + side, top + side)).resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+        mask = Image.new("L", (avatar_size, avatar_size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, avatar_size - 1, avatar_size - 1), fill=255)
+        image.paste(avatar, (x1, y1), mask)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Fallback avatar rendering failed: %s", exc)
+
+
+async def fallback_image_bytes() -> Optional[bytes]:
+    """Build a local Naz-branded card when every remote image provider fails."""
+    try:
+        size = 1024
+        accent_options = [(112, 255, 190), (159, 122, 234), (255, 184, 92)]
+        accent = random.choice(accent_options)
+        image = Image.new("RGB", (size, size), (8, 10, 18))
+        draw = ImageDraw.Draw(image, "RGBA")
+
+        for y in range(size):
+            ratio = y / max(1, size - 1)
+            color = (
+                int(8 + accent[0] * ratio * 0.08),
+                int(10 + accent[1] * ratio * 0.07),
+                int(18 + accent[2] * ratio * 0.10),
+            )
+            draw.line((0, y, size, y), fill=color)
+
+        draw.ellipse((-220, -180, 520, 560), fill=(*accent, 24), outline=(*accent, 90), width=3)
+        draw.ellipse((610, 560, 1220, 1170), fill=(92, 74, 210, 30), outline=(159, 122, 234, 95), width=3)
+        draw.line((92, 170, 932, 170), fill=(*accent, 180), width=4)
+        draw.line((92, 854, 680, 854), fill=(*accent, 90), width=2)
+
+        label_font = load_brand_font(28, bold=True)
+        title_font = load_brand_font(82, bold=True)
+        subtitle_font = load_brand_font(34)
+        footer_font = load_brand_font(23)
+
+        draw.text((96, 98), "NAZ // CONTENT SYSTEM", font=label_font, fill=(*accent, 255))
+        avatars = await brand_avatar_sources()
+        paste_round_avatar(image, avatars[0][1], (105, 290, 365, 550), accent)
+        paste_round_avatar(image, avatars[1][1], (655, 290, 915, 550), (159, 122, 234))
+        draw.line((390, 420, 630, 420), fill=(*accent, 170), width=5)
+        draw.ellipse((494, 404, 526, 436), fill=(244, 246, 252, 255))
+        draw.text((134, 590), avatars[0][0], font=footer_font, fill=(220, 224, 235, 255))
+        draw.text((695, 590), avatars[1][0], font=footer_font, fill=(220, 224, 235, 255))
+        draw.text((96, 685), "SYSTEM VISUAL", font=title_font, fill=(244, 246, 252, 255), stroke_width=1)
+        draw.text((96, 795), "AI  •  SYSTEM  •  CONTENT", font=footer_font, fill=(150, 157, 178, 255))
+
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=92, optimize=True)
+        logger.info("Local Naz branded image fallback generated")
+        return output.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Local branded image fallback failed: %s", exc)
     return None
 
 
