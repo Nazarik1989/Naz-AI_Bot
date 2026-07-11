@@ -53,6 +53,16 @@ class VisualArchiveTests(unittest.TestCase):
             }
             self.assertEqual(visual_archive.preferred_image_path(root, candidate), edited)
 
+    def test_visual_turn_cadence_is_persistent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "seen.json"
+            self.assertEqual(visual_archive.claim_visual_turn(state, 3), (False, 1))
+            self.assertEqual(visual_archive.claim_visual_turn(state, 3), (False, 2))
+            self.assertEqual(visual_archive.claim_visual_turn(state, 3), (True, 3))
+            self.assertEqual(visual_archive.claim_visual_turn(state, 3), (False, 4))
+            saved = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(saved["slot_counter"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

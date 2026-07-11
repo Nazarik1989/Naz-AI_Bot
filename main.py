@@ -119,6 +119,7 @@ VISUAL_ARCHIVE_MANIFEST = Path(
 )
 VISUAL_ARCHIVE_STATE_FILE = Path(os.getenv("VISUAL_ARCHIVE_STATE_FILE", ".visual_archive_seen.json").strip())
 VISUAL_ARCHIVE_REQUIRE_APPROVED = env_bool("VISUAL_ARCHIVE_REQUIRE_APPROVED", True)
+VISUAL_ARCHIVE_EVERY_N_POSTS = max(2, min(env_int("VISUAL_ARCHIVE_EVERY_N_POSTS", 3), 12))
 
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
@@ -3425,6 +3426,17 @@ async def try_visual_archive_autopost(
 ) -> bool:
     if not VISUAL_ARCHIVE_ENABLED:
         return False
+    is_visual_turn, slot_counter = visual_archive.claim_visual_turn(
+        VISUAL_ARCHIVE_STATE_FILE,
+        VISUAL_ARCHIVE_EVERY_N_POSTS,
+    )
+    if not is_visual_turn:
+        logger.info(
+            "VISUAL_ARCHIVE normal content turn | counter=%s | cadence=%s",
+            slot_counter,
+            VISUAL_ARCHIVE_EVERY_N_POSTS,
+        )
+        return False
     candidate = visual_archive.choose_candidate(
         VISUAL_ARCHIVE_MANIFEST,
         VISUAL_ARCHIVE_STATE_FILE,
@@ -3432,7 +3444,10 @@ async def try_visual_archive_autopost(
         require_approved=VISUAL_ARCHIVE_REQUIRE_APPROVED,
     )
     if not candidate:
-        logger.info("VISUAL_ARCHIVE has no eligible unused candidates")
+        logger.info(
+            "VISUAL_ARCHIVE turn has no eligible unused candidates | counter=%s",
+            slot_counter,
+        )
         return False
 
     candidate_id = str(candidate["id"])
@@ -3470,7 +3485,13 @@ async def try_visual_archive_autopost(
             topic=topic[:1000],
         )
         visual_archive.mark_used(VISUAL_ARCHIVE_STATE_FILE, candidate_id)
-        logger.info("VISUAL_ARCHIVE published | id=%s | file=%s", candidate_id, image_path)
+        logger.info(
+            "VISUAL_ARCHIVE published | id=%s | file=%s | counter=%s | cadence=%s",
+            candidate_id,
+            image_path,
+            slot_counter,
+            VISUAL_ARCHIVE_EVERY_N_POSTS,
+        )
         return True
     except Exception as exc:  # noqa: BLE001
         logger.exception("VISUAL_ARCHIVE failed | id=%s | error=%s", candidate_id, exc)

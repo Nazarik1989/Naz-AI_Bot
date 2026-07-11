@@ -68,6 +68,17 @@ def mark_used(state_path: Path, candidate_id: str) -> None:
     write_json_atomic(state_path, state)
 
 
+def claim_visual_turn(state_path: Path, every_n_posts: int) -> tuple[bool, int]:
+    """Advance the persistent autopost cadence and claim every Nth slot."""
+    state = read_json(state_path, {"used_ids": [], "slot_counter": 0})
+    counter = int(state.get("slot_counter") or 0) + 1
+    state["slot_counter"] = counter
+    state.setdefault("used_ids", [])
+    write_json_atomic(state_path, state)
+    cadence = max(2, int(every_n_posts))
+    return counter % cadence == 0, counter
+
+
 def visual_topic(candidate: dict[str, Any]) -> str:
     text = " ".join(str(candidate.get("ocr_text") or "").split())
     rubric = str(candidate.get("rubric") or "visual_archive")

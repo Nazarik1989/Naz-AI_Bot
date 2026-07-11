@@ -131,12 +131,15 @@ VISUAL_ARCHIVE_ROOT=images_curated
 VISUAL_ARCHIVE_MANIFEST=images_curated/catalog/publication_candidates.json
 VISUAL_ARCHIVE_STATE_FILE=.visual_archive_seen.json
 VISUAL_ARCHIVE_REQUIRE_APPROVED=true
+VISUAL_ARCHIVE_EVERY_N_POSTS=3
 ```
 
 When enabled, Naz selects an approved unused visual first, writes a post around
 its OCR meaning and rubric, preserves the original aspect ratio, then records
 the image ID in a separate seen-state file. It falls back to the normal
-topic-first autopost loop when no eligible visual is available.
+topic-first autopost loop when no eligible visual is available. The persistent
+cadence counter uses one visual on every third scheduled post by default, so
+visual posts never run consecutively and rotate through the daily time slots.
 
 ## Naz VK
 
