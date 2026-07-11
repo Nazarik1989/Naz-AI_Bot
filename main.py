@@ -20,7 +20,7 @@ import os
 import random
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from html import unescape
 from io import BytesIO
 from pathlib import Path
@@ -49,6 +49,7 @@ from telegram.ext import (
 import memory
 import controller as naz_controller
 import character_state as naz_character
+import delegated_messaging
 import duo_relationship
 import visual_archive
 import vk_publish_queue
@@ -624,12 +625,14 @@ def build_chat_messages(
         system += "\n\nКраткий контекст памяти, если он реально помогает ответу:\n" + memory_context[:1200]
     if character_context:
         system += "\n\n" + character_context
-    previous = [
-        {"role": item["role"], "content": item["content"]}
-        for item in (history or [])
-        if item.get("role") in {"user", "assistant"} and item.get("content")
-    ]
-    return [{"role": "system", "content": system}, *previous, {"role": "user", "content": user_text}]
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
+    for item in (history or [])[-20:]:
+        role = item.get("role")
+        content = str(item.get("content", "")).strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content[:5000]})
+    messages.append({"role": "user", "content": user_text})
+    return messages
 
 
 async def generate_answer(
@@ -1933,6 +1936,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user or not update.message:
         return
     user_id = update.effective_user.id
+    if context.args and context.args[0].startswith("delegate_"):
+        token = context.args[0].removeprefix("delegate_")
+        row = memory.accept_delegation_invite(token, user_id, user_display_name(update))
+        if not row:
+            await update.message.reply_text("Ссылка недействительна, уже использована или устарела.")
+            return
+        delegation = delegation_from_row(row)
+        intro = delegated_messaging.introduction(delegation)
+        await update.message.reply_text(intro)
+        memory.save_delegated_message(int(row["id"]), "assistant", intro)
+        memory.set_delegation_status(int(row["id"]), "active")
+        await context.bot.send_message(
+            chat_id=delegation.owner_user_id,
+            text=f"{delegation.contact_name} открыл(а) ссылку. Naz начал поручение #{row['id']}.",
+        )
+        return
+    if not is_admin(user_id):
+        memory.remember_reachable_peer(
+            user_id,
+            user_display_name(update),
+            (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+        )
+        await ensure_contact_named(update, context)
     memory.load_state(user_id)
     name = user_display_name(update)
     text = (
@@ -1950,6 +1976,292 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text("Главное меню Naz:", reply_markup=MAIN_KEYBOARD)
+
+
+def delegation_from_row(row: Dict[str, Any]) -> delegated_messaging.Delegation:
+    return delegated_messaging.Delegation(
+        character_id=str(row["character_id"]),
+        owner_user_id=int(row["owner_user_id"]),
+        contact_chat_id=int(row["contact_chat_id"]),
+        contact_name=str(row.get("contact_name") or row.get("contact_label") or "Собеседник"),
+        purpose=str(row["purpose"]),
+        status=str(row["status"]),
+        max_turns=int(row["max_turns"]),
+        turns_used=int(row["turns_used"]),
+        expires_at=str(row["expires_at"]),
+    )
+
+
+async def ensure_contact_named(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not ADMIN_ID or is_admin(update.effective_user.id):
+        return
+    display_name = user_display_name(update)
+    if not memory.register_contact_arrival(ADMIN_ID, update.effective_user.id, display_name):
+        return
+    prompt = await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"Мне впервые написал {display_name} (Telegram ID {update.effective_user.id}).\n"
+            "Как записать контакт? Ответь на это сообщение одним именем, например: Диман"
+        ),
+    )
+    memory.save_contact_naming_request(prompt.message_id, ADMIN_ID, update.effective_user.id)
+
+
+async def start_saved_contact_delegation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    contact: Dict[str, Any],
+    purpose: str,
+) -> None:
+    token = delegated_messaging.invite_token()
+    expires = (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds")
+    delegation_id = memory.create_delegation_invite(
+        update.effective_user.id, "naz", str(contact["alias"]), purpose, token, expires
+    )
+    row = memory.accept_delegation_invite(token, int(contact["chat_id"]), str(contact["alias"]))
+    if not row:
+        raise RuntimeError("Не удалось привязать сохранённый контакт.")
+    delegation = delegation_from_row(row)
+    intro = delegated_messaging.introduction(delegation)
+    await context.bot.send_message(chat_id=delegation.contact_chat_id, text=intro)
+    memory.save_delegated_message(delegation_id, "assistant", intro)
+    memory.set_delegation_status(delegation_id, "active")
+    await update.message.reply_text(
+        f"Нашёл {contact['alias']} и начал поручение #{delegation_id}. После разговора удалю сессию и переписку."
+    )
+
+
+async def delegate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только Назару.")
+        return
+    purpose = " ".join(context.args).strip()
+    try:
+        purpose = delegated_messaging.clean_purpose(purpose)
+    except ValueError as exc:
+        await update.message.reply_text(f"Использование: /delegate о чём и зачем поговорить\n\n{exc}")
+        return
+    context.user_data["delegation_purpose"] = purpose
+    await update.message.reply_text(
+        "Теперь отправь мне карточку нужного Telegram-контакта. Номер телефона я сохранять не буду."
+    )
+
+
+async def delegation_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not update.message.contact:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+    purpose = str(context.user_data.pop("delegation_purpose", ""))
+    if not purpose:
+        await update.message.reply_text("Сначала задай поручение: /delegate о чём поговорить")
+        return
+    contact = update.message.contact
+    label = " ".join(part for part in [contact.first_name, contact.last_name or ""] if part).strip()
+    token = delegated_messaging.invite_token()
+    expires = (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds")
+    try:
+        delegation_id = memory.create_delegation_invite(
+            update.effective_user.id, "naz", label, purpose, token, expires
+        )
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    if contact.user_id and memory.get_reachable_peer(contact.user_id):
+        row = memory.accept_delegation_invite(token, contact.user_id, label)
+        if row:
+            delegation = delegation_from_row(row)
+            intro = delegated_messaging.introduction(delegation)
+            await context.bot.send_message(chat_id=contact.user_id, text=intro)
+            memory.save_delegated_message(delegation_id, "assistant", intro)
+            memory.set_delegation_status(delegation_id, "active")
+            await update.message.reply_text(
+                f"{label} уже писал(а) боту. Naz представился и начал одноразовый разговор #{delegation_id}."
+            )
+            return
+    bot_user = await context.bot.get_me()
+    link = f"https://t.me/{bot_user.username}?start=delegate_{token}"
+    await update.message.reply_text(
+        f"Поручение #{delegation_id} подготовлено для {label}.\n\n"
+        "Перешли человеку эту одноразовую ссылку:\n" + link + "\n\n"
+        "Когда человек нажмёт Start, Naz сам представится и начнёт разговор."
+    )
+
+
+async def delegate_accept_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    token = "".join(context.args).strip()
+    name = user_display_name(update)
+    row = memory.accept_delegation_invite(token, update.effective_user.id, name)
+    if not row:
+        await update.message.reply_text("Ссылка недействительна, уже использована или устарела.")
+        return
+    delegation = delegation_from_row(row)
+    await update.message.reply_text(
+        "Согласие принято. Naz напишет только после отдельного подтверждения Назара. "
+        "В любой момент можно ответить «стоп»."
+    )
+    await context.bot.send_message(
+        chat_id=delegation.owner_user_id,
+        text=(
+            f"{delegation.contact_name} подтвердил(а) одноразовый разговор.\n\n"
+            f"Предпросмотр первой реплики:\n{delegated_messaging.introduction(delegation)}\n\n"
+            f"Отправить: /delegate_send {row['id']}\nОтменить: /delegate_stop {row['id']}"
+        ),
+    )
+
+
+async def delegate_send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    try:
+        delegation_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /delegate_send ID")
+        return
+    row = memory.get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != update.effective_user.id or row["status"] != "accepted":
+        await update.message.reply_text("Нет ожидающего подтверждения поручения с таким ID.")
+        return
+    delegation = delegation_from_row(row)
+    text = delegated_messaging.introduction(delegation)
+    await context.bot.send_message(chat_id=delegation.contact_chat_id, text=text)
+    memory.save_delegated_message(delegation_id, "assistant", text)
+    memory.set_delegation_status(delegation_id, "active")
+    await update.message.reply_text(f"Naz начал одноразовый разговор #{delegation_id} с {delegation.contact_name}.")
+
+
+async def delegate_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    try:
+        delegation_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /delegate_stop ID")
+        return
+    row = memory.get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != update.effective_user.id:
+        await update.message.reply_text("Поручение не найдено.")
+        return
+    if row.get("contact_chat_id"):
+        await context.bot.send_message(chat_id=int(row["contact_chat_id"]), text="Разговор завершён. Спасибо.")
+    memory.purge_delegation(delegation_id, "owner_stopped")
+    await update.message.reply_text("Поручение завершено; контакт и переписка удалены.")
+
+
+async def delegate_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    raw = " ".join(context.args).strip()
+    head, sep, text = raw.partition(" ")
+    if not sep or not head.isdigit() or not text.strip():
+        await update.message.reply_text("Использование: /delegate_reply ID текст")
+        return
+    delegation_id = int(head)
+    row = memory.get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != update.effective_user.id or row["status"] != "paused":
+        await update.message.reply_text("Нет приостановленного поручения с таким ID.")
+        return
+    await context.bot.send_message(chat_id=int(row["contact_chat_id"]), text=text.strip())
+    memory.save_delegated_message(delegation_id, "assistant", text.strip())
+    memory.set_delegation_status(delegation_id, "active")
+    await update.message.reply_text("Твой ответ отправлен; Naz может продолжить в рамках поручения.")
+
+
+async def contact_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /contact_add TELEGRAM_ID Имя")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("TELEGRAM_ID должен быть числом из /contact_candidates.")
+        return
+    alias = " ".join(context.args[1:]).strip()
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        display_name = " ".join(part for part in [chat.first_name or "", chat.last_name or ""] if part).strip()
+        row = memory.save_named_contact(update.effective_user.id, chat_id, display_name or str(chat_id), alias)
+    except (TelegramError, ValueError) as exc:
+        await update.message.reply_text(f"Не записал контакт: {exc}")
+        return
+    await update.message.reply_text(f"Записал: {row['alias']} → {row['display_name']} ({chat_id}).")
+
+
+async def contact_candidates_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    ids = memory.list_previous_contact_ids(update.effective_user.id)
+    if not ids:
+        await update.message.reply_text("Незаписанных прежних собеседников не нашёл.")
+        return
+    lines = ["Ранее писали боту:"]
+    for chat_id in ids:
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            name = " ".join(part for part in [chat.first_name or "", chat.last_name or ""] if part).strip()
+        except TelegramError:
+            name = "имя недоступно"
+        lines.append(f"• {chat_id} — {name}")
+    lines.append("\nЗаписать: /contact_add TELEGRAM_ID Имя")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_delegated_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    if not update.effective_user or not update.message:
+        return False
+    row = memory.get_active_delegation(update.effective_user.id)
+    if not row:
+        return False
+    delegation_id = int(row["id"])
+    delegation = delegation_from_row(row)
+    if delegated_messaging.is_stop(text):
+        await update.message.reply_text("Остановился. Контакт и переписка удалены.")
+        await context.bot.send_message(chat_id=delegation.owner_user_id, text=f"Собеседник остановил поручение #{delegation_id}.")
+        memory.purge_delegation(delegation_id, "contact_stopped")
+        return True
+    risks = delegated_messaging.assess_risk(text)
+    memory.save_delegated_message(delegation_id, "contact", text)
+    if risks:
+        memory.set_delegation_status(delegation_id, "paused")
+        await update.message.reply_text("Тут нужно подтверждение Назара. Я поставил разговор на паузу.")
+        await context.bot.send_message(
+            chat_id=delegation.owner_user_id,
+            text=f"Поручение #{delegation_id} на паузе ({', '.join(risks)}). Ответить вручную: /delegate_reply {delegation_id} текст",
+        )
+        return True
+    history = memory.get_delegated_history(delegation_id, limit=24)
+    prompt = delegated_messaging.system_prompt(
+        delegation=delegation,
+        character_context=naz_character.dialogue_context(memory.load_character_state(delegation.owner_user_id)),
+        history=history,
+    )
+    reply = await call_gpt(
+        [{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+        max_tokens=min(MAX_TOKENS, 500),
+    )
+    if reply == "OWNER_CONFIRMATION_REQUIRED" or delegated_messaging.assess_risk(reply):
+        memory.set_delegation_status(delegation_id, "paused")
+        await update.message.reply_text("Мне нужно свериться с Назаром. Поставил разговор на паузу.")
+        await context.bot.send_message(
+            chat_id=delegation.owner_user_id,
+            text=f"Naz остановил поручение #{delegation_id} для твоего ответа: /delegate_reply {delegation_id} текст",
+        )
+        return True
+    await update.message.reply_text(reply)
+    memory.save_delegated_message(delegation_id, "assistant", reply)
+    turns = memory.increment_delegation_turns(delegation_id)
+    if turns >= delegation.max_turns:
+        await update.message.reply_text("На этом поручение завершено. Спасибо за разговор.")
+        await context.bot.send_message(chat_id=delegation.owner_user_id, text=f"Поручение #{delegation_id} завершено по лимиту.")
+        memory.purge_delegation(delegation_id, "turn_limit")
+    return True
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3304,6 +3616,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
+    if await handle_delegated_reply(update, context, text):
+        return
+
+    if is_admin(user_id) and update.message.reply_to_message:
+        try:
+            named = memory.name_contact_from_reply(update.message.reply_to_message.message_id, user_id, text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        if named:
+            await update.message.reply_text(
+                f"Записал: {named['alias']} → {named['display_name']}. Теперь можно сказать: «Напиши {named['alias']}, чтобы…»"
+            )
+            return
+
+    if is_admin(user_id):
+        try:
+            request = delegated_messaging.parse_delegation_request(text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        if request:
+            spoken_alias, purpose = request
+            contact = delegated_messaging.resolve_saved_contact(memory.list_saved_contacts(user_id), spoken_alias)
+            if not contact:
+                aliases = ", ".join(str(item["alias"]) for item in memory.list_saved_contacts(user_id)) or "пока пусто"
+                await update.message.reply_text(f"Не нашёл один точный контакт «{spoken_alias}». Сохранены: {aliases}.")
+                return
+            try:
+                await start_saved_contact_delegation(update, context, contact, purpose)
+            except ValueError as exc:
+                await update.message.reply_text(str(exc))
+            return
+
+    if not is_admin(user_id):
+        memory.remember_reachable_peer(
+            user_id,
+            user_display_name(update),
+            (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+        )
+        await ensure_contact_named(update, context)
+
     if await handle_menu_button(update, context, text):
         return
 
@@ -4243,6 +4597,10 @@ def help_commands_text() -> str:
         "/relationship — состояние отношений Naz ↔ VOID\n"
         "/relationship_event event — применить событие отношений (admin)\n"
         "/thought_to_void текст — передать приватную мысль VOID\n"
+        "Напиши Диману, чтобы… — начать разговор с сохранённым контактом\n"
+        "/contact_candidates — кто раньше писал боту, но ещё не записан\n"
+        "/contact_add ID Имя — записать прежнего собеседника\n"
+        "/delegate_stop ID — завершить поручение\n"
         "/roles — список ролей\n"
         "/role marketer — выбрать expert mode\n/voice tech_hooligan — выбрать голос Naz\n/goal engagement — выбрать цель контента\n"
         "/memory — память\n"
@@ -4380,6 +4738,14 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("void", void_command))
     application.add_handler(CommandHandler("publish_void", publish_void_command))
     application.add_handler(CommandHandler("thought_to_void", thought_to_void_command))
+    application.add_handler(CommandHandler("delegate", delegate_command))
+    application.add_handler(CommandHandler("delegate_stop", delegate_stop_command))
+    application.add_handler(CommandHandler("delegate_reply", delegate_reply_command))
+    application.add_handler(CommandHandler("contact_candidates", contact_candidates_command))
+    application.add_handler(CommandHandler("contact_add", contact_add_command))
+
+    # A shared contact follows /delegate and is used only for this one conversation.
+    application.add_handler(MessageHandler(filters.CONTACT, delegation_contact))
 
     # Text router must be after commands.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
