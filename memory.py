@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import character_state as naz_character
+import duo_relationship
 from controller import normalize_state
 from prompts import (
     DEFAULT_CONTENT_GOAL,
@@ -156,10 +157,38 @@ def init_db() -> None:
                 facet TEXT NOT NULL,
                 intent TEXT NOT NULL,
                 format TEXT NOT NULL,
+                content_format TEXT NOT NULL DEFAULT 'text_story',
+                content_kind TEXT NOT NULL DEFAULT 'text',
                 hook TEXT NOT NULL,
                 media TEXT NOT NULL,
                 topic TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(conn, "content_signatures", "content_format", "TEXT NOT NULL DEFAULT 'text_story'")
+        _ensure_column(conn, "content_signatures", "content_kind", "TEXT NOT NULL DEFAULT 'text'")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relationship_states (
+                relationship_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                version TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS private_thoughts (
+                thought_id TEXT PRIMARY KEY,
+                speaker TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'new',
+                created_at TEXT NOT NULL,
+                consumed_at TEXT
             )
             """
         )
@@ -228,7 +257,7 @@ def get_recent_content_signatures(user_id: int, limit: int = 12) -> List[Dict[st
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT platform, facet, intent, format, hook, media, topic, created_at
+            SELECT platform, facet, intent, format, content_format, content_kind, hook, media, topic, created_at
             FROM content_signatures
             WHERE user_id = ? AND character_id = ?
             ORDER BY id DESC
@@ -244,8 +273,9 @@ def record_content_signature(user_id: int, plan: Dict[str, str], topic: str) -> 
         conn.execute(
             """
             INSERT INTO content_signatures(
-                user_id, character_id, platform, facet, intent, format, hook, media, topic, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                user_id, character_id, platform, facet, intent, format, content_format, content_kind,
+                hook, media, topic, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -254,6 +284,8 @@ def record_content_signature(user_id: int, plan: Dict[str, str], topic: str) -> 
                 str(plan.get("facet", "explorer")),
                 str(plan.get("intent", "исследовать")),
                 str(plan.get("format", "маленькая история")),
+                str(plan.get("content_format", "text_story")),
+                str(plan.get("content_kind", "text")),
                 str(plan.get("hook", "наблюдение")),
                 str(plan.get("media", "редакционная иллюстрация")),
                 topic[:1000],
@@ -271,6 +303,61 @@ def record_content_signature(user_id: int, plan: Dict[str, str], topic: str) -> 
             )
             """,
             (user_id, user_id),
+        )
+
+
+def load_relationship_state() -> duo_relationship.RelationshipState:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT state_json FROM relationship_states WHERE relationship_id='naz-void'"
+        ).fetchone()
+    if not row:
+        state = duo_relationship.RelationshipState()
+        save_relationship_state(state)
+        return state
+    try:
+        raw = json.loads(row["state_json"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return duo_relationship.normalize_state(raw if isinstance(raw, dict) else {})
+
+
+def save_relationship_state(state: duo_relationship.RelationshipState) -> None:
+    normalized = duo_relationship.normalize_state(state.to_dict())
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO relationship_states(relationship_id, state_json, version, updated_at)
+            VALUES ('naz-void', ?, ?, ?)
+            ON CONFLICT(relationship_id) DO UPDATE SET
+                state_json=excluded.state_json, version=excluded.version, updated_at=excluded.updated_at
+            """,
+            (json.dumps(normalized.to_dict(), ensure_ascii=False), normalized.version, utc_now()),
+        )
+
+
+def apply_relationship_event(event: str, *, topic: str = "", note: str = "") -> duo_relationship.RelationshipState:
+    state = duo_relationship.apply_event(load_relationship_state(), event, topic=topic, note=note)
+    save_relationship_state(state)
+    return state
+
+
+def save_private_thought(payload: Dict[str, Any], status: str = "new") -> None:
+    ok, reason = duo_relationship.validate_private_thought_payload(payload)
+    if not ok:
+        raise ValueError(reason)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO private_thoughts(
+                thought_id, speaker, receiver, topic, payload_json, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["thought_id"], payload["speaker"], payload["receiver"],
+                str(payload.get("topic", ""))[:1000], json.dumps(payload, ensure_ascii=False), status, utc_now(),
+            ),
         )
 
 

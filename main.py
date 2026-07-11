@@ -24,7 +24,7 @@ from datetime import datetime, time
 from html import unescape
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -49,6 +49,7 @@ from telegram.ext import (
 import memory
 import controller as naz_controller
 import character_state as naz_character
+import duo_relationship
 import visual_archive
 import vk_publish_queue
 from prompts import (
@@ -1027,11 +1028,20 @@ def format_source_item(item: Dict[str, str]) -> str:
 
 async def generate_source_interpretation(user_id: int, item: Dict[str, str], *, save_generated: bool = True) -> str:
     frame = random.choice(SOURCE_EDITORIAL_FRAMES)
+    character = memory.load_character_state(user_id)
+    attitude = duo_relationship.news_attitude(
+        "naz",
+        item.get("title", ""),
+        item.get("summary", ""),
+        tension=character.tension,
+        curiosity=character.curiosity,
+    )
     source_context = (
         f"Рубрика: {item.get('rubric', 'AI-находка дня')}\n"
         f"Редакторский формат: {frame['name']}\n"
         f"Угол: {frame['angle']}\n"
         f"Форма: {frame['format']}\n"
+        f"Позиция Naz: {attitude['stance']} — {attitude['tone']}\n"
         f"Тип источника: {item.get('source_type', 'rss')}\n"
         f"Источник: {item.get('source_name', '')}\n"
         f"Заголовок: {item.get('title', '')}\n"
@@ -1431,12 +1441,36 @@ def extract_void_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str
     return ""
 
 
-async def generate_void_crosspost(user_id: int, void_text: str, *, save_generated: bool = True) -> Tuple[str, List[str]]:
+async def generate_void_crosspost(
+    user_id: int,
+    void_text: str,
+    *,
+    save_generated: bool = True,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[str]]:
     risks = detect_content_risks(void_text)
     safe_void_text = redact_sensitive_text(void_text)
-    frame = random.choice(VOID_CROSSPOST_FRAMES)
-    opener = random.choice(VOID_OPENERS)
-    bridge = random.choice(NAZ_BRIDGES)
+    if isinstance((payload or {}).get("relationship_snapshot"), dict):
+        memory.save_relationship_state(duo_relationship.normalize_state(payload["relationship_snapshot"]))
+    relationship = memory.apply_relationship_event("challenge", topic=str((payload or {}).get("topic") or void_text[:200]))
+    if payload and payload.get("schema") == "private_thought.v1":
+        private_payload = payload
+    else:
+        private_payload = duo_relationship.build_private_thought_payload(
+            speaker="void",
+            thought=safe_void_text,
+            topic=str((payload or {}).get("topic") or "мысль после разговора"),
+            relationship=relationship,
+            source_kind=str((payload or {}).get("source_event") or "manual_private_thought"),
+        )
+    memory.save_private_thought(private_payload, status="received")
+    character = memory.load_character_state(user_id)
+    reflection = duo_relationship.reflection_brief(
+        receiver="naz",
+        payload=private_payload,
+        relationship=relationship,
+        receiver_character_context=naz_character.dialogue_context(character),
+    )
     recent_posts = memory.get_recent_generated_posts(user_id, task="void_crosspost", limit=3)
     recent_preview = "\n".join(
         f"- {re.sub(r'\\s+', ' ', item.get('content', '')).strip()[:300]}"
@@ -1448,28 +1482,27 @@ async def generate_void_crosspost(user_id: int, void_text: str, *, save_generate
         expert_mode=get_user_expert_mode(user_id),
         user_text=(
             f"Предварительные риски: {', '.join(risks) if risks else 'не найдены'}\n\n"
-            f"Формат выпуска: {frame}\n"
-            f"Вводная к Void: {opener}\n"
-            f"Переход к комментарию Naz: {bridge}\n"
-            f"Последние void-кросспосты, чтобы не повторять заход:\n{recent_preview}\n\n"
-            f"Пост Void:\n{safe_void_text[:3500]}\n\n"
-            "Собери готовый кросспост. Вводные фразы можно адаптировать, но не повторяй механически. "
-            "Сохрани чужой голос Void отдельно от моего комментария. "
-            "Мой комментарий пиши от первого лица: 'я вижу', 'я бы добавил', 'для меня тут важно'. "
-            "Не пиши 'Naz думает', 'Naz считает', 'комментарий Naz' и не говори обо мне в третьем лице. "
-            "Комментарий должен быть прикладным, живым и понятным обычному человеку."
+            f"Рубрика: Мысли после разговора.\n"
+            f"Последние выпуски рубрики, чтобы не повторять заход:\n{recent_preview}\n\n"
+            f"{reflection}\n\n"
+            "Пиши от первого лица Naz. Упоминание VOID или беседы допустимо и желательно, когда звучит естественно. "
+            "Не публикуй исходную реплику отдельным блоком и не называй это кросспостом. "
+            "Финальный текст — новая мысль Naz, выросшая из разговора."
         ),
         memory_context=build_user_memory_context(user_id),
         history=[],
         task="void_crosspost",
     )
     result = await call_gpt(messages, max_tokens=TASK_MAX_TOKENS["void_crosspost"], model=CONTENT_MODEL_NAME)
+    original, originality_reason = duo_relationship.reflection_is_original(private_payload["thought"], result)
+    if not original:
+        raise ValueError(f"reflection blocked: {originality_reason}")
     if save_generated and not is_warning_response(result):
         memory.save_generated_post(
             user_id=user_id,
             expert_mode=get_user_expert_mode(user_id),
             task="void_crosspost",
-            topic=frame,
+            topic="Мысли после разговора",
             content=result,
             image_count=0,
             published_to_channel=False,
@@ -1969,6 +2002,46 @@ async def character_set_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     state = memory.set_character_axis(update.effective_user.id, context.args[0], value)
     await update.message.reply_text(naz_character.format_status(state))
+
+
+async def character_simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    count = 10
+    if context.args:
+        try:
+            count = max(1, min(30, int(context.args[0])))
+        except ValueError:
+            pass
+    state = memory.load_character_state(update.effective_user.id)
+    plans = naz_character.simulate(
+        state,
+        memory.get_recent_content_signatures(update.effective_user.id, limit=16),
+        count=count,
+    )
+    lines = ["Naz simulation · состояние базы не изменено", ""]
+    for index, plan in enumerate(plans, 1):
+        lines.append(
+            f"{index}. {plan['event']} → {plan['facet']} · {plan['state']}\n"
+            f"   {plan['content_format_label']} / {plan['format']} / {plan['hook']}"
+        )
+    await reply_long(update, "\n".join(lines), MAIN_KEYBOARD)
+
+
+async def relationship_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(duo_relationship.format_status(memory.load_relationship_state()))
+
+
+async def relationship_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if not context.args or context.args[0] not in duo_relationship.EVENT_DELTAS:
+        await update.message.reply_text("Используй: /relationship_event <event>\n" + ", ".join(sorted(duo_relationship.EVENT_DELTAS)))
+        return
+    topic = " ".join(context.args[1:]).strip()
+    state = memory.apply_relationship_event(context.args[0], topic=topic)
+    await update.message.reply_text(duo_relationship.format_status(state))
 
 
 async def roles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2630,7 +2703,7 @@ async def void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.effective_user or not update.message:
         return
     if ADMIN_ONLY_CONTENT and not is_admin(update.effective_user.id):
-        await reply_long(update, "🔒 Void-кросспостинг доступен только админу.", MAIN_KEYBOARD)
+        await reply_long(update, "🔒 Приватный разговор с VOID доступен только админу.", MAIN_KEYBOARD)
         return
 
     void_text = extract_void_text(update, context)
@@ -2641,20 +2714,20 @@ async def void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await send_typing(update)
     try:
         post_text, risks = await generate_void_crosspost(update.effective_user.id, void_text)
-        prefix = "🕳 Void → Naz draft"
+        prefix = "🕳 Мысли после разговора · draft"
         if risks:
             prefix += "\n⚠️ Риски найдены: " + ", ".join(risks)
         await reply_long(update, f"{prefix}\n\n{post_text}", CONTENT_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("void crosspost failed")
-        await reply_long(update, f"⚠️ Не смог собрать Void-кросспост. Причина: {exc}", MAIN_KEYBOARD)
+        await reply_long(update, f"⚠️ Не смог собрать мысль после разговора. Причина: {exc}", MAIN_KEYBOARD)
 
 
 async def publish_void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
     if not is_admin(update.effective_user.id):
-        await reply_long(update, "🔒 Публикация Void-кросспоста доступна только админу.", MAIN_KEYBOARD)
+        await reply_long(update, "🔒 Публикация рубрики доступна только админу.", MAIN_KEYBOARD)
         return
     if not CHANNEL_ID:
         await reply_long(update, "⚠️ CHANNEL_ID не задан в .env/Replit Secrets.", MAIN_KEYBOARD)
@@ -2665,17 +2738,17 @@ async def publish_void_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await reply_long(update, "Пришли так: /publish_void текст Void\nИли ответь /publish_void на сообщение Void.", MAIN_KEYBOARD)
         return
 
-    await reply_long(update, "🕳 Собираю Void → Naz кросспост и проверяю safety.")
+    await reply_long(update, "🕳 Naz переваривает приватный разговор с VOID и собирает собственную мысль.")
     try:
         post_text, risks = await generate_void_crosspost(update.effective_user.id, void_text, save_generated=False)
         if risks or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in post_text.upper():
             reason = ", ".join(risks) if risks else "модель пометила материал как рискованный"
-            await reply_long(update, f"⚠️ Не публикую Void-кросспост: {reason}\n\n{post_text}", MAIN_KEYBOARD)
+            await reply_long(update, f"⚠️ Не публикую выпуск: {reason}\n\n{post_text}", MAIN_KEYBOARD)
             return
 
         images, _ = await generate_images_with_retries(update.effective_user.id, "Void Entity crosspost", post_text, count=CHANNEL_IMAGE_COUNT)
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            await reply_long(update, "⚠️ Кросспост готов, но картинка не собралась. В канал без изображения не публикую.", MAIN_KEYBOARD)
+            await reply_long(update, "⚠️ Выпуск готов, но картинка не собралась. В канал без изображения не публикую.", MAIN_KEYBOARD)
             return
 
         await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
@@ -2688,10 +2761,37 @@ async def publish_void_command(update: Update, context: ContextTypes.DEFAULT_TYP
             image_count=len(images),
             published_to_channel=True,
         )
-        await reply_long(update, "✅ Void-кросспост опубликован в канал.", MAIN_KEYBOARD)
+        await reply_long(update, "✅ Выпуск «Мысли после разговора» опубликован.", MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_void failed")
         await reply_long(update, f"⚠️ Не смог опубликовать Void-кросспост. Причина: {exc}", MAIN_KEYBOARD)
+
+
+async def thought_to_void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Приватный разговор доступен только админу.", MAIN_KEYBOARD)
+        return
+    thought = extract_void_text(update, context)
+    if len(thought) < 40:
+        await reply_long(update, "Используй: /thought_to_void приватная мысль Naz для VOID", MAIN_KEYBOARD)
+        return
+    try:
+        path = queue_naz_private_thought_for_void(
+            thought,
+            source="manual_private_conversation",
+            topic="мысль после разговора",
+        )
+    except ValueError as exc:
+        await reply_long(update, f"⚠️ Мысль не передана: {exc}", MAIN_KEYBOARD)
+        return
+    await reply_long(
+        update,
+        f"✅ Приватная мысль передана VOID: {path.name if path else 'exchange disabled'}. "
+        "Это не опубликованный пост; VOID должен самостоятельно её переварить.",
+        MAIN_KEYBOARD,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -2769,21 +2869,34 @@ def exchange_status_text() -> str:
 
 
 def queue_naz_post_for_void(post_text: str, *, source: str, topic: str = "") -> None:
-    if not post_text or len(post_text.strip()) < 40:
-        return
-    if source.startswith("void_crosspost") or source in {"publish_void", "exchange_void_to_naz"}:
-        return
-    write_exchange_payload(
-        "naz_to_void",
-        {
-            "source": "naz_ai_bot",
-            "source_event": source,
-            "topic": topic,
-            "text": redact_sensitive_text(post_text.strip())[:6000],
-            "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
-            "exchange_contract": "adapt_only_no_shared_scheduler",
-        },
+    # Published material is never fed to VOID as relationship input.  The
+    # private-thought command below is the only outbound conversational route.
+    logger.debug("Published Naz post not queued for VOID | source=%s | topic=%s", source, topic)
+
+
+def queue_naz_private_thought_for_void(thought: str, *, source: str, topic: str = "") -> Optional[Path]:
+    safe_thought = redact_sensitive_text(thought.strip())
+    if len(safe_thought) < 40:
+        raise ValueError("private thought is too short")
+    relationship = memory.apply_relationship_event("challenge", topic=topic or safe_thought[:200])
+    payload = duo_relationship.build_private_thought_payload(
+        speaker="naz",
+        thought=safe_thought,
+        topic=topic or "мысль после разговора",
+        relationship=relationship,
+        source_kind=source,
     )
+    payload.update({
+        "id": payload["thought_id"],
+        "source": "naz_ai_bot",
+        "source_event": source,
+        "exchange_kind": "private_thought",
+        "text": payload["thought"],
+        "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
+        "adaptation_role": "void_original_reflection_after_private_conversation",
+    })
+    memory.save_private_thought(payload, status="queued")
+    return write_exchange_payload("naz_to_void", payload)
 
 
 async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2805,7 +2918,12 @@ async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> No
             if len(void_text) < 40:
                 raise ValueError("empty or too short Void payload")
 
-            post_text, risks = await generate_void_crosspost(admin_user_id, void_text, save_generated=False)
+            post_text, risks = await generate_void_crosspost(
+                admin_user_id,
+                void_text,
+                save_generated=False,
+                payload=payload,
+            )
             if risks or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in post_text.upper():
                 raise ValueError(", ".join(risks) if risks else "model marked payload as risky")
 
@@ -4121,6 +4239,10 @@ def help_commands_text() -> str:
         "/character — живая грань и состояние Naz\n"
         "/character_event event — применить событие (admin)\n"
         "/character_set axis 0-100 — скорректировать состояние (admin)\n"
+        "/character_simulate 10 — безопасно показать будущие состояния\n"
+        "/relationship — состояние отношений Naz ↔ VOID\n"
+        "/relationship_event event — применить событие отношений (admin)\n"
+        "/thought_to_void текст — передать приватную мысль VOID\n"
         "/roles — список ролей\n"
         "/role marketer — выбрать expert mode\n/voice tech_hooligan — выбрать голос Naz\n/goal engagement — выбрать цель контента\n"
         "/memory — память\n"
@@ -4223,6 +4345,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("character", character_command))
     application.add_handler(CommandHandler("character_event", character_event_command))
     application.add_handler(CommandHandler("character_set", character_set_command))
+    application.add_handler(CommandHandler("character_simulate", character_simulate_command))
+    application.add_handler(CommandHandler("relationship", relationship_command))
+    application.add_handler(CommandHandler("relationship_event", relationship_event_command))
     application.add_handler(CommandHandler("roles", roles_command))
     application.add_handler(CommandHandler("role", role_command))
     application.add_handler(CommandHandler("voice", voice_command))
@@ -4254,6 +4379,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("publish_insight", publish_insight_command))
     application.add_handler(CommandHandler("void", void_command))
     application.add_handler(CommandHandler("publish_void", publish_void_command))
+    application.add_handler(CommandHandler("thought_to_void", thought_to_void_command))
 
     # Text router must be after commands.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

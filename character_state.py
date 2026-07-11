@@ -12,6 +12,8 @@ from hashlib import sha256
 from itertools import product
 from typing import Any, Iterable
 
+import content_formats
+
 
 CHARACTER_ID = "naz"
 CORE_VERSION = "naz-v1"
@@ -179,6 +181,12 @@ def plan_content(
         return novelty, tie
 
     intent, content_format, hook, media = max(candidates, key=score)
+    delivery = content_formats.choose_format(
+        history,
+        platform=platform,
+        energy=state.energy,
+        seed_key=f"naz|{topic}|{platform}|{state.revision}",
+    )
     return {
         "character": CHARACTER_ID,
         "core_version": CORE_VERSION,
@@ -186,6 +194,10 @@ def plan_content(
         "facet_instruction": FACETS[state.facet],
         "intent": intent,
         "format": content_format,
+        "content_format": str(delivery["key"]),
+        "content_format_label": str(delivery["label"]),
+        "content_kind": str(delivery["kind"]),
+        "production_brief": str(delivery["brief"]),
         "hook": hook,
         "media": media,
         "platform": platform,
@@ -209,7 +221,8 @@ def prompt_context(state: CharacterState, plan: dict[str, str]) -> str:
     return (
         "CHARACTER STATE (используй как режиссуру, не называй параметры в посте):\n"
         f"Naz сейчас: {plan['mood']}. Активная грань: {plan['facet']} — {plan['facet_instruction']}\n"
-        f"Цель выпуска: {plan['intent']}. Форма: {plan['format']}. Тип захода: {plan['hook']}.\n"
+        f"Цель выпуска: {plan['intent']}. Нарративная форма: {plan['format']}. Тип захода: {plan['hook']}.\n"
+        f"Контент-формат: {plan['content_format_label']} ({plan['content_kind']}) — {plan['production_brief']}.\n"
         f"Визуальное направление: {plan['media']}. Площадка: {plan['platform']}.\n"
         "Ядро неизменно: молодой талантливый билдер, учится через личный опыт, добрый под сарказмом. "
         "Он может ошибаться и признавать это после проверки; не превращай его в гуру или подростковую карикатуру."
@@ -235,3 +248,25 @@ def format_status(state: CharacterState) -> str:
         f"Любопытство {state.curiosity} · уверенность {state.confidence} · общительность {state.sociability}\n"
         f"Последнее событие: {state.last_event} · ревизия {state.revision}"
     )
+
+
+def simulate(
+    raw_state: dict[str, Any] | CharacterState | None,
+    recent: Iterable[dict[str, Any]],
+    *,
+    count: int = 10,
+    platform: str = "telegram",
+) -> list[dict[str, str]]:
+    state = normalize_state(raw_state.to_dict() if isinstance(raw_state, CharacterState) else raw_state)
+    history = list(recent)
+    events = ("new_topic", "void_challenge", "success", "quiet", "failure", "audience_warmth")
+    result: list[dict[str, str]] = []
+    for index in range(max(1, min(30, count))):
+        event = events[(state.revision + index) % len(events)]
+        state = apply_event(state, event)
+        plan = plan_content(state, history, topic=f"simulation-{index}", platform=platform)
+        plan["event"] = event
+        plan["state"] = mood_label(state)
+        result.append(plan)
+        history.append(plan)
+    return result
