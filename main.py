@@ -48,6 +48,7 @@ from telegram.ext import (
 
 import memory
 import controller as naz_controller
+import character_state as naz_character
 import visual_archive
 import vk_publish_queue
 from prompts import (
@@ -608,6 +609,7 @@ def build_chat_messages(
     user_text: str,
     memory_context: str,
     history: Optional[List[Dict[str, str]]] = None,
+    character_context: str = "",
 ) -> List[Dict[str, str]]:
     system = (
         "Ты Naz_AI_Bot, живой AI-помощник Назара. Это обычный диалог, не пост для канала. "
@@ -619,6 +621,8 @@ def build_chat_messages(
     )
     if memory_context:
         system += "\n\nКраткий контекст памяти, если он реально помогает ответу:\n" + memory_context[:1200]
+    if character_context:
+        system += "\n\n" + character_context
     previous = [
         {"role": item["role"], "content": item["content"]}
         for item in (history or [])
@@ -647,7 +651,13 @@ async def generate_answer(
 
     if task is None:
         history = memory.get_history(user_id, limit=20)
-        messages = build_chat_messages(user_text, memory_context, history)
+        character = memory.load_character_state(user_id)
+        messages = build_chat_messages(
+            user_text,
+            memory_context,
+            history,
+            naz_character.dialogue_context(character),
+        )
     else:
         messages = build_messages(
             state=controlled_state,
@@ -767,7 +777,13 @@ def pick_story_excerpt(query: str = "") -> str:
     return random.choice(blocks)
 
 
-async def generate_story_insight(user_id: int, topic_hint: str = "", *, save_generated: bool = True) -> str:
+async def generate_story_insight(
+    user_id: int,
+    topic_hint: str = "",
+    *,
+    save_generated: bool = True,
+    extra_instruction: str = "",
+) -> str:
     excerpt = pick_story_excerpt(topic_hint)
     if not excerpt:
         return "⚠️ Не нашёл naz_stories.md. Закинь файл в папку проекта или задай NAZ_STORIES_FILE в .env."
@@ -779,6 +795,8 @@ async def generate_story_insight(user_id: int, topic_hint: str = "", *, save_gen
         "Сделай не пересказ, а отдельный инсайт в стиле рубрики Prompt Or Die. "
         "Пиши как вывод из опыта: конкретно, живо, инженерно, без дневникового тона."
     )
+    if extra_instruction:
+        user_text += f"\n\nДополнительная режиссура:\n{extra_instruction.strip()}"
     story_signature = re.sub(r"\s+", " ", excerpt).strip()[:180]
     result = await generate_answer(
         user_id,
@@ -1910,6 +1928,47 @@ async def state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user:
         return
     await reply_long(update, get_state_text(update.effective_user.id), MAIN_KEYBOARD)
+
+
+async def character_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user:
+        return
+    state = memory.load_character_state(update.effective_user.id)
+    await reply_long(update, naz_character.format_status(state), MAIN_KEYBOARD)
+
+
+async def character_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+    allowed = sorted(naz_character.EVENT_DELTAS)
+    if not context.args or context.args[0] not in naz_character.EVENT_DELTAS:
+        await update.message.reply_text("Используй: /character_event <event>\n" + ", ".join(allowed))
+        return
+    state = memory.apply_character_event(update.effective_user.id, context.args[0])
+    await update.message.reply_text(naz_character.format_status(state))
+
+
+async def character_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+    if len(context.args) != 2 or context.args[0] not in naz_character.AXES:
+        await update.message.reply_text(
+            "Используй: /character_set <axis> <0-100>\n" + ", ".join(naz_character.AXES)
+        )
+        return
+    try:
+        value = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Значение должно быть числом от 0 до 100.")
+        return
+    state = memory.set_character_axis(update.effective_user.id, context.args[0], value)
+    await update.message.reply_text(naz_character.format_status(state))
 
 
 async def roles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3638,6 +3697,14 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             direction = random.choice(AUTOPOST_EDITORIAL_DIRECTIONS)
             topic = "инсайт из опыта запуска Naz_AI_Bot" if use_story_insight else topics[0]
             post_text = ""
+            character = memory.apply_character_event(admin_user_id, "new_topic")
+            recent_signatures = memory.get_recent_content_signatures(admin_user_id, limit=16)
+            editorial_plan = naz_character.plan_content(
+                character,
+                recent_signatures,
+                topic=topic,
+                platform="telegram",
+            )
 
             logger.info(
                 "NAZ_TELEGRAM_AUTO_LOOP attempt %s/%s | slot=%s | rubric=%s | task=%s | profile=%s | direction=%s",
@@ -3651,7 +3718,12 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             if use_story_insight:
                 logger.info("AUTOPOST story insight from %s", NAZ_STORIES_FILE)
-                post_text = await generate_story_insight(admin_user_id, topic, save_generated=False)
+                post_text = await generate_story_insight(
+                    admin_user_id,
+                    topic,
+                    save_generated=False,
+                    extra_instruction=naz_character.prompt_context(character, editorial_plan),
+                )
                 if is_warning_response(post_text):
                     reason = "story insight blocked by smart filter"
                     logger.warning("AUTOPOST fallback: %s", reason)
@@ -3664,6 +3736,12 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if not use_story_insight:
                 for candidate_topic in topics:
                     topic = candidate_topic
+                    editorial_plan = naz_character.plan_content(
+                        character,
+                        recent_signatures,
+                        topic=topic,
+                        platform="telegram",
+                    )
                     logger.info("AUTOPOST candidate topic=%s", topic)
                     post_text = await generate_content(
                         admin_user_id,
@@ -3675,6 +3753,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"Слот расписания Naz Telegram: {slot or 'ручной запуск'}.\n"
                             + format_autopost_direction(direction)
                             + format_autopost_profile(profile)
+                            + "\n"
+                            + naz_character.prompt_context(character, editorial_plan)
                         ),
                     )
                     if not is_warning_response(post_text):
@@ -3687,7 +3767,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             images, image_prompt = await generate_images_with_retries(
                 admin_user_id,
-                topic,
+                f"{topic}. Visual direction: {editorial_plan['media']}",
                 post_text,
                 count=CHANNEL_IMAGE_COUNT,
             )
@@ -3712,6 +3792,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 source=f"naz_telegram_autopost:{task}:{rubric['name']}:{profile['name']}",
                 topic=f"{topic} | {rubric['name']} | {profile['name']}",
             )
+            memory.record_content_signature(admin_user_id, editorial_plan, topic)
+            memory.apply_character_event(admin_user_id, "publish")
             logger.info("AUTOPOST done | attempt=%s | images=%s | prompt=%s", text_attempt, len(images), image_prompt)
             return
 
@@ -4036,6 +4118,9 @@ def help_commands_text() -> str:
         "/menu — открыть меню\n"
         "/help — помощь\n"
         "/state — текущий режим\n"
+        "/character — живая грань и состояние Naz\n"
+        "/character_event event — применить событие (admin)\n"
+        "/character_set axis 0-100 — скорректировать состояние (admin)\n"
         "/roles — список ролей\n"
         "/role marketer — выбрать expert mode\n/voice tech_hooligan — выбрать голос Naz\n/goal engagement — выбрать цель контента\n"
         "/memory — память\n"
@@ -4135,6 +4220,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("state", state_command))
+    application.add_handler(CommandHandler("character", character_command))
+    application.add_handler(CommandHandler("character_event", character_event_command))
+    application.add_handler(CommandHandler("character_set", character_set_command))
     application.add_handler(CommandHandler("roles", roles_command))
     application.add_handler(CommandHandler("role", role_command))
     application.add_handler(CommandHandler("voice", voice_command))

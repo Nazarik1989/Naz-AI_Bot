@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+import character_state as naz_character
 from controller import normalize_state
 from prompts import (
     DEFAULT_CONTENT_GOAL,
@@ -134,9 +135,143 @@ def init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS character_states (
+                user_id INTEGER PRIMARY KEY,
+                character_id TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                core_version TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_signatures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                character_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                facet TEXT NOT NULL,
+                intent TEXT NOT NULL,
+                format TEXT NOT NULL,
+                hook TEXT NOT NULL,
+                media TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_user_created ON chat_history(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_user_created ON memory_items(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON generated_posts(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signatures_user_created ON content_signatures(user_id, id)")
+
+
+def load_character_state(user_id: int) -> naz_character.CharacterState:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT state_json FROM character_states WHERE user_id = ? AND character_id = ?",
+            (user_id, naz_character.CHARACTER_ID),
+        ).fetchone()
+    if not row:
+        state = naz_character.CharacterState()
+        save_character_state(user_id, state)
+        return state
+    try:
+        raw = json.loads(row["state_json"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return naz_character.normalize_state(raw if isinstance(raw, dict) else {})
+
+
+def save_character_state(user_id: int, state: naz_character.CharacterState) -> None:
+    normalized = naz_character.normalize_state(state.to_dict())
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO character_states(user_id, character_id, state_json, core_version, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                character_id = excluded.character_id,
+                state_json = excluded.state_json,
+                core_version = excluded.core_version,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                json.dumps(normalized.to_dict(), ensure_ascii=False),
+                normalized.core_version,
+                utc_now(),
+            ),
+        )
+
+
+def apply_character_event(user_id: int, event: str) -> naz_character.CharacterState:
+    state = naz_character.apply_event(load_character_state(user_id), event)
+    save_character_state(user_id, state)
+    return state
+
+
+def set_character_axis(user_id: int, axis: str, value: int) -> naz_character.CharacterState:
+    state = naz_character.set_axis(load_character_state(user_id), axis, value)
+    save_character_state(user_id, state)
+    return state
+
+
+def get_recent_content_signatures(user_id: int, limit: int = 12) -> List[Dict[str, str]]:
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT platform, facet, intent, format, hook, media, topic, created_at
+            FROM content_signatures
+            WHERE user_id = ? AND character_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, naz_character.CHARACTER_ID, max(1, limit)),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_content_signature(user_id: int, plan: Dict[str, str], topic: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO content_signatures(
+                user_id, character_id, platform, facet, intent, format, hook, media, topic, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                str(plan.get("platform", "telegram")),
+                str(plan.get("facet", "explorer")),
+                str(plan.get("intent", "исследовать")),
+                str(plan.get("format", "маленькая история")),
+                str(plan.get("hook", "наблюдение")),
+                str(plan.get("media", "редакционная иллюстрация")),
+                topic[:1000],
+                utc_now(),
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM content_signatures
+            WHERE user_id = ? AND id NOT IN (
+                SELECT id FROM content_signatures
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 80
+            )
+            """,
+            (user_id, user_id),
+        )
 
 
 def _decode_state_json(raw: Optional[str]) -> Dict:
