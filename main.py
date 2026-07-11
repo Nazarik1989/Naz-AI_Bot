@@ -51,6 +51,7 @@ import controller as naz_controller
 import character_state as naz_character
 import delegated_messaging
 import duo_relationship
+import gaming_vertical
 import visual_archive
 import vk_publish_queue
 from prompts import (
@@ -2571,6 +2572,55 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await content_command(update, context, "plan")
 
 
+async def gaming_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    topic = extract_topic(update, context, default="игры как пространство для экспериментов")
+    plan = gaming_vertical.plan_gaming_content(
+        "naz", topic, memory.get_recent_content_signatures(update.effective_user.id), platform="telegram"
+    )
+    await update.message.reply_text(
+        f"🎮 Игровой план Naz\n\nРубрика: {plan['intent']}\nФормат: {plan['format']}\n"
+        f"Коммерческий угол: {plan['commercial_angle']}\nТема: {topic}"
+    )
+
+
+async def gaming_command(update: Update, context: ContextTypes.DEFAULT_TYPE, *, commercial: bool = False) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if ADMIN_ONLY_CONTENT and not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Игровые черновики сейчас доступны только админу.")
+        return
+    topic = extract_topic(update, context, default="игры как пространство для экспериментов")
+    recent = memory.get_recent_content_signatures(update.effective_user.id)
+    plan = gaming_vertical.plan_gaming_content("naz", topic, recent, platform="telegram", commercial=commercial)
+    await send_typing(update)
+    try:
+        result = await generate_content(
+            update.effective_user.id,
+            topic,
+            "post",
+            extra_instruction=gaming_vertical.prompt_context("naz", plan),
+        )
+        memory.record_content_signature(update.effective_user.id, plan, topic)
+        await reply_long(update, result, CONTENT_KEYBOARD)
+        await update.message.reply_text(
+            f"🎮 {plan['intent']} · {plan['format']} · {plan['commercial_angle']}\n"
+            "Это черновик: игровая автопубликация пока выключена."
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("gaming_command failed")
+        await update.message.reply_text(f"⚠️ Игровой черновик не получился: {exc}")
+
+
+async def gaming_draft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await gaming_command(update, context, commercial=False)
+
+
+async def gaming_commercial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await gaming_command(update, context, commercial=True)
+
+
 async def hooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await content_command(update, context, "hooks")
 
@@ -4610,6 +4660,9 @@ def help_commands_text() -> str:
         "/viral тема — вирусный пост\n"
         "/script тема — сценарий Reels\n"
         "/plan тема — контент-план\n"
+        "/gaming тема — игровой черновик Naz\n"
+        "/gaming_commercial тема — игровой черновик с проверкой продукта\n"
+        "/gaming_plan тема — показать игровую рубрику и формат\n"
         "/hooks тема — заголовки\n"
         "/imagepost тема — пост + 2 картинки\n"
         "/image тема — одна картинка\n"
@@ -4729,6 +4782,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("viral", viral_command))
     application.add_handler(CommandHandler("script", script_command))
     application.add_handler(CommandHandler("plan", plan_command))
+    application.add_handler(CommandHandler("gaming", gaming_draft_command))
+    application.add_handler(CommandHandler("gaming_commercial", gaming_commercial_command))
+    application.add_handler(CommandHandler("gaming_plan", gaming_plan_command))
     application.add_handler(CommandHandler("hooks", hooks_command))
     application.add_handler(CommandHandler("insight", insight_command))
     application.add_handler(CommandHandler("imagepost", imagepost_command))
