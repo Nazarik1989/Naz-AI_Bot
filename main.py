@@ -13,6 +13,8 @@ Telegram AI Content OS:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -100,6 +102,11 @@ def env_float(name: str, default: float) -> float:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "openai/gpt-image-2").strip()
+OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024").strip()
+OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip()
+OPENAI_IMAGE_TIMEOUT_SECONDS = max(30, min(env_int("OPENAI_IMAGE_TIMEOUT_SECONDS", 120), 300))
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini").strip()
 CONTENT_MODEL_NAME = os.getenv("CONTENT_MODEL_NAME", MODEL_NAME).strip()
 
@@ -108,7 +115,7 @@ CHANNEL_ID = os.getenv("NAZ_TELEGRAM_CHANNEL_ID", os.getenv("CHANNEL_ID", "")).s
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_MODEL = os.getenv("HF_MODEL", "black-forest-labs/FLUX.1-schnell").strip()
-IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "bfl").strip().lower()
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "openai").strip().lower()
 BFL_API_KEY = os.getenv("BFL_API_KEY", "").strip()
 BFL_MODEL = os.getenv("BFL_MODEL", "flux-2-pro").strip().lower()
 BFL_API_BASE = os.getenv("BFL_API_BASE", "https://api.bfl.ai/v1").strip().rstrip("/")
@@ -545,7 +552,7 @@ def ensure_openai_client() -> OpenAI:
     if openai_client is None:
         openai_client = OpenAI(
             api_key=OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1",
+            base_url=OPENAI_BASE_URL,
             default_headers={
                 "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://replit.com"),
                 "X-Title": APP_NAME,
@@ -1559,6 +1566,15 @@ async def generate_selected_angle_content(user_id: int) -> str:
 
 
 async def build_image_prompt(user_id: int, topic: str, post_text: str, variant: int = 1) -> str:
+    character_direction = "Naz mood: lively and practical; facet: builder."
+    try:
+        character = memory.load_character_state(user_id)
+        character_direction = (
+            f"Naz mood: {naz_character.mood_label(character)}; "
+            f"active character facet: {character.facet}."
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Character state unavailable for image prompt: %s", type(exc).__name__)
     messages = [
         {
             "role": "system",
@@ -1573,6 +1589,8 @@ async def build_image_prompt(user_id: int, topic: str, post_text: str, variant: 
             "role": "user",
             "content": (
                 f"Topic: {topic}\n"
+                f"Rubric and context: {topic}\n"
+                f"{character_direction}\n"
                 f"Variant: {variant}\n\n"
                 f"Post text:\n{post_text[:1800]}\n\n"
                 "Extract the main scene, conflict, mood, subject, setting, and visual metaphor. "
@@ -1604,6 +1622,73 @@ async def build_image_prompt(user_id: int, topic: str, post_text: str, variant: 
 # -----------------------------------------------------------------------------
 # Image generation
 # -----------------------------------------------------------------------------
+
+
+async def download_generated_image(url: str) -> bytes:
+    if not url.startswith("https://"):
+        raise RuntimeError("Images API returned a non-HTTPS image URL")
+    try:
+        async with httpx.AsyncClient(timeout=OPENAI_IMAGE_TIMEOUT_SECONDS, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Images API URL download failed: {type(exc).__name__}") from exc
+    content_type = response.headers.get("content-type", "").lower()
+    if not response.content or not content_type.startswith("image/"):
+        raise RuntimeError("Images API URL did not return image content")
+    return response.content
+
+
+async def generate_openai_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
+    """Generate through the OpenAI-compatible Images API configured for OpenRouter."""
+    if not OPENROUTER_API_KEY:
+        logger.warning("OPENAI_API_KEY is empty. OpenAI-compatible image generation skipped.")
+        return None
+
+    def _request():
+        client = ensure_openai_client()
+        return client.images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=f"{prompt}\nComposition variation: {variant}.",
+            size=OPENAI_IMAGE_SIZE,
+            quality=OPENAI_IMAGE_QUALITY,
+            n=1,
+            timeout=OPENAI_IMAGE_TIMEOUT_SECONDS,
+        )
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(_request), timeout=OPENAI_IMAGE_TIMEOUT_SECONDS + 5
+        )
+        if not getattr(response, "data", None):
+            raise RuntimeError("Images API returned no image data")
+        item = response.data[0]
+        encoded = getattr(item, "b64_json", None)
+        if encoded:
+            try:
+                image = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise RuntimeError("Images API returned invalid base64 image data") from exc
+            if not image:
+                raise RuntimeError("Images API returned an empty base64 image")
+            logger.info("OpenAI-compatible image ready | model=%s | variant=%s", OPENAI_IMAGE_MODEL, variant)
+            return image
+        url = str(getattr(item, "url", None) or "")
+        if url:
+            image = await download_generated_image(url)
+            logger.info("OpenAI-compatible image URL ready | model=%s | variant=%s", OPENAI_IMAGE_MODEL, variant)
+            return image
+        raise RuntimeError("Images API response has neither b64_json nor URL")
+    except Exception as exc:  # noqa: BLE001
+        status_code = getattr(exc, "status_code", None)
+        logger.warning(
+            "Requested OpenRouter image model is unavailable or generation failed; "
+            "continuing with BFL/HF fallback | model=%s | status=%s | error=%s",
+            OPENAI_IMAGE_MODEL,
+            status_code if status_code is not None else "unknown",
+            type(exc).__name__,
+        )
+        return None
 
 
 async def generate_bfl_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
@@ -1714,10 +1799,11 @@ async def generate_hf_image_bytes(prompt: str, variant: int = 1) -> Optional[byt
 async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
     """Generate through the preferred provider, then try the configured backup."""
     providers = {
+        "openai": (generate_openai_image_bytes, generate_bfl_image_bytes, generate_hf_image_bytes),
         "bfl": (generate_bfl_image_bytes, generate_hf_image_bytes),
         "huggingface": (generate_hf_image_bytes, generate_bfl_image_bytes),
         "hf": (generate_hf_image_bytes, generate_bfl_image_bytes),
-    }.get(IMAGE_PROVIDER, (generate_bfl_image_bytes, generate_hf_image_bytes))
+    }.get(IMAGE_PROVIDER, (generate_openai_image_bytes, generate_bfl_image_bytes, generate_hf_image_bytes))
 
     for provider in providers:
         image = await provider(prompt, variant=variant)
