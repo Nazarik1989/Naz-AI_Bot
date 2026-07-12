@@ -43,9 +43,7 @@ NAZ_VK_ENABLED
 NAZ_VK_PUBLIC_ID
 NAZ_VK_AUTO_ON
 NAZ_VK_AUTO_TIMES
-NAZ_VK_PAYLOAD_DIR
-NAZ_VK_BROWSER_PROFILE_DIR
-NAZ_VK_HELPER_MODE
+NAZ_VK_QUEUE_DIR
 ```
 
 Current Naz VK rubrics:
@@ -56,9 +54,14 @@ AI без успешного успеха
 Ошибка недели
 ```
 
-The current repo registers this config and creates the payload/profile
-directories. A browser helper can be wired later without moving schedule
-ownership to VOID.
+Naz is only a producer of `vk_publish_job.v1` directories under
+`NAZ_VK_QUEUE_DIR/pending`. It has no VK credentials, cookies, browser profile,
+Playwright, or direct publishing code. The shared VK Publisher consumes these
+jobs independently. The canonical queue root is
+`/var/lib/void-vk-publisher/queue`; its directories are group-owned by
+`vkqueue`. Producer and consumer services use `UMask=0027`; Naz also writes job
+files as `0640`, job directories as `0750`, and keeps the setgid bit on
+`pending` so new jobs inherit the queue group.
 
 ## Cross-posting
 

@@ -49,6 +49,7 @@ from telegram.ext import (
 import memory
 import controller as naz_controller
 import visual_archive
+import vk_publish_queue
 from prompts import (
     CONTENT_TASK_PROMPTS,
     DEFAULT_CONTENT_GOAL,
@@ -138,9 +139,7 @@ NAZ_VK_ENABLED = env_bool("NAZ_VK_ENABLED", False)
 NAZ_VK_PUBLIC_ID = os.getenv("NAZ_VK_PUBLIC_ID", "").strip()
 NAZ_VK_AUTO_ON = env_bool("NAZ_VK_AUTO_ON", False)
 NAZ_VK_AUTO_TIMES = os.getenv("NAZ_VK_AUTO_TIMES", "11:20,16:40,20:20").strip()
-NAZ_VK_PAYLOAD_DIR = Path(os.getenv("NAZ_VK_PAYLOAD_DIR", "content_inbox/naz_vk_payloads").strip())
-NAZ_VK_BROWSER_PROFILE_DIR = Path(os.getenv("NAZ_VK_BROWSER_PROFILE_DIR", ".browser_profiles/naz_vk").strip())
-NAZ_VK_HELPER_MODE = os.getenv("NAZ_VK_HELPER_MODE", "naz").strip()
+NAZ_VK_QUEUE_DIR = Path(os.getenv("NAZ_VK_QUEUE_DIR", "/var/lib/void-vk-publisher/queue").strip())
 AGENT_CONTENT_SYNC_ENABLED = env_bool("AGENT_CONTENT_SYNC_ENABLED", True)
 AGENT_CONTENT_SYNC_TIMES = os.getenv("AGENT_CONTENT_SYNC_TIMES", "23:57").strip()
 AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
@@ -605,7 +604,11 @@ def build_user_memory_context(user_id: int) -> str:
         return "Память временно недоступна."
 
 
-def build_chat_messages(user_text: str, memory_context: str) -> List[Dict[str, str]]:
+def build_chat_messages(
+    user_text: str,
+    memory_context: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, str]]:
     system = (
         "Ты Naz_AI_Bot, живой AI-помощник Назара. Это обычный диалог, не пост для канала. "
         "Отвечай коротко: обычно 2-6 предложений. Если пользователь просит подробно, можно больше. "
@@ -616,10 +619,12 @@ def build_chat_messages(user_text: str, memory_context: str) -> List[Dict[str, s
     )
     if memory_context:
         system += "\n\nКраткий контекст памяти, если он реально помогает ответу:\n" + memory_context[:1200]
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_text},
+    previous = [
+        {"role": item["role"], "content": item["content"]}
+        for item in (history or [])
+        if item.get("role") in {"user", "assistant"} and item.get("content")
     ]
+    return [{"role": "system", "content": system}, *previous, {"role": "user", "content": user_text}]
 
 
 async def generate_answer(
@@ -641,7 +646,8 @@ async def generate_answer(
     memory_context = build_user_memory_context(user_id)
 
     if task is None:
-        messages = build_chat_messages(user_text, memory_context)
+        history = memory.get_history(user_id, limit=20)
+        messages = build_chat_messages(user_text, memory_context, history)
     else:
         messages = build_messages(
             state=controlled_state,
@@ -661,6 +667,8 @@ async def generate_answer(
         task=task,
     )
     memory.save_state(user_id, updated_state)
+    if task is None:
+        memory.save_dialog_turn(user_id, user_text, result)
     return result
 
 
@@ -1982,6 +1990,108 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await reply_long(update, memory.get_stats(), CONTROL_KEYBOARD)
 
 
+def dialog_command_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.args:
+        try:
+            return int(context.args[0])
+        except (TypeError, ValueError):
+            pass
+    return update.effective_user.id
+
+
+async def dialog_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Команда доступна только администратору.", MAIN_KEYBOARD)
+        return
+    target_id = dialog_command_user_id(update, context)
+    history = memory.get_history(target_id, limit=20)
+    if not history:
+        text = f"Диалог user_id={target_id} пуст."
+    else:
+        lines = [f"Последний контекст user_id={target_id}:"]
+        lines.extend(f"{item['role']}: {item['content']}" for item in history)
+        text = "\n\n".join(lines)
+    await reply_long(update, text, CONTROL_KEYBOARD)
+
+
+async def dialog_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Команда доступна только администратору.", MAIN_KEYBOARD)
+        return
+    target_id = dialog_command_user_id(update, context)
+    memory.clear_dialog_history(target_id)
+    await reply_long(
+        update,
+        f"✅ Диалог user_id={target_id} очищен. Характер, настройки и контентная память сохранены.",
+        CONTROL_KEYBOARD,
+    )
+
+
+async def vk_queue_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Команда доступна только администратору.", MAIN_KEYBOARD)
+        return
+    status = vk_publish_queue.queue_status(NAZ_VK_QUEUE_DIR)
+    await reply_long(
+        update,
+        (
+            f"VK Publisher: pending={status['pending']}, processing={status['processing']}, "
+            f"done={status['done']}, failed={status['failed']}.\nОчередь: {status['path']}"
+        ),
+        CONTROL_KEYBOARD,
+    )
+
+
+async def create_naz_vk_job(topic: str, *, source_ref: str, not_before: Optional[datetime] = None) -> dict:
+    if not NAZ_VK_ENABLED:
+        raise vk_publish_queue.QueueError("NAZ_VK_ENABLED выключен")
+    if not NAZ_VK_PUBLIC_ID:
+        raise vk_publish_queue.QueueError("NAZ_VK_PUBLIC_ID не задан")
+    user_id = ADMIN_ID or 0
+    rubric = random.choice(NAZ_VK_RUBRICS)
+    text = await generate_content(
+        user_id,
+        topic,
+        "post",
+        save_generated=False,
+        extra_instruction=(
+            f"Рубрика VK: {rubric['name']}. {rubric['angle']}. {rubric['format']}. "
+            "Верни только готовый текст публикации; не выбирай группу и не добавляй служебные поля."
+        ),
+    )
+    if is_warning_response(text):
+        raise vk_publish_queue.QueueError("модель отклонила создание безопасного текста")
+    images, _ = await generate_images_with_retries(user_id, topic, text, count=1)
+    media = [vk_publish_queue.MediaInput("image-1.png", images[0])] if images else []
+    return vk_publish_queue.enqueue(
+        NAZ_VK_QUEUE_DIR,
+        target_group_id=NAZ_VK_PUBLIC_ID,
+        text=text,
+        media=media,
+        track_query=topic,
+        created_at=datetime.now(ZoneInfo(BOT_TIMEZONE)),
+        not_before=not_before,
+        dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
+        source_ref=source_ref,
+    )
+
+
+async def vk_queue_draft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Команда доступна только администратору.", MAIN_KEYBOARD)
+        return
+    topic = extract_topic(update, context, default="AI, контент и автоматизация")
+    await send_typing(update)
+    try:
+        job = await create_naz_vk_job(topic, source_ref=f"manual:{topic.strip().lower()}")
+        await reply_long(update, f"✅ Задание VK поставлено: {job['job_id']}", CONTROL_KEYBOARD)
+    except vk_publish_queue.DuplicateJobError:
+        await reply_long(update, "ℹ️ Такое задание уже находится в очереди.", CONTROL_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("VK queue draft failed")
+        await reply_long(update, f"⚠️ Не удалось поставить задание VK в очередь: {exc}", CONTROL_KEYBOARD)
+
+
 async def content_command(update: Update, context: ContextTypes.DEFAULT_TYPE, task: str) -> None:
     if not update.effective_user or not update.message:
         return
@@ -3027,8 +3137,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_typing(update)
     try:
         answer = await generate_answer(user_id, text)
-        memory.save_message(user_id, "user", text)
-        memory.save_message(user_id, "assistant", answer)
         await reply_long(update, answer, ANGLE_KEYBOARD if is_angle_engine_message(answer) else MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("handle_message failed")
@@ -3745,19 +3853,50 @@ def setup_naz_vk_schedule(application: Application) -> None:
         logger.warning("Naz VK schedule enabled, but NAZ_VK_PUBLIC_ID is empty")
         return
 
-    NAZ_VK_PAYLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    NAZ_VK_BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    rubrics = ", ".join(rubric["name"] for rubric in NAZ_VK_RUBRICS)
-    logger.info(
-        "Naz VK schedule configured | public=%s | times=%s | helper=%s | payload_dir=%s | profile_dir=%s | rubrics=%s",
-        NAZ_VK_PUBLIC_ID,
-        NAZ_VK_AUTO_TIMES,
-        NAZ_VK_HELPER_MODE,
-        NAZ_VK_PAYLOAD_DIR,
-        NAZ_VK_BROWSER_PROFILE_DIR,
-        rubrics,
-    )
-    logger.info("Naz VK publisher is not registered yet: payload/browser helper integration must consume this Naz-owned config.")
+    if not application.job_queue:
+        logger.warning("Naz VK JobQueue is not available")
+        return
+    tz = ZoneInfo(BOT_TIMEZONE)
+    scheduled = []
+    for raw_time in NAZ_VK_AUTO_TIMES.split(","):
+        raw_time = raw_time.strip()
+        try:
+            hour_text, minute_text = raw_time.split(":", maxsplit=1)
+            hour, minute = int(hour_text), int(minute_text)
+            if hour not in range(24) or minute not in range(60):
+                raise ValueError
+        except ValueError:
+            logger.warning("Invalid NAZ_VK_AUTO_TIMES value skipped: %s", raw_time)
+            continue
+        slot = f"{hour:02d}:{minute:02d}"
+        application.job_queue.run_daily(
+            naz_vk_queue_job,
+            time=time(hour=hour, minute=minute, tzinfo=tz),
+            name=f"naz_vk_queue_{hour:02d}_{minute:02d}",
+            data={"slot": slot},
+        )
+        scheduled.append(slot)
+    if scheduled:
+        logger.info("Naz VK queue scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
+    else:
+        logger.warning("Naz VK enabled, but NAZ_VK_AUTO_TIMES has no valid times")
+
+
+async def naz_vk_queue_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not (NAZ_VK_ENABLED and NAZ_VK_AUTO_ON):
+        return
+    slot = str((context.job.data or {}).get("slot", "manual"))
+    today = datetime.now(ZoneInfo(BOT_TIMEZONE)).date().isoformat()
+    source_ref = f"schedule:{today}:{slot}"
+    topic = f"Naz VK, слот {slot}: практическая заметка об AI, разработке или контент-системах"
+    try:
+        job = await create_naz_vk_job(topic, source_ref=source_ref)
+        logger.info("Naz VK job queued | job_id=%s | slot=%s", job["job_id"], slot)
+    except vk_publish_queue.DuplicateJobError:
+        logger.info("Naz VK schedule cooldown: slot already queued | %s", source_ref)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Naz VK enqueue failed | slot=%s", slot)
+        await notify_admin(context.bot, f"⚠️ Не удалось поставить задание VK ({slot}) в очередь: {exc}")
 
 
 def setup_source_monitoring(application: Application) -> None:
@@ -4003,6 +4142,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("memory", memory_command))
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("dialog_context", dialog_context_command))
+    application.add_handler(CommandHandler("dialog_reset", dialog_reset_command))
+    application.add_handler(CommandHandler("vk_queue_status", vk_queue_status_command))
+    application.add_handler(CommandHandler("vk_queue_draft", vk_queue_draft_command))
     application.add_handler(CommandHandler("sources", sources_command))
     application.add_handler(CommandHandler("scan_sources", scan_sources_command))
     application.add_handler(CommandHandler("publish_source", publish_source_command))

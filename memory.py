@@ -263,6 +263,37 @@ def save_message(user_id: int, role: str, content: str) -> None:
         )
 
 
+def save_dialog_turn(user_id: int, user_content: str, assistant_content: str) -> None:
+    """Persist one complete dialog turn in a single SQLite transaction."""
+    if not user_content or not assistant_content:
+        return
+    state = load_state(user_id)
+    if not state.get("memory_enabled", True):
+        return
+    now = utc_now()
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO chat_history(user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (
+                (user_id, "user", user_content[:8000], now),
+                (user_id, "assistant", assistant_content[:8000], now),
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM chat_history
+            WHERE user_id = ?
+              AND id NOT IN (
+                SELECT id FROM chat_history
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 40
+              )
+            """,
+            (user_id, user_id),
+        )
+
+
 def get_history(user_id: int, limit: int = 10) -> List[Dict[str, str]]:
     with db() as conn:
         rows = conn.execute(
@@ -270,6 +301,12 @@ def get_history(user_id: int, limit: int = 10) -> List[Dict[str, str]]:
             (user_id, limit),
         ).fetchall()
     return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+
+
+def clear_dialog_history(user_id: int) -> None:
+    """Clear conversation transcript without touching state or content memory."""
+    with db() as conn:
+        conn.execute("DELETE FROM chat_history WHERE user_id = ?", (user_id,))
 
 
 def add_memory_item(user_id: int, kind: str, content: str, title: Optional[str] = None) -> None:

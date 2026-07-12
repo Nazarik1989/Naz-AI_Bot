@@ -152,9 +152,7 @@ NAZ_VK_ENABLED=false
 NAZ_VK_PUBLIC_ID=
 NAZ_VK_AUTO_ON=false
 NAZ_VK_AUTO_TIMES=11:20,16:40,20:20
-NAZ_VK_PAYLOAD_DIR=content_inbox/naz_vk_payloads
-NAZ_VK_BROWSER_PROFILE_DIR=.browser_profiles/naz_vk
-NAZ_VK_HELPER_MODE=naz
+NAZ_VK_QUEUE_DIR=/var/lib/void-vk-publisher/queue
 ```
 
 The current code registers the Naz VK configuration and creates the payload /
