@@ -97,11 +97,15 @@ still work as fallbacks, but new Naz deployments should prefer the
 
 ## Images
 
-The default image chain uses the official pinned FLUX.2 Pro endpoint first,
-then Hugging Face, then a local Naz-branded card:
+The default image chain uses the OpenAI-compatible Images API through
+OpenRouter, then BFL, Hugging Face, and finally the local Naz-branded fallback:
 
 ```text
-IMAGE_PROVIDER=bfl
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+OPENAI_IMAGE_MODEL=openai/gpt-image-2
+OPENAI_IMAGE_SIZE=1024x1024
+OPENAI_IMAGE_QUALITY=medium
+IMAGE_PROVIDER=openai
 BFL_API_KEY=...
 BFL_MODEL=flux-2-pro
 BFL_IMAGE_WIDTH=1024
@@ -111,13 +115,17 @@ HF_TOKEN=...
 ALLOW_IMAGE_FALLBACK=true
 ```
 
-The BFL API is asynchronous. Naz submits a generation request, polls the
-returned `polling_url`, and downloads the signed result immediately. If BFL is
-unavailable or has no balance, Hugging Face is tried automatically. When HF
-credits become available again, no code change is required. If both remote
-providers fail, Pillow renders a square branded fallback locally; no random
-stock-photo service is used. The card reuses the current Naz bot and
+The Images API uses the existing `OPENAI_API_KEY`, the configured
+`OPENAI_BASE_URL`, and accepts either base64 image data or a provider URL. If it
+fails, the asynchronous BFL API is tried, followed by Hugging Face. Only after
+all remote providers fail does Pillow render a square branded fallback; no
+random stock-photo service is used. The card reuses the current Naz bot and
 `@PromptOrDie` Telegram avatars when they are available.
+
+The canonical GPT Image 2 model ID is `openai/gpt-image-2`, verified through
+OpenRouter's authenticated `GET /api/v1/images/models`. Naz never substitutes a
+different OpenAI image model silently: an unavailable/rejected model is logged
+and the existing BFL → Hugging Face → local fallback chain is used.
 
 Files placed in `FALLBACK_IMAGE_DIR` take priority over the generated card.
 Naz randomly selects a JPG, PNG, or WebP from that directory and center-crops
