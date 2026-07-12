@@ -73,17 +73,110 @@ HF_TOKEN=Hugging Face token
 
 ## Autoposting
 
+Naz Telegram autoposting is owned by this project. VOID should not generate
+Naz channel autoposts or share a scheduler with Naz.
+
 Enabled by default:
 
 ```text
 AUTOPOST_ENABLED=true
+NAZ_TELEGRAM_AUTO_ON=true
 BOT_TIMEZONE=Europe/Moscow
-AUTOPOST_TIMES=10:00,20:00
-AUTOPOST_TASKS=post,viral
+NAZ_TELEGRAM_AUTO_TIMES=09:30,13:30,17:30,21:30
+NAZ_TELEGRAM_AUTO_TASKS=post,viral
 ```
 
-The bot schedules posts at the comma-separated `AUTOPOST_TIMES` values in
-`BOT_TIMEZONE`. `AUTOPOST_TASKS` can contain `post` and `viral`.
+The bot schedules posts at the comma-separated `NAZ_TELEGRAM_AUTO_TIMES`
+values in `BOT_TIMEZONE`. Each slot selects a Naz rubric from the in-repo
+rubric schedule, then writes only finished Naz posts to `naz_to_void` exchange
+for adaptation.
+
+Legacy `AUTOPOST_ENABLED`, `AUTOPOST_TIMES`, `AUTOPOST_TASKS`, and `CHANNEL_ID`
+still work as fallbacks, but new Naz deployments should prefer the
+`NAZ_TELEGRAM_*` variables.
+
+## Images
+
+The default image chain uses the official pinned FLUX.2 Pro endpoint first,
+then Hugging Face, then a local Naz-branded card:
+
+```text
+IMAGE_PROVIDER=bfl
+BFL_API_KEY=...
+BFL_MODEL=flux-2-pro
+BFL_IMAGE_WIDTH=1024
+BFL_IMAGE_HEIGHT=1024
+FALLBACK_IMAGE_DIR=assets/fallback_images
+HF_TOKEN=...
+ALLOW_IMAGE_FALLBACK=true
+```
+
+The BFL API is asynchronous. Naz submits a generation request, polls the
+returned `polling_url`, and downloads the signed result immediately. If BFL is
+unavailable or has no balance, Hugging Face is tried automatically. When HF
+credits become available again, no code change is required. If both remote
+providers fail, Pillow renders a square branded fallback locally; no random
+stock-photo service is used. The card reuses the current Naz bot and
+`@PromptOrDie` Telegram avatars when they are available.
+
+Files placed in `FALLBACK_IMAGE_DIR` take priority over the generated card.
+Naz randomly selects a JPG, PNG, or WebP from that directory and center-crops
+it to 1024x1024. The avatar card is used only when the directory is empty.
+
+Image-first publishing is a separate, review-gated path:
+
+```text
+VISUAL_ARCHIVE_ENABLED=false
+VISUAL_ARCHIVE_ROOT=images_curated
+VISUAL_ARCHIVE_MANIFEST=images_curated/catalog/publication_candidates.json
+VISUAL_ARCHIVE_STATE_FILE=.visual_archive_seen.json
+VISUAL_ARCHIVE_REQUIRE_APPROVED=true
+VISUAL_ARCHIVE_EVERY_N_POSTS=3
+```
+
+When enabled, Naz selects an approved unused visual first, writes a post around
+its OCR meaning and rubric, preserves the original aspect ratio, then records
+the image ID in a separate seen-state file. It falls back to the normal
+topic-first autopost loop when no eligible visual is available. The persistent
+cadence counter uses one visual on every third scheduled post by default, so
+visual posts never run consecutively and rotate through the daily time slots.
+
+## Naz VK
+
+VK is configured as a separate Naz-owned producer contour. It can target the
+shared VK public, but Naz owns only content generation and queue scheduling:
+
+```text
+NAZ_VK_ENABLED=false
+NAZ_VK_PUBLIC_ID=
+NAZ_VK_AUTO_ON=false
+NAZ_VK_AUTO_TIMES=11:20,16:40,20:20
+NAZ_VK_SCHEDULER=systemd
+NAZ_VK_QUEUE_DIR=/var/lib/void-vk-publisher/queue
+```
+
+Production uses the tracked `naz-vk-producer.service` and `.timer`. The timer
+creates one queue job per invocation without starting Telegram polling. Set
+`NAZ_VK_SCHEDULER=telegram` only for local compatibility with the in-process
+JobQueue schedule, or `off` to disable both scheduler registrations. The
+standalone command itself remains available when the scheduler mode is `off`.
+
+Naz creates only canonical filesystem jobs in the deployment-owned `pending`
+inbox. Browser state, VK credentials, consumption, and publication remain
+outside this process.
+
+## Cross-posting
+
+Naz and VOID exchange posts only through file queues under
+`CROSSPOST_EXCHANGE_DIR`:
+
+```text
+void_to_naz/inbox
+naz_to_void/inbox
+```
+
+The exchange contract is adaptation-only: one project can bring material to the
+other, but neither project owns the other's scheduler.
 
 ## VPS
 

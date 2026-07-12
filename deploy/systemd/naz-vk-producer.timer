@@ -1,0 +1,13 @@
+[Unit]
+Description=Schedule Naz VK queue producer
+
+[Timer]
+OnCalendar=*-*-* 11:20:00 Europe/Moscow
+OnCalendar=*-*-* 16:40:00 Europe/Moscow
+OnCalendar=*-*-* 20:20:00 Europe/Moscow
+Persistent=true
+AccuracySec=1min
+Unit=naz-vk-producer.service
+
+[Install]
+WantedBy=timers.target

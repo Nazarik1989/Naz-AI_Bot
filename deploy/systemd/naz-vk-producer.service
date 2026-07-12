@@ -1,0 +1,31 @@
+[Unit]
+Description=Naz VK queue producer (one job)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=naz
+Group=naz
+SupplementaryGroups=vkqueue
+WorkingDirectory=/opt/naz-ai-bot
+EnvironmentFile=/etc/naz-ai-bot/naz.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/naz-ai-bot/.venv/bin/python -B -m naz_vk_producer
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/naz-ai-bot /var/cache/naz-ai-bot /var/lib/void-vk-publisher/queue/pending

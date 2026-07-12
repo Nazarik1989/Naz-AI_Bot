@@ -20,15 +20,16 @@ import os
 import random
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from html import unescape
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 load_dotenv()
 
@@ -47,6 +48,12 @@ from telegram.ext import (
 
 import memory
 import controller as naz_controller
+import character_state as naz_character
+import delegated_messaging
+import duo_relationship
+import gaming_vertical
+import visual_archive
+import vk_publish_queue
 from prompts import (
     CONTENT_TASK_PROMPTS,
     DEFAULT_CONTENT_GOAL,
@@ -97,10 +104,27 @@ MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini").strip()
 CONTENT_MODEL_NAME = os.getenv("CONTENT_MODEL_NAME", MODEL_NAME).strip()
 
 ADMIN_ID = env_int("ADMIN_ID", 0)
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = os.getenv("NAZ_TELEGRAM_CHANNEL_ID", os.getenv("CHANNEL_ID", "")).strip()
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_MODEL = os.getenv("HF_MODEL", "black-forest-labs/FLUX.1-schnell").strip()
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "bfl").strip().lower()
+BFL_API_KEY = os.getenv("BFL_API_KEY", "").strip()
+BFL_MODEL = os.getenv("BFL_MODEL", "flux-2-pro").strip().lower()
+BFL_API_BASE = os.getenv("BFL_API_BASE", "https://api.bfl.ai/v1").strip().rstrip("/")
+BFL_IMAGE_WIDTH = max(512, min(env_int("BFL_IMAGE_WIDTH", 1024), 2048))
+BFL_IMAGE_HEIGHT = max(512, min(env_int("BFL_IMAGE_HEIGHT", 1024), 2048))
+BFL_POLL_INTERVAL_SECONDS = max(0.5, min(env_float("BFL_POLL_INTERVAL_SECONDS", 1.0), 5.0))
+BFL_TIMEOUT_SECONDS = max(30, min(env_int("BFL_TIMEOUT_SECONDS", 150), 300))
+FALLBACK_IMAGE_DIR = Path(os.getenv("FALLBACK_IMAGE_DIR", "assets/fallback_images").strip())
+VISUAL_ARCHIVE_ENABLED = env_bool("VISUAL_ARCHIVE_ENABLED", False)
+VISUAL_ARCHIVE_ROOT = Path(os.getenv("VISUAL_ARCHIVE_ROOT", "images_curated").strip())
+VISUAL_ARCHIVE_MANIFEST = Path(
+    os.getenv("VISUAL_ARCHIVE_MANIFEST", "images_curated/catalog/publication_candidates.json").strip()
+)
+VISUAL_ARCHIVE_STATE_FILE = Path(os.getenv("VISUAL_ARCHIVE_STATE_FILE", ".visual_archive_seen.json").strip())
+VISUAL_ARCHIVE_REQUIRE_APPROVED = env_bool("VISUAL_ARCHIVE_REQUIRE_APPROVED", True)
+VISUAL_ARCHIVE_EVERY_N_POSTS = max(2, min(env_int("VISUAL_ARCHIVE_EVERY_N_POSTS", 3), 12))
 
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
@@ -109,12 +133,18 @@ MONITORED_SOURCES_FILE = Path(os.getenv("MONITORED_SOURCES_FILE", "monitored_sou
 SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip())
 AGENT_CONTENT_INBOX = Path(os.getenv("AGENT_CONTENT_INBOX", "content_inbox/agent_content").strip())
 
-AUTOPOST_ENABLED = env_bool("AUTOPOST_ENABLED", True)
-AUTOPOST_TIMES = os.getenv("AUTOPOST_TIMES", "10:00,20:00").strip()
-AUTOPOST_TASKS = os.getenv("AUTOPOST_TASKS", "post,viral").strip()
+AUTOPOST_ENABLED = env_bool("NAZ_TELEGRAM_AUTO_ON", env_bool("AUTOPOST_ENABLED", True))
+AUTOPOST_TIMES = os.getenv("NAZ_TELEGRAM_AUTO_TIMES", os.getenv("AUTOPOST_TIMES", "09:30,13:30,17:30,21:30")).strip()
+AUTOPOST_TASKS = os.getenv("NAZ_TELEGRAM_AUTO_TASKS", os.getenv("AUTOPOST_TASKS", "post,viral")).strip()
 AUTOPOST_INSIGHT_CHANCE = max(0.0, min(env_float("AUTOPOST_INSIGHT_CHANCE", 0.35), 1.0))
 SOURCE_MONITOR_ENABLED = env_bool("SOURCE_MONITOR_ENABLED", False)
 SOURCE_MONITOR_TIMES = os.getenv("SOURCE_MONITOR_TIMES", "12:00,18:00").strip()
+NAZ_VK_ENABLED = env_bool("NAZ_VK_ENABLED", False)
+NAZ_VK_PUBLIC_ID = os.getenv("NAZ_VK_PUBLIC_ID", "").strip()
+NAZ_VK_AUTO_ON = env_bool("NAZ_VK_AUTO_ON", False)
+NAZ_VK_AUTO_TIMES = os.getenv("NAZ_VK_AUTO_TIMES", "11:20,16:40,20:20").strip()
+NAZ_VK_SCHEDULER = os.getenv("NAZ_VK_SCHEDULER", "systemd").strip().lower()
+NAZ_VK_QUEUE_DIR = Path(os.getenv("NAZ_VK_QUEUE_DIR", "/var/lib/void-vk-publisher/queue").strip())
 AGENT_CONTENT_SYNC_ENABLED = env_bool("AGENT_CONTENT_SYNC_ENABLED", True)
 AGENT_CONTENT_SYNC_TIMES = os.getenv("AGENT_CONTENT_SYNC_TIMES", "23:57").strip()
 AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
@@ -165,6 +195,8 @@ CONTENT_MODEL_TASKS = {
 # In-memory fast state. Persistent truth is SQLite.
 USER_MODES: Dict[int, str] = {}
 USER_PENDING_ACTIONS: Dict[int, str] = {}
+AUTOPOST_SKIP_ALERTS: Dict[str, str] = {}
+FALLBACK_AVATAR_CACHE: Dict[str, bytes] = {}
 
 openai_client: Optional[OpenAI] = None
 
@@ -185,6 +217,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BTN_AI = "🧠 AI"
 BTN_CONTENT = "🚀 Контент"
+BTN_LINKS = "🔗 Связи"
 BTN_CONTROL = "📊 Центр управления"
 BTN_HELP = "ℹ️ Помощь"
 BTN_BACK = "🔙 Назад"
@@ -229,6 +262,10 @@ BTN_STATS = "📈 Статистика"
 BTN_MEMORY = "🧠 Память"
 BTN_AUTOPOST = "📢 Автопостинг"
 BTN_SETTINGS = "⚙️ Настройки"
+
+BTN_CROSSPOST_STATUS = "🔄 Статус обмена"
+BTN_VOID_DRAFT = "🕳 Void → Naz draft"
+BTN_VOID_PUBLISH = "📣 Void → Naz в канал"
 
 # Angle Engine v2.4
 BTN_ANGLE_1 = "1️⃣ Угол 1"
@@ -312,7 +349,7 @@ def make_keyboard(rows: List[List[str]]) -> ReplyKeyboardMarkup:
     )
 
 
-MAIN_KEYBOARD = make_keyboard([[BTN_AI, BTN_CONTENT], [BTN_CONTROL, BTN_HELP]])
+MAIN_KEYBOARD = make_keyboard([[BTN_AI, BTN_CONTENT], [BTN_LINKS, BTN_CONTROL], [BTN_HELP]])
 AI_KEYBOARD = make_keyboard([[BTN_EXPERT_MENU], [BTN_VOICE_MENU, BTN_GOAL_MENU], [BTN_BACK]])
 EXPERT_KEYBOARD = make_keyboard([
     [BTN_COPYWRITER, BTN_MARKETER],
@@ -335,6 +372,7 @@ GOAL_KEYBOARD = make_keyboard([
 ])
 CONTENT_KEYBOARD = make_keyboard([[BTN_POST, BTN_VIRAL], [BTN_REELS, BTN_PLAN], [BTN_HOOKS, BTN_IMAGE], [BTN_BACK]])
 CONTROL_KEYBOARD = make_keyboard([[BTN_STATS, BTN_MEMORY], [BTN_AUTOPOST, BTN_SETTINGS], [BTN_BACK]])
+CROSSPOST_KEYBOARD = make_keyboard([[BTN_CROSSPOST_STATUS], [BTN_VOID_DRAFT, BTN_VOID_PUBLISH], [BTN_BACK]])
 ANGLE_KEYBOARD = make_keyboard([
     [BTN_ANGLE_1, BTN_ANGLE_2],
     [BTN_ANGLE_3, BTN_ANGLE_4],
@@ -571,7 +609,12 @@ def build_user_memory_context(user_id: int) -> str:
         return "Память временно недоступна."
 
 
-def build_chat_messages(user_text: str, memory_context: str) -> List[Dict[str, str]]:
+def build_chat_messages(
+    user_text: str,
+    memory_context: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    character_context: str = "",
+) -> List[Dict[str, str]]:
     system = (
         "Ты Naz_AI_Bot, живой AI-помощник Назара. Это обычный диалог, не пост для канала. "
         "Отвечай коротко: обычно 2-6 предложений. Если пользователь просит подробно, можно больше. "
@@ -582,13 +625,24 @@ def build_chat_messages(user_text: str, memory_context: str) -> List[Dict[str, s
     )
     if memory_context:
         system += "\n\nКраткий контекст памяти, если он реально помогает ответу:\n" + memory_context[:1200]
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_text},
-    ]
+    if character_context:
+        system += "\n\n" + character_context
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
+    for item in (history or [])[-20:]:
+        role = item.get("role")
+        content = str(item.get("content", "")).strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content[:5000]})
+    messages.append({"role": "user", "content": user_text})
+    return messages
 
 
-async def generate_answer(user_id: int, user_text: str, task: str | None = None, source_topic: str | None = None) -> str:
+async def generate_answer(
+    user_id: int,
+    user_text: str,
+    task: str | None = None,
+    source_topic: str | None = None,
+) -> str:
     """Generate answer through Controller → State → Prompt Builder → GPT."""
     state = memory.load_state(user_id)
     control = naz_controller.controller(user_text, state, task=task, source_topic=source_topic)
@@ -602,7 +656,14 @@ async def generate_answer(user_id: int, user_text: str, task: str | None = None,
     memory_context = build_user_memory_context(user_id)
 
     if task is None:
-        messages = build_chat_messages(user_text, memory_context)
+        history = memory.get_history(user_id, limit=20)
+        character = memory.load_character_state(user_id)
+        messages = build_chat_messages(
+            user_text,
+            memory_context,
+            history,
+            naz_character.dialogue_context(character),
+        )
     else:
         messages = build_messages(
             state=controlled_state,
@@ -622,6 +683,8 @@ async def generate_answer(user_id: int, user_text: str, task: str | None = None,
         task=task,
     )
     memory.save_state(user_id, updated_state)
+    if task is None:
+        memory.save_dialog_turn(user_id, user_text, result)
     return result
 
 
@@ -720,7 +783,13 @@ def pick_story_excerpt(query: str = "") -> str:
     return random.choice(blocks)
 
 
-async def generate_story_insight(user_id: int, topic_hint: str = "", *, save_generated: bool = True) -> str:
+async def generate_story_insight(
+    user_id: int,
+    topic_hint: str = "",
+    *,
+    save_generated: bool = True,
+    extra_instruction: str = "",
+) -> str:
     excerpt = pick_story_excerpt(topic_hint)
     if not excerpt:
         return "⚠️ Не нашёл naz_stories.md. Закинь файл в папку проекта или задай NAZ_STORIES_FILE в .env."
@@ -732,6 +801,8 @@ async def generate_story_insight(user_id: int, topic_hint: str = "", *, save_gen
         "Сделай не пересказ, а отдельный инсайт в стиле рубрики Prompt Or Die. "
         "Пиши как вывод из опыта: конкретно, живо, инженерно, без дневникового тона."
     )
+    if extra_instruction:
+        user_text += f"\n\nДополнительная режиссура:\n{extra_instruction.strip()}"
     story_signature = re.sub(r"\s+", " ", excerpt).strip()[:180]
     result = await generate_answer(
         user_id,
@@ -962,11 +1033,20 @@ def format_source_item(item: Dict[str, str]) -> str:
 
 async def generate_source_interpretation(user_id: int, item: Dict[str, str], *, save_generated: bool = True) -> str:
     frame = random.choice(SOURCE_EDITORIAL_FRAMES)
+    character = memory.load_character_state(user_id)
+    attitude = duo_relationship.news_attitude(
+        "naz",
+        item.get("title", ""),
+        item.get("summary", ""),
+        tension=character.tension,
+        curiosity=character.curiosity,
+    )
     source_context = (
         f"Рубрика: {item.get('rubric', 'AI-находка дня')}\n"
         f"Редакторский формат: {frame['name']}\n"
         f"Угол: {frame['angle']}\n"
         f"Форма: {frame['format']}\n"
+        f"Позиция Naz: {attitude['stance']} — {attitude['tone']}\n"
         f"Тип источника: {item.get('source_type', 'rss')}\n"
         f"Источник: {item.get('source_name', '')}\n"
         f"Заголовок: {item.get('title', '')}\n"
@@ -1056,7 +1136,9 @@ def choose_agent_content_date_for_sync() -> str:
 
     seen = load_agent_content_seen()
     changed = [path for path in dirs if seen.get(path.name) != agent_manifest_hash(path)]
-    pool = changed or dirs
+    pool = changed or (dirs if AGENT_CONTENT_REUSE_SEEN else [])
+    if not pool:
+        return current_bot_date()
     return random.choice(pool).name
 
 
@@ -1347,7 +1429,7 @@ VOID_OPENERS = [
 NAZ_BRIDGES = [
     "А я бы добавил вот что.",
     "Перевожу на рабочий язык.",
-    "Naz-ремарка после Void.",
+    "Моя ремарка после Void.",
     "А теперь человеческая часть.",
     "Если вытащить отсюда пользу, получается так.",
     "И вот где это касается AI, ботов и контента.",
@@ -1364,12 +1446,36 @@ def extract_void_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str
     return ""
 
 
-async def generate_void_crosspost(user_id: int, void_text: str, *, save_generated: bool = True) -> Tuple[str, List[str]]:
+async def generate_void_crosspost(
+    user_id: int,
+    void_text: str,
+    *,
+    save_generated: bool = True,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[str]]:
     risks = detect_content_risks(void_text)
     safe_void_text = redact_sensitive_text(void_text)
-    frame = random.choice(VOID_CROSSPOST_FRAMES)
-    opener = random.choice(VOID_OPENERS)
-    bridge = random.choice(NAZ_BRIDGES)
+    if isinstance((payload or {}).get("relationship_snapshot"), dict):
+        memory.save_relationship_state(duo_relationship.normalize_state(payload["relationship_snapshot"]))
+    relationship = memory.apply_relationship_event("challenge", topic=str((payload or {}).get("topic") or void_text[:200]))
+    if payload and payload.get("schema") == "private_thought.v1":
+        private_payload = payload
+    else:
+        private_payload = duo_relationship.build_private_thought_payload(
+            speaker="void",
+            thought=safe_void_text,
+            topic=str((payload or {}).get("topic") or "мысль после разговора"),
+            relationship=relationship,
+            source_kind=str((payload or {}).get("source_event") or "manual_private_thought"),
+        )
+    memory.save_private_thought(private_payload, status="received")
+    character = memory.load_character_state(user_id)
+    reflection = duo_relationship.reflection_brief(
+        receiver="naz",
+        payload=private_payload,
+        relationship=relationship,
+        receiver_character_context=naz_character.dialogue_context(character),
+    )
     recent_posts = memory.get_recent_generated_posts(user_id, task="void_crosspost", limit=3)
     recent_preview = "\n".join(
         f"- {re.sub(r'\\s+', ' ', item.get('content', '')).strip()[:300]}"
@@ -1381,25 +1487,27 @@ async def generate_void_crosspost(user_id: int, void_text: str, *, save_generate
         expert_mode=get_user_expert_mode(user_id),
         user_text=(
             f"Предварительные риски: {', '.join(risks) if risks else 'не найдены'}\n\n"
-            f"Формат выпуска: {frame}\n"
-            f"Вводная к Void: {opener}\n"
-            f"Переход к комментарию Naz: {bridge}\n"
-            f"Последние void-кросспосты, чтобы не повторять заход:\n{recent_preview}\n\n"
-            f"Пост Void:\n{safe_void_text[:3500]}\n\n"
-            "Собери готовый кросспост. Вводные фразы можно адаптировать, но не повторяй механически. "
-            "Сохрани чужой голос Void отдельно от комментария Naz. Комментарий Naz должен быть прикладным и живым."
+            f"Рубрика: Мысли после разговора.\n"
+            f"Последние выпуски рубрики, чтобы не повторять заход:\n{recent_preview}\n\n"
+            f"{reflection}\n\n"
+            "Пиши от первого лица Naz. Упоминание VOID или беседы допустимо и желательно, когда звучит естественно. "
+            "Не публикуй исходную реплику отдельным блоком и не называй это кросспостом. "
+            "Финальный текст — новая мысль Naz, выросшая из разговора."
         ),
         memory_context=build_user_memory_context(user_id),
         history=[],
         task="void_crosspost",
     )
     result = await call_gpt(messages, max_tokens=TASK_MAX_TOKENS["void_crosspost"], model=CONTENT_MODEL_NAME)
+    original, originality_reason = duo_relationship.reflection_is_original(private_payload["thought"], result)
+    if not original:
+        raise ValueError(f"reflection blocked: {originality_reason}")
     if save_generated and not is_warning_response(result):
         memory.save_generated_post(
             user_id=user_id,
             expert_mode=get_user_expert_mode(user_id),
             task="void_crosspost",
-            topic=frame,
+            topic="Мысли после разговора",
             content=result,
             image_count=0,
             published_to_channel=False,
@@ -1498,15 +1606,79 @@ async def build_image_prompt(user_id: int, topic: str, post_text: str, variant: 
 # -----------------------------------------------------------------------------
 
 
-async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
-    """Generate one image through Hugging Face.
+async def generate_bfl_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
+    """Generate one image through the official asynchronous BFL API."""
+    if not BFL_API_KEY:
+        logger.warning("BFL_API_KEY is empty. BFL image generation skipped.")
+        return None
 
-    Returns bytes on success, None on failure. The bot must not crash because
-    image generation is an external dependency.
-    """
+    model = BFL_MODEL if re.fullmatch(r"flux-[a-z0-9-]+", BFL_MODEL) else "flux-2-pro"
+    endpoint = f"{BFL_API_BASE}/{model}"
+    headers = {
+        "accept": "application/json",
+        "x-key": BFL_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "prompt": f"{prompt}\nComposition variation: {variant}.",
+        "width": BFL_IMAGE_WIDTH,
+        "height": BFL_IMAGE_HEIGHT,
+        "output_format": "jpeg",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = await client.post(endpoint, headers=headers, json=payload)
+            if response.status_code != 200:
+                logger.error("BFL submit error %s | %s", response.status_code, response.text[:500])
+                return None
+
+            data = response.json()
+            polling_url = str(data.get("polling_url") or "")
+            if not polling_url.startswith("https://"):
+                logger.error("BFL response has no valid polling_url | %s", str(data)[:500])
+                return None
+
+            deadline = asyncio.get_running_loop().time() + BFL_TIMEOUT_SECONDS
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(BFL_POLL_INTERVAL_SECONDS)
+                poll_response = await client.get(
+                    polling_url,
+                    headers={"accept": "application/json", "x-key": BFL_API_KEY},
+                )
+                if poll_response.status_code != 200:
+                    logger.error("BFL poll error %s | %s", poll_response.status_code, poll_response.text[:500])
+                    return None
+
+                result = poll_response.json()
+                status = str(result.get("status") or "")
+                if status == "Ready":
+                    sample_url = str((result.get("result") or {}).get("sample") or "")
+                    if not sample_url.startswith("https://"):
+                        logger.error("BFL result has no valid sample URL | %s", str(result)[:500])
+                        return None
+                    image_response = await client.get(sample_url)
+                    content_type = image_response.headers.get("content-type", "")
+                    if image_response.status_code == 200 and image_response.content and content_type.startswith("image/"):
+                        logger.info("BFL image ready | model=%s | variant=%s", model, variant)
+                        return image_response.content
+                    logger.error("BFL image download error %s | %s", image_response.status_code, image_response.text[:300])
+                    return None
+                if status in {"Error", "Failed"}:
+                    logger.error("BFL generation failed | %s", str(result)[:500])
+                    return None
+
+            logger.error("BFL generation timed out after %ss", BFL_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("BFL image request failed: %s", exc)
+    return None
+
+
+async def generate_hf_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
+    """Generate one image through Hugging Face when its credits are available."""
     if not HF_TOKEN:
-        logger.warning("HF_TOKEN is empty. Image generation skipped.")
-        return await fallback_image_bytes() if ALLOW_IMAGE_FALLBACK else None
+        logger.warning("HF_TOKEN is empty. Hugging Face image generation skipped.")
+        return None
 
     endpoint = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
     headers = {
@@ -1536,20 +1708,177 @@ async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]
         logger.error("HF image error %s | %s", response.status_code, response.text[:500])
     except Exception as exc:  # noqa: BLE001
         logger.exception("HF image request failed: %s", exc)
+    return None
+
+
+async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
+    """Generate through the preferred provider, then try the configured backup."""
+    providers = {
+        "bfl": (generate_bfl_image_bytes, generate_hf_image_bytes),
+        "huggingface": (generate_hf_image_bytes, generate_bfl_image_bytes),
+        "hf": (generate_hf_image_bytes, generate_bfl_image_bytes),
+    }.get(IMAGE_PROVIDER, (generate_bfl_image_bytes, generate_hf_image_bytes))
+
+    for provider in providers:
+        image = await provider(prompt, variant=variant)
+        if image:
+            return image
 
     return await fallback_image_bytes() if ALLOW_IMAGE_FALLBACK else None
 
 
-async def fallback_image_bytes() -> Optional[bytes]:
-    """Fallback picture to prove Telegram delivery path still works."""
+def load_brand_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+async def telegram_avatar_bytes(chat_id: str) -> Optional[bytes]:
+    """Fetch and cache a Telegram chat avatar without exposing the bot token."""
+    if not BOT_TOKEN or not chat_id:
+        return None
+    if chat_id in FALLBACK_AVATAR_CACHE:
+        return FALLBACK_AVATAR_CACHE[chat_id]
+
+    api_base = f"https://api.telegram.org/bot{BOT_TOKEN}"
     try:
-        seed = random.randint(1000, 999999)
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            response = await client.get(f"https://picsum.photos/seed/naz-{seed}/1024/1024")
-        if response.status_code == 200 and response.content:
-            return response.content
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            chat_response = await client.get(f"{api_base}/getChat", params={"chat_id": chat_id})
+            chat_data = chat_response.json() if chat_response.status_code == 200 else {}
+            photo = (chat_data.get("result") or {}).get("photo") or {}
+            file_id = str(photo.get("big_file_id") or photo.get("small_file_id") or "")
+            if not file_id:
+                return None
+
+            file_response = await client.get(f"{api_base}/getFile", params={"file_id": file_id})
+            file_data = file_response.json() if file_response.status_code == 200 else {}
+            file_path = str((file_data.get("result") or {}).get("file_path") or "")
+            if not file_path:
+                return None
+
+            avatar_response = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
+            if avatar_response.status_code == 200 and avatar_response.content:
+                FALLBACK_AVATAR_CACHE[chat_id] = avatar_response.content
+                return avatar_response.content
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Fallback image failed: %s", exc)
+        logger.warning("Telegram avatar unavailable for %s: %s", chat_id, exc)
+    return None
+
+
+async def brand_avatar_sources() -> List[Tuple[str, Optional[bytes]]]:
+    bot_chat_id = ""
+    if BOT_TOKEN:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe")
+            data = response.json() if response.status_code == 200 else {}
+            username = str((data.get("result") or {}).get("username") or "")
+            bot_chat_id = f"@{username}" if username else ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Telegram bot profile unavailable for fallback card: %s", exc)
+
+    return [
+        ("NAZ AI BOT", await telegram_avatar_bytes(bot_chat_id)),
+        ("@PromptOrDie", await telegram_avatar_bytes(CHANNEL_ID or "@PromptOrDie")),
+    ]
+
+
+def paste_round_avatar(
+    image: Image.Image,
+    avatar_bytes: Optional[bytes],
+    box: Tuple[int, int, int, int],
+    accent: Tuple[int, int, int],
+) -> None:
+    x1, y1, x2, y2 = box
+    avatar_size = x2 - x1
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.ellipse((x1 - 8, y1 - 8, x2 + 8, y2 + 8), fill=(*accent, 220))
+    draw.ellipse((x1, y1, x2, y2), fill=(24, 28, 42, 255))
+    if not avatar_bytes:
+        return
+    try:
+        avatar = Image.open(BytesIO(avatar_bytes)).convert("RGB")
+        side = min(avatar.width, avatar.height)
+        left = (avatar.width - side) // 2
+        top = (avatar.height - side) // 2
+        avatar = avatar.crop((left, top, left + side, top + side)).resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+        mask = Image.new("L", (avatar_size, avatar_size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, avatar_size - 1, avatar_size - 1), fill=255)
+        image.paste(avatar, (x1, y1), mask)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Fallback avatar rendering failed: %s", exc)
+
+
+async def fallback_image_bytes() -> Optional[bytes]:
+    """Build a local Naz-branded card when every remote image provider fails."""
+    try:
+        size = 1024
+        if FALLBACK_IMAGE_DIR.exists():
+            candidates = [
+                path for path in FALLBACK_IMAGE_DIR.iterdir()
+                if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+            ]
+            if candidates:
+                source = random.choice(candidates)
+                with Image.open(source) as library_image:
+                    prepared = ImageOps.fit(
+                        library_image.convert("RGB"),
+                        (size, size),
+                        method=Image.Resampling.LANCZOS,
+                    )
+                    output = BytesIO()
+                    prepared.save(output, format="JPEG", quality=92, optimize=True)
+                logger.info("Local fallback image selected | file=%s", source.name)
+                return output.getvalue()
+
+        accent_options = [(112, 255, 190), (159, 122, 234), (255, 184, 92)]
+        accent = random.choice(accent_options)
+        image = Image.new("RGB", (size, size), (8, 10, 18))
+        draw = ImageDraw.Draw(image, "RGBA")
+
+        for y in range(size):
+            ratio = y / max(1, size - 1)
+            color = (
+                int(8 + accent[0] * ratio * 0.08),
+                int(10 + accent[1] * ratio * 0.07),
+                int(18 + accent[2] * ratio * 0.10),
+            )
+            draw.line((0, y, size, y), fill=color)
+
+        draw.ellipse((-220, -180, 520, 560), fill=(*accent, 24), outline=(*accent, 90), width=3)
+        draw.ellipse((610, 560, 1220, 1170), fill=(92, 74, 210, 30), outline=(159, 122, 234, 95), width=3)
+        draw.line((92, 170, 932, 170), fill=(*accent, 180), width=4)
+        draw.line((92, 854, 680, 854), fill=(*accent, 90), width=2)
+
+        label_font = load_brand_font(28, bold=True)
+        title_font = load_brand_font(82, bold=True)
+        subtitle_font = load_brand_font(34)
+        footer_font = load_brand_font(23)
+
+        draw.text((96, 98), "NAZ // CONTENT SYSTEM", font=label_font, fill=(*accent, 255))
+        avatars = await brand_avatar_sources()
+        paste_round_avatar(image, avatars[0][1], (105, 290, 365, 550), accent)
+        paste_round_avatar(image, avatars[1][1], (655, 290, 915, 550), (159, 122, 234))
+        draw.line((390, 420, 630, 420), fill=(*accent, 170), width=5)
+        draw.ellipse((494, 404, 526, 436), fill=(244, 246, 252, 255))
+        draw.text((134, 590), avatars[0][0], font=footer_font, fill=(220, 224, 235, 255))
+        draw.text((695, 590), avatars[1][0], font=footer_font, fill=(220, 224, 235, 255))
+        draw.text((96, 685), "SYSTEM VISUAL", font=title_font, fill=(244, 246, 252, 255), stroke_width=1)
+        draw.text((96, 795), "AI  •  SYSTEM  •  CONTENT", font=footer_font, fill=(150, 157, 178, 255))
+
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=92, optimize=True)
+        logger.info("Local Naz branded image fallback generated")
+        return output.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Local branded image fallback failed: %s", exc)
     return None
 
 
@@ -1558,7 +1887,7 @@ async def generate_images_for_post(user_id: int, topic: str, post_text: str, cou
     image_prompt = await build_image_prompt(user_id, topic, post_text, variant=1)
     images: List[bytes] = []
 
-    # Последовательно, чтобы не ловить лишние rate limits на HF.
+    # Последовательно, чтобы не ловить лишние rate limits у image providers.
     for variant in range(1, count + 1):
         img = await generate_image_bytes(image_prompt, variant=variant)
         if img:
@@ -1609,6 +1938,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user or not update.message:
         return
     user_id = update.effective_user.id
+    if context.args and context.args[0].startswith("delegate_"):
+        token = context.args[0].removeprefix("delegate_")
+        row = memory.accept_delegation_invite(token, user_id, user_display_name(update))
+        if not row:
+            await update.message.reply_text("Ссылка недействительна, уже использована или устарела.")
+            return
+        delegation = delegation_from_row(row)
+        intro = delegated_messaging.introduction(delegation)
+        await update.message.reply_text(intro)
+        memory.save_delegated_message(int(row["id"]), "assistant", intro)
+        memory.set_delegation_status(int(row["id"]), "active")
+        await context.bot.send_message(
+            chat_id=delegation.owner_user_id,
+            text=f"{delegation.contact_name} открыл(а) ссылку. Naz начал поручение #{row['id']}.",
+        )
+        return
+    if not is_admin(user_id):
+        memory.remember_reachable_peer(
+            user_id,
+            user_display_name(update),
+            (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+        )
+        await ensure_contact_named(update, context)
     memory.load_state(user_id)
     name = user_display_name(update)
     text = (
@@ -1628,6 +1980,292 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Главное меню Naz:", reply_markup=MAIN_KEYBOARD)
 
 
+def delegation_from_row(row: Dict[str, Any]) -> delegated_messaging.Delegation:
+    return delegated_messaging.Delegation(
+        character_id=str(row["character_id"]),
+        owner_user_id=int(row["owner_user_id"]),
+        contact_chat_id=int(row["contact_chat_id"]),
+        contact_name=str(row.get("contact_name") or row.get("contact_label") or "Собеседник"),
+        purpose=str(row["purpose"]),
+        status=str(row["status"]),
+        max_turns=int(row["max_turns"]),
+        turns_used=int(row["turns_used"]),
+        expires_at=str(row["expires_at"]),
+    )
+
+
+async def ensure_contact_named(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not ADMIN_ID or is_admin(update.effective_user.id):
+        return
+    display_name = user_display_name(update)
+    if not memory.register_contact_arrival(ADMIN_ID, update.effective_user.id, display_name):
+        return
+    prompt = await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"Мне впервые написал {display_name} (Telegram ID {update.effective_user.id}).\n"
+            "Как записать контакт? Ответь на это сообщение одним именем, например: Диман"
+        ),
+    )
+    memory.save_contact_naming_request(prompt.message_id, ADMIN_ID, update.effective_user.id)
+
+
+async def start_saved_contact_delegation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    contact: Dict[str, Any],
+    purpose: str,
+) -> None:
+    token = delegated_messaging.invite_token()
+    expires = (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds")
+    delegation_id = memory.create_delegation_invite(
+        update.effective_user.id, "naz", str(contact["alias"]), purpose, token, expires
+    )
+    row = memory.accept_delegation_invite(token, int(contact["chat_id"]), str(contact["alias"]))
+    if not row:
+        raise RuntimeError("Не удалось привязать сохранённый контакт.")
+    delegation = delegation_from_row(row)
+    intro = delegated_messaging.introduction(delegation)
+    await context.bot.send_message(chat_id=delegation.contact_chat_id, text=intro)
+    memory.save_delegated_message(delegation_id, "assistant", intro)
+    memory.set_delegation_status(delegation_id, "active")
+    await update.message.reply_text(
+        f"Нашёл {contact['alias']} и начал поручение #{delegation_id}. После разговора удалю сессию и переписку."
+    )
+
+
+async def delegate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только Назару.")
+        return
+    purpose = " ".join(context.args).strip()
+    try:
+        purpose = delegated_messaging.clean_purpose(purpose)
+    except ValueError as exc:
+        await update.message.reply_text(f"Использование: /delegate о чём и зачем поговорить\n\n{exc}")
+        return
+    context.user_data["delegation_purpose"] = purpose
+    await update.message.reply_text(
+        "Теперь отправь мне карточку нужного Telegram-контакта. Номер телефона я сохранять не буду."
+    )
+
+
+async def delegation_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not update.message.contact:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+    purpose = str(context.user_data.pop("delegation_purpose", ""))
+    if not purpose:
+        await update.message.reply_text("Сначала задай поручение: /delegate о чём поговорить")
+        return
+    contact = update.message.contact
+    label = " ".join(part for part in [contact.first_name, contact.last_name or ""] if part).strip()
+    token = delegated_messaging.invite_token()
+    expires = (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds")
+    try:
+        delegation_id = memory.create_delegation_invite(
+            update.effective_user.id, "naz", label, purpose, token, expires
+        )
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    if contact.user_id and memory.get_reachable_peer(contact.user_id):
+        row = memory.accept_delegation_invite(token, contact.user_id, label)
+        if row:
+            delegation = delegation_from_row(row)
+            intro = delegated_messaging.introduction(delegation)
+            await context.bot.send_message(chat_id=contact.user_id, text=intro)
+            memory.save_delegated_message(delegation_id, "assistant", intro)
+            memory.set_delegation_status(delegation_id, "active")
+            await update.message.reply_text(
+                f"{label} уже писал(а) боту. Naz представился и начал одноразовый разговор #{delegation_id}."
+            )
+            return
+    bot_user = await context.bot.get_me()
+    link = f"https://t.me/{bot_user.username}?start=delegate_{token}"
+    await update.message.reply_text(
+        f"Поручение #{delegation_id} подготовлено для {label}.\n\n"
+        "Перешли человеку эту одноразовую ссылку:\n" + link + "\n\n"
+        "Когда человек нажмёт Start, Naz сам представится и начнёт разговор."
+    )
+
+
+async def delegate_accept_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    token = "".join(context.args).strip()
+    name = user_display_name(update)
+    row = memory.accept_delegation_invite(token, update.effective_user.id, name)
+    if not row:
+        await update.message.reply_text("Ссылка недействительна, уже использована или устарела.")
+        return
+    delegation = delegation_from_row(row)
+    await update.message.reply_text(
+        "Согласие принято. Naz напишет только после отдельного подтверждения Назара. "
+        "В любой момент можно ответить «стоп»."
+    )
+    await context.bot.send_message(
+        chat_id=delegation.owner_user_id,
+        text=(
+            f"{delegation.contact_name} подтвердил(а) одноразовый разговор.\n\n"
+            f"Предпросмотр первой реплики:\n{delegated_messaging.introduction(delegation)}\n\n"
+            f"Отправить: /delegate_send {row['id']}\nОтменить: /delegate_stop {row['id']}"
+        ),
+    )
+
+
+async def delegate_send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    try:
+        delegation_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /delegate_send ID")
+        return
+    row = memory.get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != update.effective_user.id or row["status"] != "accepted":
+        await update.message.reply_text("Нет ожидающего подтверждения поручения с таким ID.")
+        return
+    delegation = delegation_from_row(row)
+    text = delegated_messaging.introduction(delegation)
+    await context.bot.send_message(chat_id=delegation.contact_chat_id, text=text)
+    memory.save_delegated_message(delegation_id, "assistant", text)
+    memory.set_delegation_status(delegation_id, "active")
+    await update.message.reply_text(f"Naz начал одноразовый разговор #{delegation_id} с {delegation.contact_name}.")
+
+
+async def delegate_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    try:
+        delegation_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /delegate_stop ID")
+        return
+    row = memory.get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != update.effective_user.id:
+        await update.message.reply_text("Поручение не найдено.")
+        return
+    if row.get("contact_chat_id"):
+        await context.bot.send_message(chat_id=int(row["contact_chat_id"]), text="Разговор завершён. Спасибо.")
+    memory.purge_delegation(delegation_id, "owner_stopped")
+    await update.message.reply_text("Поручение завершено; контакт и переписка удалены.")
+
+
+async def delegate_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    raw = " ".join(context.args).strip()
+    head, sep, text = raw.partition(" ")
+    if not sep or not head.isdigit() or not text.strip():
+        await update.message.reply_text("Использование: /delegate_reply ID текст")
+        return
+    delegation_id = int(head)
+    row = memory.get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != update.effective_user.id or row["status"] != "paused":
+        await update.message.reply_text("Нет приостановленного поручения с таким ID.")
+        return
+    await context.bot.send_message(chat_id=int(row["contact_chat_id"]), text=text.strip())
+    memory.save_delegated_message(delegation_id, "assistant", text.strip())
+    memory.set_delegation_status(delegation_id, "active")
+    await update.message.reply_text("Твой ответ отправлен; Naz может продолжить в рамках поручения.")
+
+
+async def contact_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /contact_add TELEGRAM_ID Имя")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("TELEGRAM_ID должен быть числом из /contact_candidates.")
+        return
+    alias = " ".join(context.args[1:]).strip()
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        display_name = " ".join(part for part in [chat.first_name or "", chat.last_name or ""] if part).strip()
+        row = memory.save_named_contact(update.effective_user.id, chat_id, display_name or str(chat_id), alias)
+    except (TelegramError, ValueError) as exc:
+        await update.message.reply_text(f"Не записал контакт: {exc}")
+        return
+    await update.message.reply_text(f"Записал: {row['alias']} → {row['display_name']} ({chat_id}).")
+
+
+async def contact_candidates_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    ids = memory.list_previous_contact_ids(update.effective_user.id)
+    if not ids:
+        await update.message.reply_text("Незаписанных прежних собеседников не нашёл.")
+        return
+    lines = ["Ранее писали боту:"]
+    for chat_id in ids:
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            name = " ".join(part for part in [chat.first_name or "", chat.last_name or ""] if part).strip()
+        except TelegramError:
+            name = "имя недоступно"
+        lines.append(f"• {chat_id} — {name}")
+    lines.append("\nЗаписать: /contact_add TELEGRAM_ID Имя")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_delegated_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    if not update.effective_user or not update.message:
+        return False
+    row = memory.get_active_delegation(update.effective_user.id)
+    if not row:
+        return False
+    delegation_id = int(row["id"])
+    delegation = delegation_from_row(row)
+    if delegated_messaging.is_stop(text):
+        await update.message.reply_text("Остановился. Контакт и переписка удалены.")
+        await context.bot.send_message(chat_id=delegation.owner_user_id, text=f"Собеседник остановил поручение #{delegation_id}.")
+        memory.purge_delegation(delegation_id, "contact_stopped")
+        return True
+    risks = delegated_messaging.assess_risk(text)
+    memory.save_delegated_message(delegation_id, "contact", text)
+    if risks:
+        memory.set_delegation_status(delegation_id, "paused")
+        await update.message.reply_text("Тут нужно подтверждение Назара. Я поставил разговор на паузу.")
+        await context.bot.send_message(
+            chat_id=delegation.owner_user_id,
+            text=f"Поручение #{delegation_id} на паузе ({', '.join(risks)}). Ответить вручную: /delegate_reply {delegation_id} текст",
+        )
+        return True
+    history = memory.get_delegated_history(delegation_id, limit=24)
+    prompt = delegated_messaging.system_prompt(
+        delegation=delegation,
+        character_context=naz_character.dialogue_context(memory.load_character_state(delegation.owner_user_id)),
+        history=history,
+    )
+    reply = await call_gpt(
+        [{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+        max_tokens=min(MAX_TOKENS, 500),
+    )
+    if reply == "OWNER_CONFIRMATION_REQUIRED" or delegated_messaging.assess_risk(reply):
+        memory.set_delegation_status(delegation_id, "paused")
+        await update.message.reply_text("Мне нужно свериться с Назаром. Поставил разговор на паузу.")
+        await context.bot.send_message(
+            chat_id=delegation.owner_user_id,
+            text=f"Naz остановил поручение #{delegation_id} для твоего ответа: /delegate_reply {delegation_id} текст",
+        )
+        return True
+    await update.message.reply_text(reply)
+    memory.save_delegated_message(delegation_id, "assistant", reply)
+    turns = memory.increment_delegation_turns(delegation_id)
+    if turns >= delegation.max_turns:
+        await update.message.reply_text("На этом поручение завершено. Спасибо за разговор.")
+        await context.bot.send_message(chat_id=delegation.owner_user_id, text=f"Поручение #{delegation_id} завершено по лимиту.")
+        memory.purge_delegation(delegation_id, "turn_limit")
+    return True
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(help_commands_text(), reply_markup=HELP_KEYBOARD)
@@ -1637,6 +2275,87 @@ async def state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user:
         return
     await reply_long(update, get_state_text(update.effective_user.id), MAIN_KEYBOARD)
+
+
+async def character_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user:
+        return
+    state = memory.load_character_state(update.effective_user.id)
+    await reply_long(update, naz_character.format_status(state), MAIN_KEYBOARD)
+
+
+async def character_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+    allowed = sorted(naz_character.EVENT_DELTAS)
+    if not context.args or context.args[0] not in naz_character.EVENT_DELTAS:
+        await update.message.reply_text("Используй: /character_event <event>\n" + ", ".join(allowed))
+        return
+    state = memory.apply_character_event(update.effective_user.id, context.args[0])
+    await update.message.reply_text(naz_character.format_status(state))
+
+
+async def character_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+    if len(context.args) != 2 or context.args[0] not in naz_character.AXES:
+        await update.message.reply_text(
+            "Используй: /character_set <axis> <0-100>\n" + ", ".join(naz_character.AXES)
+        )
+        return
+    try:
+        value = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Значение должно быть числом от 0 до 100.")
+        return
+    state = memory.set_character_axis(update.effective_user.id, context.args[0], value)
+    await update.message.reply_text(naz_character.format_status(state))
+
+
+async def character_simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    count = 10
+    if context.args:
+        try:
+            count = max(1, min(30, int(context.args[0])))
+        except ValueError:
+            pass
+    state = memory.load_character_state(update.effective_user.id)
+    plans = naz_character.simulate(
+        state,
+        memory.get_recent_content_signatures(update.effective_user.id, limit=16),
+        count=count,
+    )
+    lines = ["Naz simulation · состояние базы не изменено", ""]
+    for index, plan in enumerate(plans, 1):
+        lines.append(
+            f"{index}. {plan['event']} → {plan['facet']} · {plan['state']}\n"
+            f"   {plan['content_format_label']} / {plan['format']} / {plan['hook']}"
+        )
+    await reply_long(update, "\n".join(lines), MAIN_KEYBOARD)
+
+
+async def relationship_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(duo_relationship.format_status(memory.load_relationship_state()))
+
+
+async def relationship_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    if not context.args or context.args[0] not in duo_relationship.EVENT_DELTAS:
+        await update.message.reply_text("Используй: /relationship_event <event>\n" + ", ".join(sorted(duo_relationship.EVENT_DELTAS)))
+        return
+    topic = " ".join(context.args[1:]).strip()
+    state = memory.apply_relationship_event(context.args[0], topic=topic)
+    await update.message.reply_text(duo_relationship.format_status(state))
 
 
 async def roles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1717,6 +2436,105 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await reply_long(update, memory.get_stats(), CONTROL_KEYBOARD)
 
 
+def dialog_command_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.args:
+        try:
+            return int(context.args[0])
+        except (TypeError, ValueError):
+            pass
+    return update.effective_user.id
+
+
+async def dialog_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Команда доступна только администратору.", MAIN_KEYBOARD)
+        return
+    target_id = dialog_command_user_id(update, context)
+    history = memory.get_history(target_id, limit=20)
+    if not history:
+        text = f"Диалог user_id={target_id} пуст."
+    else:
+        lines = [f"Последний контекст user_id={target_id}:"]
+        lines.extend(f"{item['role']}: {item['content']}" for item in history)
+        text = "\n\n".join(lines)
+    await reply_long(update, text, CONTROL_KEYBOARD)
+
+
+async def dialog_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Команда доступна только администратору.", MAIN_KEYBOARD)
+        return
+    target_id = dialog_command_user_id(update, context)
+    memory.clear_dialog_history(target_id)
+    await reply_long(
+        update,
+        f"✅ Диалог user_id={target_id} очищен. Характер, настройки и контентная память сохранены.",
+        CONTROL_KEYBOARD,
+    )
+
+
+async def vk_queue_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Команда доступна только администратору.", MAIN_KEYBOARD)
+        return
+    status = vk_publish_queue.queue_status(NAZ_VK_QUEUE_DIR)
+    await reply_long(
+        update,
+        f"VK Publisher producer queue готова.\nPending: {status['path']}",
+        CONTROL_KEYBOARD,
+    )
+
+
+async def create_naz_vk_job(topic: str, *, source_ref: str, not_before: Optional[datetime] = None) -> dict:
+    if not NAZ_VK_ENABLED:
+        raise vk_publish_queue.QueueError("NAZ_VK_ENABLED выключен")
+    if not NAZ_VK_PUBLIC_ID:
+        raise vk_publish_queue.QueueError("NAZ_VK_PUBLIC_ID не задан")
+    user_id = ADMIN_ID or 0
+    rubric = random.choice(NAZ_VK_RUBRICS)
+    text = await generate_content(
+        user_id,
+        topic,
+        "post",
+        save_generated=False,
+        extra_instruction=(
+            f"Рубрика VK: {rubric['name']}. {rubric['angle']}. {rubric['format']}. "
+            "Верни только готовый текст публикации; не выбирай группу и не добавляй служебные поля."
+        ),
+    )
+    if is_warning_response(text):
+        raise vk_publish_queue.QueueError("модель отклонила создание безопасного текста")
+    images, _ = await generate_images_with_retries(user_id, topic, text, count=1)
+    media = [vk_publish_queue.MediaInput("image-1.png", images[0])] if images else []
+    return vk_publish_queue.enqueue(
+        NAZ_VK_QUEUE_DIR,
+        target_group_id=NAZ_VK_PUBLIC_ID,
+        text=text,
+        media=media,
+        track_query=topic,
+        created_at=datetime.now(ZoneInfo(BOT_TIMEZONE)),
+        not_before=not_before,
+        dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
+        source_ref=source_ref,
+    )
+
+
+async def vk_queue_draft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Команда доступна только администратору.", MAIN_KEYBOARD)
+        return
+    topic = extract_topic(update, context, default="AI, контент и автоматизация")
+    await send_typing(update)
+    try:
+        job = await create_naz_vk_job(topic, source_ref=f"manual:{topic.strip().lower()}")
+        await reply_long(update, f"✅ Задание VK поставлено: {job['job_id']}", CONTROL_KEYBOARD)
+    except vk_publish_queue.DuplicateJobError:
+        await reply_long(update, "ℹ️ Такое задание уже находится в очереди.", CONTROL_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("VK queue draft failed")
+        await reply_long(update, f"⚠️ Не удалось поставить задание VK в очередь: {exc}", CONTROL_KEYBOARD)
+
+
 async def content_command(update: Update, context: ContextTypes.DEFAULT_TYPE, task: str) -> None:
     if not update.effective_user or not update.message:
         return
@@ -1750,6 +2568,55 @@ async def script_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await content_command(update, context, "plan")
+
+
+async def gaming_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    topic = extract_topic(update, context, default="игры как пространство для экспериментов")
+    plan = gaming_vertical.plan_gaming_content(
+        "naz", topic, memory.get_recent_content_signatures(update.effective_user.id), platform="telegram"
+    )
+    await update.message.reply_text(
+        f"🎮 Игровой план Naz\n\nРубрика: {plan['intent']}\nФормат: {plan['format']}\n"
+        f"Коммерческий угол: {plan['commercial_angle']}\nТема: {topic}"
+    )
+
+
+async def gaming_command(update: Update, context: ContextTypes.DEFAULT_TYPE, *, commercial: bool = False) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if ADMIN_ONLY_CONTENT and not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Игровые черновики сейчас доступны только админу.")
+        return
+    topic = extract_topic(update, context, default="игры как пространство для экспериментов")
+    recent = memory.get_recent_content_signatures(update.effective_user.id)
+    plan = gaming_vertical.plan_gaming_content("naz", topic, recent, platform="telegram", commercial=commercial)
+    await send_typing(update)
+    try:
+        result = await generate_content(
+            update.effective_user.id,
+            topic,
+            "post",
+            extra_instruction=gaming_vertical.prompt_context("naz", plan),
+        )
+        memory.record_content_signature(update.effective_user.id, plan, topic)
+        await reply_long(update, result, CONTENT_KEYBOARD)
+        await update.message.reply_text(
+            f"🎮 {plan['intent']} · {plan['format']} · {plan['commercial_angle']}\n"
+            "Это черновик: игровая автопубликация пока выключена."
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("gaming_command failed")
+        await update.message.reply_text(f"⚠️ Игровой черновик не получился: {exc}")
+
+
+async def gaming_draft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await gaming_command(update, context, commercial=False)
+
+
+async def gaming_commercial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await gaming_command(update, context, commercial=True)
 
 
 async def hooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2196,7 +3063,7 @@ async def void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.effective_user or not update.message:
         return
     if ADMIN_ONLY_CONTENT and not is_admin(update.effective_user.id):
-        await reply_long(update, "🔒 Void-кросспостинг доступен только админу.", MAIN_KEYBOARD)
+        await reply_long(update, "🔒 Приватный разговор с VOID доступен только админу.", MAIN_KEYBOARD)
         return
 
     void_text = extract_void_text(update, context)
@@ -2207,20 +3074,20 @@ async def void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await send_typing(update)
     try:
         post_text, risks = await generate_void_crosspost(update.effective_user.id, void_text)
-        prefix = "🕳 Void → Naz draft"
+        prefix = "🕳 Мысли после разговора · draft"
         if risks:
             prefix += "\n⚠️ Риски найдены: " + ", ".join(risks)
         await reply_long(update, f"{prefix}\n\n{post_text}", CONTENT_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("void crosspost failed")
-        await reply_long(update, f"⚠️ Не смог собрать Void-кросспост. Причина: {exc}", MAIN_KEYBOARD)
+        await reply_long(update, f"⚠️ Не смог собрать мысль после разговора. Причина: {exc}", MAIN_KEYBOARD)
 
 
 async def publish_void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
     if not is_admin(update.effective_user.id):
-        await reply_long(update, "🔒 Публикация Void-кросспоста доступна только админу.", MAIN_KEYBOARD)
+        await reply_long(update, "🔒 Публикация рубрики доступна только админу.", MAIN_KEYBOARD)
         return
     if not CHANNEL_ID:
         await reply_long(update, "⚠️ CHANNEL_ID не задан в .env/Replit Secrets.", MAIN_KEYBOARD)
@@ -2231,17 +3098,17 @@ async def publish_void_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await reply_long(update, "Пришли так: /publish_void текст Void\nИли ответь /publish_void на сообщение Void.", MAIN_KEYBOARD)
         return
 
-    await reply_long(update, "🕳 Собираю Void → Naz кросспост и проверяю safety.")
+    await reply_long(update, "🕳 Naz переваривает приватный разговор с VOID и собирает собственную мысль.")
     try:
         post_text, risks = await generate_void_crosspost(update.effective_user.id, void_text, save_generated=False)
         if risks or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in post_text.upper():
             reason = ", ".join(risks) if risks else "модель пометила материал как рискованный"
-            await reply_long(update, f"⚠️ Не публикую Void-кросспост: {reason}\n\n{post_text}", MAIN_KEYBOARD)
+            await reply_long(update, f"⚠️ Не публикую выпуск: {reason}\n\n{post_text}", MAIN_KEYBOARD)
             return
 
         images, _ = await generate_images_with_retries(update.effective_user.id, "Void Entity crosspost", post_text, count=CHANNEL_IMAGE_COUNT)
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            await reply_long(update, "⚠️ Кросспост готов, но картинка не собралась. В канал без изображения не публикую.", MAIN_KEYBOARD)
+            await reply_long(update, "⚠️ Выпуск готов, но картинка не собралась. В канал без изображения не публикую.", MAIN_KEYBOARD)
             return
 
         await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
@@ -2254,10 +3121,37 @@ async def publish_void_command(update: Update, context: ContextTypes.DEFAULT_TYP
             image_count=len(images),
             published_to_channel=True,
         )
-        await reply_long(update, "✅ Void-кросспост опубликован в канал.", MAIN_KEYBOARD)
+        await reply_long(update, "✅ Выпуск «Мысли после разговора» опубликован.", MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("publish_void failed")
         await reply_long(update, f"⚠️ Не смог опубликовать Void-кросспост. Причина: {exc}", MAIN_KEYBOARD)
+
+
+async def thought_to_void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Приватный разговор доступен только админу.", MAIN_KEYBOARD)
+        return
+    thought = extract_void_text(update, context)
+    if len(thought) < 40:
+        await reply_long(update, "Используй: /thought_to_void приватная мысль Naz для VOID", MAIN_KEYBOARD)
+        return
+    try:
+        path = queue_naz_private_thought_for_void(
+            thought,
+            source="manual_private_conversation",
+            topic="мысль после разговора",
+        )
+    except ValueError as exc:
+        await reply_long(update, f"⚠️ Мысль не передана: {exc}", MAIN_KEYBOARD)
+        return
+    await reply_long(
+        update,
+        f"✅ Приватная мысль передана VOID: {path.name if path else 'exchange disabled'}. "
+        "Это не опубликованный пост; VOID должен самостоятельно её переварить.",
+        MAIN_KEYBOARD,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -2304,21 +3198,65 @@ def move_exchange_file(path: Path, direction: str, box: str) -> None:
     os.replace(path, target)
 
 
-def queue_naz_post_for_void(post_text: str, *, source: str, topic: str = "") -> None:
-    if not post_text or len(post_text.strip()) < 40:
-        return
-    if source.startswith("void_crosspost") or source in {"publish_void", "exchange_void_to_naz"}:
-        return
-    write_exchange_payload(
-        "naz_to_void",
-        {
-            "source": "naz_ai_bot",
-            "source_event": source,
-            "topic": topic,
-            "text": redact_sensitive_text(post_text.strip())[:6000],
-            "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
-        },
+def exchange_file_count(direction: str, box: str) -> int:
+    path = exchange_dir(direction, box)
+    if not path.exists():
+        return 0
+    return sum(1 for item in path.glob("*.json") if item.is_file())
+
+
+def exchange_status_text() -> str:
+    ensure_exchange_dirs()
+    return (
+        "🔗 Связь Naz ↔ Void\n\n"
+        f"Статус: {'включена' if CROSSPOST_EXCHANGE_ENABLED else 'выключена'}\n"
+        f"Автопубликация: {'включена' if CROSSPOST_EXCHANGE_AUTO_PUBLISH else 'draft-режим'}\n"
+        f"Папка: {CROSSPOST_EXCHANGE_DIR}\n"
+        f"Интервал: {CROSSPOST_EXCHANGE_INTERVAL_SECONDS} сек\n"
+        f"За проход: {CROSSPOST_EXCHANGE_MAX_PER_RUN}\n\n"
+        "Void → Naz:\n"
+        f"• ждёт: {exchange_file_count('void_to_naz', 'inbox')}\n"
+        f"• обработано: {exchange_file_count('void_to_naz', 'processed')}\n"
+        f"• ошибки: {exchange_file_count('void_to_naz', 'failed')}\n\n"
+        "Naz → Void:\n"
+        f"• ждёт: {exchange_file_count('naz_to_void', 'inbox')}\n"
+        f"• обработано: {exchange_file_count('naz_to_void', 'processed')}\n"
+        f"• ошибки: {exchange_file_count('naz_to_void', 'failed')}\n\n"
+        "Ручные команды:\n"
+        "/void текст — собрать черновик Void → Naz\n"
+        "/publish_void текст — опубликовать Void → Naz"
     )
+
+
+def queue_naz_post_for_void(post_text: str, *, source: str, topic: str = "") -> None:
+    # Published material is never fed to VOID as relationship input.  The
+    # private-thought command below is the only outbound conversational route.
+    logger.debug("Published Naz post not queued for VOID | source=%s | topic=%s", source, topic)
+
+
+def queue_naz_private_thought_for_void(thought: str, *, source: str, topic: str = "") -> Optional[Path]:
+    safe_thought = redact_sensitive_text(thought.strip())
+    if len(safe_thought) < 40:
+        raise ValueError("private thought is too short")
+    relationship = memory.apply_relationship_event("challenge", topic=topic or safe_thought[:200])
+    payload = duo_relationship.build_private_thought_payload(
+        speaker="naz",
+        thought=safe_thought,
+        topic=topic or "мысль после разговора",
+        relationship=relationship,
+        source_kind=source,
+    )
+    payload.update({
+        "id": payload["thought_id"],
+        "source": "naz_ai_bot",
+        "source_event": source,
+        "exchange_kind": "private_thought",
+        "text": payload["thought"],
+        "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
+        "adaptation_role": "void_original_reflection_after_private_conversation",
+    })
+    memory.save_private_thought(payload, status="queued")
+    return write_exchange_payload("naz_to_void", payload)
 
 
 async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2340,7 +3278,12 @@ async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> No
             if len(void_text) < 40:
                 raise ValueError("empty or too short Void payload")
 
-            post_text, risks = await generate_void_crosspost(admin_user_id, void_text, save_generated=False)
+            post_text, risks = await generate_void_crosspost(
+                admin_user_id,
+                void_text,
+                save_generated=False,
+                payload=payload,
+            )
             if risks or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in post_text.upper():
                 raise ValueError(", ".join(risks) if risks else "model marked payload as risky")
 
@@ -2425,6 +3368,13 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await update.message.reply_text("🔒 Раздел контента сейчас доступен только админу.", reply_markup=MAIN_KEYBOARD)
             return True
         await update.message.reply_text("🚀 Выбери, что собрать:", reply_markup=CONTENT_KEYBOARD)
+        return True
+
+    if text == BTN_LINKS:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Связи между ботами доступны только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        await update.message.reply_text(exchange_status_text(), reply_markup=CROSSPOST_KEYBOARD)
         return True
 
     if text == BTN_CONTROL:
@@ -2589,6 +3539,29 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         return True
 
+    if text == BTN_CROSSPOST_STATUS:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Статус обмена доступен только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        await update.message.reply_text(exchange_status_text(), reply_markup=CROSSPOST_KEYBOARD)
+        return True
+
+    if text == BTN_VOID_DRAFT:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Void-кросспостинг доступен только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        USER_PENDING_ACTIONS[user_id] = "void_draft"
+        await update.message.reply_text("Пришли текст Void. Я соберу Naz-черновик с моим комментарием.", reply_markup=CROSSPOST_KEYBOARD)
+        return True
+
+    if text == BTN_VOID_PUBLISH:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Публикация Void-кросспоста доступна только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        USER_PENDING_ACTIONS[user_id] = "void_publish"
+        await update.message.reply_text("Пришли текст Void. Я соберу кросспост и отправлю в канал.", reply_markup=CROSSPOST_KEYBOARD)
+        return True
+
     if text == BTN_HELP_CAPABILITIES:
         await update.message.reply_text(help_capabilities_text(), reply_markup=HELP_KEYBOARD)
         return True
@@ -2617,6 +3590,46 @@ async def handle_pending_action(update: Update, context: ContextTypes.DEFAULT_TY
     if not topic:
         await update.message.reply_text("Тема пустая. Напиши тему ещё раз.", reply_markup=CONTENT_KEYBOARD)
         return True
+
+    if action in {"void_draft", "void_publish"}:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Void-кросспостинг доступен только админу.", reply_markup=MAIN_KEYBOARD)
+            return True
+        await send_typing(update)
+        try:
+            if action == "void_draft":
+                post_text, risks = await generate_void_crosspost(user_id, topic)
+                prefix = "🕳 Void → Naz draft"
+                if risks:
+                    prefix += "\n⚠️ Риски: " + ", ".join(risks)
+                await reply_long(update, f"{prefix}\n\n{post_text}", CROSSPOST_KEYBOARD)
+                return True
+
+            if not CHANNEL_ID:
+                await update.message.reply_text("⚠️ CHANNEL_ID не задан, публиковать некуда.", reply_markup=CROSSPOST_KEYBOARD)
+                return True
+            post_text, risks = await generate_void_crosspost(user_id, topic, save_generated=False)
+            blocked, reason = should_block_publication(post_text, risks)
+            if blocked:
+                await reply_long(update, f"⚠️ Не публикую Void-кросспост: {reason}\n\n{post_text}", CROSSPOST_KEYBOARD)
+                return True
+            images, _ = await generate_images_with_retries(user_id, "Void Entity crosspost", post_text, count=CHANNEL_IMAGE_COUNT)
+            await publish_to_channel(context.bot, post_text, images=images)
+            memory.save_generated_post(
+                user_id=user_id,
+                expert_mode=get_user_expert_mode(user_id),
+                task="publish_void",
+                topic="Void Entity crosspost",
+                content=post_text,
+                image_count=len(images),
+                published_to_channel=True,
+            )
+            await update.message.reply_text("✅ Void-кросспост опубликован в канал.", reply_markup=CROSSPOST_KEYBOARD)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("void pending action failed")
+            await update.message.reply_text(f"⚠️ Не смог выполнить Void-кросспост. Причина: {exc}", reply_markup=CROSSPOST_KEYBOARD)
+            return True
 
     await send_typing(update)
     try:
@@ -2651,6 +3664,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
+    if await handle_delegated_reply(update, context, text):
+        return
+
+    if is_admin(user_id) and update.message.reply_to_message:
+        try:
+            named = memory.name_contact_from_reply(update.message.reply_to_message.message_id, user_id, text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        if named:
+            await update.message.reply_text(
+                f"Записал: {named['alias']} → {named['display_name']}. Теперь можно сказать: «Напиши {named['alias']}, чтобы…»"
+            )
+            return
+
+    if is_admin(user_id):
+        try:
+            request = delegated_messaging.parse_delegation_request(text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        if request:
+            spoken_alias, purpose = request
+            contact = delegated_messaging.resolve_saved_contact(memory.list_saved_contacts(user_id), spoken_alias)
+            if not contact:
+                aliases = ", ".join(str(item["alias"]) for item in memory.list_saved_contacts(user_id)) or "пока пусто"
+                await update.message.reply_text(f"Не нашёл один точный контакт «{spoken_alias}». Сохранены: {aliases}.")
+                return
+            try:
+                await start_saved_contact_delegation(update, context, contact, purpose)
+            except ValueError as exc:
+                await update.message.reply_text(str(exc))
+            return
+
+    if not is_admin(user_id):
+        memory.remember_reachable_peer(
+            user_id,
+            user_display_name(update),
+            (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+        )
+        await ensure_contact_named(update, context)
+
     if await handle_menu_button(update, context, text):
         return
 
@@ -2661,8 +3716,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_typing(update)
     try:
         answer = await generate_answer(user_id, text)
-        memory.save_message(user_id, "user", text)
-        memory.save_message(user_id, "assistant", answer)
         await reply_long(update, answer, ANGLE_KEYBOARD if is_angle_engine_message(answer) else MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("handle_message failed")
@@ -2747,6 +3800,223 @@ AUTOPOST_PROFILES: List[Dict[str, str]] = [
 ]
 
 
+NAZ_TELEGRAM_RUBRICS: List[Dict[str, object]] = [
+    {
+        "name": "Утренний дожим",
+        "slots": ["09:30"],
+        "task": "post",
+        "topics": [
+            "Что сегодня можно упростить в AI-системе, пока она не начала шуметь",
+            "Один маленький дожим в боте, который экономит день",
+            "Почему утро в проекте лучше начинать не с вдохновения, а с проверки контура",
+            "Как понять, что бот уже почти работает, но ему не хватает одного скучного шага",
+            "Почему рабочий день лучше спасает маленькая проверка, а не большой план",
+            "Что проверить в автопостинге до того, как он начнёт писать в канал",
+            "Как один лог может заменить час тревоги",
+            "Почему кнопка 'работает' ещё не значит, что система готова",
+            "Зачем AI-проекту утренний чек без героизма",
+            "Как не перепутать прогресс с красивым ответом модели",
+            "Почему иногда лучший апгрейд — убрать лишний автоматизм",
+            "Как маленькая настройка расписания меняет настроение всего канала",
+        ],
+        "profile": {
+            "name": "Дожиматель",
+            "voice": "сфокусированно и прямо, меньше украшений, больше результата",
+            "angle": "один практический шаг, который превращает хаос в управляемый процесс",
+            "format": "короткий рабочий пост: симптом, действие, результат",
+            "avoid": "не обещать чудес и не превращать пост в чеклист ради чеклиста",
+        },
+    },
+    {
+        "name": "AI без магии",
+        "slots": ["13:30"],
+        "task": "post",
+        "topics": [
+            "Почему нейросети — это не магия, а рабочий инструмент",
+            "Как предпринимателю начать использовать AI без хаоса",
+            "Где заканчивается генератор текста и начинается контент-система",
+            "Почему хороший AI-помощник начинается не с модели, а с понятной задачи",
+            "Как объяснить AI-проект человеку, который не хочет слушать про токены",
+            "Почему промпт не спасает процесс, если никто не проверяет результат",
+            "Что на самом деле покупает человек, когда просит 'сделайте мне AI-бота'",
+            "Почему AI без редактора быстро превращается в шумную машинку",
+            "Как отличить полезную автоматизацию от красивой игрушки",
+            "Почему бизнесу чаще нужен не агент, а нормальная граница ответственности",
+            "Что должно быть в AI-системе до первой публичной кнопки",
+            "Как говорить про AI без хайпа и без страха",
+        ],
+        "profile": {
+            "name": "Очевидная мелочь",
+            "voice": "спокойно и человечно, как будто объясняешь важную вещь без умничанья",
+            "angle": "простая деталь, которую все пропускают, а потом из-за неё ломается проект",
+            "format": "заметка на один инсайт: мелочь, последствия, зачем это помнить",
+            "avoid": "не уходить в мотивацию и не продавать AI как волшебную кнопку",
+        },
+    },
+    {
+        "name": "Баг, который стал системой",
+        "slots": ["17:30"],
+        "task": "viral",
+        "topics": [
+            "Как маленький баг в интеграции ломает весь пользовательский опыт",
+            "Почему AI-проект ломается не из-за модели, а из-за процесса",
+            "Что должно быть у Telegram-бота, чтобы он не был игрушкой",
+            "Почему одинаковая ошибка в двух ботах не всегда значит один виноватый commit",
+            "Как баг становится инструкцией, если перестать сразу чинить всё подряд",
+            "Почему 'оно вчера работало' — плохая диагностика, но хороший хук",
+            "Как Telegram polling превращает локальный дубль в странную аварию",
+            "Почему ошибка доставки страшнее ошибки генерации",
+            "Что делать, когда бот молчит, но сервисы по отдельности живые",
+            "Почему rollback иногда лечит совесть, но не систему",
+            "Как понять, что проблема живёт не в коде, а между сервисами",
+            "Почему самый полезный баг — тот, после которого появляется проверка",
+        ],
+        "profile": {
+            "name": "Build in public",
+            "voice": "честно, живо, без героизма; как рабочая заметка после реального дожима",
+            "angle": "что сломалось, как искали причину, какой вывод остался после починки",
+            "format": "мини-история: симптом, ложная версия, настоящая причина, урок",
+            "avoid": "не раскрывать секреты, IP, токены, внутренние URL и клиентские детали",
+        },
+    },
+    {
+        "name": "Naz после смены",
+        "slots": ["21:30"],
+        "task": "post",
+        "topics": [
+            "Как память меняет поведение AI-ассистента в диалоге",
+            "Почему автопостинг без редакторской логики быстро становится шумом",
+            "Философия контроля: почему AI-системе нужны границы",
+            "Почему ботам тоже нужен вечерний разбор полётов",
+            "Как отличить живой стиль от набора любимых фраз",
+            "Почему канал устаёт не от частоты постов, а от одинакового дыхания",
+            "Что значит 'контроль' в системе, которая умеет писать сама",
+            "Почему иногда надо не добавлять рубрику, а дать старой рубрике новый темп",
+            "Как память помогает не повторять себя, если ей правильно пользоваться",
+            "Почему хороший автопостинг должен уметь молчать",
+            "Как не превратить AI-канал в аккуратное бубнение",
+            "Зачем системе отдельный голос для ночных выводов",
+        ],
+        "profile": {
+            "name": "Философия без тумана",
+            "voice": "чуть глубже и тише, но всё равно понятно обычному человеку",
+            "angle": "маленькая философская мысль из разработки: про память, контроль, доверие или шум",
+            "format": "короткая заметка без списков: наблюдение, поворот, человеческий вывод",
+            "avoid": "не уходить в абстрактный мотивационный туман",
+        },
+    },
+]
+
+
+NAZ_VK_RUBRICS: List[Dict[str, str]] = [
+    {
+        "name": "Naz Dev Log",
+        "angle": "короткая рабочая заметка о сборке, баге, проверке или дожиме AI-системы",
+        "format": "плотный VK-пост без Telegram-обрывистости: контекст, вывод, прикладной смысл",
+    },
+    {
+        "name": "AI без успешного успеха",
+        "angle": "практический разбор AI-инструмента или привычки без хайпа",
+        "format": "объяснить человеческим языком, где польза, где ловушка, что делать дальше",
+    },
+    {
+        "name": "Ошибка недели",
+        "angle": "одна ошибка в боте, контенте или интеграции и нормальный вывод после неё",
+        "format": "сцена, сбой, причина, дожим, вывод",
+    },
+]
+
+
+def select_naz_telegram_rubric(slot: str = "") -> Dict[str, object]:
+    matching = [
+        rubric for rubric in NAZ_TELEGRAM_RUBRICS
+        if slot and slot in [str(item) for item in rubric.get("slots", [])]
+    ]
+    return random.choice(matching or NAZ_TELEGRAM_RUBRICS)
+
+
+AUTOPOST_EDITORIAL_DIRECTIONS: List[Dict[str, str]] = [
+    {
+        "name": "Мини-сцена",
+        "shape": "начни с маленькой узнаваемой сцены, потом покажи, какой системный вывод за ней спрятан",
+        "rhythm": "короткие фразы, живой поворот, без списка",
+        "avoid": "не начинать с тезиса и не заканчивать одинаковым 'дожали'",
+    },
+    {
+        "name": "Анти-совет",
+        "shape": "начни с вредного подхода, который хочется сделать на автомате, затем разверни в нормальную практику",
+        "rhythm": "чуть резче, но без токсичности; один конфликт, один вывод",
+        "avoid": "не делать кликбейт и не морализировать",
+    },
+    {
+        "name": "Тихая философия",
+        "shape": "вытащи спокойное наблюдение из конкретной рабочей детали",
+        "rhythm": "медленнее, глубже, меньше технических слов",
+        "avoid": "не уходить в туман и общие слова про будущее",
+    },
+    {
+        "name": "Разбор ошибки",
+        "shape": "покажи симптом, ложную причину, настоящую причину и маленький вывод",
+        "rhythm": "плотно и ясно, как заметка после диагностики",
+        "avoid": "не пересказывать длинную хронологию",
+    },
+    {
+        "name": "Почти мем",
+        "shape": "начни с нелепости разработки или контента, но быстро выведи к пользе",
+        "rhythm": "иронично, легче, с одной смешной деталью",
+        "avoid": "не превращать в стендап",
+    },
+    {
+        "name": "Письмо себе",
+        "shape": "напиши как короткую записку человеку, который завтра снова полезет чинить систему",
+        "rhythm": "лично, тепло, без поучения",
+        "avoid": "не делать мотивационный пост",
+    },
+    {
+        "name": "Один вопрос",
+        "shape": "пост строится вокруг одного вопроса, который меняет взгляд на задачу",
+        "rhythm": "вопрос, две-три проверки, вывод",
+        "avoid": "не превращать в FAQ",
+    },
+]
+
+
+def recent_autopost_topic_text(user_id: int, limit: int = 12) -> str:
+    posts = memory.get_recent_generated_posts(user_id, limit=limit)
+    chunks = []
+    for item in posts:
+        topic = str(item.get("topic") or "")
+        task = str(item.get("task") or "")
+        if "autopost" in task or "source_monitor" in task or "agent_content" in task:
+            chunks.append(topic)
+    state = memory.load_state(user_id)
+    chunks.extend(str(topic) for topic in (state.get("recent_topics") or [])[-12:])
+    return "\n".join(chunks)
+
+
+def is_fresh_autopost_topic(topic: str, recent_text: str) -> bool:
+    fingerprint = naz_controller.topic_fingerprint(topic)
+    recent_lines = [line.strip() for line in recent_text.splitlines() if line.strip()]
+    return not any(naz_controller.is_similar_topic(fingerprint, line) for line in recent_lines)
+
+
+def select_autopost_topics(user_id: int, rubric: Dict[str, object], limit: int = 7) -> List[str]:
+    topics = [str(item) for item in rubric.get("topics", AUTOPOST_TOPICS) if str(item).strip()]
+    random.shuffle(topics)
+    recent_text = recent_autopost_topic_text(user_id)
+    fresh = [topic for topic in topics if is_fresh_autopost_topic(topic, recent_text)]
+    return (fresh or topics)[:limit]
+
+
+def format_autopost_direction(direction: Dict[str, str]) -> str:
+    return (
+        f"Редакторская форма выпуска: {direction['name']}.\n"
+        f"Композиция: {direction['shape']}.\n"
+        f"Ритм: {direction['rhythm']}.\n"
+        f"Отдельно избегать: {direction['avoid']}.\n"
+    )
+
+
 def get_autopost_tasks() -> List[str]:
     allowed = {"post", "viral"}
     tasks = [item.strip() for item in AUTOPOST_TASKS.split(",") if item.strip()]
@@ -2780,6 +4050,32 @@ async def notify_admin(bot, text: str) -> None:
         logger.warning("Admin notification failed: %s", exc)
 
 
+def unique_recent_reasons(reasons: List[str], limit: int = 5) -> List[str]:
+    unique: List[str] = []
+    for reason in reasons:
+        if reason and reason not in unique:
+            unique.append(reason)
+    return unique[-limit:]
+
+
+async def notify_autopost_skip_once(bot, reasons: List[str]) -> None:
+    unique_reasons = unique_recent_reasons(reasons)
+    signature = hashlib.sha256("\n".join(unique_reasons).encode("utf-8")).hexdigest()[:16]
+    date_key = current_bot_date()
+    if AUTOPOST_SKIP_ALERTS.get(date_key) == signature:
+        logger.info("AUTOPOST skip alert suppressed: duplicate failure signature for %s", date_key)
+        return
+    AUTOPOST_SKIP_ALERTS[date_key] = signature
+    if len(AUTOPOST_SKIP_ALERTS) > 10:
+        for key in sorted(AUTOPOST_SKIP_ALERTS)[:-10]:
+            AUTOPOST_SKIP_ALERTS.pop(key, None)
+    await notify_admin(
+        bot,
+        "⚠️ Автопостинг пропустил слот после нескольких попыток.\n\n"
+        + "\n".join(f"- {reason}" for reason in unique_reasons),
+    )
+
+
 async def generate_images_with_retries(
     user_id: int,
     topic: str,
@@ -2800,6 +4096,95 @@ async def generate_images_with_retries(
     return [], last_prompt
 
 
+def curated_visual_bytes(path: Path) -> bytes:
+    """Prepare an existing curated visual for Telegram without forcing a square crop."""
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=92, optimize=True)
+        return output.getvalue()
+
+
+async def try_visual_archive_autopost(
+    context: ContextTypes.DEFAULT_TYPE,
+    admin_user_id: int,
+    slot: str,
+) -> bool:
+    if not VISUAL_ARCHIVE_ENABLED:
+        return False
+    is_visual_turn, slot_counter = visual_archive.claim_visual_turn(
+        VISUAL_ARCHIVE_STATE_FILE,
+        VISUAL_ARCHIVE_EVERY_N_POSTS,
+    )
+    if not is_visual_turn:
+        logger.info(
+            "VISUAL_ARCHIVE normal content turn | counter=%s | cadence=%s",
+            slot_counter,
+            VISUAL_ARCHIVE_EVERY_N_POSTS,
+        )
+        return False
+    candidate = visual_archive.choose_candidate(
+        VISUAL_ARCHIVE_MANIFEST,
+        VISUAL_ARCHIVE_STATE_FILE,
+        VISUAL_ARCHIVE_ROOT,
+        require_approved=VISUAL_ARCHIVE_REQUIRE_APPROVED,
+    )
+    if not candidate:
+        logger.info(
+            "VISUAL_ARCHIVE turn has no eligible unused candidates | counter=%s",
+            slot_counter,
+        )
+        return False
+
+    candidate_id = str(candidate["id"])
+    image_path = visual_archive.preferred_image_path(VISUAL_ARCHIVE_ROOT, candidate)
+    topic = visual_archive.visual_topic(candidate)
+    try:
+        post_text = await generate_content(
+            admin_user_id,
+            topic,
+            "post",
+            save_generated=False,
+            extra_instruction=(
+                "Это image-first публикация. Сначала прочитай смысл визуала, затем напиши самостоятельный Naz-пост вокруг него. "
+                "Не переписывай текст с картинки дословно, не упоминай OCR и не описывай изображение как каталог. "
+                f"Рубрика архива: {candidate.get('rubric', 'visual_archive')}. Слот: {slot or 'manual'}."
+            ),
+        )
+        if is_warning_response(post_text):
+            logger.warning("VISUAL_ARCHIVE candidate blocked | id=%s", candidate_id)
+            return False
+        image_bytes = curated_visual_bytes(image_path)
+        await send_post_with_images(context.bot, CHANNEL_ID, post_text, [image_bytes])
+        memory.save_generated_post(
+            user_id=admin_user_id,
+            expert_mode=get_user_expert_mode(admin_user_id),
+            task=f"visual_archive:{candidate.get('rubric', 'visual_archive')}",
+            topic=topic[:1000],
+            content=post_text,
+            image_count=1,
+            published_to_channel=True,
+        )
+        queue_naz_post_for_void(
+            post_text,
+            source=f"visual_archive:{candidate.get('rubric', 'visual_archive')}",
+            topic=topic[:1000],
+        )
+        visual_archive.mark_used(VISUAL_ARCHIVE_STATE_FILE, candidate_id)
+        logger.info(
+            "VISUAL_ARCHIVE published | id=%s | file=%s | counter=%s | cadence=%s",
+            candidate_id,
+            image_path,
+            slot_counter,
+            VISUAL_ARCHIVE_EVERY_N_POSTS,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("VISUAL_ARCHIVE failed | id=%s | error=%s", candidate_id, exc)
+        return False
+
+
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHANNEL_ID:
         logger.warning("AUTOPOST skipped: CHANNEL_ID empty")
@@ -2811,23 +4196,54 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if get_user_expert_mode(admin_user_id) not in EXPERT_MODES:
             set_user_expert_mode(admin_user_id, DEFAULT_EXPERT_MODE)
 
-    logger.info("AUTOPOST started")
+    job_data = context.job.data if context.job else {}
+    slot = str(job_data.get("slot", "")) if isinstance(job_data, dict) else ""
+    logger.info("NAZ_TELEGRAM_AUTO_LOOP started | slot=%s", slot or "manual")
+
+    if await try_visual_archive_autopost(context, admin_user_id, slot):
+        return
 
     failure_reasons: List[str] = []
     try:
         for text_attempt in range(1, AUTOPOST_TEXT_ATTEMPTS + 1):
-            topics = AUTOPOST_TOPICS[:]
-            random.shuffle(topics)
+            rubric = select_naz_telegram_rubric(slot)
+            topics = select_autopost_topics(admin_user_id, rubric, limit=7)
             use_story_insight = bool(read_naz_stories()) and random.random() < AUTOPOST_INSIGHT_CHANCE
-            task = "insight" if use_story_insight else random.choice(get_autopost_tasks())
-            profile = random.choice(AUTOPOST_PROFILES)
+            rubric_task = str(rubric.get("task", "")).strip()
+            task = "insight" if use_story_insight else (rubric_task if rubric_task in get_autopost_tasks() else random.choice(get_autopost_tasks()))
+            profile = rubric.get("profile")
+            if not isinstance(profile, dict):
+                profile = random.choice(AUTOPOST_PROFILES)
+            direction = random.choice(AUTOPOST_EDITORIAL_DIRECTIONS)
             topic = "инсайт из опыта запуска Naz_AI_Bot" if use_story_insight else topics[0]
             post_text = ""
+            character = memory.apply_character_event(admin_user_id, "new_topic")
+            recent_signatures = memory.get_recent_content_signatures(admin_user_id, limit=16)
+            editorial_plan = naz_character.plan_content(
+                character,
+                recent_signatures,
+                topic=topic,
+                platform="telegram",
+            )
 
-            logger.info("AUTOPOST attempt %s/%s | task=%s | profile=%s", text_attempt, AUTOPOST_TEXT_ATTEMPTS, task, profile["name"])
+            logger.info(
+                "NAZ_TELEGRAM_AUTO_LOOP attempt %s/%s | slot=%s | rubric=%s | task=%s | profile=%s | direction=%s",
+                text_attempt,
+                AUTOPOST_TEXT_ATTEMPTS,
+                slot or "manual",
+                rubric["name"],
+                task,
+                profile["name"],
+                direction["name"],
+            )
             if use_story_insight:
                 logger.info("AUTOPOST story insight from %s", NAZ_STORIES_FILE)
-                post_text = await generate_story_insight(admin_user_id, topic, save_generated=False)
+                post_text = await generate_story_insight(
+                    admin_user_id,
+                    topic,
+                    save_generated=False,
+                    extra_instruction=naz_character.prompt_context(character, editorial_plan),
+                )
                 if is_warning_response(post_text):
                     reason = "story insight blocked by smart filter"
                     logger.warning("AUTOPOST fallback: %s", reason)
@@ -2840,13 +4256,26 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if not use_story_insight:
                 for candidate_topic in topics:
                     topic = candidate_topic
+                    editorial_plan = naz_character.plan_content(
+                        character,
+                        recent_signatures,
+                        topic=topic,
+                        platform="telegram",
+                    )
                     logger.info("AUTOPOST candidate topic=%s", topic)
                     post_text = await generate_content(
                         admin_user_id,
                         topic,
                         task,
                         save_generated=False,
-                        extra_instruction=format_autopost_profile(profile),
+                        extra_instruction=(
+                            f"Рубрика Naz: {rubric['name']}.\n"
+                            f"Слот расписания Naz Telegram: {slot or 'ручной запуск'}.\n"
+                            + format_autopost_direction(direction)
+                            + format_autopost_profile(profile)
+                            + "\n"
+                            + naz_character.prompt_context(character, editorial_plan)
+                        ),
                     )
                     if not is_warning_response(post_text):
                         break
@@ -2858,7 +4287,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             images, image_prompt = await generate_images_with_retries(
                 admin_user_id,
-                topic,
+                f"{topic}. Visual direction: {editorial_plan['media']}",
                 post_text,
                 count=CHANNEL_IMAGE_COUNT,
             )
@@ -2872,22 +4301,24 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             memory.save_generated_post(
                 user_id=admin_user_id,
                 expert_mode=get_user_expert_mode(admin_user_id),
-                task=f"autopost:{task}:{profile['name']}",
-                topic=f"{topic} | {profile['name']}",
+                task=f"naz_telegram_autopost:{task}:{rubric['name']}:{profile['name']}",
+                topic=f"{topic} | {rubric['name']} | {profile['name']}",
                 content=post_text,
                 image_count=len(images),
                 published_to_channel=True,
             )
-            queue_naz_post_for_void(post_text, source=f"autopost:{task}:{profile['name']}", topic=f"{topic} | {profile['name']}")
+            queue_naz_post_for_void(
+                post_text,
+                source=f"naz_telegram_autopost:{task}:{rubric['name']}:{profile['name']}",
+                topic=f"{topic} | {rubric['name']} | {profile['name']}",
+            )
+            memory.record_content_signature(admin_user_id, editorial_plan, topic)
+            memory.apply_character_event(admin_user_id, "publish")
             logger.info("AUTOPOST done | attempt=%s | images=%s | prompt=%s", text_attempt, len(images), image_prompt)
             return
 
         logger.warning("AUTOPOST skipped after retries: %s", "; ".join(failure_reasons[-5:]))
-        await notify_admin(
-            context.bot,
-            "⚠️ Автопостинг пропустил слот после нескольких попыток.\n\n"
-            + "\n".join(f"- {reason}" for reason in failure_reasons[-5:]),
-        )
+        await notify_autopost_skip_once(context.bot, failure_reasons)
     except Exception as exc:  # noqa: BLE001
         logger.exception("AUTOPOST failed: %s", exc)
         await notify_admin(context.bot, f"⚠️ AUTOPOST failed: {type(exc).__name__}: {exc}")
@@ -2965,7 +4396,7 @@ async def agent_content_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             context.bot,
             admin_user_id,
             date_text,
-            force=AGENT_CONTENT_REUSE_SEEN,
+            force=False,
             publish=AGENT_CONTENT_AUTO_PUBLISH,
         )
         logger.info("AGENT_CONTENT_SYNC done | %s", result)
@@ -3002,6 +4433,7 @@ def setup_autoposting(application: Application) -> None:
             auto_post_job,
             time=time(hour=hour, minute=minute, tzinfo=tz),
             name=f"naz_autopost_{hour:02d}_{minute:02d}",
+            data={"slot": f"{hour:02d}:{minute:02d}", "owner": "naz_telegram"},
         )
         scheduled.append(f"{hour:02d}:{minute:02d}")
 
@@ -3010,6 +4442,66 @@ def setup_autoposting(application: Application) -> None:
         return
 
     logger.info("Autoposting scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
+
+
+def setup_naz_vk_schedule(application: Application) -> None:
+    if NAZ_VK_SCHEDULER != "telegram":
+        logger.info("Naz VK Telegram scheduler disabled | mode=%s", NAZ_VK_SCHEDULER)
+        return
+    if not NAZ_VK_ENABLED:
+        logger.info("Naz VK disabled")
+        return
+    if not NAZ_VK_AUTO_ON:
+        logger.info("Naz VK schedule disabled")
+        return
+    if not NAZ_VK_PUBLIC_ID:
+        logger.warning("Naz VK schedule enabled, but NAZ_VK_PUBLIC_ID is empty")
+        return
+
+    if not application.job_queue:
+        logger.warning("Naz VK JobQueue is not available")
+        return
+    tz = ZoneInfo(BOT_TIMEZONE)
+    scheduled = []
+    for raw_time in NAZ_VK_AUTO_TIMES.split(","):
+        raw_time = raw_time.strip()
+        try:
+            hour_text, minute_text = raw_time.split(":", maxsplit=1)
+            hour, minute = int(hour_text), int(minute_text)
+            if hour not in range(24) or minute not in range(60):
+                raise ValueError
+        except ValueError:
+            logger.warning("Invalid NAZ_VK_AUTO_TIMES value skipped: %s", raw_time)
+            continue
+        slot = f"{hour:02d}:{minute:02d}"
+        application.job_queue.run_daily(
+            naz_vk_queue_job,
+            time=time(hour=hour, minute=minute, tzinfo=tz),
+            name=f"naz_vk_queue_{hour:02d}_{minute:02d}",
+            data={"slot": slot},
+        )
+        scheduled.append(slot)
+    if scheduled:
+        logger.info("Naz VK queue scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
+    else:
+        logger.warning("Naz VK enabled, but NAZ_VK_AUTO_TIMES has no valid times")
+
+
+async def naz_vk_queue_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if NAZ_VK_SCHEDULER != "telegram" or not (NAZ_VK_ENABLED and NAZ_VK_AUTO_ON):
+        return
+    slot = str((context.job.data or {}).get("slot", "manual"))
+    today = datetime.now(ZoneInfo(BOT_TIMEZONE)).date().isoformat()
+    source_ref = f"schedule:{today}:{slot}"
+    topic = f"Naz VK, слот {slot}: практическая заметка об AI, разработке или контент-системах"
+    try:
+        job = await create_naz_vk_job(topic, source_ref=source_ref)
+        logger.info("Naz VK job queued | job_id=%s | slot=%s", job["job_id"], slot)
+    except vk_publish_queue.DuplicateJobError:
+        logger.info("Naz VK schedule cooldown: slot already queued | %s", source_ref)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Naz VK enqueue failed | slot=%s", slot)
+        await notify_admin(context.bot, f"⚠️ Не удалось поставить задание VK ({slot}) в очередь: {exc}")
 
 
 def setup_source_monitoring(application: Application) -> None:
@@ -3134,7 +4626,11 @@ def help_capabilities_text() -> str:
         "• статистика\n"
         "• автопостинг в канал\n"
         "• защита админ-функций\n"
-        "• Angle Engine: новые углы вместо повторов"
+        "• Angle Engine: новые углы вместо повторов\n\n"
+        "🔗 Связи:\n"
+        "• обмен постами Naz ↔ Void через локальные очереди\n"
+        "• статус входящих/исходящих кросспостов\n"
+        "• ручной Void → Naz draft/publish"
     )
 
 
@@ -3145,6 +4641,17 @@ def help_commands_text() -> str:
         "/menu — открыть меню\n"
         "/help — помощь\n"
         "/state — текущий режим\n"
+        "/character — живая грань и состояние Naz\n"
+        "/character_event event — применить событие (admin)\n"
+        "/character_set axis 0-100 — скорректировать состояние (admin)\n"
+        "/character_simulate 10 — безопасно показать будущие состояния\n"
+        "/relationship — состояние отношений Naz ↔ VOID\n"
+        "/relationship_event event — применить событие отношений (admin)\n"
+        "/thought_to_void текст — передать приватную мысль VOID\n"
+        "Напиши Диману, чтобы… — начать разговор с сохранённым контактом\n"
+        "/contact_candidates — кто раньше писал боту, но ещё не записан\n"
+        "/contact_add ID Имя — записать прежнего собеседника\n"
+        "/delegate_stop ID — завершить поручение\n"
         "/roles — список ролей\n"
         "/role marketer — выбрать expert mode\n/voice tech_hooligan — выбрать голос Naz\n/goal engagement — выбрать цель контента\n"
         "/memory — память\n"
@@ -3154,6 +4661,9 @@ def help_commands_text() -> str:
         "/viral тема — вирусный пост\n"
         "/script тема — сценарий Reels\n"
         "/plan тема — контент-план\n"
+        "/gaming тема — игровой черновик Naz\n"
+        "/gaming_commercial тема — игровой черновик с проверкой продукта\n"
+        "/gaming_plan тема — показать игровую рубрику и формат\n"
         "/hooks тема — заголовки\n"
         "/imagepost тема — пост + 2 картинки\n"
         "/image тема — одна картинка\n"
@@ -3161,6 +4671,9 @@ def help_commands_text() -> str:
         "Void-кросспостинг:\n"
         "/void текст или reply — черновик Void → Naz\n"
         "/publish_void текст или reply — опубликовать Void → Naz в канал\n\n"
+        "Связь Naz ↔ Void:\n"
+        "Кнопка 🔗 Связи показывает очереди обмена и быстрые действия.\n"
+        "Автообмен идёт через папки, без Telegram-пинг-понга.\n\n"
         "Источники:\n"
         "/sources — список источников\n"
         "/scan_sources рубрика — черновик интерпретации\n"
@@ -3241,6 +4754,12 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("state", state_command))
+    application.add_handler(CommandHandler("character", character_command))
+    application.add_handler(CommandHandler("character_event", character_event_command))
+    application.add_handler(CommandHandler("character_set", character_set_command))
+    application.add_handler(CommandHandler("character_simulate", character_simulate_command))
+    application.add_handler(CommandHandler("relationship", relationship_command))
+    application.add_handler(CommandHandler("relationship_event", relationship_event_command))
     application.add_handler(CommandHandler("roles", roles_command))
     application.add_handler(CommandHandler("role", role_command))
     application.add_handler(CommandHandler("voice", voice_command))
@@ -3248,6 +4767,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("memory", memory_command))
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("dialog_context", dialog_context_command))
+    application.add_handler(CommandHandler("dialog_reset", dialog_reset_command))
+    application.add_handler(CommandHandler("vk_queue_status", vk_queue_status_command))
+    application.add_handler(CommandHandler("vk_queue_draft", vk_queue_draft_command))
     application.add_handler(CommandHandler("sources", sources_command))
     application.add_handler(CommandHandler("scan_sources", scan_sources_command))
     application.add_handler(CommandHandler("publish_source", publish_source_command))
@@ -3260,6 +4783,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("viral", viral_command))
     application.add_handler(CommandHandler("script", script_command))
     application.add_handler(CommandHandler("plan", plan_command))
+    application.add_handler(CommandHandler("gaming", gaming_draft_command))
+    application.add_handler(CommandHandler("gaming_commercial", gaming_commercial_command))
+    application.add_handler(CommandHandler("gaming_plan", gaming_plan_command))
     application.add_handler(CommandHandler("hooks", hooks_command))
     application.add_handler(CommandHandler("insight", insight_command))
     application.add_handler(CommandHandler("imagepost", imagepost_command))
@@ -3268,12 +4794,22 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("publish_insight", publish_insight_command))
     application.add_handler(CommandHandler("void", void_command))
     application.add_handler(CommandHandler("publish_void", publish_void_command))
+    application.add_handler(CommandHandler("thought_to_void", thought_to_void_command))
+    application.add_handler(CommandHandler("delegate", delegate_command))
+    application.add_handler(CommandHandler("delegate_stop", delegate_stop_command))
+    application.add_handler(CommandHandler("delegate_reply", delegate_reply_command))
+    application.add_handler(CommandHandler("contact_candidates", contact_candidates_command))
+    application.add_handler(CommandHandler("contact_add", contact_add_command))
+
+    # A shared contact follows /delegate and is used only for this one conversation.
+    application.add_handler(MessageHandler(filters.CONTACT, delegation_contact))
 
     # Text router must be after commands.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
 
     setup_autoposting(application)
+    setup_naz_vk_schedule(application)
     setup_source_monitoring(application)
     setup_agent_content_sync(application)
     setup_crosspost_exchange(application)

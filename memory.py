@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+import character_state as naz_character
+import duo_relationship
 from controller import normalize_state
 from prompts import (
     DEFAULT_CONTENT_GOAL,
@@ -134,9 +136,565 @@ def init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS character_states (
+                user_id INTEGER PRIMARY KEY,
+                character_id TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                core_version TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_signatures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                character_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                facet TEXT NOT NULL,
+                intent TEXT NOT NULL,
+                format TEXT NOT NULL,
+                content_format TEXT NOT NULL DEFAULT 'text_story',
+                content_kind TEXT NOT NULL DEFAULT 'text',
+                hook TEXT NOT NULL,
+                media TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(conn, "content_signatures", "content_format", "TEXT NOT NULL DEFAULT 'text_story'")
+        _ensure_column(conn, "content_signatures", "content_kind", "TEXT NOT NULL DEFAULT 'text'")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relationship_states (
+                relationship_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                version TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS private_thoughts (
+                thought_id TEXT PRIMARY KEY,
+                speaker TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'new',
+                created_at TEXT NOT NULL,
+                consumed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_contacts (
+                chat_id INTEGER PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                alias TEXT,
+                display_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending_name',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_user_id, alias)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contact_naming_requests (
+                prompt_message_id INTEGER PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                contact_chat_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reachable_peers (
+                chat_id INTEGER PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS delegation_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL UNIQUE,
+                owner_user_id INTEGER NOT NULL,
+                character_id TEXT NOT NULL,
+                contact_label TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'waiting',
+                contact_chat_id INTEGER,
+                contact_name TEXT,
+                max_turns INTEGER NOT NULL DEFAULT 20,
+                turns_used INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS delegated_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                delegation_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS delegation_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                character_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                turns_used INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_user_created ON chat_history(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_user_created ON memory_items(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON generated_posts(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signatures_user_created ON content_signatures(user_id, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_delegation_contact ON delegation_invites(contact_chat_id, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_delegated_messages ON delegated_messages(delegation_id, id)")
+
+
+def create_delegation_invite(
+    owner_user_id: int,
+    character_id: str,
+    contact_label: str,
+    purpose: str,
+    token: str,
+    expires_at: str,
+    max_turns: int = 20,
+) -> int:
+    """Create one pending recipient binding; never store a phone number."""
+    init_db()
+    with db() as conn:
+        active = conn.execute(
+            "SELECT id FROM delegation_invites WHERE owner_user_id=? AND status IN ('accepted','active','paused')",
+            (owner_user_id,),
+        ).fetchone()
+        if active:
+            raise ValueError(f"Сначала заверши текущее поручение #{active['id']}.")
+        stale = conn.execute(
+            "SELECT id FROM delegation_invites WHERE owner_user_id=?",
+            (owner_user_id,),
+        ).fetchall()
+        for row in stale:
+            conn.execute("DELETE FROM delegated_messages WHERE delegation_id=?", (row["id"],))
+        conn.execute("DELETE FROM delegation_invites WHERE owner_user_id=?", (owner_user_id,))
+        now = utc_now()
+        cur = conn.execute(
+            """
+            INSERT INTO delegation_invites(
+                token, owner_user_id, character_id, contact_label, purpose, status,
+                max_turns, expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'waiting', ?, ?, ?, ?)
+            """,
+            (token, owner_user_id, character_id, contact_label[:200], purpose[:1200], max_turns, expires_at, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def remember_reachable_peer(chat_id: int, display_name: str, expires_at: str) -> None:
+    """Remember a user who contacted the bot first, only for short-lived matching."""
+    init_db()
+    with db() as conn:
+        conn.execute("DELETE FROM reachable_peers WHERE expires_at<=?", (utc_now(),))
+        conn.execute(
+            """INSERT INTO reachable_peers(chat_id, display_name, expires_at, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(chat_id) DO UPDATE SET
+                   display_name=excluded.display_name, expires_at=excluded.expires_at""",
+            (chat_id, display_name[:200], expires_at, utc_now()),
+        )
+
+
+def register_contact_arrival(owner_user_id: int, chat_id: int, display_name: str) -> bool:
+    """Return True only when the owner should be asked to name this new contact."""
+    init_db()
+    with db() as conn:
+        row = conn.execute("SELECT status FROM saved_contacts WHERE chat_id=?", (chat_id,)).fetchone()
+        if row:
+            return False
+        now = utc_now()
+        conn.execute(
+            """INSERT INTO saved_contacts(chat_id, owner_user_id, display_name, status, created_at, updated_at)
+               VALUES (?, ?, ?, 'pending_name', ?, ?)""",
+            (chat_id, owner_user_id, display_name[:200], now, now),
+        )
+        return True
+
+
+def save_contact_naming_request(prompt_message_id: int, owner_user_id: int, contact_chat_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO contact_naming_requests(
+                prompt_message_id, owner_user_id, contact_chat_id, created_at
+            ) VALUES (?, ?, ?, ?)""",
+            (prompt_message_id, owner_user_id, contact_chat_id, utc_now()),
+        )
+
+
+def name_contact_from_reply(prompt_message_id: int, owner_user_id: int, alias: str) -> Optional[Dict[str, Any]]:
+    clean_alias = " ".join((alias or "").split()).strip()[:80]
+    if not clean_alias:
+        return None
+    with db() as conn:
+        request = conn.execute(
+            "SELECT * FROM contact_naming_requests WHERE prompt_message_id=? AND owner_user_id=?",
+            (prompt_message_id, owner_user_id),
+        ).fetchone()
+        if not request:
+            return None
+        duplicate = conn.execute(
+            "SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND lower(alias)=lower(?) AND chat_id<>?",
+            (owner_user_id, clean_alias, request["contact_chat_id"]),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("Такое имя уже занято другим контактом.")
+        conn.execute(
+            """UPDATE saved_contacts SET alias=?, status='saved', updated_at=? WHERE chat_id=?""",
+            (clean_alias, utc_now(), request["contact_chat_id"]),
+        )
+        conn.execute("DELETE FROM contact_naming_requests WHERE prompt_message_id=?", (prompt_message_id,))
+        row = conn.execute("SELECT * FROM saved_contacts WHERE chat_id=?", (request["contact_chat_id"],)).fetchone()
+    return dict(row) if row else None
+
+
+def list_saved_contacts(owner_user_id: int) -> List[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT chat_id, alias, display_name FROM saved_contacts WHERE owner_user_id=? AND status='saved' ORDER BY alias",
+            (owner_user_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_named_contact(owner_user_id: int, chat_id: int, display_name: str, alias: str) -> Dict[str, Any]:
+    clean_alias = " ".join((alias or "").split()).strip()[:80]
+    if not clean_alias:
+        raise ValueError("Имя контакта пустое.")
+    init_db()
+    with db() as conn:
+        duplicate = conn.execute(
+            "SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND lower(alias)=lower(?) AND chat_id<>?",
+            (owner_user_id, clean_alias, chat_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("Такое имя уже занято другим контактом.")
+        now = utc_now()
+        conn.execute(
+            """INSERT INTO saved_contacts(chat_id, owner_user_id, alias, display_name, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'saved', ?, ?)
+               ON CONFLICT(chat_id) DO UPDATE SET owner_user_id=excluded.owner_user_id,
+                   alias=excluded.alias, display_name=excluded.display_name, status='saved', updated_at=excluded.updated_at""",
+            (chat_id, owner_user_id, clean_alias, display_name[:200], now, now),
+        )
+        row = conn.execute("SELECT * FROM saved_contacts WHERE chat_id=?", (chat_id,)).fetchone()
+    return dict(row)
+
+
+def list_previous_contact_ids(owner_user_id: int, limit: int = 30) -> List[int]:
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT user_id FROM chat_history
+               WHERE user_id<>? AND user_id NOT IN (
+                   SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND status='saved'
+               ) ORDER BY user_id DESC LIMIT ?""",
+            (owner_user_id, owner_user_id, max(1, limit)),
+        ).fetchall()
+    return [int(row["user_id"]) for row in rows]
+
+
+def get_reachable_peer(chat_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        conn.execute("DELETE FROM reachable_peers WHERE expires_at<=?", (utc_now(),))
+        row = conn.execute("SELECT * FROM reachable_peers WHERE chat_id=?", (chat_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def forget_reachable_peer(chat_id: int) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM reachable_peers WHERE chat_id=?", (chat_id,))
+
+
+def get_delegation(delegation_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def accept_delegation_invite(token: str, contact_chat_id: int, contact_name: str) -> Optional[Dict[str, Any]]:
+    init_db()
+    now = utc_now()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM delegation_invites WHERE token=? AND status='waiting' AND expires_at>?",
+            (token, now),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            """UPDATE delegation_invites
+               SET status='accepted', contact_chat_id=?, contact_name=?, updated_at=?
+               WHERE id=?""",
+            (contact_chat_id, contact_name[:200], now, row["id"]),
+        )
+        result = dict(row)
+        result.update(status="accepted", contact_chat_id=contact_chat_id, contact_name=contact_name[:200], updated_at=now)
+        return result
+
+
+def set_delegation_status(delegation_id: int, status: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE delegation_invites SET status=?, updated_at=? WHERE id=?",
+            (status, utc_now(), delegation_id),
+        )
+
+
+def get_active_delegation(contact_chat_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """SELECT * FROM delegation_invites
+               WHERE contact_chat_id=? AND status='active' AND expires_at>?
+               ORDER BY id DESC LIMIT 1""",
+            (contact_chat_id, utc_now()),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_delegated_message(delegation_id: int, role: str, content: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO delegated_messages(delegation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (delegation_id, role, content[:8000], utc_now()),
+        )
+
+
+def get_delegated_history(delegation_id: int, limit: int = 10) -> List[Dict[str, str]]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT role, content FROM delegated_messages
+               WHERE delegation_id=? ORDER BY id DESC LIMIT ?""",
+            (delegation_id, max(1, limit)),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def increment_delegation_turns(delegation_id: int) -> int:
+    with db() as conn:
+        conn.execute(
+            "UPDATE delegation_invites SET turns_used=turns_used+1, updated_at=? WHERE id=?",
+            (utc_now(), delegation_id),
+        )
+        row = conn.execute("SELECT turns_used FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+    return int(row["turns_used"]) if row else 0
+
+
+def purge_delegation(delegation_id: int, outcome: str) -> None:
+    """Erase recipient identity and transcript; retain only anonymous operational audit."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+        if not row:
+            return
+        conn.execute(
+            """INSERT INTO delegation_audit(owner_user_id, character_id, outcome, turns_used, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (row["owner_user_id"], row["character_id"], outcome[:80], row["turns_used"], utc_now()),
+        )
+        conn.execute("DELETE FROM delegated_messages WHERE delegation_id=?", (delegation_id,))
+        if row["contact_chat_id"] is not None:
+            conn.execute("DELETE FROM reachable_peers WHERE chat_id=?", (row["contact_chat_id"],))
+        conn.execute("DELETE FROM delegation_invites WHERE id=?", (delegation_id,))
+
+
+def load_character_state(user_id: int) -> naz_character.CharacterState:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT state_json FROM character_states WHERE user_id = ? AND character_id = ?",
+            (user_id, naz_character.CHARACTER_ID),
+        ).fetchone()
+    if not row:
+        state = naz_character.CharacterState()
+        save_character_state(user_id, state)
+        return state
+    try:
+        raw = json.loads(row["state_json"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return naz_character.normalize_state(raw if isinstance(raw, dict) else {})
+
+
+def save_character_state(user_id: int, state: naz_character.CharacterState) -> None:
+    normalized = naz_character.normalize_state(state.to_dict())
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO character_states(user_id, character_id, state_json, core_version, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                character_id = excluded.character_id,
+                state_json = excluded.state_json,
+                core_version = excluded.core_version,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                json.dumps(normalized.to_dict(), ensure_ascii=False),
+                normalized.core_version,
+                utc_now(),
+            ),
+        )
+
+
+def apply_character_event(user_id: int, event: str) -> naz_character.CharacterState:
+    state = naz_character.apply_event(load_character_state(user_id), event)
+    save_character_state(user_id, state)
+    return state
+
+
+def set_character_axis(user_id: int, axis: str, value: int) -> naz_character.CharacterState:
+    state = naz_character.set_axis(load_character_state(user_id), axis, value)
+    save_character_state(user_id, state)
+    return state
+
+
+def get_recent_content_signatures(user_id: int, limit: int = 12) -> List[Dict[str, str]]:
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT platform, facet, intent, format, content_format, content_kind, hook, media, topic, created_at
+            FROM content_signatures
+            WHERE user_id = ? AND character_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, naz_character.CHARACTER_ID, max(1, limit)),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_content_signature(user_id: int, plan: Dict[str, str], topic: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO content_signatures(
+                user_id, character_id, platform, facet, intent, format, content_format, content_kind,
+                hook, media, topic, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                str(plan.get("platform", "telegram")),
+                str(plan.get("facet", "explorer")),
+                str(plan.get("intent", "исследовать")),
+                str(plan.get("format", "маленькая история")),
+                str(plan.get("content_format", "text_story")),
+                str(plan.get("content_kind", "text")),
+                str(plan.get("hook", "наблюдение")),
+                str(plan.get("media", "редакционная иллюстрация")),
+                topic[:1000],
+                utc_now(),
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM content_signatures
+            WHERE user_id = ? AND id NOT IN (
+                SELECT id FROM content_signatures
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 80
+            )
+            """,
+            (user_id, user_id),
+        )
+
+
+def load_relationship_state() -> duo_relationship.RelationshipState:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT state_json FROM relationship_states WHERE relationship_id='naz-void'"
+        ).fetchone()
+    if not row:
+        state = duo_relationship.RelationshipState()
+        save_relationship_state(state)
+        return state
+    try:
+        raw = json.loads(row["state_json"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return duo_relationship.normalize_state(raw if isinstance(raw, dict) else {})
+
+
+def save_relationship_state(state: duo_relationship.RelationshipState) -> None:
+    normalized = duo_relationship.normalize_state(state.to_dict())
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO relationship_states(relationship_id, state_json, version, updated_at)
+            VALUES ('naz-void', ?, ?, ?)
+            ON CONFLICT(relationship_id) DO UPDATE SET
+                state_json=excluded.state_json, version=excluded.version, updated_at=excluded.updated_at
+            """,
+            (json.dumps(normalized.to_dict(), ensure_ascii=False), normalized.version, utc_now()),
+        )
+
+
+def apply_relationship_event(event: str, *, topic: str = "", note: str = "") -> duo_relationship.RelationshipState:
+    state = duo_relationship.apply_event(load_relationship_state(), event, topic=topic, note=note)
+    save_relationship_state(state)
+    return state
+
+
+def save_private_thought(payload: Dict[str, Any], status: str = "new") -> None:
+    ok, reason = duo_relationship.validate_private_thought_payload(payload)
+    if not ok:
+        raise ValueError(reason)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO private_thoughts(
+                thought_id, speaker, receiver, topic, payload_json, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["thought_id"], payload["speaker"], payload["receiver"],
+                str(payload.get("topic", ""))[:1000], json.dumps(payload, ensure_ascii=False), status, utc_now(),
+            ),
+        )
 
 
 def _decode_state_json(raw: Optional[str]) -> Dict:
@@ -263,6 +821,37 @@ def save_message(user_id: int, role: str, content: str) -> None:
         )
 
 
+def save_dialog_turn(user_id: int, user_content: str, assistant_content: str) -> None:
+    """Persist one complete dialog turn in a single SQLite transaction."""
+    if not user_content or not assistant_content:
+        return
+    state = load_state(user_id)
+    if not state.get("memory_enabled", True):
+        return
+    now = utc_now()
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO chat_history(user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (
+                (user_id, "user", user_content[:8000], now),
+                (user_id, "assistant", assistant_content[:8000], now),
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM chat_history
+            WHERE user_id = ?
+              AND id NOT IN (
+                SELECT id FROM chat_history
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 40
+              )
+            """,
+            (user_id, user_id),
+        )
+
+
 def get_history(user_id: int, limit: int = 10) -> List[Dict[str, str]]:
     with db() as conn:
         rows = conn.execute(
@@ -270,6 +859,12 @@ def get_history(user_id: int, limit: int = 10) -> List[Dict[str, str]]:
             (user_id, limit),
         ).fetchall()
     return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+
+
+def clear_dialog_history(user_id: int) -> None:
+    """Clear conversation transcript without touching state or content memory."""
+    with db() as conn:
+        conn.execute("DELETE FROM chat_history WHERE user_id = ?", (user_id,))
 
 
 def add_memory_item(user_id: int, kind: str, content: str, title: Optional[str] = None) -> None:
