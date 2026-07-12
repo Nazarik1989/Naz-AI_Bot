@@ -2479,10 +2479,7 @@ async def vk_queue_status_command(update: Update, context: ContextTypes.DEFAULT_
     status = vk_publish_queue.queue_status(NAZ_VK_QUEUE_DIR)
     await reply_long(
         update,
-        (
-            f"VK Publisher: pending={status['pending']}, processing={status['processing']}, "
-            f"done={status['done']}, failed={status['failed']}.\nОчередь: {status['path']}"
-        ),
+        f"VK Publisher producer queue готова.\nPending: {status['path']}",
         CONTROL_KEYBOARD,
     )
 

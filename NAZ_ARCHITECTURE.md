@@ -58,10 +58,14 @@ Naz is only a producer of `vk_publish_job.v1` directories under
 `NAZ_VK_QUEUE_DIR/pending`. It has no VK credentials, cookies, browser profile,
 Playwright, or direct publishing code. The shared VK Publisher consumes these
 jobs independently. The canonical queue root is
-`/var/lib/void-vk-publisher/queue`; its directories are group-owned by
-`vkqueue`. Producer and consumer services use `UMask=0027`; Naz also writes job
-files as `0640`, job directories as `0750`, and keeps the setgid bit on
-`pending` so new jobs inherit the queue group.
+`/var/lib/void-vk-publisher/queue`. Deployment creates the root as
+`publisher:vkqueue` mode `0710` and `pending` as `publisher:vkqueue` mode
+`03730`. Naz never chmods, chowns, or lists this shared inbox; it only verifies
+that `pending` is a real directory. With `UMask=0027`, Naz writes its own job
+files as `0640` and job directories as `0770`. Private `processing`, `done`,
+and `failed` are owned by `publisher:publisher` mode `0700`; only the VOID
+consumer performs cross-state dedupe and failed jobs are retried through its
+administrative `requeue-failed` command.
 
 ## Cross-posting
 

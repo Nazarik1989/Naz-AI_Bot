@@ -20,7 +20,7 @@ from typing import Iterable, Optional, Union
 
 SCHEMA = "vk_publish_job.v1"
 PRODUCER = "naz"
-STATES = ("pending", "processing", "done", "failed")
+CONSUMER_STATES = ("pending", "processing", "done", "failed")
 JOB_FIELDS = frozenset({
     "schema", "job_id", "producer", "target_group_id", "text", "media",
     "track_query", "created_at", "not_before", "dedupe_key", "source_ref",
@@ -77,20 +77,12 @@ def canonical_job_id(dedupe_key: str) -> str:
     return f"naz-{digest[:24]}"
 
 
-def _dedupe_exists(queue_root: Path, dedupe_key: str, job_id: str) -> bool:
-    for state in STATES:
-        state_dir = queue_root / state
-        if (state_dir / job_id).exists():
-            return True
-        if not state_dir.exists():
-            continue
-        for job_file in state_dir.glob("*/job.json"):
-            try:
-                if json.loads(job_file.read_text(encoding="utf-8")).get("dedupe_key") == dedupe_key:
-                    return True
-            except (OSError, ValueError, TypeError):
-                continue
-    return False
+def _require_pending(queue_root: Path) -> Path:
+    """Return the deployment-owned inbox without listing or mutating it."""
+    pending = queue_root / "pending"
+    if pending.is_symlink() or not pending.is_dir():
+        raise QueueError(f"pending must be an existing real directory: {pending}")
+    return pending
 
 
 def _media_size(item: MediaInput) -> int:
@@ -174,15 +166,12 @@ def enqueue(
     job_id = canonical_job_id(key)
     if os.name != "nt":
         os.umask(0o027)
-    pending = queue_root / "pending"
-    pending.mkdir(parents=True, exist_ok=True, mode=0o750)
-    if os.name != "nt":
-        os.chmod(pending, 0o2750)
-    if _dedupe_exists(queue_root, key, job_id):
-        raise DuplicateJobError(f"job with dedupe_key {key} already exists")
+    pending = _require_pending(queue_root)
     final_dir = pending / job_id
+    if final_dir.exists():
+        raise DuplicateJobError(f"job {job_id} already exists in pending")
     temp_dir = Path(tempfile.mkdtemp(prefix=f".{job_id}-", dir=pending))
-    os.chmod(temp_dir, 0o750)
+    os.chmod(temp_dir, 0o770)
     try:
         for item, name in zip(items, names):
             destination = temp_dir / name
@@ -221,7 +210,7 @@ def enqueue(
             if final_dir.exists() or exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
                 raise DuplicateJobError(f"job {job_id} was enqueued concurrently") from exc
             raise
-        os.chmod(final_dir, 0o750)
+        os.chmod(final_dir, 0o770)
         return job
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -230,8 +219,5 @@ def enqueue(
 
 def queue_status(queue_root: Path) -> dict:
     root = Path(queue_root)
-    counts = {
-        state: len(list((root / state).glob("*/job.json"))) if (root / state).exists() else 0
-        for state in STATES
-    }
-    return {**counts, "path": str(root / "pending")}
+    pending = _require_pending(root)
+    return {"path": str(pending), "ready": True}

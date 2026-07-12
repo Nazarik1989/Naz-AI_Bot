@@ -13,6 +13,7 @@ import vk_publish_queue as queue
 
 class VkPublishQueueTests(unittest.TestCase):
     def enqueue(self, root: Path, **overrides):
+        (root / "pending").mkdir(parents=True, exist_ok=True)
         values = dict(
             target_group_id="123",
             text="Безопасный текст Naz",
@@ -62,18 +63,40 @@ class VkPublishQueueTests(unittest.TestCase):
             with self.assertRaises(queue.DuplicateJobError):
                 self.enqueue(root)
 
-    def test_duplicate_is_found_in_every_consumer_state(self):
-        for state in queue.STATES:
-            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+    def test_producer_does_not_read_private_consumer_states(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pending").mkdir()
+            for state in ("processing", "done", "failed"):
+                (root / state).mkdir()
+            original_iterdir = Path.iterdir
+
+            def guarded_iterdir(path):
+                if path.name in {"processing", "done", "failed"}:
+                    raise AssertionError(f"producer read private state: {path}")
+                return original_iterdir(path)
+
+            with patch.object(Path, "iterdir", guarded_iterdir):
+                self.enqueue(root)
+
+    def test_existing_pending_is_not_chmodded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending = root / "pending"
+            pending.mkdir()
+            with patch("vk_publish_queue.os.chmod", wraps=os.chmod) as chmod:
+                self.enqueue(root)
+            self.assertNotIn(pending, [Path(call.args[0]) for call in chmod.call_args_list])
+
+    def test_enqueue_does_not_require_pending_directory_listing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pending").mkdir()
+            with patch.object(Path, "iterdir", side_effect=PermissionError("listing denied")), patch.object(
+                Path, "glob", side_effect=PermissionError("listing denied")
+            ):
                 job = self.enqueue(root)
-                source = root / "pending" / job["job_id"]
-                destination = root / state / job["job_id"]
-                if state != "pending":
-                    destination.parent.mkdir()
-                    source.rename(destination)
-                with self.assertRaises(queue.DuplicateJobError):
-                    self.enqueue(root)
+            self.assertTrue((root / "pending" / job["job_id"] / "job.json").is_file())
 
     def test_canonical_limits_are_rejected_before_enqueue(self):
         cases = (
@@ -96,7 +119,7 @@ class VkPublishQueueTests(unittest.TestCase):
             root = Path(directory)
             job = self.enqueue(root)
             job_dir = root / "pending" / job["job_id"]
-            self.assertEqual(job_dir.stat().st_mode & 0o777, 0o750)
+            self.assertEqual(job_dir.stat().st_mode & 0o777, 0o770)
             self.assertEqual((job_dir / "job.json").stat().st_mode & 0o777, 0o640)
             self.assertEqual((job_dir / "image-1.png").stat().st_mode & 0o777, 0o640)
 
@@ -131,6 +154,12 @@ class VkPublishQueueTests(unittest.TestCase):
             self.assertEqual(job["target_group_id"], "configured")
             with self.assertRaises(TypeError):
                 self.enqueue(Path(directory), producer="attacker")
+
+    def test_pending_must_exist_and_must_not_be_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(queue.QueueError):
+                queue.enqueue(root, target_group_id="123", text="text", source_ref="missing")
 
 
 if __name__ == "__main__":
