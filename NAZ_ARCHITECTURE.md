@@ -43,6 +43,7 @@ NAZ_VK_ENABLED
 NAZ_VK_PUBLIC_ID
 NAZ_VK_AUTO_ON
 NAZ_VK_AUTO_TIMES
+NAZ_VK_SCHEDULER
 NAZ_VK_QUEUE_DIR
 ```
 
@@ -66,6 +67,13 @@ files as `0640` and job directories as `0770`. Private `processing`, `done`,
 and `failed` are owned by `publisher:publisher` mode `0700`; only the VOID
 consumer performs cross-state dedupe and failed jobs are retried through its
 administrative `requeue-failed` command.
+
+Production scheduling is external: `NAZ_VK_SCHEDULER=systemd` prevents the
+Telegram process from registering VK jobs, while the tracked systemd timer
+runs `python -m naz_vk_producer` as a oneshot. Local installations may opt into
+the legacy JobQueue schedule with `NAZ_VK_SCHEDULER=telegram`. The standalone
+producer calls the same `create_naz_vk_job` path and does not start polling,
+Playwright, a consumer, or any VK-authenticated client.
 
 ## Cross-posting
 

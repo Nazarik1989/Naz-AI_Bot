@@ -25,6 +25,7 @@ class VkScheduleTests(unittest.TestCase):
                     NAZ_VK_ENABLED=enabled,
                     NAZ_VK_AUTO_ON=auto_on,
                     NAZ_VK_PUBLIC_ID="123",
+                    NAZ_VK_SCHEDULER="telegram",
                 ):
                     main.setup_naz_vk_schedule(app)
                 self.assertEqual(queue.jobs, [])
@@ -38,6 +39,7 @@ class VkScheduleTests(unittest.TestCase):
             NAZ_VK_AUTO_ON=True,
             NAZ_VK_PUBLIC_ID="123",
             NAZ_VK_AUTO_TIMES="01:02,23:59",
+            NAZ_VK_SCHEDULER="telegram",
         ):
             main.setup_naz_vk_schedule(app)
         self.assertEqual([job[1]["data"]["slot"] for job in queue.jobs], ["01:02", "23:59"])
@@ -48,7 +50,9 @@ class VkScheduleTests(unittest.TestCase):
             bot=SimpleNamespace(),
         )
         create = AsyncMock(side_effect=[{"job_id": "one"}, main.vk_publish_queue.DuplicateJobError()])
-        with patch.multiple(main, NAZ_VK_ENABLED=True, NAZ_VK_AUTO_ON=True), patch.object(
+        with patch.multiple(
+            main, NAZ_VK_ENABLED=True, NAZ_VK_AUTO_ON=True, NAZ_VK_SCHEDULER="telegram"
+        ), patch.object(
             main, "create_naz_vk_job", create
         ):
             asyncio.run(main.naz_vk_queue_job(context))
@@ -57,6 +61,18 @@ class VkScheduleTests(unittest.TestCase):
         second = create.await_args_list[1].kwargs["source_ref"]
         self.assertEqual(first, second)
         self.assertTrue(first.endswith(":11:20"))
+
+    def test_systemd_mode_disables_embedded_schedule(self):
+        queue = FakeJobQueue()
+        with patch.multiple(
+            main,
+            NAZ_VK_ENABLED=True,
+            NAZ_VK_AUTO_ON=True,
+            NAZ_VK_PUBLIC_ID="123",
+            NAZ_VK_SCHEDULER="systemd",
+        ):
+            main.setup_naz_vk_schedule(SimpleNamespace(job_queue=queue))
+        self.assertEqual(queue.jobs, [])
 
 
 if __name__ == "__main__":

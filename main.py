@@ -143,6 +143,7 @@ NAZ_VK_ENABLED = env_bool("NAZ_VK_ENABLED", False)
 NAZ_VK_PUBLIC_ID = os.getenv("NAZ_VK_PUBLIC_ID", "").strip()
 NAZ_VK_AUTO_ON = env_bool("NAZ_VK_AUTO_ON", False)
 NAZ_VK_AUTO_TIMES = os.getenv("NAZ_VK_AUTO_TIMES", "11:20,16:40,20:20").strip()
+NAZ_VK_SCHEDULER = os.getenv("NAZ_VK_SCHEDULER", "systemd").strip().lower()
 NAZ_VK_QUEUE_DIR = Path(os.getenv("NAZ_VK_QUEUE_DIR", "/var/lib/void-vk-publisher/queue").strip())
 AGENT_CONTENT_SYNC_ENABLED = env_bool("AGENT_CONTENT_SYNC_ENABLED", True)
 AGENT_CONTENT_SYNC_TIMES = os.getenv("AGENT_CONTENT_SYNC_TIMES", "23:57").strip()
@@ -4444,6 +4445,9 @@ def setup_autoposting(application: Application) -> None:
 
 
 def setup_naz_vk_schedule(application: Application) -> None:
+    if NAZ_VK_SCHEDULER != "telegram":
+        logger.info("Naz VK Telegram scheduler disabled | mode=%s", NAZ_VK_SCHEDULER)
+        return
     if not NAZ_VK_ENABLED:
         logger.info("Naz VK disabled")
         return
@@ -4484,7 +4488,7 @@ def setup_naz_vk_schedule(application: Application) -> None:
 
 
 async def naz_vk_queue_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not (NAZ_VK_ENABLED and NAZ_VK_AUTO_ON):
+    if NAZ_VK_SCHEDULER != "telegram" or not (NAZ_VK_ENABLED and NAZ_VK_AUTO_ON):
         return
     slot = str((context.job.data or {}).get("slot", "manual"))
     today = datetime.now(ZoneInfo(BOT_TIMEZONE)).date().isoformat()

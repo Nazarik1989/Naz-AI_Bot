@@ -70,3 +70,39 @@ journalctl -u naz-ai-bot -f
 ```
 
 Never commit `.env` or `naz_ai_bot.sqlite3` to GitHub.
+
+## Standalone VK producer timer
+
+Production must set the following in the separate Naz environment file
+`/etc/naz-ai-bot/naz.env`:
+
+```text
+NAZ_VK_ENABLED=true
+NAZ_VK_SCHEDULER=systemd
+NAZ_VK_QUEUE_DIR=/var/lib/void-vk-publisher/queue
+DB_PATH=/var/lib/naz-ai-bot/naz_ai_bot.sqlite3
+```
+
+The deployment layer creates `/var/lib/naz-ai-bot`, `/var/cache/naz-ai-bot`,
+the shared queue, and membership of user `naz` in supplementary group
+`vkqueue`. It also installs the tracked units:
+
+```bash
+sudo install -m 0644 deploy/systemd/naz-vk-producer.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/naz-vk-producer.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now naz-vk-producer.timer
+systemctl list-timers naz-vk-producer.timer
+```
+
+The timer has explicit Europe/Moscow slots at `11:20`, `16:40`, and `20:20`.
+systemd cannot expand `NAZ_VK_AUTO_TIMES` from an EnvironmentFile into
+`OnCalendar`; change the three `OnCalendar` lines in the timer, run
+`systemctl daemon-reload`, and restart the timer when production slots change.
+Keep `NAZ_VK_AUTO_TIMES` synchronized for documentation and optional local
+`NAZ_VK_SCHEDULER=telegram` mode.
+
+The oneshot service runs only `python -B -m naz_vk_producer`. Its writable
+paths are limited to Naz data/cache and the shared `pending` inbox; publisher
+profiles and private `processing`, `done`, and `failed` directories are not
+available to it.

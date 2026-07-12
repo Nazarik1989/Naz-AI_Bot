@@ -143,21 +143,27 @@ visual posts never run consecutively and rotate through the daily time slots.
 
 ## Naz VK
 
-VK is configured as a separate Naz-owned contour. It can target the shared VK
-public, but payloads, browser profile, helper mode, schedule, and rubrics belong
-to this repo:
+VK is configured as a separate Naz-owned producer contour. It can target the
+shared VK public, but Naz owns only content generation and queue scheduling:
 
 ```text
 NAZ_VK_ENABLED=false
 NAZ_VK_PUBLIC_ID=
 NAZ_VK_AUTO_ON=false
 NAZ_VK_AUTO_TIMES=11:20,16:40,20:20
+NAZ_VK_SCHEDULER=systemd
 NAZ_VK_QUEUE_DIR=/var/lib/void-vk-publisher/queue
 ```
 
-The current code registers the Naz VK configuration and creates the payload /
-profile directories when enabled. A concrete VK browser helper can consume this
-config without moving VK scheduling into VOID.
+Production uses the tracked `naz-vk-producer.service` and `.timer`. The timer
+creates one queue job per invocation without starting Telegram polling. Set
+`NAZ_VK_SCHEDULER=telegram` only for local compatibility with the in-process
+JobQueue schedule, or `off` to disable both scheduler registrations. The
+standalone command itself remains available when the scheduler mode is `off`.
+
+Naz creates only canonical filesystem jobs in the deployment-owned `pending`
+inbox. Browser state, VK credentials, consumption, and publication remain
+outside this process.
 
 ## Cross-posting
 
