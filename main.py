@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, time, timedelta
 from html import unescape
@@ -630,6 +631,10 @@ def build_chat_messages(
         "Если уместно, задай один короткий уточняющий вопрос. "
         "Не раскрывай приватные данные, токены, ключи, внутренние URL и технические секреты."
     )
+    system += (
+        "\n\nPLAIN TEXT ONLY: do not use Markdown or HTML. Do not use headings, "
+        "backticks, emphasis markers, or Markdown list syntax."
+    )
     if memory_context:
         system += "\n\nКраткий контекст памяти, если он реально помогает ответу:\n" + memory_context[:1200]
     if character_context:
@@ -642,6 +647,23 @@ def build_chat_messages(
             messages.append({"role": role, "content": content[:5000]})
     messages.append({"role": "user", "content": user_text})
     return messages
+
+
+def sanitize_dialog_text(text: str) -> str:
+    """Convert model formatting to readable Telegram plain text for dialogue only."""
+    value = str(text or "").replace("\r\n", "\n")
+    value = re.sub(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)", r"\1 — \2", value)
+    value = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", value)
+    value = re.sub(r"(?m)^\s*[-*+]\s+", "• ", value)
+    value = re.sub(r"(?m)^\s*(\d+)[.)]\s+", r"\1. ", value)
+    value = value.replace("```", "").replace("`", "")
+    value = value.replace("**", "").replace("__", "")
+    value = re.sub(r"(?<!\w)[*_](?=\S)", "", value)
+    value = re.sub(r"(?<=\S)[*_](?!\w)", "", value)
+    value = re.sub(r"</?[A-Za-z][^>]*>", "", value)
+    value = re.sub(r"[ \t]+\n", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
 
 
 async def generate_answer(
@@ -682,6 +704,8 @@ async def generate_answer(
         )
 
     result = await call_gpt(messages, max_tokens=task_max_tokens(task), model=task_model(task))
+    if task is None:
+        result = sanitize_dialog_text(result)
 
     updated_state = naz_controller.update_memory_after_output(
         controlled_state,
@@ -1757,6 +1781,68 @@ async def generate_bfl_image_bytes(prompt: str, variant: int = 1) -> Optional[by
     except Exception as exc:  # noqa: BLE001
         logger.exception("BFL image request failed: %s", exc)
     return None
+
+
+class ReferenceImageUnsupportedError(RuntimeError):
+    pass
+
+
+async def openrouter_model_supports_reference() -> bool:
+    if not OPENROUTER_API_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{OPENAI_BASE_URL}/images/models",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            )
+        response.raise_for_status()
+        models = response.json().get("data", [])
+        record = next((item for item in models if item.get("id") == OPENAI_IMAGE_MODEL), None)
+        modalities = ((record or {}).get("architecture") or {}).get("input_modalities") or []
+        return "image" in modalities
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Reference capability check failed | model=%s | error=%s", OPENAI_IMAGE_MODEL, type(exc).__name__)
+        return False
+
+
+async def generate_reference_image_bytes(prompt: str, reference_data_url: str) -> bytes:
+    """Edit using one reference without reference-blind provider fallback."""
+    if not await openrouter_model_supports_reference():
+        raise ReferenceImageUnsupportedError(
+            f"Модель {OPENAI_IMAGE_MODEL} сейчас не подтверждает поддержку изображения-референса."
+        )
+
+    def _request():
+        return ensure_openai_client().images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=prompt,
+            size=OPENAI_IMAGE_SIZE,
+            quality=OPENAI_IMAGE_QUALITY,
+            n=1,
+            timeout=OPENAI_IMAGE_TIMEOUT_SECONDS,
+            extra_body={
+                "input_references": [{"type": "image_url", "image_url": {"url": reference_data_url}}]
+            },
+        )
+
+    try:
+        response = await asyncio.wait_for(asyncio.to_thread(_request), timeout=OPENAI_IMAGE_TIMEOUT_SECONDS + 5)
+        item = response.data[0] if getattr(response, "data", None) else None
+        encoded = getattr(item, "b64_json", None) if item else None
+        if encoded:
+            image = base64.b64decode(encoded, validate=True)
+            if image:
+                return image
+        url = str(getattr(item, "url", None) or "") if item else ""
+        if url:
+            return await download_generated_image(url)
+        raise RuntimeError("Images API returned no edited image")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Reference image request rejected | model=%s | error=%s", OPENAI_IMAGE_MODEL, type(exc).__name__)
+        raise ReferenceImageUnsupportedError(
+            "OpenRouter отклонил редактирование по референсу; генерация с нуля не выполнялась."
+        ) from exc
 
 
 async def generate_hf_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
@@ -3743,6 +3829,119 @@ async def handle_pending_action(update: Update, context: ContextTypes.DEFAULT_TY
         return True
 
 
+IMAGE_INTENT_RE = re.compile(
+    r"\b(?:сгенерируй\s+картинк|нарисуй|создай\s+фото|сделай\s+изображени|покажи,?\s+как\s+(?:это|он|она)\s+выглядит)",
+    re.I,
+)
+MAX_DIALOG_REFERENCE_BYTES = 15 * 1024 * 1024
+
+
+def is_dialog_image_intent(text: str) -> bool:
+    return bool(IMAGE_INTENT_RE.search(text or ""))
+
+
+def validate_reference_image(data: bytes) -> str:
+    if not data or len(data) > MAX_DIALOG_REFERENCE_BYTES:
+        raise ValueError("Фотография пустая или превышает 15 МБ.")
+    try:
+        with Image.open(BytesIO(data)) as image:
+            image.verify()
+            image_format = str(image.format or "").upper()
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("Файл не является поддерживаемым изображением.") from exc
+    mime = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}.get(image_format)
+    if not mime:
+        raise ValueError("Поддерживаются фотографии JPEG, PNG и WEBP.")
+    return mime
+
+
+async def download_telegram_photo(message) -> bytes:
+    if not getattr(message, "photo", None):
+        raise ValueError("В сообщении нет фотографии.")
+    photo = message.photo[-1]
+    if getattr(photo, "file_size", 0) and photo.file_size > MAX_DIALOG_REFERENCE_BYTES:
+        raise ValueError("Фотография превышает 15 МБ.")
+    telegram_file = await photo.get_file()
+    data = bytes(await telegram_file.download_as_bytearray())
+    validate_reference_image(data)
+    return data
+
+
+async def process_dialog_image_request(
+    user_id: int,
+    instruction: str,
+    *,
+    reference_bytes: Optional[bytes] = None,
+) -> Tuple[bytes, str]:
+    clean_instruction = " ".join((instruction or "").split()).strip()
+    if not clean_instruction:
+        raise ValueError("Добавь описание изображения после команды или к фотографии.")
+    if reference_bytes is None:
+        prompt = (
+            f"Create a concrete image for this user request: {clean_instruction}. "
+            "Preserve the requested subject and mood. No text, logos, watermarks, or UI unless explicitly requested."
+        )
+        image = await generate_image_bytes(prompt)
+        if not image:
+            raise RuntimeError("Генератор изображений сейчас недоступен. Попробуй позже.")
+    else:
+        mime = validate_reference_image(reference_bytes)
+        with tempfile.TemporaryDirectory(prefix="naz-dialog-image-") as directory:
+            reference_path = Path(directory) / "reference.image"
+            reference_path.write_bytes(reference_bytes)
+            encoded = base64.b64encode(reference_path.read_bytes()).decode("ascii")
+            data_url = f"data:{mime};base64,{encoded}"
+            image = await generate_reference_image_bytes(clean_instruction, data_url)
+    short = clean_instruction[:120].rstrip()
+    event = f"[Создано изображение: {short}]"
+    memory.save_dialog_turn(user_id, clean_instruction, event)
+    return image, event
+
+
+async def send_dialog_image(update: Update, instruction: str, reference_bytes: Optional[bytes] = None) -> None:
+    if not update.message or not update.effective_user:
+        return
+    await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
+    try:
+        image, _ = await process_dialog_image_request(
+            update.effective_user.id, instruction, reference_bytes=reference_bytes
+        )
+        payload = BytesIO(image)
+        payload.name = "naz-image.png"
+        caption = sanitize_dialog_text(f"Готово. {instruction[:160]}")
+        try:
+            await update.message.reply_photo(photo=payload, caption=caption, reply_markup=MAIN_KEYBOARD)
+        except BadRequest:
+            payload.seek(0)
+            await update.message.reply_document(document=payload, caption=caption, reply_markup=MAIN_KEYBOARD)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Dialog image request failed | reference=%s | error=%s", bool(reference_bytes), type(exc).__name__)
+        message = str(exc) if isinstance(exc, (ValueError, ReferenceImageUnsupportedError)) else (
+            "Не удалось создать изображение: генератор временно недоступен. Попробуй позже."
+        )
+        await update.message.reply_text(sanitize_dialog_text(message), reply_markup=MAIN_KEYBOARD)
+
+
+async def dialog_image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    instruction = " ".join(context.args or []).strip()
+    await send_dialog_image(update, instruction)
+
+
+async def handle_photo_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    instruction = (update.message.caption or "").strip()
+    if not instruction:
+        await update.message.reply_text("Добавь к фотографии подпись с инструкцией, что нужно изменить.")
+        return
+    try:
+        reference = await download_telegram_photo(update.message)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    await send_dialog_image(update, instruction, reference)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user or not update.message.text:
         return
@@ -3798,10 +3997,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if await handle_pending_action(update, context, text):
         return
 
+    replied = update.message.reply_to_message
+    if replied and getattr(replied, "photo", None):
+        try:
+            reference = await download_telegram_photo(replied)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        await send_dialog_image(update, text, reference)
+        return
+
+    if is_dialog_image_intent(text):
+        await send_dialog_image(update, text)
+        return
+
     # Default chat through persistent expert mode and SQLite history.
     await send_typing(update)
     try:
-        answer = await generate_answer(user_id, text)
+        answer = sanitize_dialog_text(await generate_answer(user_id, text))
         await reply_long(update, answer, ANGLE_KEYBOARD if is_angle_engine_message(answer) else MAIN_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("handle_message failed")
@@ -4875,7 +5088,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("hooks", hooks_command))
     application.add_handler(CommandHandler("insight", insight_command))
     application.add_handler(CommandHandler("imagepost", imagepost_command))
-    application.add_handler(CommandHandler("image", image_only_command))
+    application.add_handler(CommandHandler("image", dialog_image_command))
     application.add_handler(CommandHandler("publish", publish_command))
     application.add_handler(CommandHandler("publish_insight", publish_insight_command))
     application.add_handler(CommandHandler("void", void_command))
@@ -4889,6 +5102,7 @@ def build_application() -> Application:
 
     # A shared contact follows /delegate and is used only for this one conversation.
     application.add_handler(MessageHandler(filters.CONTACT, delegation_contact))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo_instruction))
 
     # Text router must be after commands.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
