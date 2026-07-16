@@ -142,7 +142,7 @@ SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip
 AGENT_CONTENT_INBOX = Path(os.getenv("AGENT_CONTENT_INBOX", "content_inbox/agent_content").strip())
 
 AUTOPOST_ENABLED = env_bool("NAZ_TELEGRAM_AUTO_ON", env_bool("AUTOPOST_ENABLED", True))
-AUTOPOST_TIMES = os.getenv("NAZ_TELEGRAM_AUTO_TIMES", os.getenv("AUTOPOST_TIMES", "09:30,13:30,17:30,21:30")).strip()
+AUTOPOST_TIMES = os.getenv("NAZ_TELEGRAM_AUTO_TIMES", os.getenv("AUTOPOST_TIMES", "10:00,14:00,18:00,22:00")).strip()
 AUTOPOST_TASKS = os.getenv("NAZ_TELEGRAM_AUTO_TASKS", os.getenv("AUTOPOST_TASKS", "post,viral")).strip()
 AUTOPOST_INSIGHT_CHANCE = max(0.0, min(env_float("AUTOPOST_INSIGHT_CHANCE", 0.35), 1.0))
 SOURCE_MONITOR_ENABLED = env_bool("SOURCE_MONITOR_ENABLED", False)
@@ -3688,7 +3688,7 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"Время: {AUTOPOST_TIMES or 'не задано'}, timezone: {BOT_TIMEZONE}\n"
             f"Форматы: {', '.join(get_autopost_tasks())}\n"
             f"Канал: {CHANNEL_ID or 'не задан'}\n\n"
-            "Расписание задаётся через .env: AUTOPOST_TIMES=09:30,13:30,17:30,21:30 и AUTOPOST_TASKS=post,viral."
+            "Расписание задаётся через .env: AUTOPOST_TIMES=10:00,14:00,18:00,22:00 и AUTOPOST_TASKS=post,viral."
         )
         await update.message.reply_text(msg, reply_markup=CONTROL_KEYBOARD)
         return True
@@ -4102,7 +4102,7 @@ AUTOPOST_PROFILES: List[Dict[str, str]] = [
 NAZ_TELEGRAM_RUBRICS: List[Dict[str, object]] = [
     {
         "name": "Утренний дожим",
-        "slots": ["09:30"],
+        "slots": ["10:00"],
         "task": "post",
         "topics": [
             "Что сегодня можно упростить в AI-системе, пока она не начала шуметь",
@@ -4128,7 +4128,7 @@ NAZ_TELEGRAM_RUBRICS: List[Dict[str, object]] = [
     },
     {
         "name": "AI без магии",
-        "slots": ["13:30"],
+        "slots": ["14:00"],
         "task": "post",
         "topics": [
             "Почему нейросети — это не магия, а рабочий инструмент",
@@ -4154,7 +4154,7 @@ NAZ_TELEGRAM_RUBRICS: List[Dict[str, object]] = [
     },
     {
         "name": "Баг, который стал системой",
-        "slots": ["17:30"],
+        "slots": ["18:00"],
         "task": "viral",
         "topics": [
             "Как маленький баг в интеграции ломает весь пользовательский опыт",
@@ -4180,7 +4180,7 @@ NAZ_TELEGRAM_RUBRICS: List[Dict[str, object]] = [
     },
     {
         "name": "Naz после смены",
-        "slots": ["21:30"],
+        "slots": ["22:00"],
         "task": "post",
         "topics": [
             "Как память меняет поведение AI-ассистента в диалоге",
