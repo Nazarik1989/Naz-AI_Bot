@@ -161,6 +161,11 @@ VISUAL_ARCHIVE_EVERY_N_POSTS = max(2, min(env_int("VISUAL_ARCHIVE_EVERY_N_POSTS"
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip()
 APP_NAME = os.getenv("APP_NAME", "Naz_AI_Bot").strip()
 NAZ_STORIES_FILE = Path(os.getenv("NAZ_STORIES_FILE", "naz_stories.md").strip())
+NAZ_STORIES_EXTRA_FILES = tuple(
+    Path(item.strip())
+    for item in os.getenv("NAZ_STORIES_EXTRA_FILES", "naz_stories_2.md").split(",")
+    if item.strip()
+)
 MONITORED_SOURCES_FILE = Path(os.getenv("MONITORED_SOURCES_FILE", "monitored_sources.json").strip())
 SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip())
 AGENT_CONTENT_INBOX = Path(os.getenv("AGENT_CONTENT_INBOX", "content_inbox/agent_content").strip())
@@ -852,14 +857,24 @@ async def generate_content(
     return result
 
 
+def naz_story_files() -> tuple[Path, ...]:
+    files = (NAZ_STORIES_FILE, *NAZ_STORIES_EXTRA_FILES)
+    return tuple(dict.fromkeys(files))
+
+
 def read_naz_stories() -> str:
-    try:
-        return NAZ_STORIES_FILE.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return ""
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not read %s: %s", NAZ_STORIES_FILE, exc)
-        return ""
+    stories = []
+    for path in naz_story_files():
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read %s: %s", path, exc)
+            continue
+        if text:
+            stories.append(text)
+    return "\n\n---\n\n".join(stories)
 
 
 def split_story_blocks(text: str) -> List[str]:
@@ -916,12 +931,12 @@ async def generate_story_insight(
 ) -> str:
     excerpt = pick_story_excerpt(topic_hint)
     if not excerpt:
-        return "⚠️ Не нашёл naz_stories.md. Закинь файл в папку проекта или задай NAZ_STORIES_FILE в .env."
+        return "⚠️ Не нашёл файлы историй Naz. Добавь основной или дополнительный источник в настройки."
 
     topic = topic_hint or "инсайт из личного опыта запуска Naz_AI_Bot"
     user_text = (
         f"Тема/фокус: {topic}\n\n"
-        f"Сырьё из naz_stories.md:\n{excerpt[:2400]}\n\n"
+        f"Сырьё из историй Naz:\n{excerpt[:2400]}\n\n"
         "Сделай не пересказ, а отдельный инсайт в стиле рубрики Prompt Or Die. "
         "Пиши как вывод из опыта: конкретно, живо, инженерно, без дневникового тона."
     )
@@ -3114,7 +3129,7 @@ async def publish_insight_command(update: Update, context: ContextTypes.DEFAULT_
         return
 
     topic = extract_topic(update, context, default="")
-    await reply_long(update, "🚀 Собираю рубрику из naz_stories.md и публикую в канал.")
+    await reply_long(update, "🚀 Собираю рубрику из историй Naz и публикую в канал.")
 
     try:
         post_text = await generate_story_insight(update.effective_user.id, topic, save_generated=False)
@@ -5007,7 +5022,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 direction["name"],
             )
             if use_story_insight:
-                logger.info("AUTOPOST story insight from %s", NAZ_STORIES_FILE)
+                logger.info("AUTOPOST story insight from %s", ", ".join(map(str, naz_story_files())))
                 post_text = await generate_story_insight(
                     admin_user_id,
                     topic,
