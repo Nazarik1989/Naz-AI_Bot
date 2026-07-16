@@ -412,6 +412,17 @@ def list_saved_contacts(owner_user_id: int) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def get_saved_contact(owner_user_id: int, chat_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """SELECT chat_id, alias, display_name FROM saved_contacts
+               WHERE owner_user_id=? AND chat_id=? AND status='saved'""",
+            (int(owner_user_id), int(chat_id)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def create_pending_contact_message(
     owner_user_id: int,
     contact_chat_id: int,

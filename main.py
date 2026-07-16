@@ -122,6 +122,7 @@ CONTENT_MODEL_NAME = os.getenv("CONTENT_MODEL_NAME", MODEL_NAME).strip()
 # Voice messages use the official OpenAI API independently from OpenRouter.
 VOICE_MESSAGES_ENABLED = env_bool("VOICE_MESSAGES_ENABLED", False)
 VOICE_MESSAGES_ADMIN_ONLY = env_bool("VOICE_MESSAGES_ADMIN_ONLY", True)
+VOICE_MESSAGES_CONTACTS_ENABLED = env_bool("VOICE_MESSAGES_CONTACTS_ENABLED", False)
 OPENAI_VOICE_API_KEY = os.getenv("OPENAI_VOICE_API_KEY", "").strip()
 OPENAI_VOICE_BASE_URL = os.getenv("OPENAI_VOICE_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip()
@@ -2558,7 +2559,32 @@ async def contact_message_callback(update: Update, context: ContextTypes.DEFAULT
     )
 
 
-async def handle_delegated_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+async def send_delegated_contact_reply(update: Update, text: str, *, as_voice: bool) -> None:
+    """Reply inside an active delegation, preferring voice only when the contact used voice."""
+    if not as_voice:
+        await update.message.reply_text(text)
+        return
+    try:
+        await update.effective_chat.send_action(ChatAction.RECORD_VOICE)
+        audio = await synthesize_voice_bytes(text)
+        payload = BytesIO(audio)
+        payload.name = "naz-delegated-reply.ogg"
+        await update.message.reply_voice(
+            voice=payload,
+            caption="AI-голос Naz — помощник Назара",
+        )
+    except (RuntimeError, TelegramError):
+        logger.warning("Delegated voice reply falling back to text")
+        await update.message.reply_text(text)
+
+
+async def handle_delegated_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    reply_as_voice: bool = False,
+) -> bool:
     if not update.effective_user or not update.message:
         return False
     row = memory.get_active_delegation(update.effective_user.id)
@@ -2599,7 +2625,7 @@ async def handle_delegated_reply(update: Update, context: ContextTypes.DEFAULT_T
             text=f"Naz остановил поручение #{delegation_id} для твоего ответа: /delegate_reply {delegation_id} текст",
         )
         return True
-    await update.message.reply_text(reply)
+    await send_delegated_contact_reply(update, reply, as_voice=reply_as_voice)
     memory.save_delegated_message(delegation_id, "assistant", reply)
     turns = memory.increment_delegation_turns(delegation_id)
     if turns >= delegation.max_turns:
@@ -4135,7 +4161,15 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not VOICE_MESSAGES_ENABLED:
         await update.message.reply_text("Голосовые Naz пока выключены в настройках.")
         return
-    if VOICE_MESSAGES_ADMIN_ONLY and not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    owner_voice = is_admin(user_id)
+    active_delegation = None if owner_voice else memory.get_active_delegation(user_id)
+    saved_contact = (
+        None
+        if owner_voice or not VOICE_MESSAGES_CONTACTS_ENABLED
+        else memory.get_saved_contact(ADMIN_ID, user_id)
+    )
+    if VOICE_MESSAGES_ADMIN_ONLY and not owner_voice and not active_delegation and not saved_contact:
         await update.message.reply_text("Голосовой режим пока доступен только владельцу Naz.")
         return
     if not OPENAI_VOICE_API_KEY:
@@ -4146,7 +4180,10 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_chat.send_action(ChatAction.TYPING)
         data, filename = await download_telegram_audio(update.message)
         transcript = await transcribe_voice_bytes(data, filename)
-        if is_admin(update.effective_user.id) and await prepare_contact_message_request(update, context, transcript):
+        if active_delegation:
+            await handle_delegated_reply(update, context, transcript, reply_as_voice=True)
+            return
+        if owner_voice and await prepare_contact_message_request(update, context, transcript):
             return
         answer = sanitize_dialog_text(await generate_answer(update.effective_user.id, transcript))
         await update.effective_chat.send_action(ChatAction.RECORD_VOICE)
