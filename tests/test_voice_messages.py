@@ -136,7 +136,7 @@ class VoiceHandlerTests(unittest.TestCase):
         ) as download:
             asyncio.run(main.handle_voice_message(update, SimpleNamespace()))
         download.assert_not_awaited()
-        self.assertIn("только владельцу", update.message.reply_text.await_args.args[0])
+        self.assertIn("сохранённым контактам", update.message.reply_text.await_args.args[0])
 
     def test_active_delegation_contact_can_use_voice(self):
         update = fake_voice_update()

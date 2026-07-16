@@ -43,12 +43,14 @@ from telegram import (
     InputMediaPhoto,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
@@ -380,6 +382,7 @@ def make_keyboard(rows: List[List[str]]) -> ReplyKeyboardMarkup:
 
 
 MAIN_KEYBOARD = make_keyboard([[BTN_AI, BTN_CONTENT], [BTN_LINKS, BTN_CONTROL], [BTN_HELP]])
+CONTACT_MAIN_KEYBOARD = make_keyboard([[BTN_AI, BTN_CONTENT], [BTN_HELP]])
 AI_KEYBOARD = make_keyboard([[BTN_EXPERT_MENU], [BTN_VOICE_MENU, BTN_GOAL_MENU], [BTN_BACK]])
 EXPERT_KEYBOARD = make_keyboard([
     [BTN_COPYWRITER, BTN_MARKETER],
@@ -419,6 +422,55 @@ HELP_KEYBOARD = make_keyboard([[BTN_HELP_CAPABILITIES], [BTN_HELP_COMMANDS, BTN_
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID and user_id == ADMIN_ID)
+
+
+def get_registered_contact(user_id: int) -> Optional[Dict[str, Any]]:
+    if not ADMIN_ID or is_admin(user_id):
+        return None
+    return memory.get_saved_contact(ADMIN_ID, user_id)
+
+
+def has_registered_access(user_id: int) -> bool:
+    return is_admin(user_id) or get_registered_contact(user_id) is not None
+
+
+def main_keyboard_for(user_id: int) -> ReplyKeyboardMarkup:
+    return MAIN_KEYBOARD if is_admin(user_id) else CONTACT_MAIN_KEYBOARD
+
+
+async def reject_unregistered_user(update: Update) -> bool:
+    if not update.effective_user or not update.message:
+        return True
+    if has_registered_access(update.effective_user.id):
+        return False
+    await update.message.reply_text(
+        "🔒 Доступ к Naz открыт владельцу и сохранённым контактам. Попроси Назара добавить тебя в /contacts.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return True
+
+
+async def registered_access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    user_id = update.effective_user.id
+    if has_registered_access(user_id):
+        return
+
+    text = (update.message.text or "").strip()
+    if text.startswith("/start"):
+        return
+    if memory.get_active_delegation(user_id) and not text.startswith("/"):
+        return
+
+    memory.remember_reachable_peer(
+        user_id,
+        user_display_name(update),
+        (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+    )
+    await ensure_contact_named(update, context)
+    await reject_unregistered_user(update)
+    raise ApplicationHandlerStop
 
 
 def user_display_name(update: Update) -> str:
@@ -2168,23 +2220,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
         )
         await ensure_contact_named(update, context)
+        if await reject_unregistered_user(update):
+            return
     memory.load_state(user_id)
     name = user_display_name(update)
+    sections = (
+        "🧠 AI — режимы экспертов\n"
+        "🚀 Контент — посты, Reels, планы, картинки\n"
+    )
+    if is_admin(user_id):
+        sections += "🔗 Связи — обмен между ботами\n📊 Центр управления — память, статистика, автопостинг\n"
+    sections += "ℹ️ Помощь — доступные команды и описание проекта"
     text = (
         f"🤖 Naz AI\n\n"
         f"{name}, я твой AI-помощник для контента, нейросетей и автоматизации.\n\n"
-        "Выбери раздел:\n\n"
-        "🧠 AI — режимы экспертов\n"
-        "🚀 Контент — посты, Reels, планы, картинки\n"
-        "📊 Центр управления — память, статистика, автопостинг\n"
-        "ℹ️ Помощь — команды и описание проекта"
+        f"Выбери раздел:\n\n{sections}"
     )
-    await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+    await update.message.reply_text(text, reply_markup=main_keyboard_for(user_id))
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text("Главное меню Naz:", reply_markup=MAIN_KEYBOARD)
+    if not update.message or not update.effective_user or await reject_unregistered_user(update):
+        return
+    await update.message.reply_text("Главное меню Naz:", reply_markup=main_keyboard_for(update.effective_user.id))
 
 
 def delegation_from_row(row: Dict[str, Any]) -> delegated_messaging.Delegation:
@@ -2636,21 +2694,21 @@ async def handle_delegated_reply(
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(help_commands_text(), reply_markup=HELP_KEYBOARD)
+    if update.message and update.effective_user:
+        await update.message.reply_text(help_commands_for(update.effective_user.id), reply_markup=HELP_KEYBOARD)
 
 
 async def state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user:
         return
-    await reply_long(update, get_state_text(update.effective_user.id), MAIN_KEYBOARD)
+    await reply_long(update, get_state_text(update.effective_user.id), main_keyboard_for(update.effective_user.id))
 
 
 async def character_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user:
         return
     state = memory.load_character_state(update.effective_user.id)
-    await reply_long(update, naz_character.format_status(state), MAIN_KEYBOARD)
+    await reply_long(update, naz_character.format_status(state), main_keyboard_for(update.effective_user.id))
 
 
 async def character_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2708,7 +2766,7 @@ async def character_simulate_command(update: Update, context: ContextTypes.DEFAU
             f"{index}. {plan['event']} → {plan['facet']} · {plan['state']}\n"
             f"   {plan['content_format_label']} / {plan['format']} / {plan['hook']}"
         )
-    await reply_long(update, "\n".join(lines), MAIN_KEYBOARD)
+    await reply_long(update, "\n".join(lines), main_keyboard_for(update.effective_user.id))
 
 
 async def relationship_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2743,7 +2801,7 @@ async def role_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     set_user_expert_mode(update.effective_user.id, mode)
     data = EXPERT_MODES[mode]
-    await reply_long(update, f"✅ Режим включён: {data['title']}\n{data['short']}", MAIN_KEYBOARD)
+    await reply_long(update, f"✅ Режим включён: {data['title']}\n{data['short']}", main_keyboard_for(update.effective_user.id))
 
 
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2751,16 +2809,16 @@ async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     if not context.args:
         items = "\n".join(f"{key} — {data['title']}: {data['style']}" for key, data in VOICE_PROFILES.items())
-        await reply_long(update, "🎭 Voice profiles:\n\n" + items + "\n\nПример:\n/voice tech_hooligan", MAIN_KEYBOARD)
+        await reply_long(update, "🎭 Voice profiles:\n\n" + items + "\n\nПример:\n/voice tech_hooligan", main_keyboard_for(update.effective_user.id))
         return
     voice = context.args[0].strip().lower()
     if voice not in VOICE_PROFILES:
         items = "\n".join(VOICE_PROFILES.keys())
-        await reply_long(update, f"Такого голоса нет: {voice}\n\nДоступно:\n{items}", MAIN_KEYBOARD)
+        await reply_long(update, f"Такого голоса нет: {voice}\n\nДоступно:\n{items}", main_keyboard_for(update.effective_user.id))
         return
     set_user_voice_profile(update.effective_user.id, voice)
     data = VOICE_PROFILES[voice]
-    await reply_long(update, f"✅ Голос включён: {data['title']}\n{data['style']}", MAIN_KEYBOARD)
+    await reply_long(update, f"✅ Голос включён: {data['title']}\n{data['style']}", main_keyboard_for(update.effective_user.id))
 
 
 async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2768,23 +2826,23 @@ async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if not context.args:
         items = "\n".join(f"{key} — {data['title']}" for key, data in GOALS.items())
-        await reply_long(update, "🎯 Content goals:\n\n" + items + "\n\nПример:\n/goal engagement", MAIN_KEYBOARD)
+        await reply_long(update, "🎯 Content goals:\n\n" + items + "\n\nПример:\n/goal engagement", main_keyboard_for(update.effective_user.id))
         return
     goal = context.args[0].strip().lower()
     if goal not in GOALS:
         items = "\n".join(GOALS.keys())
-        await reply_long(update, f"Такой цели нет: {goal}\n\nДоступно:\n{items}", MAIN_KEYBOARD)
+        await reply_long(update, f"Такой цели нет: {goal}\n\nДоступно:\n{items}", main_keyboard_for(update.effective_user.id))
         return
     set_user_content_goal(update.effective_user.id, goal)
     data = GOALS[goal]
-    await reply_long(update, f"✅ Цель включена: {data['title']}\n{data['prompt']}", MAIN_KEYBOARD)
+    await reply_long(update, f"✅ Цель включена: {data['title']}\n{data['prompt']}", main_keyboard_for(update.effective_user.id))
 
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user:
         return
     if ADMIN_ID and not is_admin(update.effective_user.id):
-        await reply_long(update, "🔒 Память и управление доступны только админу.", MAIN_KEYBOARD)
+        await reply_long(update, "🔒 Память и управление доступны только админу.", main_keyboard_for(update.effective_user.id))
         return
     await reply_long(update, memory.format_memory(update.effective_user.id), CONTROL_KEYBOARD)
 
@@ -2793,14 +2851,14 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user:
         return
     memory.clear_user_memory(update.effective_user.id)
-    await reply_long(update, "🧹 Готово. История диалога и заметки памяти очищены для тебя.", MAIN_KEYBOARD)
+    await reply_long(update, "🧹 Готово. История диалога и заметки памяти очищены для тебя.", main_keyboard_for(update.effective_user.id))
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user:
         return
     if not is_admin(update.effective_user.id):
-        await reply_long(update, "🔒 Статистика доступна только админу.", MAIN_KEYBOARD)
+        await reply_long(update, "🔒 Статистика доступна только админу.", main_keyboard_for(update.effective_user.id))
         return
     await reply_long(update, memory.get_stats(), CONTROL_KEYBOARD)
 
@@ -2908,8 +2966,8 @@ async def content_command(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
     if not update.effective_user or not update.message:
         return
     user_id = update.effective_user.id
-    if ADMIN_ONLY_CONTENT and not is_admin(user_id):
-        await update.message.reply_text("🔒 Генерация контента сейчас доступна только админу.", reply_markup=MAIN_KEYBOARD)
+    if not has_registered_access(user_id):
+        await update.message.reply_text("🔒 Генерация контента доступна владельцу и сохранённым контактам.", reply_markup=ReplyKeyboardRemove())
         return
 
     topic = extract_topic(update, context, default="AI, контент и автоматизация")
@@ -2942,6 +3000,8 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def gaming_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
+    if await reject_unregistered_user(update):
+        return
     topic = extract_topic(update, context, default="игры как пространство для экспериментов")
     plan = gaming_vertical.plan_gaming_content(
         "naz", topic, memory.get_recent_content_signatures(update.effective_user.id), platform="telegram"
@@ -2955,8 +3015,8 @@ async def gaming_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def gaming_command(update: Update, context: ContextTypes.DEFAULT_TYPE, *, commercial: bool = False) -> None:
     if not update.effective_user or not update.message:
         return
-    if ADMIN_ONLY_CONTENT and not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Игровые черновики сейчас доступны только админу.")
+    if not has_registered_access(update.effective_user.id):
+        await update.message.reply_text("🔒 Игровые черновики доступны владельцу и сохранённым контактам.")
         return
     topic = extract_topic(update, context, default="игры как пространство для экспериментов")
     recent = memory.get_recent_content_signatures(update.effective_user.id)
@@ -2996,8 +3056,8 @@ async def insight_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.effective_user or not update.message:
         return
     user_id = update.effective_user.id
-    if ADMIN_ONLY_CONTENT and not is_admin(user_id):
-        await update.message.reply_text("🔒 Рубрика инсайтов сейчас доступна только админу.", reply_markup=MAIN_KEYBOARD)
+    if not has_registered_access(user_id):
+        await update.message.reply_text("🔒 Рубрика инсайтов доступна владельцу и сохранённым контактам.", reply_markup=ReplyKeyboardRemove())
         return
 
     topic = extract_topic(update, context, default="")
@@ -3332,8 +3392,8 @@ async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not update.effective_user or not update.message:
         return
     user_id = update.effective_user.id
-    if ADMIN_ONLY_CONTENT and not is_admin(user_id):
-        await update.message.reply_text("🔒 Генерация image-post сейчас доступна только админу.", reply_markup=MAIN_KEYBOARD)
+    if not has_registered_access(user_id):
+        await update.message.reply_text("🔒 Генерация image-post доступна владельцу и сохранённым контактам.", reply_markup=ReplyKeyboardRemove())
         return
 
     topic = extract_topic(update, context, default="AI, контент и автоматизация")
@@ -3368,8 +3428,8 @@ async def image_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not update.effective_user or not update.message:
         return
     user_id = update.effective_user.id
-    if ADMIN_ONLY_CONTENT and not is_admin(user_id):
-        await update.message.reply_text("🔒 Генерация картинок сейчас доступна только админу.", reply_markup=MAIN_KEYBOARD)
+    if not has_registered_access(user_id):
+        await update.message.reply_text("🔒 Генерация картинок доступна владельцу и сохранённым контактам.", reply_markup=ReplyKeyboardRemove())
         return
 
     topic = extract_topic(update, context, default="AI content automation cinematic poster")
@@ -3431,7 +3491,7 @@ async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
-    if ADMIN_ONLY_CONTENT and not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id):
         await reply_long(update, "🔒 Приватный разговор с VOID доступен только админу.", MAIN_KEYBOARD)
         return
 
@@ -3700,9 +3760,12 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     user_id = update.effective_user.id
 
+    if await reject_unregistered_user(update):
+        return True
+
     if text == BTN_BACK:
         USER_PENDING_ACTIONS.pop(user_id, None)
-        await update.message.reply_text("Главное меню:", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("Главное меню:", reply_markup=main_keyboard_for(user_id))
         return True
 
     if text == BTN_AI:
@@ -3733,22 +3796,19 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return True
 
     if text == BTN_CONTENT:
-        if ADMIN_ONLY_CONTENT and not is_admin(user_id):
-            await update.message.reply_text("🔒 Раздел контента сейчас доступен только админу.", reply_markup=MAIN_KEYBOARD)
-            return True
         await update.message.reply_text("🚀 Выбери, что собрать:", reply_markup=CONTENT_KEYBOARD)
         return True
 
     if text == BTN_LINKS:
         if not is_admin(user_id):
-            await update.message.reply_text("🔒 Связи между ботами доступны только админу.", reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_text("🔒 Связи между ботами доступны только админу.", reply_markup=main_keyboard_for(user_id))
             return True
         await update.message.reply_text(exchange_status_text(), reply_markup=CROSSPOST_KEYBOARD)
         return True
 
     if text == BTN_CONTROL:
         if not is_admin(user_id):
-            await update.message.reply_text("🔒 Центр управления доступен только админу.", reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_text("🔒 Центр управления доступен только админу.", reply_markup=main_keyboard_for(user_id))
             return True
         await update.message.reply_text("📊 Центр управления Naz:", reply_markup=CONTROL_KEYBOARD)
         return True
@@ -3843,14 +3903,11 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         memory.clear_recent_topics(user_id)
         await update.message.reply_text(
             "🧹 Recent topics очищены.\n\nТеперь можно снова писать по старой теме, но лучше всё равно искать новый угол.",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=main_keyboard_for(user_id),
         )
         return True
 
     if text in CONTENT_BUTTON_TO_ACTION:
-        if ADMIN_ONLY_CONTENT and not is_admin(user_id):
-            await update.message.reply_text("🔒 Генерация контента сейчас доступна только админу.", reply_markup=MAIN_KEYBOARD)
-            return True
         action = CONTENT_BUTTON_TO_ACTION[text]
         USER_PENDING_ACTIONS[user_id] = action
         title = ACTION_TITLES.get(action, "материал")
@@ -3932,11 +3989,11 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return True
 
     if text == BTN_HELP_CAPABILITIES:
-        await update.message.reply_text(help_capabilities_text(), reply_markup=HELP_KEYBOARD)
+        await update.message.reply_text(help_capabilities_for(user_id), reply_markup=HELP_KEYBOARD)
         return True
 
     if text == BTN_HELP_COMMANDS:
-        await update.message.reply_text(help_commands_text(), reply_markup=HELP_KEYBOARD)
+        await update.message.reply_text(help_commands_for(user_id), reply_markup=HELP_KEYBOARD)
         return True
 
     if text == BTN_HELP_ABOUT:
@@ -3953,6 +4010,10 @@ async def handle_pending_action(update: Update, context: ContextTypes.DEFAULT_TY
     action = USER_PENDING_ACTIONS.get(user_id)
     if not action:
         return False
+
+    if await reject_unregistered_user(update):
+        USER_PENDING_ACTIONS.pop(user_id, None)
+        return True
 
     USER_PENDING_ACTIONS.pop(user_id, None)
     topic = text.strip()
@@ -4167,10 +4228,10 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     saved_contact = (
         None
         if owner_voice or not VOICE_MESSAGES_CONTACTS_ENABLED
-        else memory.get_saved_contact(ADMIN_ID, user_id)
+        else get_registered_contact(user_id)
     )
     if VOICE_MESSAGES_ADMIN_ONLY and not owner_voice and not active_delegation and not saved_contact:
-        await update.message.reply_text("Голосовой режим пока доступен только владельцу Naz.")
+        await update.message.reply_text("Голосовой режим доступен владельцу, сохранённым контактам и активным поручениям.")
         return
     if not OPENAI_VOICE_API_KEY:
         await update.message.reply_text("Голосовой API ещё не настроен. Нужен отдельный официальный OpenAI key.")
@@ -4191,7 +4252,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             audio = await synthesize_voice_bytes(answer)
         except RuntimeError:
             logger.warning("Voice reply falling back to text")
-            await reply_long(update, answer, MAIN_KEYBOARD)
+            await reply_long(update, answer, main_keyboard_for(user_id))
             return
 
         payload = BytesIO(audio)
@@ -4200,22 +4261,22 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_voice(
                 voice=payload,
                 caption="AI-голос Naz",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=main_keyboard_for(user_id),
             )
         except BadRequest:
             payload.seek(0)
             await update.message.reply_document(
                 document=payload,
                 caption="Голосовой ответ Naz",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=main_keyboard_for(user_id),
             )
     except ValueError as exc:
-        await update.message.reply_text(sanitize_dialog_text(str(exc)), reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(sanitize_dialog_text(str(exc)), reply_markup=main_keyboard_for(user_id))
     except RuntimeError as exc:
-        await update.message.reply_text(sanitize_dialog_text(str(exc)), reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(sanitize_dialog_text(str(exc)), reply_markup=main_keyboard_for(user_id))
     except Exception as exc:  # noqa: BLE001
         logger.warning("Voice message failed | error=%s", type(exc).__name__)
-        await update.message.reply_text("Голосовой режим временно недоступен.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("Голосовой режим временно недоступен.", reply_markup=main_keyboard_for(user_id))
 
 
 async def process_dialog_image_request(
@@ -4252,6 +4313,9 @@ async def process_dialog_image_request(
 async def send_dialog_image(update: Update, instruction: str, reference_bytes: Optional[bytes] = None) -> None:
     if not update.message or not update.effective_user:
         return
+    if await reject_unregistered_user(update):
+        return
+    keyboard = main_keyboard_for(update.effective_user.id)
     await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
     try:
         image, _ = await process_dialog_image_request(
@@ -4261,16 +4325,16 @@ async def send_dialog_image(update: Update, instruction: str, reference_bytes: O
         payload.name = "naz-image.png"
         caption = sanitize_dialog_text(f"Готово. {instruction[:160]}")
         try:
-            await update.message.reply_photo(photo=payload, caption=caption, reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_photo(photo=payload, caption=caption, reply_markup=keyboard)
         except BadRequest:
             payload.seek(0)
-            await update.message.reply_document(document=payload, caption=caption, reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_document(document=payload, caption=caption, reply_markup=keyboard)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Dialog image request failed | reference=%s | error=%s", bool(reference_bytes), type(exc).__name__)
         message = str(exc) if isinstance(exc, (ValueError, ReferenceImageUnsupportedError)) else (
             "Не удалось создать изображение: генератор временно недоступен. Попробуй позже."
         )
-        await update.message.reply_text(sanitize_dialog_text(message), reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(sanitize_dialog_text(message), reply_markup=keyboard)
 
 
 async def dialog_image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4279,7 +4343,7 @@ async def dialog_image_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_photo_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    if not update.message or not update.effective_user or await reject_unregistered_user(update):
         return
     instruction = (update.message.caption or "").strip()
     if not instruction:
@@ -4336,13 +4400,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(str(exc))
             return
 
-    if not is_admin(user_id):
+    if not has_registered_access(user_id):
         memory.remember_reachable_peer(
             user_id,
             user_display_name(update),
             (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
         )
         await ensure_contact_named(update, context)
+        await reject_unregistered_user(update)
+        return
 
     if await handle_menu_button(update, context, text):
         return
@@ -4368,10 +4434,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_typing(update)
     try:
         answer = sanitize_dialog_text(await generate_answer(user_id, text))
-        await reply_long(update, answer, ANGLE_KEYBOARD if is_angle_engine_message(answer) else MAIN_KEYBOARD)
+        await reply_long(update, answer, ANGLE_KEYBOARD if is_angle_engine_message(answer) else main_keyboard_for(user_id))
     except Exception as exc:  # noqa: BLE001
         logger.exception("handle_message failed")
-        await reply_long(update, f"⚠️ Naz споткнулся. Причина: {exc}", MAIN_KEYBOARD)
+        await reply_long(update, f"⚠️ Naz споткнулся. Причина: {exc}", main_keyboard_for(user_id))
 
 
 # -----------------------------------------------------------------------------
@@ -5286,6 +5352,21 @@ def help_capabilities_text() -> str:
     )
 
 
+def contact_help_capabilities_text() -> str:
+    return (
+        "🤖 Что доступно контактам Naz\n\n"
+        "🧠 AI: экспертные режимы, стиль голоса и цель ответа.\n"
+        "💬 Общение: текстовые и голосовые диалоги с личной памятью.\n"
+        "🚀 Контент: посты, вирусные тексты, Reels, планы и заголовки.\n"
+        "🖼 Изображения: генерация по тексту и изменение присланной фотографии.\n\n"
+        "Публикация в каналы, автопостинг, системная память, связи ботов и управление контактами доступны только владельцу."
+    )
+
+
+def help_capabilities_for(user_id: int) -> str:
+    return help_capabilities_text() if is_admin(user_id) else contact_help_capabilities_text()
+
+
 def help_commands_text() -> str:
     return (
         "📚 Команды Naz\n\n"
@@ -5340,6 +5421,34 @@ def help_commands_text() -> str:
         "Админ:\n"
         "/stats — статистика"
     )
+
+
+def contact_help_commands_text() -> str:
+    return (
+        "📚 Доступные команды Naz\n\n"
+        "/start — открыть Naz\n"
+        "/menu — главное меню\n"
+        "/help — помощь\n"
+        "/state — текущий режим\n"
+        "/roles — список ролей\n"
+        "/role marketer — выбрать экспертный режим\n"
+        "/voice tech_hooligan — выбрать стиль ответа\n"
+        "/goal engagement — выбрать цель\n"
+        "/clear — очистить свою историю\n\n"
+        "Контент:\n"
+        "/post тема — пост\n"
+        "/viral тема — вирусный пост\n"
+        "/script тема — сценарий Reels\n"
+        "/plan тема — контент-план\n"
+        "/hooks тема — заголовки\n"
+        "/imagepost тема — пост с картинками\n"
+        "/image описание — создать картинку\n\n"
+        "Можно просто написать или отправить голосовое. Чтобы изменить фото, пришли его с инструкцией в подписи."
+    )
+
+
+def help_commands_for(user_id: int) -> str:
+    return help_commands_text() if is_admin(user_id) else contact_help_commands_text()
 
 
 def help_about_text() -> str:
@@ -5405,6 +5514,7 @@ def build_application() -> Application:
     )
 
     # Core commands
+    application.add_handler(MessageHandler(filters.ALL, registered_access_guard), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("help", help_command))

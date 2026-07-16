@@ -68,7 +68,7 @@ class DialogImageTests(unittest.TestCase):
 
     def test_image_command_sends_real_photo(self):
         update = fake_update()
-        with patch.object(
+        with patch.object(main, "reject_unregistered_user", new=AsyncMock(return_value=False)), patch.object(
             main, "process_dialog_image_request", new=AsyncMock(return_value=(png_bytes(), "event"))
         ):
             asyncio.run(main.dialog_image_command(update, SimpleNamespace(args=["рыжий", "кот"])))
@@ -80,7 +80,9 @@ class DialogImageTests(unittest.TestCase):
         update = fake_update()
         update.message.caption = "Сделай в стиле киберпанк"
         update.message.photo = [Mock()]
-        with patch.object(main, "download_telegram_photo", new=AsyncMock(return_value=b"reference")), patch.object(
+        with patch.object(main, "reject_unregistered_user", new=AsyncMock(return_value=False)), patch.object(
+            main, "download_telegram_photo", new=AsyncMock(return_value=b"reference")
+        ), patch.object(
             main, "send_dialog_image", new=AsyncMock()
         ) as send:
             asyncio.run(main.handle_photo_instruction(update, SimpleNamespace()))
@@ -138,7 +140,7 @@ class DialogImageTests(unittest.TestCase):
 
     def test_user_gets_clear_error(self):
         update = fake_update()
-        with patch.object(
+        with patch.object(main, "reject_unregistered_user", new=AsyncMock(return_value=False)), patch.object(
             main, "process_dialog_image_request", new=AsyncMock(side_effect=RuntimeError("provider down"))
         ):
             asyncio.run(main.send_dialog_image(update, "нарисуй кота"))
