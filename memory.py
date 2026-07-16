@@ -224,6 +224,7 @@ def init_db() -> None:
                 contact_chat_id INTEGER NOT NULL,
                 contact_alias TEXT NOT NULL,
                 message_text TEXT NOT NULL,
+                delivery_kind TEXT NOT NULL DEFAULT 'text',
                 status TEXT NOT NULL DEFAULT 'pending',
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -231,6 +232,7 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_column(conn, "pending_contact_messages", "delivery_kind", "TEXT NOT NULL DEFAULT 'text'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS reachable_peers (
@@ -415,6 +417,7 @@ def create_pending_contact_message(
     contact_chat_id: int,
     contact_alias: str,
     message_text: str,
+    delivery_kind: str = "text",
     ttl_minutes: int = 15,
 ) -> Dict[str, Any]:
     """Store a short-lived outbound draft that still requires owner confirmation."""
@@ -422,6 +425,8 @@ def create_pending_contact_message(
     now = datetime.now(timezone.utc)
     expires_at = (now + timedelta(minutes=max(1, min(60, int(ttl_minutes))))).isoformat(timespec="seconds")
     timestamp = now.isoformat(timespec="seconds")
+    if delivery_kind not in {"text", "voice"}:
+        raise ValueError("Недопустимый формат сообщения контакту.")
     with db() as conn:
         conn.execute(
             "DELETE FROM pending_contact_messages WHERE status<>'pending' OR expires_at<=?",
@@ -431,14 +436,15 @@ def create_pending_contact_message(
             """
             INSERT INTO pending_contact_messages(
                 owner_user_id, contact_chat_id, contact_alias, message_text,
-                status, expires_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+                delivery_kind, status, expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
             """,
             (
                 int(owner_user_id),
                 int(contact_chat_id),
                 " ".join((contact_alias or "Контакт").split())[:80],
                 message_text[:3500],
+                delivery_kind,
                 expires_at,
                 timestamp,
                 timestamp,

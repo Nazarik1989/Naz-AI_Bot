@@ -119,6 +119,27 @@ def parse_saved_contact_message_request(
     return matches[0] if len(matches) == 1 else None
 
 
+def parse_saved_contact_voice_request(
+    contacts: Iterable[dict[str, Any]],
+    text: str,
+) -> tuple[dict[str, Any], str] | None:
+    """Resolve an explicit request to synthesize and send a voice message."""
+    value = (text or "").strip()
+    matches: list[tuple[dict[str, Any], str]] = []
+    for contact in contacts:
+        for form in sorted(alias_forms(str(contact.get("alias", ""))), key=len, reverse=True):
+            patterns = (
+                rf"(?is)^(?:отправь|запиши|передай|напиши)\s+{re.escape(form)}\s+(?:голосовое(?:\s+сообщение)?|голосом)\s*[:,.\-]?\s*(.+)$",
+                rf"(?is)^(?:отправь|запиши|передай)\s+(?:голосовое(?:\s+сообщение)?)\s+{re.escape(form)}\s*[:,.\-]?\s*(.+)$",
+            )
+            command = next((match for pattern in patterns if (match := re.match(pattern, value))), None)
+            if not command:
+                continue
+            matches.append((contact, clean_contact_message(command.group(1))))
+            break
+    return matches[0] if len(matches) == 1 else None
+
+
 def clean_purpose(purpose: str) -> str:
     value = " ".join((purpose or "").split()).strip()
     if len(value) < 12:

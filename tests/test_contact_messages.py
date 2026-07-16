@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +64,22 @@ class ContactMessageTests(unittest.TestCase):
         self.assertIsNotNone(draft)
         return update, draft
 
+    def prepare_voice_draft(self) -> tuple[SimpleNamespace, dict]:
+        update = fake_message_update("Отправь Диману голосовое: Привет, созвонимся вечером?")
+        with patch.object(main, "is_admin", return_value=True):
+            handled = asyncio.run(
+                main.prepare_contact_message_request(update, SimpleNamespace(), update.message.text)
+            )
+        self.assertTrue(handled)
+        preview = update.message.reply_text.await_args.args[0]
+        self.assertIn("Формат: голосовое", preview)
+        markup = update.message.reply_text.await_args.kwargs["reply_markup"]
+        message_id = int(markup.inline_keyboard[0][0].callback_data.rsplit(":", 1)[1])
+        draft = memory.get_pending_contact_message(message_id, 77)
+        self.assertIsNotNone(draft)
+        self.assertEqual(draft["delivery_kind"], "voice")
+        return update, draft
+
     def test_preview_creates_pending_draft_without_sending(self):
         _, draft = self.prepare_draft()
         self.assertEqual(draft["contact_chat_id"], 88)
@@ -92,6 +109,34 @@ class ContactMessageTests(unittest.TestCase):
         )
         self.assertIsNone(memory.get_pending_contact_message(draft["id"], 77))
         update.callback_query.edit_message_text.assert_awaited_once()
+
+    def test_owner_confirmation_synthesizes_and_sends_voice_once(self):
+        _, draft = self.prepare_voice_draft()
+        update = fake_callback_update(f"contact_send:{draft['id']}")
+        bot = SimpleNamespace(send_voice=AsyncMock())
+        with patch.object(main, "is_admin", return_value=True), patch.object(
+            main, "synthesize_voice_bytes", new=AsyncMock(return_value=b"OggSvoice")
+        ) as synthesize:
+            asyncio.run(main.contact_message_callback(update, SimpleNamespace(bot=bot)))
+        synthesize.assert_awaited_once_with("Привет, созвонимся вечером?")
+        bot.send_voice.assert_awaited_once()
+        kwargs = bot.send_voice.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], 88)
+        self.assertEqual(kwargs["caption"], "AI-голос Naz по поручению Назара")
+        self.assertEqual(kwargs["voice"].read(), b"OggSvoice")
+        self.assertIsNone(memory.get_pending_contact_message(draft["id"], 77))
+
+    def test_voice_synthesis_failure_keeps_draft_for_retry(self):
+        _, draft = self.prepare_voice_draft()
+        update = fake_callback_update(f"contact_send:{draft['id']}")
+        bot = SimpleNamespace(send_voice=AsyncMock())
+        with patch.object(main, "is_admin", return_value=True), patch.object(
+            main, "synthesize_voice_bytes", new=AsyncMock(side_effect=RuntimeError("tts down"))
+        ):
+            asyncio.run(main.contact_message_callback(update, SimpleNamespace(bot=bot)))
+        bot.send_voice.assert_not_awaited()
+        self.assertIsNotNone(memory.get_pending_contact_message(draft["id"], 77))
+        self.assertIn("Черновик сохранён", update.callback_query.edit_message_text.await_args.args[0])
 
     def test_cancel_does_not_send(self):
         _, draft = self.prepare_draft()
@@ -126,6 +171,39 @@ class ContactMessageTests(unittest.TestCase):
             callbacks,
             [f"contact_send:{draft['id']}", f"contact_cancel:{draft['id']}"],
         )
+
+
+class ContactMessageMigrationTests(unittest.TestCase):
+    def test_existing_text_drafts_gain_text_delivery_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "legacy-contact-messages.sqlite3")
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """CREATE TABLE pending_contact_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        owner_user_id INTEGER NOT NULL,
+                        contact_chat_id INTEGER NOT NULL,
+                        contact_alias TEXT NOT NULL,
+                        message_text TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        expires_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            with patch.object(memory, "DB_PATH", db_path):
+                memory.init_db()
+                with memory.db() as conn:
+                    columns = {row["name"] for row in conn.execute("PRAGMA table_info(pending_contact_messages)")}
+                    default = conn.execute(
+                        "SELECT dflt_value FROM pragma_table_info('pending_contact_messages') WHERE name='delivery_kind'"
+                    ).fetchone()["dflt_value"]
+            self.assertIn("delivery_kind", columns)
+            self.assertEqual(default, "'text'")
 
 
 if __name__ == "__main__":

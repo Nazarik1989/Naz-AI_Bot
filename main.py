@@ -2432,7 +2432,8 @@ async def contacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(
         "Сохранённые контакты:\n"
         f"{aliases}\n\n"
-        "Подготовить сообщение: Напиши Диману: Привет, созвонимся вечером?"
+        "Текст: Напиши Диману: Привет, созвонимся вечером?\n"
+        "Голосовое: Отправь Диману голосовое: Привет, созвонимся вечером?"
     )
 
 
@@ -2445,11 +2446,17 @@ async def prepare_contact_message_request(
     if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
         return False
     contacts = memory.list_saved_contacts(update.effective_user.id)
-    request = delegated_messaging.parse_contact_message_request(text)
+    voice_request = delegated_messaging.parse_saved_contact_voice_request(contacts, text)
+    request = None if voice_request else delegated_messaging.parse_contact_message_request(text)
     contact = None
     message_text = ""
     spoken_alias = ""
-    if request:
+    delivery_kind = "text"
+    if voice_request:
+        contact, message_text = voice_request
+        spoken_alias = str(contact.get("alias", ""))
+        delivery_kind = "voice"
+    elif request:
         spoken_alias, message_text = request
         contact = delegated_messaging.resolve_saved_contact(contacts, spoken_alias)
     else:
@@ -2469,6 +2476,7 @@ async def prepare_contact_message_request(
         int(contact["chat_id"]),
         str(contact["alias"]),
         message_text,
+        delivery_kind=delivery_kind,
     )
     keyboard = InlineKeyboardMarkup(
         [[
@@ -2476,9 +2484,11 @@ async def prepare_contact_message_request(
             InlineKeyboardButton("Отмена", callback_data=f"contact_cancel:{draft['id']}"),
         ]]
     )
+    format_label = "голосовое (AI-голос Naz)" if delivery_kind == "voice" else "текст"
     await update.message.reply_text(
         "Проверь перед отправкой. Черновик действует 15 минут.\n\n"
         f"Контакт: {contact['alias']}\n\n"
+        f"Формат: {format_label}\n\n"
         "Сообщение от Назара:\n"
         f"{message_text}",
         reply_markup=keyboard,
@@ -2506,14 +2516,25 @@ async def contact_message_callback(update: Update, context: ContextTypes.DEFAULT
         memory.delete_pending_contact_message(int(draft["id"]), update.effective_user.id)
         await query.edit_message_text(f"Отменено. Сообщение для {draft['contact_alias']} не отправлено.")
         return
+    delivery_kind = str(draft.get("delivery_kind") or "text")
     delivered_text = f"Сообщение от Назара:\n\n{draft['message_text']}"
     try:
-        await context.bot.send_message(
-            chat_id=int(draft["contact_chat_id"]),
-            text=delivered_text,
-            disable_web_page_preview=True,
-        )
-    except TelegramError as exc:
+        if delivery_kind == "voice":
+            audio = await synthesize_voice_bytes(str(draft["message_text"]))
+            payload = BytesIO(audio)
+            payload.name = "naz-contact-message.ogg"
+            await context.bot.send_voice(
+                chat_id=int(draft["contact_chat_id"]),
+                voice=payload,
+                caption="AI-голос Naz по поручению Назара",
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=int(draft["contact_chat_id"]),
+                text=delivered_text,
+                disable_web_page_preview=True,
+            )
+    except (RuntimeError, TelegramError) as exc:
         logger.warning(
             "Contact message send failed | draft_id=%s | error=%s",
             draft["id"],
@@ -2531,8 +2552,9 @@ async def contact_message_callback(update: Update, context: ContextTypes.DEFAULT
         )
         return
     memory.delete_pending_contact_message(int(draft["id"]), update.effective_user.id)
+    sent_format = "голосовое" if delivery_kind == "voice" else "сообщение"
     await query.edit_message_text(
-        f"Отправлено контакту {draft['contact_alias']}.\n\n{delivered_text}"
+        f"Отправлено {sent_format} контакту {draft['contact_alias']}.\n\n{delivered_text}"
     )
 
 
@@ -5243,6 +5265,7 @@ def help_commands_text() -> str:
         "/thought_to_void текст — передать приватную мысль VOID\n"
         "/contacts — сохранённые контакты\n"
         "Напиши Диману: текст — подготовить разовое сообщение с подтверждением\n"
+        "Отправь Диману голосовое: текст — подготовить AI-голос с подтверждением\n"
         "Напиши Диману, чтобы… — начать разговор с сохранённым контактом\n"
         "/contact_candidates — кто раньше писал боту, но ещё не записан\n"
         "/contact_add ID Имя — записать прежнего собеседника\n"

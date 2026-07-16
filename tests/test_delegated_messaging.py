@@ -59,6 +59,25 @@ class DelegatedMessagingTests(unittest.TestCase):
             dm.parse_saved_contact_message_request(contacts, "Напиши сыну, чтобы позвонил вечером")
         )
 
+    def test_voice_delivery_request_is_explicit(self):
+        contacts = [{"alias": "Сын", "chat_id": 42}]
+        contact, message = dm.parse_saved_contact_voice_request(
+            contacts,
+            "Отправь сыну голосовое: привет, созвонимся вечером",
+        )
+        self.assertEqual(contact["chat_id"], 42)
+        self.assertEqual(message, "привет, созвонимся вечером")
+        contact, message = dm.parse_saved_contact_voice_request(
+            contacts,
+            "Запиши голосовое сыну тест связи",
+        )
+        self.assertEqual(contact["chat_id"], 42)
+        self.assertEqual(message, "тест связи")
+
+    def test_plain_message_is_not_misclassified_as_voice(self):
+        contacts = [{"alias": "Сын", "chat_id": 42}]
+        self.assertIsNone(dm.parse_saved_contact_voice_request(contacts, "Напиши сыну сообщение тест связи"))
+
 
 if __name__ == "__main__":
     unittest.main()
