@@ -93,6 +93,32 @@ def clean_contact_message(text: str) -> str:
     return value
 
 
+def parse_saved_contact_message_request(
+    contacts: Iterable[dict[str, Any]],
+    text: str,
+) -> tuple[dict[str, Any], str] | None:
+    """Resolve a natural spoken command against known aliases without guessing identity."""
+    match = re.match(r"(?is)^(?:напиши|отправь|передай)\s+(.+)$", (text or "").strip())
+    if not match:
+        return None
+    tail = match.group(1).strip()
+    matches: list[tuple[dict[str, Any], str]] = []
+    for contact in contacts:
+        for form in sorted(alias_forms(str(contact.get("alias", ""))), key=len, reverse=True):
+            command = re.match(
+                rf"(?is)^{re.escape(form)}(?:\s*[:,.\-]\s*|\s+(?:сообщение|текст)\s*[:,.\-]?\s*|\s+)(.+)$",
+                tail,
+            )
+            if not command:
+                continue
+            message = clean_contact_message(command.group(1))
+            if normalize_text(message).startswith("чтобы "):
+                continue
+            matches.append((contact, message))
+            break
+    return matches[0] if len(matches) == 1 else None
+
+
 def clean_purpose(purpose: str) -> str:
     value = " ".join((purpose or "").split()).strip()
     if len(value) < 12:

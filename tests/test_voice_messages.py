@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import main
 
@@ -158,6 +158,31 @@ class VoiceHandlerTests(unittest.TestCase):
         self.assertEqual(kwargs["caption"], "AI-голос Naz")
         payload = kwargs["voice"]
         self.assertEqual(payload.read(), b"opus")
+
+    def test_contact_command_stops_at_confirmation_preview(self):
+        update = fake_voice_update()
+        with patch.object(main, "VOICE_MESSAGES_ENABLED", True), patch.object(
+            main, "VOICE_MESSAGES_ADMIN_ONLY", True
+        ), patch.object(main, "OPENAI_VOICE_API_KEY", "official-key"), patch.object(
+            main, "is_admin", return_value=True
+        ), patch.object(
+            main, "download_telegram_audio", new=AsyncMock(return_value=(b"voice", "voice.ogg"))
+        ), patch.object(
+            main,
+            "transcribe_voice_bytes",
+            new=AsyncMock(return_value="Напиши сыну сообщение тест связи"),
+        ), patch.object(
+            main, "prepare_contact_message_request", new=AsyncMock(return_value=True)
+        ) as preview, patch.object(
+            main, "generate_answer", new=AsyncMock()
+        ) as generate, patch.object(
+            main, "synthesize_voice_bytes", new=AsyncMock()
+        ) as synthesize:
+            asyncio.run(main.handle_voice_message(update, SimpleNamespace()))
+        preview.assert_awaited_once_with(update, ANY, "Напиши сыну сообщение тест связи")
+        generate.assert_not_awaited()
+        synthesize.assert_not_awaited()
+        update.message.reply_voice.assert_not_awaited()
 
     def test_tts_failure_falls_back_to_plain_text(self):
         update = fake_voice_update()

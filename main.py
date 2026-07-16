@@ -2444,12 +2444,20 @@ async def prepare_contact_message_request(
     """Create an outbound preview; never send before an explicit callback confirmation."""
     if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
         return False
-    request = delegated_messaging.parse_contact_message_request(text)
-    if not request:
-        return False
-    spoken_alias, message_text = request
     contacts = memory.list_saved_contacts(update.effective_user.id)
-    contact = delegated_messaging.resolve_saved_contact(contacts, spoken_alias)
+    request = delegated_messaging.parse_contact_message_request(text)
+    contact = None
+    message_text = ""
+    spoken_alias = ""
+    if request:
+        spoken_alias, message_text = request
+        contact = delegated_messaging.resolve_saved_contact(contacts, spoken_alias)
+    else:
+        natural_request = delegated_messaging.parse_saved_contact_message_request(contacts, text)
+        if not natural_request:
+            return False
+        contact, message_text = natural_request
+        spoken_alias = str(contact.get("alias", ""))
     if not contact:
         aliases = ", ".join(str(item["alias"]) for item in contacts) or "пока пусто"
         await update.message.reply_text(
@@ -4116,6 +4124,8 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_chat.send_action(ChatAction.TYPING)
         data, filename = await download_telegram_audio(update.message)
         transcript = await transcribe_voice_bytes(data, filename)
+        if is_admin(update.effective_user.id) and await prepare_contact_message_request(update, context, transcript):
+            return
         answer = sanitize_dialog_text(await generate_answer(update.effective_user.id, transcript))
         await update.effective_chat.send_action(ChatAction.RECORD_VOICE)
         try:

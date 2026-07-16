@@ -68,6 +68,17 @@ class ContactMessageTests(unittest.TestCase):
         self.assertEqual(draft["contact_chat_id"], 88)
         self.assertEqual(draft["status"], "pending")
 
+    def test_natural_spoken_form_creates_same_safe_preview(self):
+        update = fake_message_update("Напиши Диману сообщение тест связи")
+        with patch.object(main, "is_admin", return_value=True):
+            handled = asyncio.run(
+                main.prepare_contact_message_request(update, SimpleNamespace(), update.message.text)
+            )
+        self.assertTrue(handled)
+        preview = update.message.reply_text.await_args.args[0]
+        self.assertIn("Контакт: Диман", preview)
+        self.assertIn("тест связи", preview)
+
     def test_owner_confirmation_sends_exact_message_once(self):
         _, draft = self.prepare_draft()
         update = fake_callback_update(f"contact_send:{draft['id']}")

@@ -44,6 +44,21 @@ class DelegatedMessagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "3500"):
             dm.parse_contact_message_request("Напиши Диману: " + "я" * 3501)
 
+    def test_spoken_message_resolves_known_dative_alias(self):
+        contacts = [{"alias": "Сын", "chat_id": 42}]
+        contact, message = dm.parse_saved_contact_message_request(
+            contacts,
+            "Напиши сыну сообщение тест связи, отвечать не обязательно",
+        )
+        self.assertEqual(contact["chat_id"], 42)
+        self.assertEqual(message, "тест связи, отвечать не обязательно")
+
+    def test_spoken_message_does_not_capture_delegation(self):
+        contacts = [{"alias": "Сын", "chat_id": 42}]
+        self.assertIsNone(
+            dm.parse_saved_contact_message_request(contacts, "Напиши сыну, чтобы позвонил вечером")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
