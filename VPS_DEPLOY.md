@@ -78,8 +78,10 @@ Production must set the following in the separate Naz environment file
 
 ```text
 NAZ_VK_ENABLED=true
+NAZ_VK_TIMEZONE=Europe/Moscow
 NAZ_VK_SCHEDULER=systemd
 NAZ_VK_QUEUE_DIR=/var/lib/void-vk-publisher/queue
+NAZ_VK_TRACK_STATE_FILE=/var/lib/naz-ai-bot/vk_track_rotation.json
 DB_PATH=/var/lib/naz-ai-bot/naz_ai_bot.sqlite3
 ```
 
@@ -95,12 +97,16 @@ sudo systemctl enable --now naz-vk-producer.timer
 systemctl list-timers naz-vk-producer.timer
 ```
 
-The timer has explicit Europe/Moscow slots at `11:20`, `16:40`, and `20:20`.
-systemd cannot expand `NAZ_VK_AUTO_TIMES` from an EnvironmentFile into
-`OnCalendar`; change the three `OnCalendar` lines in the timer, run
-`systemctl daemon-reload`, and restart the timer when production slots change.
-Keep `NAZ_VK_AUTO_TIMES` synchronized for documentation and optional local
-`NAZ_VK_SCHEDULER=telegram` mode.
+The timer has an explicit Europe/Moscow daily slot at `10:30` and a gaming slot
+at `16:30` on Tuesday, Thursday, and Sunday. systemd does not expand environment
+variables inside `OnCalendar`; keep `NAZ_VK_DAILY_TIME` and
+`NAZ_VK_GAMING_TIME` synchronized with the tracked timer when using the optional
+local `NAZ_VK_SCHEDULER=telegram` mode.
+
+Every job receives a query selected from the code-owned approved music catalog.
+The shared state file rotates the last eight selected queries across daily,
+gaming, manual, Telegram-scheduled, and systemd-produced jobs. If no eligible
+approved track remains, the producer fails closed and does not enqueue a post.
 
 The oneshot service runs only `python -B -m naz_vk_producer`. Its writable
 paths are limited to Naz data/cache and the shared `pending` inbox; publisher

@@ -18,6 +18,7 @@ class VkPublishQueueTests(unittest.TestCase):
             target_group_id="123",
             text="Безопасный текст Naz",
             source_ref="test:one",
+            track_query="Tycho — Awake",
             media=[queue.MediaInput("image-1.png", b"png")],
             created_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
         )
@@ -112,6 +113,16 @@ class VkPublishQueueTests(unittest.TestCase):
                     self.enqueue(Path(directory), source_ref=f"limit:{index}", **overrides)
                 pending = Path(directory) / "pending"
                 self.assertFalse(pending.exists() and list(pending.iterdir()))
+
+    def test_track_query_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(queue.QueueError, "track_query"):
+                self.enqueue(Path(directory), track_query="")
+
+    def test_track_query_must_come_from_approved_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(queue.QueueError, "approved"):
+                self.enqueue(Path(directory), track_query="Тема поста как музыка")
 
     @unittest.skipIf(os.name == "nt", "POSIX mode bits")
     def test_consumer_can_read_group_permissions(self):

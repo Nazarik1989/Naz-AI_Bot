@@ -30,7 +30,7 @@ class VkScheduleTests(unittest.TestCase):
                     main.setup_naz_vk_schedule(app)
                 self.assertEqual(queue.jobs, [])
 
-    def test_enabled_schedule_registers_configured_times(self):
+    def test_enabled_schedule_registers_daily_and_gaming_slots(self):
         queue = FakeJobQueue()
         app = SimpleNamespace(job_queue=queue)
         with patch.multiple(
@@ -38,15 +38,26 @@ class VkScheduleTests(unittest.TestCase):
             NAZ_VK_ENABLED=True,
             NAZ_VK_AUTO_ON=True,
             NAZ_VK_PUBLIC_ID="123",
-            NAZ_VK_AUTO_TIMES="01:02,23:59",
+            NAZ_VK_DAILY_TIME="10:30",
+            NAZ_VK_GAMING_TIME="16:30",
             NAZ_VK_SCHEDULER="telegram",
         ):
             main.setup_naz_vk_schedule(app)
-        self.assertEqual([job[1]["data"]["slot"] for job in queue.jobs], ["01:02", "23:59"])
+        self.assertEqual(
+            [job[1]["data"] for job in queue.jobs],
+            [
+                {"slot": "10:30", "rubric_kind": "daily"},
+                {"slot": "16:30", "rubric_kind": "gaming"},
+            ],
+        )
+        self.assertNotIn("days", queue.jobs[0][1])
+        self.assertEqual(queue.jobs[1][1]["days"], (2, 4, 0))
+        self.assertEqual(str(queue.jobs[0][1]["time"].tzinfo), "Europe/Moscow")
+        self.assertEqual(str(queue.jobs[1][1]["time"].tzinfo), "Europe/Moscow")
 
     def test_schedule_cooldown_uses_same_daily_source_ref(self):
         context = SimpleNamespace(
-            job=SimpleNamespace(data={"slot": "11:20"}),
+            job=SimpleNamespace(data={"slot": "10:30", "rubric_kind": "daily"}),
             bot=SimpleNamespace(),
         )
         create = AsyncMock(side_effect=[{"job_id": "one"}, main.vk_publish_queue.DuplicateJobError()])
@@ -60,7 +71,8 @@ class VkScheduleTests(unittest.TestCase):
         first = create.await_args_list[0].kwargs["source_ref"]
         second = create.await_args_list[1].kwargs["source_ref"]
         self.assertEqual(first, second)
-        self.assertTrue(first.endswith(":11:20"))
+        self.assertTrue(first.endswith(":daily:10:30"))
+        self.assertEqual(create.await_args_list[0].kwargs["rubric_kind"], "daily")
 
     def test_systemd_mode_disables_embedded_schedule(self):
         queue = FakeJobQueue()
