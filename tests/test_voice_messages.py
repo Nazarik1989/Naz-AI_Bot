@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import main
 
@@ -130,11 +130,105 @@ class VoiceHandlerTests(unittest.TestCase):
         with patch.object(main, "VOICE_MESSAGES_ENABLED", True), patch.object(
             main, "VOICE_MESSAGES_ADMIN_ONLY", True
         ), patch.object(main, "is_admin", return_value=False), patch.object(
+            main.memory, "get_active_delegation", return_value=None
+        ), patch.object(
             main, "download_telegram_audio", new=AsyncMock()
         ) as download:
             asyncio.run(main.handle_voice_message(update, SimpleNamespace()))
         download.assert_not_awaited()
-        self.assertIn("только владельцу", update.message.reply_text.await_args.args[0])
+        self.assertIn("сохранённым контактам", update.message.reply_text.await_args.args[0])
+
+    def test_active_delegation_contact_can_use_voice(self):
+        update = fake_voice_update()
+        active = {"id": 5, "status": "active"}
+        with patch.object(main, "VOICE_MESSAGES_ENABLED", True), patch.object(
+            main, "VOICE_MESSAGES_ADMIN_ONLY", True
+        ), patch.object(main, "OPENAI_VOICE_API_KEY", "official-key"), patch.object(
+            main, "is_admin", return_value=False
+        ), patch.object(
+            main.memory, "get_active_delegation", return_value=active
+        ), patch.object(
+            main, "download_telegram_audio", new=AsyncMock(return_value=(b"voice", "voice.ogg"))
+        ), patch.object(
+            main, "transcribe_voice_bytes", new=AsyncMock(return_value="Привет, Naz")
+        ), patch.object(
+            main, "handle_delegated_reply", new=AsyncMock(return_value=True)
+        ) as delegated, patch.object(
+            main, "generate_answer", new=AsyncMock()
+        ) as generate:
+            asyncio.run(main.handle_voice_message(update, SimpleNamespace()))
+        delegated.assert_awaited_once_with(
+            update,
+            ANY,
+            "Привет, Naz",
+            reply_as_voice=True,
+        )
+        generate.assert_not_awaited()
+
+    def test_saved_contact_can_have_ordinary_voice_conversation(self):
+        update = fake_voice_update()
+        saved_contact = {"chat_id": 77, "alias": "Друг", "display_name": "Друг"}
+        with patch.object(main, "VOICE_MESSAGES_ENABLED", True), patch.object(
+            main, "VOICE_MESSAGES_ADMIN_ONLY", True
+        ), patch.object(main, "VOICE_MESSAGES_CONTACTS_ENABLED", True), patch.object(
+            main, "OPENAI_VOICE_API_KEY", "official-key"
+        ), patch.object(main, "ADMIN_ID", 1), patch.object(
+            main, "is_admin", return_value=False
+        ), patch.object(
+            main.memory, "get_active_delegation", return_value=None
+        ), patch.object(
+            main.memory, "get_saved_contact", return_value=saved_contact
+        ) as get_contact, patch.object(
+            main, "download_telegram_audio", new=AsyncMock(return_value=(b"voice", "voice.ogg"))
+        ), patch.object(
+            main, "transcribe_voice_bytes", new=AsyncMock(return_value="Как дела?")
+        ), patch.object(
+            main, "generate_answer", new=AsyncMock(return_value="Хорошо, работаю.")
+        ) as generate, patch.object(
+            main, "synthesize_voice_bytes", new=AsyncMock(return_value=b"OggSreply")
+        ):
+            asyncio.run(main.handle_voice_message(update, SimpleNamespace()))
+        get_contact.assert_called_once_with(1, 77)
+        generate.assert_awaited_once_with(77, "Как дела?")
+        update.message.reply_voice.assert_awaited_once()
+
+    def test_saved_contact_voice_access_can_be_disabled(self):
+        update = fake_voice_update()
+        with patch.object(main, "VOICE_MESSAGES_ENABLED", True), patch.object(
+            main, "VOICE_MESSAGES_ADMIN_ONLY", True
+        ), patch.object(main, "VOICE_MESSAGES_CONTACTS_ENABLED", False), patch.object(
+            main, "is_admin", return_value=False
+        ), patch.object(
+            main.memory, "get_active_delegation", return_value=None
+        ), patch.object(
+            main.memory, "get_saved_contact"
+        ) as get_contact, patch.object(
+            main, "download_telegram_audio", new=AsyncMock()
+        ) as download:
+            asyncio.run(main.handle_voice_message(update, SimpleNamespace()))
+        get_contact.assert_not_called()
+        download.assert_not_awaited()
+
+    def test_delegated_voice_reply_uses_tts(self):
+        update = fake_voice_update()
+        with patch.object(
+            main, "synthesize_voice_bytes", new=AsyncMock(return_value=b"OggSreply")
+        ):
+            asyncio.run(main.send_delegated_contact_reply(update, "Ответ Naz", as_voice=True))
+        update.message.reply_voice.assert_awaited_once()
+        kwargs = update.message.reply_voice.await_args.kwargs
+        self.assertEqual(kwargs["caption"], "AI-голос Naz — помощник Назара")
+        self.assertEqual(kwargs["voice"].read(), b"OggSreply")
+        update.message.reply_text.assert_not_awaited()
+
+    def test_delegated_voice_reply_falls_back_to_text(self):
+        update = fake_voice_update()
+        with patch.object(
+            main, "synthesize_voice_bytes", new=AsyncMock(side_effect=RuntimeError("tts down"))
+        ):
+            asyncio.run(main.send_delegated_contact_reply(update, "Ответ Naz", as_voice=True))
+        update.message.reply_voice.assert_not_awaited()
+        update.message.reply_text.assert_awaited_once_with("Ответ Naz")
 
     def test_successful_voice_turn_reuses_dialogue_and_returns_voice(self):
         update = fake_voice_update()
@@ -158,6 +252,31 @@ class VoiceHandlerTests(unittest.TestCase):
         self.assertEqual(kwargs["caption"], "AI-голос Naz")
         payload = kwargs["voice"]
         self.assertEqual(payload.read(), b"opus")
+
+    def test_contact_command_stops_at_confirmation_preview(self):
+        update = fake_voice_update()
+        with patch.object(main, "VOICE_MESSAGES_ENABLED", True), patch.object(
+            main, "VOICE_MESSAGES_ADMIN_ONLY", True
+        ), patch.object(main, "OPENAI_VOICE_API_KEY", "official-key"), patch.object(
+            main, "is_admin", return_value=True
+        ), patch.object(
+            main, "download_telegram_audio", new=AsyncMock(return_value=(b"voice", "voice.ogg"))
+        ), patch.object(
+            main,
+            "transcribe_voice_bytes",
+            new=AsyncMock(return_value="Напиши сыну сообщение тест связи"),
+        ), patch.object(
+            main, "prepare_contact_message_request", new=AsyncMock(return_value=True)
+        ) as preview, patch.object(
+            main, "generate_answer", new=AsyncMock()
+        ) as generate, patch.object(
+            main, "synthesize_voice_bytes", new=AsyncMock()
+        ) as synthesize:
+            asyncio.run(main.handle_voice_message(update, SimpleNamespace()))
+        preview.assert_awaited_once_with(update, ANY, "Напиши сыну сообщение тест связи")
+        generate.assert_not_awaited()
+        synthesize.assert_not_awaited()
+        update.message.reply_voice.assert_not_awaited()
 
     def test_tts_failure_falls_back_to_plain_text(self):
         update = fake_voice_update()

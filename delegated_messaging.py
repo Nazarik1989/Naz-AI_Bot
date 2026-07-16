@@ -73,6 +73,73 @@ def parse_delegation_request(text: str) -> tuple[str, str] | None:
     return None
 
 
+def parse_contact_message_request(text: str) -> tuple[str, str] | None:
+    """Parse an explicit one-off message without confusing it with a delegation."""
+    value = (text or "").strip()
+    match = re.match(r"(?is)^(?:напиши|отправь|передай)\s+([^:\n]{1,80})\s*:\s*(.*)$", value)
+    if not match:
+        return None
+    alias = " ".join(match.group(1).split()).strip()
+    message = clean_contact_message(match.group(2))
+    return alias, message
+
+
+def clean_contact_message(text: str) -> str:
+    value = (text or "").replace("\x00", "").strip()
+    if not value:
+        raise ValueError("Сообщение контакту пустое.")
+    if len(value) > 3500:
+        raise ValueError("Сообщение контакту слишком длинное: максимум 3500 символов.")
+    return value
+
+
+def parse_saved_contact_message_request(
+    contacts: Iterable[dict[str, Any]],
+    text: str,
+) -> tuple[dict[str, Any], str] | None:
+    """Resolve a natural spoken command against known aliases without guessing identity."""
+    match = re.match(r"(?is)^(?:напиши|отправь|передай)\s+(.+)$", (text or "").strip())
+    if not match:
+        return None
+    tail = match.group(1).strip()
+    matches: list[tuple[dict[str, Any], str]] = []
+    for contact in contacts:
+        for form in sorted(alias_forms(str(contact.get("alias", ""))), key=len, reverse=True):
+            command = re.match(
+                rf"(?is)^{re.escape(form)}(?:\s*[:,.\-]\s*|\s+(?:сообщение|текст)\s*[:,.\-]?\s*|\s+)(.+)$",
+                tail,
+            )
+            if not command:
+                continue
+            message = clean_contact_message(command.group(1))
+            if normalize_text(message).startswith("чтобы "):
+                continue
+            matches.append((contact, message))
+            break
+    return matches[0] if len(matches) == 1 else None
+
+
+def parse_saved_contact_voice_request(
+    contacts: Iterable[dict[str, Any]],
+    text: str,
+) -> tuple[dict[str, Any], str] | None:
+    """Resolve an explicit request to synthesize and send a voice message."""
+    value = (text or "").strip()
+    matches: list[tuple[dict[str, Any], str]] = []
+    for contact in contacts:
+        for form in sorted(alias_forms(str(contact.get("alias", ""))), key=len, reverse=True):
+            patterns = (
+                rf"(?is)^(?:отправь|запиши|передай|напиши)\s+{re.escape(form)}\s+(?:голосовое(?:\s+сообщение)?|голосом)\s*[:,.\-]?\s*(.+)$",
+                rf"(?is)^(?:отправь|запиши|передай)\s+(?:голосовое(?:\s+сообщение)?)\s+{re.escape(form)}\s*[:,.\-]?\s*(.+)$",
+            )
+            command = next((match for pattern in patterns if (match := re.match(pattern, value))), None)
+            if not command:
+                continue
+            matches.append((contact, clean_contact_message(command.group(1))))
+            break
+    return matches[0] if len(matches) == 1 else None
+
+
 def clean_purpose(purpose: str) -> str:
     value = " ".join((purpose or "").split()).strip()
     if len(value) < 12:

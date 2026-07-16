@@ -31,6 +31,53 @@ class DelegatedMessagingTests(unittest.TestCase):
         self.assertIsNone(dm.resolve_saved_contact(contacts, "Диману"))
         self.assertIsNone(dm.resolve_saved_contact(contacts, "Саше"))
 
+    def test_one_off_contact_message_requires_colon(self):
+        self.assertEqual(
+            dm.parse_contact_message_request("Напиши Диману: Привет, созвонимся вечером?"),
+            ("Диману", "Привет, созвонимся вечером?"),
+        )
+        self.assertIsNone(dm.parse_contact_message_request("Напиши Диману, чтобы позвонил вечером"))
+
+    def test_empty_or_oversized_contact_message_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "пустое"):
+            dm.parse_contact_message_request("Напиши Диману:   ")
+        with self.assertRaisesRegex(ValueError, "3500"):
+            dm.parse_contact_message_request("Напиши Диману: " + "я" * 3501)
+
+    def test_spoken_message_resolves_known_dative_alias(self):
+        contacts = [{"alias": "Сын", "chat_id": 42}]
+        contact, message = dm.parse_saved_contact_message_request(
+            contacts,
+            "Напиши сыну сообщение тест связи, отвечать не обязательно",
+        )
+        self.assertEqual(contact["chat_id"], 42)
+        self.assertEqual(message, "тест связи, отвечать не обязательно")
+
+    def test_spoken_message_does_not_capture_delegation(self):
+        contacts = [{"alias": "Сын", "chat_id": 42}]
+        self.assertIsNone(
+            dm.parse_saved_contact_message_request(contacts, "Напиши сыну, чтобы позвонил вечером")
+        )
+
+    def test_voice_delivery_request_is_explicit(self):
+        contacts = [{"alias": "Сын", "chat_id": 42}]
+        contact, message = dm.parse_saved_contact_voice_request(
+            contacts,
+            "Отправь сыну голосовое: привет, созвонимся вечером",
+        )
+        self.assertEqual(contact["chat_id"], 42)
+        self.assertEqual(message, "привет, созвонимся вечером")
+        contact, message = dm.parse_saved_contact_voice_request(
+            contacts,
+            "Запиши голосовое сыну тест связи",
+        )
+        self.assertEqual(contact["chat_id"], 42)
+        self.assertEqual(message, "тест связи")
+
+    def test_plain_message_is_not_misclassified_as_voice(self):
+        contacts = [{"alias": "Сын", "chat_id": 42}]
+        self.assertIsNone(dm.parse_saved_contact_voice_request(contacts, "Напиши сыну сообщение тест связи"))
+
 
 if __name__ == "__main__":
     unittest.main()

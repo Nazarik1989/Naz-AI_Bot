@@ -11,7 +11,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import character_state as naz_character
@@ -218,6 +218,23 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS pending_contact_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                contact_chat_id INTEGER NOT NULL,
+                contact_alias TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                delivery_kind TEXT NOT NULL DEFAULT 'text',
+                status TEXT NOT NULL DEFAULT 'pending',
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(conn, "pending_contact_messages", "delivery_kind", "TEXT NOT NULL DEFAULT 'text'")
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS reachable_peers (
                 chat_id INTEGER PRIMARY KEY,
                 display_name TEXT NOT NULL,
@@ -276,6 +293,9 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signatures_user_created ON content_signatures(user_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_delegation_contact ON delegation_invites(contact_chat_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_delegated_messages ON delegated_messages(delegation_id, id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_contact_owner ON pending_contact_messages(owner_user_id, status)"
+        )
 
 
 def create_delegation_invite(
@@ -390,6 +410,85 @@ def list_saved_contacts(owner_user_id: int) -> List[Dict[str, Any]]:
             (owner_user_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_saved_contact(owner_user_id: int, chat_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """SELECT chat_id, alias, display_name FROM saved_contacts
+               WHERE owner_user_id=? AND chat_id=? AND status='saved'""",
+            (int(owner_user_id), int(chat_id)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_pending_contact_message(
+    owner_user_id: int,
+    contact_chat_id: int,
+    contact_alias: str,
+    message_text: str,
+    delivery_kind: str = "text",
+    ttl_minutes: int = 15,
+) -> Dict[str, Any]:
+    """Store a short-lived outbound draft that still requires owner confirmation."""
+    init_db()
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(minutes=max(1, min(60, int(ttl_minutes))))).isoformat(timespec="seconds")
+    timestamp = now.isoformat(timespec="seconds")
+    if delivery_kind not in {"text", "voice"}:
+        raise ValueError("Недопустимый формат сообщения контакту.")
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM pending_contact_messages WHERE status<>'pending' OR expires_at<=?",
+            (timestamp,),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO pending_contact_messages(
+                owner_user_id, contact_chat_id, contact_alias, message_text,
+                delivery_kind, status, expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                int(owner_user_id),
+                int(contact_chat_id),
+                " ".join((contact_alias or "Контакт").split())[:80],
+                message_text[:3500],
+                delivery_kind,
+                expires_at,
+                timestamp,
+                timestamp,
+            ),
+        )
+        row = conn.execute("SELECT * FROM pending_contact_messages WHERE id=?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def get_pending_contact_message(message_id: int, owner_user_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            "UPDATE pending_contact_messages SET status='expired', updated_at=? WHERE status='pending' AND expires_at<=?",
+            (now, now),
+        )
+        row = conn.execute(
+            """SELECT * FROM pending_contact_messages
+               WHERE id=? AND owner_user_id=? AND status='pending' AND expires_at>?""",
+            (int(message_id), int(owner_user_id), now),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_pending_contact_message(message_id: int, owner_user_id: int) -> bool:
+    """Erase a confirmed or cancelled outbound draft, including its message text."""
+    with db() as conn:
+        cur = conn.execute(
+            "DELETE FROM pending_contact_messages WHERE id=? AND owner_user_id=?",
+            (int(message_id), int(owner_user_id)),
+        )
+    return cur.rowcount == 1
 
 
 def save_named_contact(owner_user_id: int, chat_id: int, display_name: str, alias: str) -> Dict[str, Any]:
