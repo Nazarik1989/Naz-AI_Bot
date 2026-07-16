@@ -34,7 +34,7 @@ Autoposting is configured in `.env`:
 ```text
 AUTOPOST_ENABLED=true
 BOT_TIMEZONE=Europe/Moscow
-AUTOPOST_TIMES=10:00,20:00
+AUTOPOST_TIMES=10:00,14:00,18:00,22:00
 AUTOPOST_TASKS=post,viral
 ```
 

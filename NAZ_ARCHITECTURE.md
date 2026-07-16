@@ -24,10 +24,10 @@ NAZ_TELEGRAM_AUTO_TASKS
 The default slots are:
 
 ```text
-09:30 - Утренний дожим
-13:30 - AI без магии
-17:30 - Баг, который стал системой
-21:30 - Naz после смены
+10:00 - Утренний дожим
+14:00 - AI без магии
+18:00 - Баг, который стал системой
+22:00 - Naz после смены
 ```
 
 Each slot chooses a Naz rubric, topic, task, and voice profile inside `main.py`.
