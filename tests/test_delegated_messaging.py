@@ -31,6 +31,19 @@ class DelegatedMessagingTests(unittest.TestCase):
         self.assertIsNone(dm.resolve_saved_contact(contacts, "Диману"))
         self.assertIsNone(dm.resolve_saved_contact(contacts, "Саше"))
 
+    def test_one_off_contact_message_requires_colon(self):
+        self.assertEqual(
+            dm.parse_contact_message_request("Напиши Диману: Привет, созвонимся вечером?"),
+            ("Диману", "Привет, созвонимся вечером?"),
+        )
+        self.assertIsNone(dm.parse_contact_message_request("Напиши Диману, чтобы позвонил вечером"))
+
+    def test_empty_or_oversized_contact_message_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "пустое"):
+            dm.parse_contact_message_request("Напиши Диману:   ")
+        with self.assertRaisesRegex(ValueError, "3500"):
+            dm.parse_contact_message_request("Напиши Диману: " + "я" * 3501)
+
 
 if __name__ == "__main__":
     unittest.main()

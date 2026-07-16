@@ -73,6 +73,26 @@ def parse_delegation_request(text: str) -> tuple[str, str] | None:
     return None
 
 
+def parse_contact_message_request(text: str) -> tuple[str, str] | None:
+    """Parse an explicit one-off message without confusing it with a delegation."""
+    value = (text or "").strip()
+    match = re.match(r"(?is)^(?:напиши|отправь|передай)\s+([^:\n]{1,80})\s*:\s*(.*)$", value)
+    if not match:
+        return None
+    alias = " ".join(match.group(1).split()).strip()
+    message = clean_contact_message(match.group(2))
+    return alias, message
+
+
+def clean_contact_message(text: str) -> str:
+    value = (text or "").replace("\x00", "").strip()
+    if not value:
+        raise ValueError("Сообщение контакту пустое.")
+    if len(value) > 3500:
+        raise ValueError("Сообщение контакту слишком длинное: максимум 3500 символов.")
+    return value
+
+
 def clean_purpose(purpose: str) -> str:
     value = " ".join((purpose or "").split()).strip()
     if len(value) < 12:

@@ -37,12 +37,20 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 load_dotenv()
 
 from openai import OpenAI
-from telegram import InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -2413,6 +2421,113 @@ async def contact_candidates_command(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_text("\n".join(lines))
 
 
+async def contacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return
+    contacts = memory.list_saved_contacts(update.effective_user.id)
+    if not contacts:
+        await update.message.reply_text("Сохранённых контактов пока нет.")
+        return
+    aliases = "\n".join(f"• {item['alias']}" for item in contacts)
+    await update.message.reply_text(
+        "Сохранённые контакты:\n"
+        f"{aliases}\n\n"
+        "Подготовить сообщение: Напиши Диману: Привет, созвонимся вечером?"
+    )
+
+
+async def prepare_contact_message_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> bool:
+    """Create an outbound preview; never send before an explicit callback confirmation."""
+    if not update.effective_user or not update.message or not is_admin(update.effective_user.id):
+        return False
+    request = delegated_messaging.parse_contact_message_request(text)
+    if not request:
+        return False
+    spoken_alias, message_text = request
+    contacts = memory.list_saved_contacts(update.effective_user.id)
+    contact = delegated_messaging.resolve_saved_contact(contacts, spoken_alias)
+    if not contact:
+        aliases = ", ".join(str(item["alias"]) for item in contacts) or "пока пусто"
+        await update.message.reply_text(
+            f"Не нашёл один точный контакт «{spoken_alias}». Сохранены: {aliases}."
+        )
+        return True
+    draft = memory.create_pending_contact_message(
+        update.effective_user.id,
+        int(contact["chat_id"]),
+        str(contact["alias"]),
+        message_text,
+    )
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Отправить", callback_data=f"contact_send:{draft['id']}"),
+            InlineKeyboardButton("Отмена", callback_data=f"contact_cancel:{draft['id']}"),
+        ]]
+    )
+    await update.message.reply_text(
+        "Проверь перед отправкой. Черновик действует 15 минут.\n\n"
+        f"Контакт: {contact['alias']}\n\n"
+        "Сообщение от Назара:\n"
+        f"{message_text}",
+        reply_markup=keyboard,
+    )
+    return True
+
+
+async def contact_message_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        await query.edit_message_text("Это подтверждение доступно только Назару.")
+        return
+    match = re.fullmatch(r"contact_(send|cancel):(\d+)", str(query.data or ""))
+    if not match:
+        return
+    action, message_id_text = match.groups()
+    draft = memory.get_pending_contact_message(int(message_id_text), update.effective_user.id)
+    if not draft:
+        await query.edit_message_text("Черновик уже обработан или истёк. Создай новый.")
+        return
+    if action == "cancel":
+        memory.delete_pending_contact_message(int(draft["id"]), update.effective_user.id)
+        await query.edit_message_text(f"Отменено. Сообщение для {draft['contact_alias']} не отправлено.")
+        return
+    delivered_text = f"Сообщение от Назара:\n\n{draft['message_text']}"
+    try:
+        await context.bot.send_message(
+            chat_id=int(draft["contact_chat_id"]),
+            text=delivered_text,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        logger.warning(
+            "Contact message send failed | draft_id=%s | error=%s",
+            draft["id"],
+            type(exc).__name__,
+        )
+        await query.edit_message_text(
+            f"Не отправил сообщение для {draft['contact_alias']}. Возможно, контакт заблокировал бота. "
+            "Черновик сохранён — можно попробовать кнопку ещё раз.",
+            reply_markup=InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("🔁 Повторить", callback_data=f"contact_send:{draft['id']}"),
+                    InlineKeyboardButton("Отмена", callback_data=f"contact_cancel:{draft['id']}"),
+                ]]
+            ),
+        )
+        return
+    memory.delete_pending_contact_message(int(draft["id"]), update.effective_user.id)
+    await query.edit_message_text(
+        f"Отправлено контакту {draft['contact_alias']}.\n\n{delivered_text}"
+    )
+
+
 async def handle_delegated_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     if not update.effective_user or not update.message:
         return False
@@ -4133,6 +4248,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if is_admin(user_id):
         try:
+            if await prepare_contact_message_request(update, context, text):
+                return
             request = delegated_messaging.parse_delegation_request(text)
         except ValueError as exc:
             await update.message.reply_text(str(exc))
@@ -5114,6 +5231,8 @@ def help_commands_text() -> str:
         "/relationship — состояние отношений Naz ↔ VOID\n"
         "/relationship_event event — применить событие отношений (admin)\n"
         "/thought_to_void текст — передать приватную мысль VOID\n"
+        "/contacts — сохранённые контакты\n"
+        "Напиши Диману: текст — подготовить разовое сообщение с подтверждением\n"
         "Напиши Диману, чтобы… — начать разговор с сохранённым контактом\n"
         "/contact_candidates — кто раньше писал боту, но ещё не записан\n"
         "/contact_add ID Имя — записать прежнего собеседника\n"
@@ -5264,8 +5383,12 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("delegate", delegate_command))
     application.add_handler(CommandHandler("delegate_stop", delegate_stop_command))
     application.add_handler(CommandHandler("delegate_reply", delegate_reply_command))
+    application.add_handler(CommandHandler("contacts", contacts_command))
     application.add_handler(CommandHandler("contact_candidates", contact_candidates_command))
     application.add_handler(CommandHandler("contact_add", contact_add_command))
+    application.add_handler(
+        CallbackQueryHandler(contact_message_callback, pattern=r"^contact_(?:send|cancel):\d+$")
+    )
 
     # A shared contact follows /delegate and is used only for this one conversation.
     application.add_handler(MessageHandler(filters.CONTACT, delegation_contact))
