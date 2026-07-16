@@ -98,6 +98,65 @@ class RegisteredContactAccessTests(unittest.TestCase):
         self.assertNotIn("/publish", text)
         self.assertNotIn("/contacts", text)
 
+    def test_contact_capabilities_show_every_user_feature(self):
+        text = main.help_capabilities_for(77)
+        expected = (
+            "текстовый и голосовой диалог с сохранением контекста",
+            "голосовые ответы AI-голосом Naz",
+            "генерация изображений и редактирование",
+            "посты, сценарии, идеи, заголовки и контент-планы",
+            "игровые идеи и разборы",
+            "только к пользовательским функциям",
+        )
+        for phrase in expected:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_contact_capabilities_do_not_expose_admin_features(self):
+        text = main.help_capabilities_for(77)
+        admin_only = (
+            "управление контактами",
+            "сообщений контактам",
+            "предпросмотр",
+            "делегированные разговоры",
+            "автопостинг",
+            "для VK",
+            "content-agent",
+            "статистика",
+            "Naz ↔ VOID",
+        )
+        for phrase in admin_only:
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, text)
+
+    def test_admin_capabilities_include_user_and_admin_features(self):
+        text = main.help_capabilities_for(1)
+        expected = (
+            "текстовый и голосовой диалог с сохранением контекста",
+            "список и управление контактами",
+            "текстовых и голосовых сообщений контактам",
+            "предпросмотр и подтверждение перед отправкой",
+            "делегированные разговоры",
+            "публикация и автопостинг в Telegram",
+            "постов Naz для VK с музыкой",
+            "источники и content-agent",
+            "память, статистика, характер Naz",
+            "обмен материалами Naz ↔ VOID",
+        )
+        for phrase in expected:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_help_texts_do_not_show_obsolete_versions(self):
+        texts = (
+            main.help_capabilities_text(),
+            main.contact_help_capabilities_text(),
+            main.help_about_text(),
+        )
+        for text in texts:
+            self.assertNotIn("v2.1", text)
+            self.assertNotIn("Naz_AI_Bot v2", text)
+
     def test_unknown_user_is_stopped_before_handlers(self):
         update = fake_update(user_id=99, text="Нарисуй кота")
         with patch.object(main, "ensure_contact_named", new=AsyncMock()) as notify_owner:
