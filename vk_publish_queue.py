@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Optional, Union
 
+from naz_vk_music import APPROVED_QUERIES
+
 
 SCHEMA = "vk_publish_job.v1"
 PRODUCER = "naz"
@@ -104,7 +106,12 @@ def validate_canonical_job(job: dict, job_dir: Path) -> None:
         raise QueueError("target_group_id must be a non-empty JSON string")
     if not isinstance(job["text"], str) or not job["text"] or len(job["text"]) > MAX_TEXT_LENGTH:
         raise QueueError("invalid text")
-    if not isinstance(job["track_query"], str) or len(job["track_query"]) > MAX_TRACK_QUERY_LENGTH:
+    if (
+        not isinstance(job["track_query"], str)
+        or not job["track_query"].strip()
+        or len(job["track_query"]) > MAX_TRACK_QUERY_LENGTH
+        or job["track_query"] not in APPROVED_QUERIES
+    ):
         raise QueueError("invalid track_query")
     key = job["dedupe_key"]
     if not isinstance(key, str) or len(key) > MAX_DEDUPE_KEY_LENGTH or not _SAFE_DEDUPE.fullmatch(key):
@@ -141,12 +148,14 @@ def enqueue(
     text = text.strip()
     source_ref = source_ref.strip()
     track_query = track_query.strip()
-    if not target_group_id or not text or not source_ref:
-        raise QueueError("target_group_id, text and source_ref are required")
+    if not target_group_id or not text or not source_ref or not track_query:
+        raise QueueError("target_group_id, text, source_ref and track_query are required")
     if len(text) > MAX_TEXT_LENGTH:
         raise QueueError(f"text exceeds {MAX_TEXT_LENGTH} characters")
     if len(track_query) > MAX_TRACK_QUERY_LENGTH:
         raise QueueError(f"track_query exceeds {MAX_TRACK_QUERY_LENGTH} characters")
+    if track_query not in APPROVED_QUERIES:
+        raise QueueError("track_query is not in the approved Naz VK music catalog")
     items = list(media)
     if len(items) > MAX_MEDIA_COUNT:
         raise QueueError(f"media exceeds {MAX_MEDIA_COUNT} files")

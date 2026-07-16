@@ -65,6 +65,7 @@ import character_state as naz_character
 import delegated_messaging
 import duo_relationship
 import gaming_vertical
+import naz_vk_music
 import visual_archive
 import vk_publish_queue
 from prompts import (
@@ -173,9 +174,14 @@ SOURCE_MONITOR_TIMES = os.getenv("SOURCE_MONITOR_TIMES", "12:00,18:00").strip()
 NAZ_VK_ENABLED = env_bool("NAZ_VK_ENABLED", False)
 NAZ_VK_PUBLIC_ID = os.getenv("NAZ_VK_PUBLIC_ID", "").strip()
 NAZ_VK_AUTO_ON = env_bool("NAZ_VK_AUTO_ON", False)
-NAZ_VK_AUTO_TIMES = os.getenv("NAZ_VK_AUTO_TIMES", "11:20,16:40,20:20").strip()
+NAZ_VK_DAILY_TIME = os.getenv("NAZ_VK_DAILY_TIME", "10:30").strip()
+NAZ_VK_GAMING_TIME = os.getenv("NAZ_VK_GAMING_TIME", "16:30").strip()
+NAZ_VK_TIMEZONE = os.getenv("NAZ_VK_TIMEZONE", "Europe/Moscow").strip()
 NAZ_VK_SCHEDULER = os.getenv("NAZ_VK_SCHEDULER", "systemd").strip().lower()
 NAZ_VK_QUEUE_DIR = Path(os.getenv("NAZ_VK_QUEUE_DIR", "/var/lib/void-vk-publisher/queue").strip())
+NAZ_VK_TRACK_STATE_FILE = Path(
+    os.getenv("NAZ_VK_TRACK_STATE_FILE", "/var/lib/naz-ai-bot/vk_track_rotation.json").strip()
+)
 AGENT_CONTENT_SYNC_ENABLED = env_bool("AGENT_CONTENT_SYNC_ENABLED", True)
 AGENT_CONTENT_SYNC_TIMES = os.getenv("AGENT_CONTENT_SYNC_TIMES", "23:57").strip()
 AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
@@ -2912,38 +2918,64 @@ async def vk_queue_status_command(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-async def create_naz_vk_job(topic: str, *, source_ref: str, not_before: Optional[datetime] = None) -> dict:
+async def create_naz_vk_job(
+    topic: str,
+    *,
+    source_ref: str,
+    not_before: Optional[datetime] = None,
+    rubric_kind: str = "daily",
+) -> dict:
     if not NAZ_VK_ENABLED:
         raise vk_publish_queue.QueueError("NAZ_VK_ENABLED выключен")
     if not NAZ_VK_PUBLIC_ID:
         raise vk_publish_queue.QueueError("NAZ_VK_PUBLIC_ID не задан")
     user_id = ADMIN_ID or 0
-    rubric = random.choice(NAZ_VK_RUBRICS)
+    rubric = select_naz_vk_rubric(rubric_kind)
+    extra_instruction = (
+        f"Рубрика VK: {rubric['name']}. {rubric['angle']}. {rubric['format']}. "
+        "Верни только готовый текст публикации; не выбирай группу и не добавляй служебные поля."
+    )
+    gaming_plan = None
+    if rubric_kind == "gaming":
+        gaming_plan = gaming_vertical.plan_gaming_content(
+            "naz",
+            topic,
+            memory.get_recent_content_signatures(user_id),
+            platform="vk",
+        )
+        extra_instruction += "\n" + gaming_vertical.prompt_context("naz", gaming_plan)
     text = await generate_content(
         user_id,
         topic,
         "post",
         save_generated=False,
-        extra_instruction=(
-            f"Рубрика VK: {rubric['name']}. {rubric['angle']}. {rubric['format']}. "
-            "Верни только готовый текст публикации; не выбирай группу и не добавляй служебные поля."
-        ),
+        extra_instruction=extra_instruction,
     )
     if is_warning_response(text):
         raise vk_publish_queue.QueueError("модель отклонила создание безопасного текста")
     images, _ = await generate_images_with_retries(user_id, topic, text, count=1)
     media = [vk_publish_queue.MediaInput("image-1.png", images[0])] if images else []
-    return vk_publish_queue.enqueue(
-        NAZ_VK_QUEUE_DIR,
-        target_group_id=NAZ_VK_PUBLIC_ID,
-        text=text,
-        media=media,
-        track_query=topic,
-        created_at=datetime.now(ZoneInfo(BOT_TIMEZONE)),
-        not_before=not_before,
-        dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
-        source_ref=source_ref,
+    now = datetime.now(ZoneInfo(NAZ_VK_TIMEZONE))
+    job = naz_vk_music.enqueue_with_track_rotation(
+        NAZ_VK_TRACK_STATE_FILE,
+        requested_tags=str(rubric["track_tags"]).split(","),
+        seed=source_ref,
+        post_topic=topic,
+        enqueue_job=lambda track_query: vk_publish_queue.enqueue(
+            NAZ_VK_QUEUE_DIR,
+            target_group_id=NAZ_VK_PUBLIC_ID,
+            text=text,
+            media=media,
+            track_query=track_query,
+            created_at=now,
+            not_before=not_before,
+            dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
+            source_ref=source_ref,
+        ),
     )
+    if gaming_plan:
+        memory.record_content_signature(user_id, gaming_plan, topic)
+    return job
 
 
 async def vk_queue_draft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4629,20 +4661,40 @@ NAZ_TELEGRAM_RUBRICS: List[Dict[str, object]] = [
 NAZ_VK_RUBRICS: List[Dict[str, str]] = [
     {
         "name": "Naz Dev Log",
+        "kind": "daily",
         "angle": "короткая рабочая заметка о сборке, баге, проверке или дожиме AI-системы",
         "format": "плотный VK-пост без Telegram-обрывистости: контекст, вывод, прикладной смысл",
+        "track_tags": "daily,focus,builder,systems",
     },
     {
         "name": "AI без успешного успеха",
+        "kind": "daily",
         "angle": "практический разбор AI-инструмента или привычки без хайпа",
         "format": "объяснить человеческим языком, где польза, где ловушка, что делать дальше",
+        "track_tags": "daily,focus,warm,systems",
     },
     {
         "name": "Ошибка недели",
+        "kind": "daily",
         "angle": "одна ошибка в боте, контенте или интеграции и нормальный вывод после неё",
         "format": "сцена, сбой, причина, дожим, вывод",
+        "track_tags": "daily,glitch,reflective,energy",
+    },
+    {
+        "name": "Игровая лаборатория VK",
+        "kind": "gaming",
+        "angle": "игровая механика, мод, AI-инструмент или честный эксперимент без выдуманного личного опыта",
+        "format": "самостоятельный VK-пост: конкретная игровая деталь, разбор механики и вопрос или вывод для игроков",
+        "track_tags": "gaming,mechanic,cyber,arcade,builder,identity,humor",
     },
 ]
+
+
+def select_naz_vk_rubric(kind: str) -> Dict[str, str]:
+    matching = [rubric for rubric in NAZ_VK_RUBRICS if rubric.get("kind") == kind]
+    if not matching:
+        raise vk_publish_queue.QueueError(f"неизвестный тип VK-рубрики: {kind}")
+    return random.choice(matching)
 
 
 def select_naz_telegram_rubric(slot: str = "") -> Dict[str, object]:
@@ -5179,42 +5231,64 @@ def setup_naz_vk_schedule(application: Application) -> None:
     if not application.job_queue:
         logger.warning("Naz VK JobQueue is not available")
         return
-    tz = ZoneInfo(BOT_TIMEZONE)
-    scheduled = []
-    for raw_time in NAZ_VK_AUTO_TIMES.split(","):
-        raw_time = raw_time.strip()
+    tz = ZoneInfo(NAZ_VK_TIMEZONE)
+
+    def parse_vk_time(raw_time: str, label: str) -> tuple[int, int] | None:
         try:
             hour_text, minute_text = raw_time.split(":", maxsplit=1)
             hour, minute = int(hour_text), int(minute_text)
             if hour not in range(24) or minute not in range(60):
                 raise ValueError
         except ValueError:
-            logger.warning("Invalid NAZ_VK_AUTO_TIMES value skipped: %s", raw_time)
-            continue
+            logger.warning("Invalid %s value skipped: %s", label, raw_time)
+            return None
+        return hour, minute
+
+    scheduled = []
+    daily = parse_vk_time(NAZ_VK_DAILY_TIME, "NAZ_VK_DAILY_TIME")
+    if daily:
+        hour, minute = daily
         slot = f"{hour:02d}:{minute:02d}"
         application.job_queue.run_daily(
             naz_vk_queue_job,
             time=time(hour=hour, minute=minute, tzinfo=tz),
-            name=f"naz_vk_queue_{hour:02d}_{minute:02d}",
-            data={"slot": slot},
+            name=f"naz_vk_daily_{hour:02d}_{minute:02d}",
+            data={"slot": slot, "rubric_kind": "daily"},
         )
-        scheduled.append(slot)
+        scheduled.append(f"daily {slot}")
+    gaming = parse_vk_time(NAZ_VK_GAMING_TIME, "NAZ_VK_GAMING_TIME")
+    if gaming:
+        hour, minute = gaming
+        slot = f"{hour:02d}:{minute:02d}"
+        application.job_queue.run_daily(
+            naz_vk_queue_job,
+            time=time(hour=hour, minute=minute, tzinfo=tz),
+            days=(2, 4, 0),
+            name=f"naz_vk_gaming_{hour:02d}_{minute:02d}",
+            data={"slot": slot, "rubric_kind": "gaming"},
+        )
+        scheduled.append(f"gaming Tue/Thu/Sun {slot}")
     if scheduled:
-        logger.info("Naz VK queue scheduled at %s %s", ", ".join(scheduled), BOT_TIMEZONE)
+        logger.info("Naz VK queue scheduled at %s %s", ", ".join(scheduled), NAZ_VK_TIMEZONE)
     else:
-        logger.warning("Naz VK enabled, but NAZ_VK_AUTO_TIMES has no valid times")
+        logger.warning("Naz VK enabled, but its schedule has no valid times")
 
 
 async def naz_vk_queue_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if NAZ_VK_SCHEDULER != "telegram" or not (NAZ_VK_ENABLED and NAZ_VK_AUTO_ON):
         return
     slot = str((context.job.data or {}).get("slot", "manual"))
-    today = datetime.now(ZoneInfo(BOT_TIMEZONE)).date().isoformat()
-    source_ref = f"schedule:{today}:{slot}"
-    topic = f"Naz VK, слот {slot}: практическая заметка об AI, разработке или контент-системах"
+    rubric_kind = str((context.job.data or {}).get("rubric_kind", "daily"))
+    today = datetime.now(ZoneInfo(NAZ_VK_TIMEZONE)).date().isoformat()
+    source_ref = f"schedule:{today}:{rubric_kind}:{slot}"
+    topic = (
+        "Игровая лаборатория Naz VK: механика, мод, AI-инструмент или эксперимент для игроков"
+        if rubric_kind == "gaming"
+        else "Naz VK: практическая заметка об AI, разработке или контент-системах"
+    )
     try:
-        job = await create_naz_vk_job(topic, source_ref=source_ref)
-        logger.info("Naz VK job queued | job_id=%s | slot=%s", job["job_id"], slot)
+        job = await create_naz_vk_job(topic, source_ref=source_ref, rubric_kind=rubric_kind)
+        logger.info("Naz VK job queued | job_id=%s | kind=%s | slot=%s", job["job_id"], rubric_kind, slot)
     except vk_publish_queue.DuplicateJobError:
         logger.info("Naz VK schedule cooldown: slot already queued | %s", source_ref)
     except Exception as exc:  # noqa: BLE001

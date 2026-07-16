@@ -42,9 +42,12 @@ VK config is deliberately separate:
 NAZ_VK_ENABLED
 NAZ_VK_PUBLIC_ID
 NAZ_VK_AUTO_ON
-NAZ_VK_AUTO_TIMES
+NAZ_VK_DAILY_TIME
+NAZ_VK_GAMING_TIME
+NAZ_VK_TIMEZONE
 NAZ_VK_SCHEDULER
 NAZ_VK_QUEUE_DIR
+NAZ_VK_TRACK_STATE_FILE
 ```
 
 Current Naz VK rubrics:
@@ -53,6 +56,7 @@ Current Naz VK rubrics:
 Naz Dev Log
 AI без успешного успеха
 Ошибка недели
+Игровая лаборатория VK
 ```
 
 Naz is only a producer of `vk_publish_job.v1` directories under
