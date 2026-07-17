@@ -27,7 +27,7 @@ from datetime import datetime, time, timedelta
 from html import unescape
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -3170,7 +3170,15 @@ async def create_naz_vk_job(
             "NAZ_VK_IMAGE_POLICY must be required or text_music"
         )
     user_id = ADMIN_ID or 0
-    rubric = select_naz_vk_rubric(rubric_kind)
+    accepted_theme_keys = memory.get_recent_semantic_theme_keys(
+        user_id,
+        limit=semantic_autopost.THEME_COOLDOWN,
+    )
+    rejected_theme_keys = memory.get_recent_rejected_semantic_theme_keys(user_id)
+    rubric = select_naz_vk_rubric(
+        rubric_kind,
+        excluded_theme_keys=(*accepted_theme_keys, *rejected_theme_keys),
+    )
     base_instruction = (
         f"Рубрика VK: {rubric['name']}. {rubric['angle']}. {rubric['format']}. "
         "Верни только готовый текст публикации; не выбирай группу и не добавляй служебные поля."
@@ -5059,11 +5067,28 @@ NAZ_VK_RUBRICS: List[Dict[str, str]] = [
 ]
 
 
-def select_naz_vk_rubric(kind: str) -> Dict[str, str]:
+def select_naz_vk_rubric(
+    kind: str,
+    *,
+    excluded_theme_keys: Iterable[str] = (),
+) -> Dict[str, str]:
     matching = [rubric for rubric in NAZ_VK_RUBRICS if rubric.get("kind") == kind]
     if not matching:
         raise vk_publish_queue.QueueError(f"неизвестный тип VK-рубрики: {kind}")
-    return random.choice(matching)
+    excluded = {
+        str(key)
+        for key in excluded_theme_keys
+        if str(key).strip()
+    }
+    available = [
+        rubric
+        for rubric in matching
+        if any(
+            theme.key not in excluded
+            for theme in semantic_autopost.compatible_themes(str(rubric["name"]))
+        )
+    ]
+    return random.choice(available or matching)
 
 
 def select_naz_telegram_rubric(slot: str = "") -> Dict[str, object]:

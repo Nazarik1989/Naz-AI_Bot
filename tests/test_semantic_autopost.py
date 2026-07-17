@@ -280,6 +280,24 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertNotIn("relationships", recent)
         self.assertIn("game", recent)
 
+    def test_vk_rubric_selector_skips_fully_exhausted_theme_set(self):
+        dev_log_keys = {
+            theme.key
+            for theme in semantic.compatible_themes("Naz Dev Log")
+        }
+        with patch.object(main.random, "choice", side_effect=lambda items: items[0]):
+            rubric = main.select_naz_vk_rubric(
+                "daily",
+                excluded_theme_keys=dev_log_keys,
+            )
+        self.assertNotEqual(rubric["name"], "Naz Dev Log")
+        self.assertTrue(
+            any(
+                theme.key not in dev_log_keys
+                for theme in semantic.compatible_themes(str(rubric["name"]))
+            )
+        )
+
     def test_two_rejections_create_no_vk_draft_or_queue_job(self):
         theme = semantic.THEMES_BY_KEY["work"]
         result = semantic.GenerationResult(False, "", 2, rejected("duplicate twice"))
