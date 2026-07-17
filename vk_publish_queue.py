@@ -208,10 +208,10 @@ def enqueue(
     if final_dir.exists():
         raise DuplicateJobError(f"job {job_id} already exists in pending")
     temp_dir = Path(tempfile.mkdtemp(prefix=f".{job_id}-", dir=pending))
-    # Keep the shared inbox SGID contract so files inherit ``vkqueue`` rather
-    # than the producer's primary ``naz`` group and remain readable by publisher.
-    os.chmod(temp_dir, 0o2770)
     try:
+        # Do not chmod the inherited SGID directory before creating files:
+        # RestrictSUIDSGID forbids setting SGID, while clearing it would make
+        # media and job.json inherit the producer's private primary group.
         for item, name in zip(items, names):
             destination = temp_dir / name
             if isinstance(item.content, bytes):
@@ -243,13 +243,15 @@ def enqueue(
         )
         os.chmod(job_file, 0o640)
         validate_canonical_job(job, temp_dir)
+        # Files already inherited the shared group. Open the completed hidden
+        # directory to the consumer immediately before the atomic rename.
+        os.chmod(temp_dir, 0o770)
         try:
             os.replace(temp_dir, final_dir)
         except OSError as exc:
             if final_dir.exists() or exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
                 raise DuplicateJobError(f"job {job_id} was enqueued concurrently") from exc
             raise
-        os.chmod(final_dir, 0o2770)
         return job
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
