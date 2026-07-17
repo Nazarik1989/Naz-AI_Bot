@@ -233,6 +233,49 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertEqual(second.key, "care")
         self.assertEqual(skipped.key, "conflict")
 
+    def test_semantic_card_catalog_is_complete_and_rotates_per_theme(self):
+        self.assertEqual(
+            {theme.key for theme in semantic.THEMES},
+            set(semantic.CARDS_BY_THEME),
+        )
+        self.assertTrue(
+            all(len(cards) >= 3 for cards in semantic.CARDS_BY_THEME.values())
+        )
+        care_cards = semantic.CARDS_BY_THEME["care"]
+        first = semantic.select_card("care", [])
+        second = semantic.select_card("care", [first.key])
+        third = semantic.select_card("care", [first.key, second.key])
+        wrapped = semantic.select_card(
+            "care", [first.key, second.key, third.key]
+        )
+
+        self.assertEqual((first, second, third), care_cards)
+        self.assertEqual(wrapped, first)
+
+    def test_semantic_card_reaches_both_generation_prompts(self):
+        card = semantic.CARDS_BY_THEME["care"][0]
+        generate = AsyncMock(side_effect=["first", "second"])
+        evaluate = AsyncMock(side_effect=[rejected("duplicate"), accepted()])
+        result = asyncio.run(
+            semantic.generate_with_gate(
+                generate=generate,
+                evaluate=evaluate,
+                theme=semantic.THEMES_BY_KEY["care"],
+                platform="vk",
+                rubric_name="Человеческая деталь",
+                is_model_warning=lambda text: False,
+                card=card,
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.card_key, card.key)
+        for call in generate.await_args_list:
+            self.assertIn(card.key, call.args[0])
+            self.assertIn(card.thesis, call.args[0])
+            self.assertIn(card.conclusion_boundary, call.args[0])
+        self.assertIn("другую конкретную сцену", generate.await_args_list[1].args[0])
+
     def test_meaning_repeat_is_rejected_without_literal_word_match(self):
         history = [
             {
@@ -415,6 +458,7 @@ class SemanticAutopostTests(unittest.TestCase):
             semantic_theme=theme.key,
             source_ref="timer:failed",
         )
+        self.assertEqual(memory.get_recent_semantic_card_keys(1), [])
 
     def test_legacy_generated_post_without_semantic_theme_remains_readable(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
@@ -665,7 +709,14 @@ class SemanticAutopostTests(unittest.TestCase):
 
     def test_only_accepted_theme_enters_history(self):
         theme = semantic.THEMES_BY_KEY["care"]
-        result = semantic.GenerationResult(True, "Принятый пост", 1, accepted())
+        result = semantic.GenerationResult(
+            True,
+            "Принятый пост",
+            1,
+            accepted(),
+            "care",
+            "care_corridor_light",
+        )
         main.commit_accepted_autopost_state(
             user_id=7,
             topic="понятная ошибка",
@@ -676,6 +727,9 @@ class SemanticAutopostTests(unittest.TestCase):
             result=result,
         )
         self.assertEqual(memory.get_recent_semantic_theme_keys(7), ["care"])
+        self.assertEqual(
+            memory.get_recent_semantic_card_keys(7), ["care_corridor_light"]
+        )
         with self.assertRaises(ValueError):
             main.commit_accepted_autopost_state(
                 user_id=7,
@@ -687,6 +741,9 @@ class SemanticAutopostTests(unittest.TestCase):
                 result=semantic.GenerationResult(False, "", 2, rejected()),
             )
         self.assertEqual(memory.get_recent_semantic_theme_keys(7), ["care"])
+        self.assertEqual(
+            memory.get_recent_semantic_card_keys(7), ["care_corridor_light"]
+        )
 
     def test_telegram_and_vk_prompts_have_separate_platform_context(self):
         telegram = prompts.build_messages(
