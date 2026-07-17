@@ -117,6 +117,8 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
             ) as permissions, patch.object(
                 naz_vk_producer, "_validate_browser_isolation"
             ) as browser_isolation, patch.object(
+                naz_vk_producer, "_validate_database_access"
+            ) as database_access, patch.object(
                 naz_vk_producer.naz.memory, "init_db"
             ) as init_db, patch.object(
                 naz_vk_producer.naz, "create_naz_vk_job", new=AsyncMock()
@@ -127,6 +129,7 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
                 )
             permissions.assert_called_once_with(queue)
             browser_isolation.assert_called_once_with(base / "profile")
+            database_access.assert_called_once_with()
             init_db.assert_not_called()
             create_job.assert_not_awaited()
             self.assertEqual(
@@ -135,6 +138,7 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
                     "publisher allowlist",
                     "browser profile isolation",
                     "queue write scope",
+                    "database write scope",
                     "API configuration",
                     "music catalog and histories",
                     "bounded media policy",
@@ -180,6 +184,7 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
             line for line in service.splitlines() if line.startswith("ReadWritePaths=")
         ]
         self.assertEqual(len(writable), 1)
+        self.assertIn("/opt/naz-ai-bot", writable[0])
         self.assertIn("/var/lib/void-vk-publisher/queue/pending", writable[0])
         self.assertNotIn("profile", writable[0].casefold())
 

@@ -29,4 +29,4 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-ReadWritePaths=/var/lib/naz-ai-bot /var/cache/naz-ai-bot /var/lib/void-vk-publisher/queue/pending
+ReadWritePaths=/opt/naz-ai-bot /var/lib/naz-ai-bot /var/cache/naz-ai-bot /var/lib/void-vk-publisher/queue/pending

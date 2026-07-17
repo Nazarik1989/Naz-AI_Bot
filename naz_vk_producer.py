@@ -7,7 +7,9 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import stat
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -113,6 +115,33 @@ def _validate_browser_isolation(profile_dir: Path, user_name: str = "naz") -> No
         raise PreflightError("Naz must not have access to the publisher browser profile")
 
 
+def _validate_database_access(user_name: str = "naz") -> None:
+    database = Path(naz.memory.DB_PATH)
+    if not database.is_absolute():
+        database = Path("/opt/naz-ai-bot") / database
+    if database.is_symlink() or not database.is_file():
+        raise PreflightError("Naz database must be an existing regular file")
+    runuser = shutil.which("runuser")
+    if not runuser:
+        raise PreflightError("runuser is required for database permission checks")
+    can_write_database = subprocess.run(
+        [runuser, "-u", user_name, "--", "test", "-w", str(database)],
+        check=False,
+    ).returncode == 0
+    can_write_parent = subprocess.run(
+        [runuser, "-u", user_name, "--", "test", "-w", str(database.parent)],
+        check=False,
+    ).returncode == 0
+    can_enter_parent = subprocess.run(
+        [runuser, "-u", user_name, "--", "test", "-x", str(database.parent)],
+        check=False,
+    ).returncode == 0
+    if not can_write_database:
+        raise PreflightError("Naz service account cannot write the database")
+    if not (can_write_parent and can_enter_parent):
+        raise PreflightError("Naz service account cannot create SQLite sidecars")
+
+
 def _validate_schedule(timer_unit: Path) -> None:
     try:
         ZoneInfo(naz.NAZ_VK_TIMEZONE)
@@ -169,6 +198,11 @@ def check_config(
     except OSError as exc:
         raise PreflightError("shared queue permissions are unavailable") from exc
     checks.append("queue write scope")
+    try:
+        _validate_database_access()
+    except OSError as exc:
+        raise PreflightError("Naz database permissions are unavailable") from exc
+    checks.append("database write scope")
 
     if not naz.OPENROUTER_API_KEY:
         raise PreflightError("content API configuration is missing")
