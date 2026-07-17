@@ -171,6 +171,7 @@ class SemanticDecision:
     conclusion: str
     narrative_shape: str
     key_meanings: tuple[str, ...]
+    retry_theme_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,23 +368,36 @@ def generation_history_context(
     )
 
 
-def build_gate_prompt(candidate: str, recent_posts: Sequence[Mapping[str, str]]) -> str:
+def build_gate_prompt(
+    candidate: str,
+    recent_posts: Sequence[Mapping[str, str]],
+    *,
+    retry_themes: Sequence[SemanticTheme] = (),
+) -> str:
     history_blocks = []
     for index, post in enumerate(recent_posts[-SEMANTIC_HISTORY_LIMIT:], start=1):
         theme = str(post.get("semantic_theme") or "legacy/unknown")
         content = str(post.get("content") or "")[:3500]
         history_blocks.append(f"[{index}] theme={theme}\n{content}")
     history = "\n\n".join(history_blocks) or "(история пуста)"
+    retry_catalog = "\n".join(
+        f"- {theme.key}: {theme.label}; {theme.brief}"
+        for theme in retry_themes
+    ) or "(смена оси недоступна)"
     return (
         "Ты — строгий семантический редактор Naz. Сравни кандидат с последними принятыми/подготовленными "
         "постами по смыслу, а не по отдельным словам.\n"
         "Отклони кандидат, если повторяется центральный тезис или вывод, та же мысль пересказана другой "
         "лексикой, близко повторён сюжетный ход, либо почти совпадает набор ключевых смыслов. Общий голос "
         "персонажа сам по себе дублем не считается.\n"
+        "Если кандидат отклонён и каталог свежих осей не пуст, выбери retry_theme_key строго из каталога. "
+        "Выбирай по смыслу всей истории: новая ось не должна вести к тому же тезису, выводу или сюжетному "
+        "ходу. Если кандидат принят или каталог пуст, верни пустую строку.\n"
         "Верни только JSON без markdown:\n"
         '{"accepted":true|false,"reason":"коротко","central_thesis":"одна мысль",'
         '"conclusion":"эмоциональный/практический вывод","narrative_shape":"сцена→поворот→вывод",'
-        '"key_meanings":["смысл 1","смысл 2"]}\n\n'
+        '"key_meanings":["смысл 1","смысл 2"],"retry_theme_key":"allowed_key_or_empty"}\n\n'
+        f"КАТАЛОГ СВЕЖИХ ОСЕЙ ДЛЯ RETRY:\n{retry_catalog}\n\n"
         f"ПОСЛЕДНИЕ ПОСТЫ:\n{history}\n\nКАНДИДАТ:\n{candidate[:5000]}"
     )
 
@@ -407,6 +421,7 @@ def parse_gate_response(raw: str) -> SemanticDecision:
         conclusion=str(payload.get("conclusion") or "")[:1000],
         narrative_shape=str(payload.get("narrative_shape") or "")[:500],
         key_meanings=tuple(str(item)[:300] for item in meanings[:8] if str(item).strip()),
+        retry_theme_key=str(payload.get("retry_theme_key") or "")[:80],
     )
 
 
@@ -423,6 +438,7 @@ async def generate_with_gate(
     rubric_name: str,
     is_model_warning: Callable[[str], bool],
     correction_theme: SemanticTheme | None = None,
+    correction_themes: Mapping[str, SemanticTheme] | None = None,
 ) -> GenerationResult:
     """Run exactly one initial generation and at most one corrective generation."""
     first_text = await generate(
@@ -435,7 +451,11 @@ async def generate_with_gate(
     if first_decision.accepted:
         return GenerationResult(True, first_text, 1, first_decision, theme.key)
 
-    retry_theme = correction_theme or theme
+    retry_theme = (
+        correction_theme
+        or (correction_themes or {}).get(first_decision.retry_theme_key)
+        or theme
+    )
     second_text = await generate(
         correction_instruction(
             retry_theme,

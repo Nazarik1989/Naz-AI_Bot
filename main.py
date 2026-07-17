@@ -775,9 +775,27 @@ async def generate_answer(
     source_topic: str | None = None,
     platform: str = "telegram",
     commit_state: bool = True,
+    inherit_interactive_context: bool = True,
 ) -> str:
     """Generate answer through Controller → State → Prompt Builder → GPT."""
     state = memory.load_state(user_id)
+    if not inherit_interactive_context:
+        # Interactive roles, angles and private memory belong to user-driven
+        # requests. Semantic autopost has server-side editorial direction and
+        # a shared history of actually published posts.
+        state = dict(state)
+        state["expert"] = DEFAULT_EXPERT_MODE
+        state["expert_mode"] = DEFAULT_EXPERT_MODE
+        state["voice"] = DEFAULT_VOICE_PROFILE
+        state["voice_profile"] = DEFAULT_VOICE_PROFILE
+        state["goal"] = DEFAULT_CONTENT_GOAL
+        state["content_goal"] = DEFAULT_CONTENT_GOAL
+        state["recent_topics"] = []
+        state["best_posts"] = []
+        state["rejected_topics"] = []
+        state["last_blocked_topic"] = ""
+        state["suggested_angles"] = []
+        state["selected_angle_index"] = 0
     control = naz_controller.controller(user_text, state, task=task, source_topic=source_topic)
 
     if control.get("blocked"):
@@ -786,7 +804,11 @@ async def generate_answer(
 
     controlled_state = control["state"]
     expert_mode = controlled_state.get("expert_mode", DEFAULT_EXPERT_MODE)
-    memory_context = build_user_memory_context(user_id)
+    memory_context = (
+        build_user_memory_context(user_id)
+        if inherit_interactive_context
+        else ""
+    )
 
     if task is None:
         history = memory.get_history(user_id, limit=20)
@@ -838,6 +860,7 @@ async def generate_content(
     extra_instruction: str = "",
     platform: str = "telegram",
     commit_state: bool = True,
+    inherit_interactive_context: bool = True,
 ) -> str:
     task_title = ACTION_TITLES.get(task, task)
     user_text = (
@@ -866,6 +889,7 @@ async def generate_content(
         source_topic=topic,
         platform=platform,
         commit_state=commit_state,
+        inherit_interactive_context=inherit_interactive_context,
     )
     if save_generated and not is_warning_response(result):
         memory.save_generated_post(
@@ -883,6 +907,8 @@ async def generate_content(
 async def evaluate_autopost_candidate(
     candidate: str,
     recent_posts: List[Dict[str, str]],
+    *,
+    retry_themes: tuple[semantic_autopost.SemanticTheme, ...] = (),
 ) -> semantic_autopost.SemanticDecision:
     """Use a model as a meaning-level judge; invalid review output fails closed."""
     if not recent_posts:
@@ -894,7 +920,11 @@ async def evaluate_autopost_candidate(
             "",
             (),
         )
-    prompt = semantic_autopost.build_gate_prompt(candidate, recent_posts)
+    prompt = semantic_autopost.build_gate_prompt(
+        candidate,
+        recent_posts,
+        retry_themes=retry_themes,
+    )
     try:
         raw = await call_gpt(
             [
@@ -942,9 +972,23 @@ async def generate_semantic_autopost_candidate(
         limit=semantic_autopost.SEMANTIC_HISTORY_LIMIT,
     )
     history_context = semantic_autopost.generation_history_context(recent_posts)
+    recent_theme_set = {
+        str(key)
+        for key in recent_themes
+        if str(key).strip()
+    }
+    correction_themes = {
+        candidate.key: candidate
+        for candidate in semantic_autopost.compatible_themes(rubric_name)
+        if candidate.key != theme.key and candidate.key not in recent_theme_set
+    }
 
     async def evaluate(candidate: str) -> semantic_autopost.SemanticDecision:
-        return await evaluate_autopost_candidate(candidate, recent_posts)
+        return await evaluate_autopost_candidate(
+            candidate,
+            recent_posts,
+            retry_themes=tuple(correction_themes.values()),
+        )
 
     async def generate_with_history(instruction: str) -> str:
         if history_context:
@@ -956,6 +1000,7 @@ async def generate_semantic_autopost_candidate(
         evaluate=evaluate,
         theme=theme,
         correction_theme=None,
+        correction_themes=correction_themes,
         platform=platform,
         rubric_name=rubric_name,
         is_model_warning=is_warning_response,
@@ -1081,6 +1126,7 @@ async def generate_story_insight(
     save_generated: bool = True,
     extra_instruction: str = "",
     commit_state: bool = True,
+    inherit_interactive_context: bool = True,
 ) -> str:
     excerpt = pick_story_excerpt(topic_hint)
     if not excerpt:
@@ -1103,6 +1149,7 @@ async def generate_story_insight(
         source_topic=f"Naz Stories | {topic} | {story_signature}",
         platform="telegram",
         commit_state=commit_state,
+        inherit_interactive_context=inherit_interactive_context,
     )
 
     if save_generated and not is_warning_response(result):
@@ -3186,6 +3233,7 @@ async def create_naz_vk_job(
             extra_instruction=f"{base_instruction}\n{instruction}",
             platform="vk",
             commit_state=False,
+            inherit_interactive_context=False,
         )
 
     theme, semantic_result = await generate_semantic_autopost_candidate(
@@ -5302,6 +5350,7 @@ async def try_visual_archive_autopost(
                 ),
                 platform="telegram",
                 commit_state=False,
+                inherit_interactive_context=False,
             )
 
         theme, semantic_result = await generate_semantic_autopost_candidate(
@@ -5426,6 +5475,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     save_generated=False,
                     extra_instruction=combined,
                     commit_state=False,
+                    inherit_interactive_context=False,
                 )
             return await generate_content(
                 admin_user_id,
@@ -5435,6 +5485,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 extra_instruction=combined,
                 platform="telegram",
                 commit_state=False,
+                inherit_interactive_context=False,
             )
 
         logger.info(
