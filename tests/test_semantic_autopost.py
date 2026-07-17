@@ -165,8 +165,8 @@ class SemanticAutopostTests(unittest.TestCase):
         ), patch.object(
             main, "evaluate_autopost_candidate", new=decisions
         ), patch.object(
-            main.memory, "record_rejected_semantic_theme"
-        ) as record_rejection:
+            main.semantic_autopost, "select_correction_theme"
+        ) as select_correction:
             _, result = asyncio.run(
                 main.generate_semantic_autopost_candidate(
                     user_id=1,
@@ -179,12 +179,21 @@ class SemanticAutopostTests(unittest.TestCase):
 
         self.assertTrue(result.accepted)
         self.assertEqual(generate.await_count, 2)
+        select_correction.assert_not_called()
+        self.assertEqual(
+            result.theme_key,
+            semantic.select_theme(
+                "AI без успешного успеха",
+                [],
+                platform="vk",
+                seed="slot",
+            ).key,
+        )
         for call in generate.await_args_list:
             prompt = call.args[0]
             self.assertIn("SEMANTIC ANTI-REPEAT CONTEXT", prompt)
             self.assertIn(history[0]["content"], prompt)
             self.assertIn(history[1]["content"], prompt)
-        record_rejection.assert_not_called()
 
     def test_legacy_generated_post_without_semantic_theme_remains_readable(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
