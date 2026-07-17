@@ -937,13 +937,6 @@ async def generate_semantic_autopost_candidate(
         platform=platform,
         seed=seed,
     )
-    correction_theme = semantic_autopost.select_correction_theme(
-        rubric_name,
-        recent_themes,
-        initial_theme_key=theme.key,
-        platform=platform,
-        seed=f"{seed}:correction",
-    )
     recent_posts = memory.get_recent_posts_for_semantic_gate(
         user_id,
         limit=semantic_autopost.SEMANTIC_HISTORY_LIMIT,
@@ -962,7 +955,7 @@ async def generate_semantic_autopost_candidate(
         generate=generate_with_history,
         evaluate=evaluate,
         theme=theme,
-        correction_theme=correction_theme,
+        correction_theme=None,
         platform=platform,
         rubric_name=rubric_name,
         is_model_warning=is_warning_response,
