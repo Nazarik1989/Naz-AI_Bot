@@ -1029,8 +1029,9 @@ async def generate_semantic_autopost_candidate(
         limit=semantic_autopost.SEMANTIC_HISTORY_LIMIT,
     )
     history_profile = await get_autopost_history_profile(user_id, recent_posts)
-    occupied = set(history_profile.occupied_theme_keys)
-    blocked = occupied | set(rejected_themes)
+    # The eight-post profile guides generation and the gate; it is not another
+    # hard theme ban. One axis can support genuinely different theses/scenes.
+    blocked = set(rejected_themes)
     theme = semantic_autopost.select_theme(
         rubric_name,
         recent_themes,
