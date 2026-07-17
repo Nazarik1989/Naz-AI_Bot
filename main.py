@@ -34,7 +34,8 @@ import httpx
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-load_dotenv()
+if os.getenv("NAZ_ENV_LOADED_BY_SYSTEMD") != "1":
+    load_dotenv()
 
 from openai import OpenAI
 from telegram import (

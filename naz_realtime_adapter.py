@@ -10,6 +10,7 @@ import main
 
 REALTIME_MODEL: Final = "gpt-realtime-2.1"
 MAX_SUMMARY_CHARS: Final = 4_000
+IDEMPOTENCY_KEY_RE: Final = re.compile(r"^[A-Za-z0-9_-]{20,100}$")
 
 
 def _require_registered_user(user_id: int) -> None:
@@ -51,16 +52,45 @@ def _clean_summary(summary: str) -> str:
     return value[:MAX_SUMMARY_CHARS].rstrip()
 
 
-def save_final_summary(user_id: int, summary: str) -> bool:
-    """Safely persist one final Hub summary in the same user's Naz memory."""
+def save_final_summary(user_id: int, summary: str, *, idempotency_key: str) -> bool:
+    """Atomically persist at most one Hub summary for a server-issued key."""
     _require_registered_user(user_id)
     clean_summary = _clean_summary(summary)
-    if not main.memory.load_state(user_id).get("memory_enabled", True):
-        return False
-    main.memory.add_memory_item(
-        user_id,
-        "realtime_voice_summary",
-        clean_summary,
-        title="Realtime Voice Hub",
-    )
-    return True
+    if not isinstance(idempotency_key, str) or not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+        raise ValueError("idempotency_key is invalid")
+    memory_enabled = bool(main.memory.load_state(user_id).get("memory_enabled", True))
+    with main.memory.db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS realtime_voice_deliveries (
+                idempotency_key TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                saved INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        existing = conn.execute(
+            "SELECT user_id, saved FROM realtime_voice_deliveries WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            if int(existing["user_id"]) != user_id:
+                raise PermissionError("Idempotency key belongs to another user")
+            return bool(existing["saved"])
+        if memory_enabled:
+            conn.execute(
+                """
+                INSERT INTO memory_items(user_id, kind, title, content, created_at)
+                VALUES (?, 'realtime_voice_summary', 'Realtime Voice Hub', ?, ?)
+                """,
+                (user_id, clean_summary, main.memory.utc_now()),
+            )
+        conn.execute(
+            """
+            INSERT INTO realtime_voice_deliveries(idempotency_key, user_id, saved, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (idempotency_key, user_id, int(memory_enabled), main.memory.utc_now()),
+        )
+    return memory_enabled
