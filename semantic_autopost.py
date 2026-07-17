@@ -141,17 +141,17 @@ RUBRIC_THEME_KEYS: Mapping[str, tuple[str, ...]] = {
 # A corrective axis should be meaningfully distant, not merely a different key
 # from the same clarity/control/responsibility cluster.
 DIVERGENT_THEME_KEYS: Mapping[str, tuple[str, ...]] = {
-    "relationships": ("game", "music", "city", "body", "domestic_absurdity", "memory", "creativity"),
-    "city": ("work", "game", "creativity", "music", "body", "care", "conflict"),
-    "work": ("body", "domestic_absurdity", "music", "city", "game", "memory", "creativity"),
-    "creativity": ("relationships", "city", "music", "game", "body", "domestic_absurdity", "memory"),
-    "music": ("work", "care", "conflict", "memory", "domestic_absurdity", "relationships", "practical_future"),
-    "game": ("city", "work", "care", "memory", "body", "domestic_absurdity", "music"),
-    "body": ("creativity", "music", "game", "city", "relationships", "memory", "practical_future"),
-    "domestic_absurdity": ("relationships", "city", "music", "game", "body", "memory", "care"),
-    "memory": ("game", "music", "city", "body", "domestic_absurdity", "creativity", "conflict"),
-    "care": ("game", "music", "city", "body", "domestic_absurdity", "creativity", "attention"),
-    "conflict": ("music", "city", "body", "domestic_absurdity", "memory", "creativity", "attention"),
+    "relationships": ("game", "music", "city", "body", "domestic_absurdity", "memory"),
+    "city": ("game", "music", "body", "domestic_absurdity", "memory"),
+    "work": ("body", "domestic_absurdity", "music", "city", "game", "memory"),
+    "creativity": ("city", "music", "game", "body", "domestic_absurdity", "memory"),
+    "music": ("game", "city", "body", "domestic_absurdity", "memory"),
+    "game": ("city", "music", "memory", "body", "domestic_absurdity"),
+    "body": ("music", "game", "city", "domestic_absurdity", "memory"),
+    "domestic_absurdity": ("city", "music", "game", "body", "memory"),
+    "memory": ("game", "music", "city", "body", "domestic_absurdity"),
+    "care": ("game", "music", "city", "body", "domestic_absurdity", "memory"),
+    "conflict": ("music", "city", "body", "domestic_absurdity", "memory", "game"),
     "practical_future": ("relationships", "city", "music", "game", "body", "domestic_absurdity", "memory"),
     "attention": ("relationships", "city", "music", "game", "body", "domestic_absurdity", "memory"),
 }
