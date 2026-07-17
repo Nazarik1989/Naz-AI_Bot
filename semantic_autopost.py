@@ -215,21 +215,26 @@ def select_theme(
         for key in excluded_theme_keys
         if str(key).strip()
     }
+    compatible = {theme.key for theme in compatible_themes(rubric_name)}
+    start = 0
+    if recent and recent[-1] in THEMES_BY_KEY:
+        start = (
+            next(index for index, theme in enumerate(THEMES) if theme.key == recent[-1])
+            + 1
+        ) % len(THEMES)
+    ordered = (*THEMES[start:], *THEMES[:start])
     candidates = [
         theme
-        for theme in compatible_themes(rubric_name)
-        if theme.key not in recent and theme.key not in excluded
+        for theme in ordered
+        if theme.key in compatible
+        and theme.key not in recent
+        and theme.key not in excluded
     ]
     if not candidates:
         raise NoSemanticThemeAvailable(
             f"semantic theme cooldown exhausted for rubric={rubric_name!r}"
         )
-    return max(
-        candidates,
-        key=lambda theme: sha256(
-            f"{seed}|{platform}|{rubric_name}|{theme.key}".encode("utf-8")
-        ).hexdigest(),
-    )
+    return candidates[0]
 
 
 def select_correction_theme(
