@@ -313,11 +313,6 @@ def theme_instruction(theme: SemanticTheme, *, platform: str, rubric_name: str) 
     )
 
 
-def _pick_variant(values: Sequence[str], seed: str) -> str:
-    digest = int(sha256(seed.encode("utf-8")).hexdigest()[:12], 16)
-    return values[digest % len(values)]
-
-
 def correction_instruction(
     theme: SemanticTheme,
     rejected: SemanticDecision,
@@ -325,10 +320,6 @@ def correction_instruction(
     platform: str,
     rubric_name: str,
 ) -> str:
-    rejected_summary = " | ".join(
-        part for part in (rejected.central_thesis, rejected.conclusion, rejected.narrative_shape) if part
-    )
-    scene = _pick_variant(theme.scenes, f"scene|{rejected_summary}")
     rejected_meanings = "; ".join(rejected.key_meanings) or "(не выделены)"
     return (
         f"{theme_instruction(theme, platform=platform, rubric_name=rubric_name)}\n"
@@ -340,7 +331,9 @@ def correction_instruction(
         f"- вывод: {rejected.conclusion or '(не указан)'}\n"
         f"- сюжетная форма: {rejected.narrative_shape or '(не указана)'}\n"
         f"- ключевые смыслы: {rejected_meanings}\n"
-        f"Обязательная новая конкретная сцена: {scene}.\n"
+        "Самостоятельно выбери новую конкретную сцену, которой нет ни в отклонённом варианте, "
+        "ни в последних постах из anti-repeat context. Не превращай готовые примеры оси "
+        "в обязательный шаблон.\n"
         "Сформулируй существенно другой самостоятельный вывод из новой сцены и границ выбранной оси. "
         "Не используй готовую типовую мораль оси: вывод должен принадлежать именно этому выпуску.\n"
         "Не перефразируй первый вариант, не сохраняй его сюжетный ход и не приходи к его морали другими словами."

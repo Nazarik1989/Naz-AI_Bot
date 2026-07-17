@@ -276,8 +276,10 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertIn(first_rejection.central_thesis, second_prompt)
         self.assertIn(first_rejection.conclusion, second_prompt)
         self.assertIn(first_rejection.narrative_shape, second_prompt)
-        self.assertIn("Обязательная новая конкретная сцена", second_prompt)
+        self.assertIn("Самостоятельно выбери новую конкретную сцену", second_prompt)
         self.assertIn("существенно другой самостоятельный вывод", second_prompt)
+        for canned_scene in correction_theme.scenes:
+            self.assertNotIn(canned_scene, second_prompt)
         for canned_conclusion in correction_theme.conclusions:
             self.assertNotIn(canned_conclusion, second_prompt)
 
