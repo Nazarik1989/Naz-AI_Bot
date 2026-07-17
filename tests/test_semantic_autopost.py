@@ -235,6 +235,24 @@ class SemanticAutopostTests(unittest.TestCase):
             semantic.DIVERGENT_THEME_KEYS[initial.key],
         )
 
+    def test_rejected_theme_cooldown_is_persistent_but_not_accepted_history(self):
+        memory.record_rejected_semantic_theme(
+            user_id=7,
+            platform="vk",
+            semantic_theme="memory",
+            source_ref="timer:test",
+        )
+        self.assertEqual(
+            memory.get_recent_rejected_semantic_theme_keys(7),
+            ["memory"],
+        )
+        self.assertEqual(memory.get_recent_semantic_theme_keys(7), [])
+        memory.init_db()
+        self.assertEqual(
+            memory.get_recent_rejected_semantic_theme_keys(7),
+            ["memory"],
+        )
+
     def test_two_rejections_create_no_vk_draft_or_queue_job(self):
         theme = semantic.THEMES_BY_KEY["work"]
         result = semantic.GenerationResult(False, "", 2, rejected("duplicate twice"))
