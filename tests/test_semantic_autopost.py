@@ -253,7 +253,7 @@ class SemanticAutopostTests(unittest.TestCase):
             ["memory"],
         )
 
-    def test_rejected_theme_cooldown_keeps_last_ten_axes(self):
+    def test_rejected_theme_cooldown_keeps_distinct_axes(self):
         for index, theme in enumerate(
             (
                 "relationships",
@@ -276,9 +276,18 @@ class SemanticAutopostTests(unittest.TestCase):
                 source_ref=f"timer:{index}",
             )
         recent = memory.get_recent_rejected_semantic_theme_keys(9)
-        self.assertEqual(len(recent), 10)
-        self.assertNotIn("relationships", recent)
+        self.assertEqual(len(recent), 11)
+        self.assertIn("relationships", recent)
         self.assertIn("game", recent)
+        memory.record_rejected_semantic_theme(
+            user_id=9,
+            platform="telegram",
+            semantic_theme="game",
+            source_ref="timer:repeat",
+        )
+        recent = memory.get_recent_rejected_semantic_theme_keys(9)
+        self.assertEqual(len(recent), 11)
+        self.assertEqual(recent[-1], "game")
 
     def test_vk_rubric_selector_skips_fully_exhausted_theme_set(self):
         dev_log_keys = {
