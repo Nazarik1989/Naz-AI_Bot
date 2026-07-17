@@ -226,6 +226,19 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS autopost_semantic_profiles (
+                user_id INTEGER NOT NULL,
+                character_id TEXT NOT NULL,
+                history_digest TEXT NOT NULL,
+                occupied_themes_json TEXT NOT NULL,
+                exclusion_summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, character_id, history_digest)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS relationship_states (
                 relationship_id TEXT PRIMARY KEY,
                 state_json TEXT NOT NULL,
@@ -944,6 +957,95 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
         {key: value for key, value in item.items() if key != "_order"}
         for item in combined[-max(1, limit):]
     ]
+
+
+def get_cached_semantic_history_profile(
+    user_id: int,
+    history_digest: str,
+) -> Optional[Dict[str, Any]]:
+    clean_digest = str(history_digest or "").strip()
+    if not clean_digest:
+        return None
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT occupied_themes_json, exclusion_summary
+            FROM autopost_semantic_profiles
+            WHERE user_id = ? AND character_id = ? AND history_digest = ?
+            """,
+            (user_id, naz_character.CHARACTER_ID, clean_digest),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        occupied = json.loads(row["occupied_themes_json"] or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(occupied, list):
+        return None
+    return {
+        "history_digest": clean_digest,
+        "occupied_theme_keys": [
+            str(item)[:120]
+            for item in occupied
+            if str(item).strip()
+        ],
+        "exclusion_summary": str(row["exclusion_summary"] or ""),
+    }
+
+
+def cache_semantic_history_profile(
+    *,
+    user_id: int,
+    history_digest: str,
+    occupied_theme_keys: Iterable[str],
+    exclusion_summary: str,
+) -> None:
+    clean_digest = str(history_digest or "").strip()
+    if not clean_digest:
+        raise ValueError("semantic history profile requires a digest")
+    occupied = [
+        str(item)[:120]
+        for item in occupied_theme_keys
+        if str(item).strip()
+    ]
+    init_db()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO autopost_semantic_profiles(
+                user_id, character_id, history_digest, occupied_themes_json,
+                exclusion_summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                clean_digest,
+                json.dumps(occupied, ensure_ascii=False),
+                str(exclusion_summary or "")[:5000],
+                utc_now(),
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM autopost_semantic_profiles
+            WHERE user_id = ? AND character_id = ? AND history_digest NOT IN (
+                SELECT history_digest
+                FROM autopost_semantic_profiles
+                WHERE user_id = ? AND character_id = ?
+                ORDER BY created_at DESC
+                LIMIT 12
+            )
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                user_id,
+                naz_character.CHARACTER_ID,
+            ),
+        )
 
 
 def record_accepted_semantic_post(

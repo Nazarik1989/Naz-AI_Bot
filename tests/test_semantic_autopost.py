@@ -16,10 +16,7 @@ import semantic_autopost as semantic
 import vk_publish_queue
 
 
-def rejected(
-    reason: str = "same meaning",
-    occupied_theme_keys: tuple[str, ...] = (),
-) -> semantic.SemanticDecision:
+def rejected(reason: str = "same meaning") -> semantic.SemanticDecision:
     return semantic.SemanticDecision(
         False,
         reason,
@@ -27,7 +24,6 @@ def rejected(
         "без человеческой проверки автоматизация опасна",
         "сбой → проверка → правило",
         ("контроль", "проверка", "автоматизация"),
-        occupied_theme_keys,
     )
 
 
@@ -227,19 +223,65 @@ class SemanticAutopostTests(unittest.TestCase):
                 "conclusion": "полная автономность без контроля опасна",
                 "narrative_shape": "пример → риск → граница",
                 "key_meanings": ["автоматизация", "человеческий выбор", "граница"],
-                "occupied_theme_keys": ["care", "attention", "care"],
             },
             ensure_ascii=False,
         )
         with patch.object(main, "call_gpt", new=AsyncMock(return_value=response)) as judge:
             decision = asyncio.run(main.evaluate_autopost_candidate(candidate, history))
         self.assertFalse(decision.accepted)
-        self.assertEqual(decision.occupied_theme_keys, ("care", "attention"))
         sent_prompt = judge.await_args.args[0][1]["content"]
         self.assertIn(history[0]["content"], sent_prompt)
         self.assertIn(candidate, sent_prompt)
-        self.assertIn("Кандидат в occupied_theme_keys не учитывай", sent_prompt)
-        self.assertNotIn("retry_theme_key", sent_prompt)
+
+    def test_history_profile_requires_every_theme_and_is_cached_by_digest(self):
+        history = [
+            {
+                "semantic_theme": "",
+                "platform": "telegram",
+                "content": "Пауза без телефона вернула внимание к ожиданию.",
+            },
+            {
+                "semantic_theme": "city",
+                "platform": "vk",
+                "content": "Городская остановка изменила ритм вечера.",
+            },
+        ]
+        statuses = {
+            theme.key: {
+                "occupied": theme.key in {"attention", "city"},
+                "reason": (
+                    "центральная мысль уже есть"
+                    if theme.key in {"attention", "city"}
+                    else "центрального смысла нет"
+                ),
+            }
+            for theme in semantic.THEMES
+        }
+        response = json.dumps({"themes": statuses}, ensure_ascii=False)
+        judge = AsyncMock(return_value=response)
+
+        with patch.object(main, "call_gpt", new=judge):
+            first = asyncio.run(main.get_autopost_history_profile(1, history))
+            memory.init_db()
+            second = asyncio.run(main.get_autopost_history_profile(1, history))
+
+        self.assertEqual(first.occupied_theme_keys, ("city", "attention"))
+        self.assertEqual(first, second)
+        self.assertEqual(judge.await_count, 1)
+        self.assertIn("city:", first.exclusion_summary)
+        self.assertIn("attention:", first.exclusion_summary)
+
+        incomplete = dict(statuses)
+        incomplete.pop("attention")
+        with self.assertRaisesRegex(ValueError, "every theme"):
+            semantic.parse_history_profile(
+                json.dumps({"themes": incomplete}, ensure_ascii=False),
+                history_digest="digest",
+            )
+
+        prompt = semantic.build_history_profile_prompt(history)
+        for theme in semantic.THEMES:
+            self.assertIn(f'"{theme.key}"', prompt)
 
     def test_both_generations_see_history_and_retry_excludes_initial_axis(self):
         history = [
@@ -256,11 +298,11 @@ class SemanticAutopostTests(unittest.TestCase):
         ]
         generate = AsyncMock(side_effect=["Первый вариант", "Второй вариант"])
         occupied = ("memory", "city", "attention")
-        decisions = AsyncMock(
-            side_effect=[
-                rejected("duplicate", occupied_theme_keys=occupied),
-                accepted(),
-            ]
+        decisions = AsyncMock(side_effect=[rejected("duplicate"), accepted()])
+        profile = semantic.SemanticHistoryProfile(
+            "digest",
+            occupied,
+            "memory: занято\ncity: занято\nattention: занято",
         )
         with patch.object(
             main.memory, "get_recent_semantic_theme_keys", return_value=[]
@@ -268,6 +310,8 @@ class SemanticAutopostTests(unittest.TestCase):
             main.memory, "get_recent_posts_for_semantic_gate", return_value=history
         ), patch.object(
             main, "evaluate_autopost_candidate", new=decisions
+        ), patch.object(
+            main, "get_autopost_history_profile", new=AsyncMock(return_value=profile)
         ), patch.object(
             main.semantic_autopost, "select_correction_theme"
         ) as select_correction:
@@ -402,29 +446,16 @@ class SemanticAutopostTests(unittest.TestCase):
         for canned_conclusion in correction_theme.conclusions:
             self.assertNotIn(canned_conclusion, second_prompt)
 
-    def test_server_excludes_gate_classified_history_before_retry(self):
+    def test_server_uses_precomputed_history_profile_for_retry(self):
         generate = AsyncMock(side_effect=["Первый вариант", "Второй вариант"])
-        evaluate = AsyncMock(
-            side_effect=[
-                rejected(
-                    "memory repeats legacy history",
-                    occupied_theme_keys=("memory", "city", "attention"),
-                ),
-                accepted(),
-            ]
-        )
-        seen_occupied = []
-
-        def choose_retry(decision):
-            seen_occupied.extend(decision.occupied_theme_keys)
-            return semantic.THEMES_BY_KEY["music"]
+        evaluate = AsyncMock(side_effect=[rejected("memory repeats legacy history"), accepted()])
 
         result = asyncio.run(
             semantic.generate_with_gate(
                 generate=generate,
                 evaluate=evaluate,
                 theme=semantic.THEMES_BY_KEY["memory"],
-                correction_theme_selector=choose_retry,
+                correction_theme_selector=lambda _decision: semantic.THEMES_BY_KEY["music"],
                 platform="vk",
                 rubric_name="Маленький эксперимент",
                 is_model_warning=lambda text: False,
@@ -434,7 +465,6 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(result.attempts, 2)
         self.assertEqual(result.theme_key, "music")
-        self.assertEqual(seen_occupied, ["memory", "city", "attention"])
         self.assertIn("(memory)", generate.await_args_list[0].args[0])
         self.assertIn("(music)", generate.await_args_list[1].args[0])
 
