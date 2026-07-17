@@ -283,7 +283,7 @@ class SemanticAutopostTests(unittest.TestCase):
         for theme in semantic.THEMES:
             self.assertIn(f'"{theme.key}"', prompt)
 
-    def test_both_generations_see_history_and_retry_excludes_initial_axis(self):
+    def test_void_style_retry_keeps_theme_and_passes_rejection_semantics(self):
         history = [
             {
                 "semantic_theme": "",
@@ -334,20 +334,17 @@ class SemanticAutopostTests(unittest.TestCase):
             platform="vk",
             seed="slot",
         )
-        retry_theme = semantic.select_theme(
-            "AI без успешного успеха",
-            [],
-            platform="vk",
-            seed="slot:semantic-retry",
-            excluded_theme_keys=(initial_theme.key, *sorted(occupied)),
-        )
-        self.assertEqual(result.theme_key, retry_theme.key)
+        self.assertEqual(result.theme_key, initial_theme.key)
         self.assertNotIn(result.theme_key, occupied)
         for call in generate.await_args_list:
             prompt = call.args[0]
             self.assertIn("SEMANTIC ANTI-REPEAT CONTEXT", prompt)
             self.assertIn(history[0]["content"], prompt)
             self.assertIn(history[1]["content"], prompt)
+        retry_prompt = generate.await_args_list[1].args[0]
+        self.assertEqual(decisions.await_args_list[0].args[0], "Первый вариант")
+        self.assertIn("duplicate", retry_prompt)
+        self.assertIn(f"({initial_theme.key})", retry_prompt)
 
     def test_legacy_generated_post_without_semantic_theme_remains_readable(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
