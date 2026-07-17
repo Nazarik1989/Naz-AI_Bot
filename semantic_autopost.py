@@ -155,6 +155,7 @@ class GenerationResult:
     text: str
     attempts: int
     decision: SemanticDecision
+    theme_key: str = ""
 
 
 class NoSemanticThemeAvailable(RuntimeError):
@@ -174,10 +175,20 @@ def select_theme(
     *,
     platform: str,
     seed: str,
+    excluded_theme_keys: Iterable[str] = (),
 ) -> SemanticTheme:
     """Choose a rubric-compatible axis before generation, across platforms."""
     recent = [str(key) for key in recent_theme_keys if str(key).strip()][-THEME_COOLDOWN:]
-    candidates = [theme for theme in compatible_themes(rubric_name) if theme.key not in recent]
+    excluded = {
+        str(key)
+        for key in excluded_theme_keys
+        if str(key).strip()
+    }
+    candidates = [
+        theme
+        for theme in compatible_themes(rubric_name)
+        if theme.key not in recent and theme.key not in excluded
+    ]
     if not candidates:
         raise NoSemanticThemeAvailable(
             f"semantic theme cooldown exhausted for rubric={rubric_name!r}"
@@ -297,6 +308,7 @@ async def generate_with_gate(
     platform: str,
     rubric_name: str,
     is_model_warning: Callable[[str], bool],
+    correction_theme: SemanticTheme | None = None,
 ) -> GenerationResult:
     """Run exactly one initial generation and at most one corrective generation."""
     first_text = await generate(
@@ -307,11 +319,12 @@ async def generate_with_gate(
     else:
         first_decision = await evaluate(first_text)
     if first_decision.accepted:
-        return GenerationResult(True, first_text, 1, first_decision)
+        return GenerationResult(True, first_text, 1, first_decision, theme.key)
 
+    retry_theme = correction_theme or theme
     second_text = await generate(
         correction_instruction(
-            theme,
+            retry_theme,
             first_decision,
             platform=platform,
             rubric_name=rubric_name,
@@ -322,5 +335,5 @@ async def generate_with_gate(
     else:
         second_decision = await evaluate(second_text)
     if second_decision.accepted:
-        return GenerationResult(True, second_text, 2, second_decision)
-    return GenerationResult(False, "", 2, second_decision)
+        return GenerationResult(True, second_text, 2, second_decision, retry_theme.key)
+    return GenerationResult(False, "", 2, second_decision, retry_theme.key)

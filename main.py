@@ -937,6 +937,13 @@ async def generate_semantic_autopost_candidate(
         platform=platform,
         seed=seed,
     )
+    correction_theme = semantic_autopost.select_theme(
+        rubric_name,
+        recent_themes,
+        platform=platform,
+        seed=f"{seed}:correction",
+        excluded_theme_keys=(theme.key,),
+    )
     recent_posts = memory.get_recent_posts_for_semantic_gate(
         user_id,
         limit=semantic_autopost.SEMANTIC_HISTORY_LIMIT,
@@ -949,6 +956,7 @@ async def generate_semantic_autopost_candidate(
         generate=generate,
         evaluate=evaluate,
         theme=theme,
+        correction_theme=correction_theme,
         platform=platform,
         rubric_name=rubric_name,
         is_model_warning=is_warning_response,
@@ -957,11 +965,12 @@ async def generate_semantic_autopost_candidate(
         "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | theme=%s | attempts=%s | accepted=%s",
         platform,
         rubric_name,
-        theme.key,
+        result.theme_key or theme.key,
         result.attempts,
         result.accepted,
     )
-    return theme, result
+    accepted_theme = semantic_autopost.THEMES_BY_KEY.get(result.theme_key, theme)
+    return accepted_theme, result
 
 
 def commit_accepted_autopost_state(
