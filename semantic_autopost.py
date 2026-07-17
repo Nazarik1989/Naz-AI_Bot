@@ -29,6 +29,16 @@ class SemanticTheme:
     conclusions: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticCard:
+    key: str
+    theme_key: str
+    scene: str
+    tension: str
+    thesis: str
+    conclusion_boundary: str
+
+
 THEMES: tuple[SemanticTheme, ...] = (
     SemanticTheme(
         "relationships",
@@ -124,6 +134,54 @@ THEMES: tuple[SemanticTheme, ...] = (
 )
 
 THEMES_BY_KEY = {theme.key: theme for theme in THEMES}
+
+SEMANTIC_CARDS: tuple[SemanticCard, ...] = (
+    SemanticCard("relationships_pause", "relationships", "пауза в переписке или разговоре", "скорость ответа против точности понимания", "пауза может быть способом не исказить ответ, а не знаком холода", "не сводить вывод к универсальному совету отвечать медленнее"),
+    SemanticCard("relationships_help", "relationships", "помощь, о которой не просили", "доброе намерение против чужой самостоятельности", "поддержка остаётся поддержкой, пока оставляет человеку право отказаться", "не морализировать про личные границы вообще"),
+    SemanticCard("relationships_shared_word", "relationships", "двое по-разному поняли одно бытовое слово или договорённость", "кажущееся согласие против реального смысла", "уточнение общего языка иногда важнее формального согласия", "не завершать тезисом «надо лучше коммуницировать»"),
+    SemanticCard("city_detour", "city", "случайный обход привычного городского маршрута", "эффективность пути против нового наблюдения", "город раскрывается не только через цель, но и через вынужденные отклонения", "не превращать прогулку в совет по продуктивности"),
+    SemanticCard("city_after_close", "city", "место после закрытия: погасшая витрина, пустой двор или остановка", "назначение места против его жизни вне расписания", "городская деталь меняет смысл, когда исчезает обслуживающая её функция", "не делать вывод про одиночество как универсальную драму"),
+    SemanticCard("city_shared_silence", "city", "короткое молчаливое соседство незнакомых людей", "анонимность против временной общности", "совместное пространство иногда создаёт связь без знакомства", "не приписывать незнакомцам выдуманные биографии"),
+    SemanticCard("work_handoff", "work", "передача незавершённой работы другому человеку", "желание выглядеть закончившим против ясности состояния", "качество работы включает честно обозначенный незакрытый край", "не сводить вывод к чек-листам и контролю мелочей"),
+    SemanticCard("work_stop", "work", "остановка процесса из-за слабого, но странного сигнала", "темп против цены продолжения вслепую", "профессионализм иногда проявляется в своевременной остановке, а не в героическом продолжении", "не повторять мораль «слушай тело» или «проверяй всё»"),
+    SemanticCard("work_remove_ritual", "work", "ненужный шаг, который продолжают выполнять по привычке", "ритуал надёжности против реальной пользы", "ремесло умеет не только добавлять процедуры, но и убирать пустые", "не рекламировать автоматизацию как готовый ответ"),
+    SemanticCard("creativity_cut", "creativity", "любимая деталь, которую пришлось убрать из законченной работы", "привязанность автора против целостности формы", "отказ от удачного фрагмента может сделать замысел слышнее", "не заканчивать лозунгом про смелость отпускать"),
+    SemanticCard("creativity_constraint", "creativity", "жёсткое ограничение материала, цвета, длины или времени", "свобода вариантов против ясности решения", "ограничение может проявить выбор, который прятался в изобилии", "не объявлять любые ограничения полезными"),
+    SemanticCard("creativity_unfinished", "creativity", "черновик, который ценен не как будущий шедевр", "завершённость против сохранённого направления мысли", "иногда функция черновика — не стать финалом, а удержать поворот", "не романтизировать вечную незавершённость"),
+    SemanticCard("music_changed_room", "music", "один трек по-разному звучит в комнате и в движении", "неизменная запись против меняющегося слушателя", "контекст слышания участвует в музыке почти как ещё один инструмент", "не делать музыку лекарством от любого состояния"),
+    SemanticCard("music_after_sound", "music", "несколько секунд после окончания альбома или концерта", "желание немедленно заполнить тишину против остаточного звучания", "часть музыкального опыта возникает уже после последней ноты", "не превращать тишину в превосходство над шумом"),
+    SemanticCard("music_wrong_track", "music", "неподходящий по настроению трек, который неожиданно сработал", "ожидаемое соответствие против полезного несовпадения", "музыка иногда меняет состояние именно потому, что не подтверждает его", "не советовать универсальные плейлисты"),
+    SemanticCard("game_build_cost", "game", "выбор билда, который закрывает другие возможности", "идеальный вариант против цены специализации", "интерес решения появляется там, где выбор действительно что-то отнимает", "не переносить игровую механику в банальный совет про жизнь"),
+    SemanticCard("game_side_path", "game", "пропущенная побочная ветка из-за спешки к цели", "эффективное прохождение против любопытства", "игровой маршрут выражает приоритет игрока не хуже финального результата", "не утверждать, что медленная игра всегда правильнее"),
+    SemanticCard("game_team_resource", "game", "игрок тратит редкий ресурс ради команды", "личная эффективность против общего темпа", "командная механика делает цену помощи видимой и потому честной", "не сводить к морали о самопожертвовании"),
+    SemanticCard("body_temperature", "body", "температура воздуха, одежды или предмета меняет восприятие сцены", "абстрактный план против физического качества момента", "телесная деталь может менять смысл происходящего без диагноза и самокопания", "не заканчивать призывом «слушай сигналы тела»"),
+    SemanticCard("body_stairs", "body", "разговор меняется после подъёма, дороги или другой простой нагрузки", "содержание слов против ритма дыхания и движения", "мысль существует не отдельно от темпа, в котором её произносят", "не делать вывод про отдых и продуктивность"),
+    SemanticCard("body_hands", "body", "руки запоминают способ действия раньше формулировки", "объяснение против навыка", "часть знания живёт в повторённом движении, а не в красивом описании", "не объявлять интуицию безошибочной"),
+    SemanticCard("domestic_wrong_place", "domestic_absurdity", "обычный предмет устойчиво живёт в нелогичном месте", "правильный порядок против удобства реальной жизни", "бытовая система честнее схемы, если отражает фактическое действие", "не возвращаться к коробкам, складам и генеральной уборке"),
+    SemanticCard("domestic_duplicate", "domestic_absurdity", "дома обнаруживаются два одинаковых предмета, потому что первый постоянно терялся", "борьба с причиной против практичного обхода", "иногда дублирование — не бардак, а дешёвая плата за спокойный быт", "не превращать в урок про резервирование систем"),
+    SemanticCard("domestic_label", "domestic_absurdity", "старая подпись пережила предмет или задачу", "память обозначения против изменившейся реальности", "ярлык может продолжать управлять действием после исчезновения причины", "не сводить к совету чаще обновлять списки"),
+    SemanticCard("memory_receipt", "memory", "случайная бумажная мелочь сохраняет порядок событий", "ничтожность предмета против точности хронологии", "память иногда держится не на важном, а на правильно расположенном следе", "не романтизировать хранение любого хлама"),
+    SemanticCard("memory_old_hint", "memory", "старая подсказка или название показывает прежний способ думать", "нынешнее самоописание против следа старой версии себя", "след прошлого ценен не ностальгией, а разницей между тогдашним и нынешним выбором", "не повторять сюжет про очистку дисков, архивов и удаление лишнего"),
+    SemanticCard("memory_missing_piece", "memory", "в знакомой истории обнаруживается отсутствующая деталь", "уверенность воспоминания против неполноты источника", "пробел иногда честнее уверенно достроенного прошлого", "не заканчивать недоверием ко всей памяти"),
+    SemanticCard("care_corridor_light", "care", "для поздно возвращающегося человека оставляют удобную мелочь в пространстве", "незаметность действия против реального облегчения", "забота может менять среду, не требуя благодарности и отчёта", "не повторять мораль про снижение чужой нагрузки вообще"),
+    SemanticCard("care_mismatch", "care", "заранее обозначают различие вкуса, режима или ограничения", "удобство большинства против конкретного несовпадения", "надёжная забота учитывает различие до того, как оно станет проблемой", "не превращать в инструкцию по сервису"),
+    SemanticCard("care_return", "care", "вещь возвращают так, чтобы следующий человек мог сразу ею пользоваться", "формальное возвращение против закрытого цикла", "уважение проявляется в состоянии, в котором после нас продолжают действие", "не сводить вывод к проверкам, зарядке и чек-листам"),
+    SemanticCard("conflict_shared_resource", "conflict", "двум людям одновременно нужен один ресурс или пространство", "равные основания против невозможности полного удовлетворения", "справедливое решение может распределять не удобство, а неудобство", "не объявлять компромисс универсальной добродетелью"),
+    SemanticCard("conflict_rule_exception", "conflict", "понятное правило сталкивается с редким исключением", "предсказуемость для всех против точности в одном случае", "зрелое правило умеет показать цену исключения, а не делать вид, что её нет", "не сводить к лозунгу про гибкость"),
+    SemanticCard("conflict_different_clock", "conflict", "одна задача срочная для одного человека и обычная для другого", "разные временные масштабы против общей работы", "часть конфликта исчезает, когда стороны называют не позицию, а свой дедлайн", "не заканчивать советом «просто поговорите»"),
+    SemanticCard("future_default", "practical_future", "новая настройка по умолчанию незаметно меняет повседневный выбор", "удобство автоматического решения против потери осознанного момента", "будущее чаще входит через дефолт, чем через громкое изобретение", "не делать технологию злодеем или спасителем"),
+    SemanticCard("future_new_refusal", "practical_future", "новый инструмент создаёт действие, от которого приходится сознательно отказываться", "расширение возможностей против новой ответственности", "полезность технологии видна и по тому, какие лишние действия она позволяет не делать", "не повторять мораль про автоматизацию всего"),
+    SemanticCard("future_visible_exception", "practical_future", "автоматизация делает редкое исключение заметнее обычного процесса", "масштабирование нормы против ценности отклонения", "хорошая система будущего не прячет исключения, а оставляет им понятный выход", "не уходить в архитектурный или AI-жаргон"),
+    SemanticCard("attention_unfinished_thought", "attention", "уведомление приходит в момент почти сформулированной мысли", "мгновенный внешний сигнал против хрупкого внутреннего хода", "потеря внимания измеряется не минутами, а исчезнувшей связью между мыслями", "не завершать банальным призывом отключить уведомления"),
+    SemanticCard("attention_background_change", "attention", "в знакомом фоне меняется один звук, свет или ритм", "привычное игнорирование против значимого отклонения", "внимание часто включается не громкостью, а нарушением ожидаемого рисунка", "не превращать наблюдение в проверку перед действием"),
+    SemanticCard("attention_single_choice", "attention", "среди множества вариантов человек замечает один по неожиданной причине", "изобилие вариантов против личного критерия", "выбор становится своим, когда появляется причина, не заданная витриной", "не делать вывод про минимализм и отказ от выбора"),
+)
+
+CARDS_BY_THEME = {
+    theme.key: tuple(card for card in SEMANTIC_CARDS if card.theme_key == theme.key)
+    for theme in THEMES
+}
+
 EXPERIENTIAL_THEME_KEYS = frozenset(
     {"city", "music", "game", "body", "domestic_absurdity", "memory"}
 )
@@ -187,6 +245,7 @@ class GenerationResult:
     attempts: int
     decision: SemanticDecision
     theme_key: str = ""
+    card_key: str = ""
 
 
 class NoSemanticThemeAvailable(RuntimeError):
@@ -235,6 +294,33 @@ def select_theme(
             f"semantic theme cooldown exhausted for rubric={rubric_name!r}"
         )
     return candidates[0]
+
+
+def select_card(theme_key: str, recent_card_keys: Iterable[str]) -> SemanticCard:
+    """Rotate the editorial meanings inside one axis; never choose randomly."""
+    cards = CARDS_BY_THEME.get(theme_key, ())
+    if not cards:
+        raise ValueError(f"semantic card catalog is empty for theme={theme_key!r}")
+    recent = [str(key) for key in recent_card_keys if str(key).strip()]
+    last_index = -1
+    for key in reversed(recent):
+        match = next((index for index, card in enumerate(cards) if card.key == key), None)
+        if match is not None:
+            last_index = match
+            break
+    return cards[(last_index + 1) % len(cards)]
+
+
+def card_instruction(card: SemanticCard) -> str:
+    return (
+        f"Server-side смысловая карточка выпуска: {card.key}.\n"
+        f"Поле конкретной сцены: {card.scene}.\n"
+        f"Смысловое напряжение: {card.tension}.\n"
+        f"Направление центрального тезиса: {card.thesis}.\n"
+        f"Граница вывода: {card.conclusion_boundary}.\n"
+        "Карточка задаёт уникальный смысл этого выпуска, но не готовый текст. "
+        "Не перечисляй её поля и не превращай их в служебные заголовки."
+    )
 
 
 def select_correction_theme(
@@ -536,38 +622,53 @@ async def generate_with_gate(
     is_model_warning: Callable[[str], bool],
     correction_theme: SemanticTheme | None = None,
     correction_theme_selector: Callable[[SemanticDecision], SemanticTheme | None] | None = None,
+    card: SemanticCard | None = None,
 ) -> GenerationResult:
     """Run exactly one initial generation and at most one corrective generation."""
-    first_text = await generate(
-        theme_instruction(theme, platform=platform, rubric_name=rubric_name)
-    )
+    first_instruction = theme_instruction(theme, platform=platform, rubric_name=rubric_name)
+    if card is not None:
+        first_instruction += "\n" + card_instruction(card)
+    first_text = await generate(first_instruction)
     if is_model_warning(first_text):
         first_decision = blocked_decision("generation blocked before semantic review")
     else:
         first_decision = await evaluate(first_text)
     if first_decision.accepted:
-        return GenerationResult(True, first_text, 1, first_decision, theme.key)
+        return GenerationResult(
+            True, first_text, 1, first_decision, theme.key, card.key if card else ""
+        )
 
     if correction_theme is not None:
         retry_theme = correction_theme
     elif correction_theme_selector is not None:
         retry_theme = correction_theme_selector(first_decision)
         if retry_theme is None:
-            return GenerationResult(False, "", 1, first_decision, theme.key)
+            return GenerationResult(
+                False, "", 1, first_decision, theme.key, card.key if card else ""
+            )
     else:
         retry_theme = theme
-    second_text = await generate(
-        correction_instruction(
-            retry_theme,
-            first_decision,
-            platform=platform,
-            rubric_name=rubric_name,
-        )
+    second_instruction = correction_instruction(
+        retry_theme,
+        first_decision,
+        platform=platform,
+        rubric_name=rubric_name,
     )
+    if card is not None:
+        second_instruction += (
+            "\n" + card_instruction(card)
+            + "\nВо второй попытке сохрани смысловую карточку, но выбери другую "
+            "конкретную сцену внутри её поля и иной финальный ход."
+        )
+    second_text = await generate(second_instruction)
     if is_model_warning(second_text):
         second_decision = blocked_decision("corrective generation blocked before semantic review")
     else:
         second_decision = await evaluate(second_text)
     if second_decision.accepted:
-        return GenerationResult(True, second_text, 2, second_decision, retry_theme.key)
-    return GenerationResult(False, "", 2, second_decision, retry_theme.key)
+        return GenerationResult(
+            True, second_text, 2, second_decision, retry_theme.key, card.key if card else ""
+        )
+    return GenerationResult(
+        False, "", 2, second_decision, retry_theme.key, card.key if card else ""
+    )

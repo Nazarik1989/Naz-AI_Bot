@@ -157,6 +157,7 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "generated_posts", "semantic_theme", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "generated_posts", "semantic_card", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "generated_posts", "external_job_id", "TEXT NOT NULL DEFAULT ''")
 
         conn.execute(
@@ -224,6 +225,7 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_column(conn, "autopost_semantic_history", "semantic_card", "TEXT NOT NULL DEFAULT ''")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS autopost_semantic_profiles (
@@ -849,6 +851,37 @@ def get_recent_semantic_theme_keys(user_id: int, limit: int = 5) -> List[str]:
     return [str(row["semantic_theme"]) for row in reversed(rows)]
 
 
+def get_recent_semantic_card_keys(user_id: int, limit: int = 80) -> List[str]:
+    """Return meaning cards from confirmed Telegram/VK publications only."""
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT semantic_card
+            FROM (
+                SELECT semantic_card, created_at
+                FROM autopost_semantic_history
+                WHERE user_id = ? AND character_id = ?
+                  AND semantic_card <> '' AND platform <> 'vk'
+                UNION ALL
+                SELECT semantic_card, created_at
+                FROM generated_posts
+                WHERE user_id = ? AND published_to_channel = 1
+                  AND semantic_card <> '' AND task LIKE 'naz_vk_queue:%'
+            )
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                user_id,
+                max(1, limit),
+            ),
+        ).fetchall()
+    return [str(row["semantic_card"]) for row in reversed(rows)]
+
+
 def get_recent_rejected_semantic_theme_keys(user_id: int, limit: int = 12) -> List[str]:
     """Return blocked axes since the latest confirmed publication."""
     init_db()
@@ -1076,6 +1109,7 @@ def record_accepted_semantic_post(
     user_id: int,
     platform: str,
     semantic_theme: str,
+    semantic_card: str = "",
     central_thesis: str,
     conclusion: str,
     narrative_shape: str,
@@ -1093,16 +1127,17 @@ def record_accepted_semantic_post(
         conn.execute(
             """
             INSERT OR IGNORE INTO autopost_semantic_history(
-                user_id, character_id, platform, semantic_theme, central_thesis,
+                user_id, character_id, platform, semantic_theme, semantic_card, central_thesis,
                 conclusion, narrative_shape, key_meanings_json, content,
                 content_hash, source_ref, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
                 naz_character.CHARACTER_ID,
                 str(platform)[:40],
                 clean_theme[:120],
+                str(semantic_card or "")[:160],
                 str(central_thesis or "")[:1000],
                 str(conclusion or "")[:1000],
                 str(narrative_shape or "")[:500],
@@ -1426,6 +1461,7 @@ def save_generated_post(
     image_count: int = 0,
     published_to_channel: bool = False,
     semantic_theme: str = "",
+    semantic_card: str = "",
     external_job_id: str = "",
 ) -> None:
     with db() as conn:
@@ -1433,9 +1469,9 @@ def save_generated_post(
             """
             INSERT INTO generated_posts(
                 user_id, expert_mode, task, topic, content, image_count,
-                published_to_channel, semantic_theme, external_job_id, created_at
+                published_to_channel, semantic_theme, semantic_card, external_job_id, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -1446,6 +1482,7 @@ def save_generated_post(
                 image_count,
                 int(published_to_channel),
                 str(semantic_theme or "")[:120],
+                str(semantic_card or "")[:160],
                 str(external_job_id or "")[:120],
                 utc_now(),
             ),

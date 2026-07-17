@@ -1020,6 +1020,7 @@ async def generate_semantic_autopost_candidate(
         user_id,
         limit=semantic_autopost.THEME_COOLDOWN,
     )
+    recent_cards = memory.get_recent_semantic_card_keys(user_id)
     rejected_themes = memory.get_recent_rejected_semantic_theme_keys(
         user_id,
         limit=len(semantic_autopost.THEMES),
@@ -1039,6 +1040,7 @@ async def generate_semantic_autopost_candidate(
         seed=seed,
         excluded_theme_keys=blocked,
     )
+    card = semantic_autopost.select_card(theme.key, recent_cards)
     history_context = semantic_autopost.generation_history_context(recent_posts)
     exclusion_context = semantic_autopost.history_profile_context(history_profile)
 
@@ -1061,6 +1063,7 @@ async def generate_semantic_autopost_candidate(
         platform=platform,
         rubric_name=rubric_name,
         is_model_warning=is_warning_response,
+        card=card,
     )
     if not result.accepted:
         memory.record_rejected_semantic_theme(
@@ -1076,10 +1079,11 @@ async def generate_semantic_autopost_candidate(
             seed,
         )
     logger.info(
-        "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | theme=%s | attempts=%s | accepted=%s | reason=%s",
+        "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | theme=%s | card=%s | attempts=%s | accepted=%s | reason=%s",
         platform,
         rubric_name,
         result.theme_key or theme.key,
+        result.card_key or card.key,
         result.attempts,
         result.accepted,
         result.decision.reason[:500].replace("\n", " "),
@@ -1115,6 +1119,7 @@ def commit_accepted_autopost_state(
         user_id=user_id,
         platform=platform,
         semantic_theme=theme.key,
+        semantic_card=result.card_key,
         central_thesis=result.decision.central_thesis,
         conclusion=result.decision.conclusion,
         narrative_shape=result.decision.narrative_shape,
@@ -3361,6 +3366,7 @@ async def create_naz_vk_job(
         image_count=len(media),
         published_to_channel=False,
         semantic_theme=theme.key,
+        semantic_card=semantic_result.card_key,
         external_job_id=str(job["job_id"]),
     )
     if gaming_plan:
