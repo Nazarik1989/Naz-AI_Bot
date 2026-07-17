@@ -18,7 +18,7 @@ import vk_publish_queue
 
 def rejected(
     reason: str = "same meaning",
-    retry_theme_key: str = "",
+    occupied_theme_keys: tuple[str, ...] = (),
 ) -> semantic.SemanticDecision:
     return semantic.SemanticDecision(
         False,
@@ -27,7 +27,7 @@ def rejected(
         "без человеческой проверки автоматизация опасна",
         "сбой → проверка → правило",
         ("контроль", "проверка", "автоматизация"),
-        retry_theme_key,
+        occupied_theme_keys,
     )
 
 
@@ -227,17 +227,21 @@ class SemanticAutopostTests(unittest.TestCase):
                 "conclusion": "полная автономность без контроля опасна",
                 "narrative_shape": "пример → риск → граница",
                 "key_meanings": ["автоматизация", "человеческий выбор", "граница"],
+                "occupied_theme_keys": ["care", "attention", "care"],
             },
             ensure_ascii=False,
         )
         with patch.object(main, "call_gpt", new=AsyncMock(return_value=response)) as judge:
             decision = asyncio.run(main.evaluate_autopost_candidate(candidate, history))
         self.assertFalse(decision.accepted)
+        self.assertEqual(decision.occupied_theme_keys, ("care", "attention"))
         sent_prompt = judge.await_args.args[0][1]["content"]
         self.assertIn(history[0]["content"], sent_prompt)
         self.assertIn(candidate, sent_prompt)
+        self.assertIn("Кандидат в occupied_theme_keys не учитывай", sent_prompt)
+        self.assertNotIn("retry_theme_key", sent_prompt)
 
-    def test_both_generations_see_shared_semantic_history_without_banning_axis(self):
+    def test_both_generations_see_history_and_retry_excludes_initial_axis(self):
         history = [
             {
                 "semantic_theme": "",
@@ -251,7 +255,13 @@ class SemanticAutopostTests(unittest.TestCase):
             },
         ]
         generate = AsyncMock(side_effect=["Первый вариант", "Второй вариант"])
-        decisions = AsyncMock(side_effect=[rejected("duplicate"), accepted()])
+        occupied = ("memory", "city", "attention")
+        decisions = AsyncMock(
+            side_effect=[
+                rejected("duplicate", occupied_theme_keys=occupied),
+                accepted(),
+            ]
+        )
         with patch.object(
             main.memory, "get_recent_semantic_theme_keys", return_value=[]
         ), patch.object(
@@ -274,15 +284,21 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(generate.await_count, 2)
         select_correction.assert_not_called()
-        self.assertEqual(
-            result.theme_key,
-            semantic.select_theme(
-                "AI без успешного успеха",
-                [],
-                platform="vk",
-                seed="slot",
-            ).key,
+        initial_theme = semantic.select_theme(
+            "AI без успешного успеха",
+            [],
+            platform="vk",
+            seed="slot",
         )
+        retry_theme = semantic.select_theme(
+            "AI без успешного успеха",
+            [],
+            platform="vk",
+            seed="slot:semantic-retry",
+            excluded_theme_keys=(initial_theme.key, *sorted(occupied)),
+        )
+        self.assertEqual(result.theme_key, retry_theme.key)
+        self.assertNotIn(result.theme_key, occupied)
         for call in generate.await_args_list:
             prompt = call.args[0]
             self.assertIn("SEMANTIC ANTI-REPEAT CONTEXT", prompt)
@@ -386,20 +402,29 @@ class SemanticAutopostTests(unittest.TestCase):
         for canned_conclusion in correction_theme.conclusions:
             self.assertNotIn(canned_conclusion, second_prompt)
 
-    def test_gate_selected_retry_theme_changes_only_second_generation(self):
+    def test_server_excludes_gate_classified_history_before_retry(self):
         generate = AsyncMock(side_effect=["Первый вариант", "Второй вариант"])
         evaluate = AsyncMock(
             side_effect=[
-                rejected("memory repeats legacy history", retry_theme_key="city"),
+                rejected(
+                    "memory repeats legacy history",
+                    occupied_theme_keys=("memory", "city", "attention"),
+                ),
                 accepted(),
             ]
         )
+        seen_occupied = []
+
+        def choose_retry(decision):
+            seen_occupied.extend(decision.occupied_theme_keys)
+            return semantic.THEMES_BY_KEY["music"]
+
         result = asyncio.run(
             semantic.generate_with_gate(
                 generate=generate,
                 evaluate=evaluate,
                 theme=semantic.THEMES_BY_KEY["memory"],
-                correction_themes={"city": semantic.THEMES_BY_KEY["city"]},
+                correction_theme_selector=choose_retry,
                 platform="vk",
                 rubric_name="Маленький эксперимент",
                 is_model_warning=lambda text: False,
@@ -408,9 +433,10 @@ class SemanticAutopostTests(unittest.TestCase):
 
         self.assertTrue(result.accepted)
         self.assertEqual(result.attempts, 2)
-        self.assertEqual(result.theme_key, "city")
+        self.assertEqual(result.theme_key, "music")
+        self.assertEqual(seen_occupied, ["memory", "city", "attention"])
         self.assertIn("(memory)", generate.await_args_list[0].args[0])
-        self.assertIn("(city)", generate.await_args_list[1].args[0])
+        self.assertIn("(music)", generate.await_args_list[1].args[0])
 
     def test_correction_axis_excludes_initial_and_full_cooldown(self):
         recent = ["relationships", "work", "care", "memory", "conflict"]
