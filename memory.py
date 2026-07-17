@@ -122,6 +122,26 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS realtime_voice_summary_sessions (
+                user_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, session_id)
+            )
+            """
+        )
+        legacy_realtime_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='realtime_voice_deliveries'"
+        ).fetchone()
+        if legacy_realtime_table:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO realtime_voice_summary_sessions(user_id, session_id, created_at)
+                SELECT user_id, idempotency_key, created_at FROM realtime_voice_deliveries
+                """
+            )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS generated_posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -974,6 +994,37 @@ def add_memory_item(user_id: int, kind: str, content: str, title: Optional[str] 
             "INSERT INTO memory_items(user_id, kind, title, content, created_at) VALUES (?, ?, ?, ?, ?)",
             (user_id, kind, title, content[:8000], utc_now()),
         )
+
+
+def save_realtime_voice_summary_once(
+    user_id: int,
+    session_id: str,
+    content: str,
+    *,
+    memory_enabled: bool,
+) -> bool:
+    """Atomically record one persistent Hub session and optionally its summary."""
+    now = utc_now()
+    with db() as conn:
+        inserted = conn.execute(
+            """
+            INSERT OR IGNORE INTO realtime_voice_summary_sessions(user_id, session_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, session_id, now),
+        )
+        if inserted.rowcount != 1:
+            return False
+        if not memory_enabled:
+            return False
+        conn.execute(
+            """
+            INSERT INTO memory_items(user_id, kind, title, content, created_at)
+            VALUES (?, 'realtime_voice_summary', 'Realtime Voice Hub', ?, ?)
+            """,
+            (user_id, content[:8000], now),
+        )
+    return True
 
 
 def get_memory_context(user_id: int, limit: int = 8) -> str:

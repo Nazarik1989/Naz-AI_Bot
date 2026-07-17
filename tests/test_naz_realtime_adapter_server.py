@@ -28,13 +28,15 @@ class NazRealtimeAdapterServerTests(unittest.TestCase):
             "request_id": "request_id_123456789012345",
             "operation": "final_summary",
             "user_id": 1,
-            "idempotency_key": "session_key_123456789012345",
+            "session_id": "session_key_123456789012345",
             "summary": "Серверный итог",
         }
         first = server.handle_request(request)
         second = server.handle_request(request)
         self.assertTrue(first["ok"])
         self.assertEqual(first["receipt"], second["receipt"])
+        self.assertTrue(first["saved"])
+        self.assertFalse(second["saved"])
         with memory.db() as conn:
             count = conn.execute(
                 "SELECT COUNT(*) AS count FROM memory_items WHERE kind='realtime_voice_summary'"
@@ -47,7 +49,7 @@ class NazRealtimeAdapterServerTests(unittest.TestCase):
             "request_id": "request_id_123456789012345",
             "operation": "final_summary",
             "user_id": 1,
-            "idempotency_key": "session_key_123456789012345",
+            "session_id": "session_key_123456789012345",
             "summary": "Итог",
             "persona": "naz",
         }

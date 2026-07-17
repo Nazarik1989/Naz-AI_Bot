@@ -10,7 +10,7 @@ import main
 
 REALTIME_MODEL: Final = "gpt-realtime-2.1"
 MAX_SUMMARY_CHARS: Final = 4_000
-IDEMPOTENCY_KEY_RE: Final = re.compile(r"^[A-Za-z0-9_-]{20,100}$")
+SESSION_ID_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 def _require_registered_user(user_id: int) -> None:
@@ -52,45 +52,27 @@ def _clean_summary(summary: str) -> str:
     return value[:MAX_SUMMARY_CHARS].rstrip()
 
 
-def save_final_summary(user_id: int, summary: str, *, idempotency_key: str) -> bool:
-    """Atomically persist at most one Hub summary for a server-issued key."""
+def _validate_session_id(session_id: str) -> str:
+    if not isinstance(session_id, str):
+        raise TypeError("session_id must be a string")
+    if not SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError("session_id is invalid")
+    return session_id
+
+
+def save_final_summary(user_id: int, summary: str, session_id: str) -> bool:
+    """Persist a final summary once for a trusted Hub identity and session.
+
+    ``user_id`` must come from the Hub's authenticated server-side identity,
+    never from an unverified browser field.
+    """
     _require_registered_user(user_id)
     clean_summary = _clean_summary(summary)
-    if not isinstance(idempotency_key, str) or not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
-        raise ValueError("idempotency_key is invalid")
+    safe_session_id = _validate_session_id(session_id)
     memory_enabled = bool(main.memory.load_state(user_id).get("memory_enabled", True))
-    with main.memory.db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS realtime_voice_deliveries (
-                idempotency_key TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                saved INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        existing = conn.execute(
-            "SELECT user_id, saved FROM realtime_voice_deliveries WHERE idempotency_key=?",
-            (idempotency_key,),
-        ).fetchone()
-        if existing is not None:
-            if int(existing["user_id"]) != user_id:
-                raise PermissionError("Idempotency key belongs to another user")
-            return bool(existing["saved"])
-        if memory_enabled:
-            conn.execute(
-                """
-                INSERT INTO memory_items(user_id, kind, title, content, created_at)
-                VALUES (?, 'realtime_voice_summary', 'Realtime Voice Hub', ?, ?)
-                """,
-                (user_id, clean_summary, main.memory.utc_now()),
-            )
-        conn.execute(
-            """
-            INSERT INTO realtime_voice_deliveries(idempotency_key, user_id, saved, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (idempotency_key, user_id, int(memory_enabled), main.memory.utc_now()),
-        )
-    return memory_enabled
+    return main.memory.save_realtime_voice_summary_once(
+        user_id,
+        safe_session_id,
+        clean_summary,
+        memory_enabled=memory_enabled,
+    )
