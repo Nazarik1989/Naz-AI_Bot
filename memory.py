@@ -821,7 +821,7 @@ def get_recent_semantic_theme_keys(user_id: int, limit: int = 5) -> List[str]:
     return [str(row["semantic_theme"]) for row in reversed(rows)]
 
 
-def get_recent_rejected_semantic_theme_keys(user_id: int, limit: int = 6) -> List[str]:
+def get_recent_rejected_semantic_theme_keys(user_id: int, limit: int = 10) -> List[str]:
     """Return recently blocked axes separately from accepted-theme history."""
     init_db()
     with db() as conn:
