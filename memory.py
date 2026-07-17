@@ -821,16 +821,17 @@ def get_recent_semantic_theme_keys(user_id: int, limit: int = 5) -> List[str]:
     return [str(row["semantic_theme"]) for row in reversed(rows)]
 
 
-def get_recent_rejected_semantic_theme_keys(user_id: int, limit: int = 10) -> List[str]:
+def get_recent_rejected_semantic_theme_keys(user_id: int, limit: int = 12) -> List[str]:
     """Return recently blocked axes separately from accepted-theme history."""
     init_db()
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT semantic_theme
+            SELECT semantic_theme, MAX(id) AS latest_id
             FROM autopost_semantic_rejections
             WHERE user_id = ? AND character_id = ? AND semantic_theme <> ''
-            ORDER BY id DESC
+            GROUP BY semantic_theme
+            ORDER BY latest_id DESC
             LIMIT ?
             """,
             (user_id, naz_character.CHARACTER_ID, max(1, limit)),
