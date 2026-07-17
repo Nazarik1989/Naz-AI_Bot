@@ -937,12 +937,12 @@ async def generate_semantic_autopost_candidate(
         platform=platform,
         seed=seed,
     )
-    correction_theme = semantic_autopost.select_theme(
+    correction_theme = semantic_autopost.select_correction_theme(
         rubric_name,
         recent_themes,
+        initial_theme_key=theme.key,
         platform=platform,
         seed=f"{seed}:correction",
-        excluded_theme_keys=(theme.key,),
     )
     recent_posts = memory.get_recent_posts_for_semantic_gate(
         user_id,

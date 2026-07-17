@@ -128,14 +128,32 @@ THEMES_BY_KEY = {theme.key: theme for theme in THEMES}
 # A rubric narrows the catalogue; it does not dictate a ready-made topic.
 RUBRIC_THEME_KEYS: Mapping[str, tuple[str, ...]] = {
     "Утренний дожим": ("work", "body", "care", "domestic_absurdity", "attention", "practical_future", "creativity"),
-    "AI без магии": ("work", "care", "conflict", "practical_future", "attention", "relationships", "creativity"),
+    "AI без магии": ("work", "care", "conflict", "practical_future", "attention", "relationships", "creativity", "city", "music", "game", "body", "domestic_absurdity", "memory"),
     "Баг, который стал системой": ("work", "care", "conflict", "memory", "domestic_absurdity", "relationships", "practical_future"),
     "Naz после смены": ("relationships", "city", "music", "body", "memory", "care", "creativity", "attention"),
     "Naz Dev Log": ("work", "care", "memory", "conflict", "domestic_absurdity", "practical_future", "body"),
-    "AI без успешного успеха": ("work", "care", "conflict", "practical_future", "attention", "relationships", "creativity"),
-    "Ошибка недели": ("work", "care", "conflict", "memory", "domestic_absurdity", "relationships", "practical_future"),
+    "AI без успешного успеха": ("work", "care", "conflict", "practical_future", "attention", "relationships", "creativity", "city", "music", "game", "body", "domestic_absurdity", "memory"),
+    "Ошибка недели": ("work", "care", "conflict", "memory", "domestic_absurdity", "relationships", "practical_future", "body", "creativity"),
     "Игровая лаборатория VK": ("game", "relationships", "creativity", "music", "conflict", "attention", "practical_future"),
     "visual_archive": ("city", "relationships", "creativity", "music", "body", "domestic_absurdity", "memory", "attention"),
+}
+
+# A corrective axis should be meaningfully distant, not merely a different key
+# from the same clarity/control/responsibility cluster.
+DIVERGENT_THEME_KEYS: Mapping[str, tuple[str, ...]] = {
+    "relationships": ("game", "music", "city", "body", "domestic_absurdity", "memory", "creativity"),
+    "city": ("work", "game", "creativity", "music", "body", "care", "conflict"),
+    "work": ("body", "domestic_absurdity", "music", "city", "game", "memory", "creativity"),
+    "creativity": ("relationships", "city", "music", "game", "body", "domestic_absurdity", "memory"),
+    "music": ("work", "care", "conflict", "memory", "domestic_absurdity", "relationships", "practical_future"),
+    "game": ("city", "work", "care", "memory", "body", "domestic_absurdity", "music"),
+    "body": ("creativity", "music", "game", "city", "relationships", "memory", "practical_future"),
+    "domestic_absurdity": ("relationships", "city", "music", "game", "body", "memory", "care"),
+    "memory": ("game", "music", "city", "body", "domestic_absurdity", "creativity", "conflict"),
+    "care": ("game", "music", "city", "body", "domestic_absurdity", "creativity", "attention"),
+    "conflict": ("music", "city", "body", "domestic_absurdity", "memory", "creativity", "attention"),
+    "practical_future": ("relationships", "city", "music", "game", "body", "domestic_absurdity", "memory"),
+    "attention": ("relationships", "city", "music", "game", "body", "domestic_absurdity", "memory"),
 }
 
 
@@ -192,6 +210,44 @@ def select_theme(
     if not candidates:
         raise NoSemanticThemeAvailable(
             f"semantic theme cooldown exhausted for rubric={rubric_name!r}"
+        )
+    return max(
+        candidates,
+        key=lambda theme: sha256(
+            f"{seed}|{platform}|{rubric_name}|{theme.key}".encode("utf-8")
+        ).hexdigest(),
+    )
+
+
+def select_correction_theme(
+    rubric_name: str,
+    recent_theme_keys: Iterable[str],
+    *,
+    initial_theme_key: str,
+    platform: str,
+    seed: str,
+) -> SemanticTheme:
+    """Prefer a rubric-compatible axis outside the initial theme's meaning cluster."""
+    recent = {
+        str(key)
+        for key in list(recent_theme_keys)[-THEME_COOLDOWN:]
+        if str(key).strip()
+    }
+    preferred = set(DIVERGENT_THEME_KEYS.get(initial_theme_key, ()))
+    candidates = [
+        theme
+        for theme in compatible_themes(rubric_name)
+        if theme.key in preferred
+        and theme.key not in recent
+        and theme.key != initial_theme_key
+    ]
+    if not candidates:
+        return select_theme(
+            rubric_name,
+            recent,
+            platform=platform,
+            seed=seed,
+            excluded_theme_keys=(initial_theme_key,),
         )
     return max(
         candidates,

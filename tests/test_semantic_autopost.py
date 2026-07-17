@@ -189,15 +189,19 @@ class SemanticAutopostTests(unittest.TestCase):
             platform="vk",
             seed="slot",
         )
-        correction = semantic.select_theme(
+        correction = semantic.select_correction_theme(
             "AI без магии",
             recent,
+            initial_theme_key=initial.key,
             platform="vk",
             seed="slot:correction",
-            excluded_theme_keys=(initial.key,),
         )
         self.assertNotEqual(initial.key, correction.key)
         self.assertNotIn(correction.key, recent)
+        self.assertIn(
+            correction.key,
+            semantic.DIVERGENT_THEME_KEYS[initial.key],
+        )
 
     def test_two_rejections_create_no_vk_draft_or_queue_job(self):
         theme = semantic.THEMES_BY_KEY["work"]
