@@ -64,6 +64,7 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
         ]
         self.assertEqual(environment_files, ["EnvironmentFile=/opt/naz-ai-bot/.env"])
         self.assertNotIn("/etc/naz-ai-bot/naz.env", service)
+        self.assertIn("Environment=NAZ_ENV_LOADED_BY_SYSTEMD=1", service)
 
     def test_check_config_is_read_only_and_complete(self):
         import naz_vk_producer
