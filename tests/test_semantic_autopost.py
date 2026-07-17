@@ -253,6 +253,33 @@ class SemanticAutopostTests(unittest.TestCase):
             ["memory"],
         )
 
+    def test_rejected_theme_cooldown_keeps_last_ten_axes(self):
+        for index, theme in enumerate(
+            (
+                "relationships",
+                "work",
+                "care",
+                "memory",
+                "conflict",
+                "practical_future",
+                "attention",
+                "creativity",
+                "body",
+                "music",
+                "game",
+            )
+        ):
+            memory.record_rejected_semantic_theme(
+                user_id=9,
+                platform="vk",
+                semantic_theme=theme,
+                source_ref=f"timer:{index}",
+            )
+        recent = memory.get_recent_rejected_semantic_theme_keys(9)
+        self.assertEqual(len(recent), 10)
+        self.assertNotIn("relationships", recent)
+        self.assertIn("game", recent)
+
     def test_two_rejections_create_no_vk_draft_or_queue_job(self):
         theme = semantic.THEMES_BY_KEY["work"]
         result = semantic.GenerationResult(False, "", 2, rejected("duplicate twice"))
