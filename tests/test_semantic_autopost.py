@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import character_state
+import controller
 import main
 import memory
 import prompts
@@ -47,6 +48,20 @@ class SemanticAutopostTests(unittest.TestCase):
         )
         self.db_patch.start()
         memory.init_db()
+
+    def test_controller_keeps_character_voice_without_forcing_builder_moral(self):
+        prompt = controller.build_clean_gpt_input(
+            "Сделай пост о вечернем городе",
+            controller.normalize_state({}),
+            "post",
+            "вечерний город",
+        )
+        self.assertIn("Бери конкретную сцену из выбранной смысловой оси", prompt)
+        self.assertIn("только когда сам материал действительно про разработку", prompt)
+        self.assertNotIn(
+            "Показывай путь через бардак, баги, кривой код, сломанные интеграции",
+            prompt,
+        )
 
     def tearDown(self):
         self.db_patch.stop()
