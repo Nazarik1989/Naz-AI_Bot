@@ -207,6 +207,32 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertNotIn(theme.key, recent)
         self.assertTrue(result.accepted)
 
+    def test_theme_selection_round_robins_after_last_accepted(self):
+        recent = ["creativity", "music", "game", "body", "memory"]
+        first = semantic.select_theme(
+            "Человеческая деталь",
+            recent,
+            platform="vk",
+            seed="slot-a",
+        )
+        second = semantic.select_theme(
+            "Человеческая деталь",
+            recent,
+            platform="vk",
+            seed="slot-b",
+        )
+        skipped = semantic.select_theme(
+            "Человеческая деталь",
+            recent,
+            platform="vk",
+            seed="slot-c",
+            excluded_theme_keys=("care",),
+        )
+
+        self.assertEqual(first.key, "care")
+        self.assertEqual(second.key, "care")
+        self.assertEqual(skipped.key, "conflict")
+
     def test_meaning_repeat_is_rejected_without_literal_word_match(self):
         history = [
             {
