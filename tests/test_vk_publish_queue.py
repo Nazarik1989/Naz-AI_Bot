@@ -40,6 +40,19 @@ class VkPublishQueueTests(unittest.TestCase):
             self.assertIsInstance(job["target_group_id"], str)
             queue.validate_canonical_job(job, root / "pending" / job["job_id"])
 
+    def test_only_consumer_done_job_is_reported_as_completed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = self.enqueue(root)
+            (root / "done").mkdir()
+            (root / "pending" / job["job_id"]).replace(root / "done" / job["job_id"])
+
+            completed = queue.completed_naz_job(root, job["job_id"])
+
+            self.assertIsNotNone(completed)
+            self.assertEqual(completed["job_id"], job["job_id"])
+            self.assertEqual(completed["text"], "Безопасный текст Naz")
+
     def test_materialized_job_matches_shared_consumer_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

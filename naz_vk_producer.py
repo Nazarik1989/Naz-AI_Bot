@@ -98,6 +98,14 @@ def _validate_queue_permissions(queue_root: Path, user_name: str = "naz") -> Non
         state_path = queue_root / state_name
         if state_path.exists() and _permission_bits(state_path, uid, gids) & 0o2:
             raise PreflightError(f"Naz must not write the shared {state_name} state")
+        if (
+            state_name == "done"
+            and state_path.exists()
+            and not (_permission_bits(state_path, uid, gids) & 0o1)
+        ):
+            raise PreflightError(
+                "Naz needs execute-only traversal of done to confirm its known job ids"
+            )
 
 
 def _validate_browser_isolation(profile_dir: Path, user_name: str = "naz") -> None:
@@ -254,7 +262,11 @@ async def produce_one(now: datetime | None = None) -> dict:
     default_topic = (
         "Игровая лаборатория Naz VK: механика, мод, AI-инструмент или эксперимент для игроков"
         if rubric_kind == "gaming"
-        else "Naz VK: практическая заметка об AI, разработке или контент-системах"
+        else (
+            "Оригинальная заметка Naz вокруг одной конкретной сцены, предмета, действия "
+            "или встречи. Выбранная server-side смысловая ось задаёт предмет выпуска; "
+            "AI, разработка и системы не являются обязательной темой."
+        )
     )
     topic = os.getenv(
         "NAZ_VK_ONESHOT_TOPIC",

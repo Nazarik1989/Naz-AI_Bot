@@ -157,6 +157,7 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "generated_posts", "semantic_theme", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "generated_posts", "external_job_id", "TEXT NOT NULL DEFAULT ''")
 
         conn.execute(
             """
@@ -805,18 +806,32 @@ def record_content_signature(user_id: int, plan: Dict[str, str], topic: str) -> 
 
 
 def get_recent_semantic_theme_keys(user_id: int, limit: int = 5) -> List[str]:
-    """Return accepted Naz themes across every publishing platform."""
+    """Return themes from confirmed Telegram/VK publications only."""
     init_db()
     with db() as conn:
         rows = conn.execute(
             """
             SELECT semantic_theme
-            FROM autopost_semantic_history
-            WHERE user_id = ? AND character_id = ? AND semantic_theme <> ''
-            ORDER BY id DESC
+            FROM (
+                SELECT semantic_theme, created_at
+                FROM autopost_semantic_history
+                WHERE user_id = ? AND character_id = ?
+                  AND semantic_theme <> '' AND platform <> 'vk'
+                UNION ALL
+                SELECT semantic_theme, created_at
+                FROM generated_posts
+                WHERE user_id = ? AND published_to_channel = 1
+                  AND semantic_theme <> '' AND task LIKE 'naz_vk_queue:%'
+            )
+            ORDER BY created_at DESC
             LIMIT ?
             """,
-            (user_id, naz_character.CHARACTER_ID, max(1, limit)),
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                user_id,
+                max(1, limit),
+            ),
         ).fetchall()
     return [str(row["semantic_theme"]) for row in reversed(rows)]
 
@@ -878,7 +893,7 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
             """
             SELECT semantic_theme, content, platform, created_at, id
             FROM autopost_semantic_history
-            WHERE user_id = ? AND character_id = ?
+            WHERE user_id = ? AND character_id = ? AND platform <> 'vk'
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -888,7 +903,7 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
             """
             SELECT semantic_theme, content, task, created_at, id
             FROM generated_posts
-            WHERE user_id = ?
+            WHERE user_id = ? AND published_to_channel = 1
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -1286,15 +1301,16 @@ def save_generated_post(
     image_count: int = 0,
     published_to_channel: bool = False,
     semantic_theme: str = "",
+    external_job_id: str = "",
 ) -> None:
     with db() as conn:
         conn.execute(
             """
             INSERT INTO generated_posts(
                 user_id, expert_mode, task, topic, content, image_count,
-                published_to_channel, semantic_theme, created_at
+                published_to_channel, semantic_theme, external_job_id, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -1305,9 +1321,45 @@ def save_generated_post(
                 image_count,
                 int(published_to_channel),
                 str(semantic_theme or "")[:120],
+                str(external_job_id or "")[:120],
                 utc_now(),
             ),
         )
+
+
+def get_unpublished_vk_jobs(user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    """Return only Naz job ids already known to this producer; never list consumer state."""
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, external_job_id, content
+            FROM generated_posts
+            WHERE user_id = ? AND task LIKE 'naz_vk_queue:%'
+              AND published_to_channel = 0 AND external_job_id <> ''
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, max(1, limit)),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_vk_generated_post_published(user_id: int, row_id: int) -> bool:
+    """Promote one queued VK draft only after its exact job is confirmed done."""
+    with db() as conn:
+        updated = conn.execute(
+            """
+            UPDATE generated_posts
+            SET published_to_channel = 1
+            WHERE id = ? AND user_id = ? AND task LIKE 'naz_vk_queue:%'
+              AND published_to_channel = 0
+            """,
+            (int(row_id), user_id),
+        )
+    if updated.rowcount != 1:
+        return False
+    return True
 
 
 def get_recent_generated_posts(user_id: int, task: str = "", limit: int = 3) -> List[Dict[str, str]]:

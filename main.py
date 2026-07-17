@@ -931,40 +931,35 @@ async def generate_semantic_autopost_candidate(
         user_id,
         limit=semantic_autopost.THEME_COOLDOWN,
     )
-    rejected_themes = memory.get_recent_rejected_semantic_theme_keys(user_id)
-    try:
-        theme = semantic_autopost.select_theme(
-            rubric_name,
-            recent_themes,
-            platform=platform,
-            seed=seed,
-            excluded_theme_keys=rejected_themes,
-        )
-    except semantic_autopost.NoSemanticThemeAvailable:
-        theme = semantic_autopost.select_theme(
-            rubric_name,
-            recent_themes,
-            platform=platform,
-            seed=seed,
-        )
+    theme = semantic_autopost.select_theme(
+        rubric_name,
+        recent_themes,
+        platform=platform,
+        seed=seed,
+    )
     correction_theme = semantic_autopost.select_correction_theme(
         rubric_name,
         recent_themes,
         initial_theme_key=theme.key,
         platform=platform,
         seed=f"{seed}:correction",
-        excluded_theme_keys=rejected_themes,
     )
     recent_posts = memory.get_recent_posts_for_semantic_gate(
         user_id,
         limit=semantic_autopost.SEMANTIC_HISTORY_LIMIT,
     )
+    history_context = semantic_autopost.generation_history_context(recent_posts)
 
     async def evaluate(candidate: str) -> semantic_autopost.SemanticDecision:
         return await evaluate_autopost_candidate(candidate, recent_posts)
 
+    async def generate_with_history(instruction: str) -> str:
+        if history_context:
+            instruction = f"{instruction}\n\n{history_context}"
+        return await generate(instruction)
+
     result = await semantic_autopost.generate_with_gate(
-        generate=generate,
+        generate=generate_with_history,
         evaluate=evaluate,
         theme=theme,
         correction_theme=correction_theme,
@@ -972,27 +967,14 @@ async def generate_semantic_autopost_candidate(
         rubric_name=rubric_name,
         is_model_warning=is_warning_response,
     )
-    if result.attempts > 1:
-        memory.record_rejected_semantic_theme(
-            user_id=user_id,
-            platform=platform,
-            semantic_theme=theme.key,
-            source_ref=seed,
-        )
-    if not result.accepted:
-        memory.record_rejected_semantic_theme(
-            user_id=user_id,
-            platform=platform,
-            semantic_theme=correction_theme.key,
-            source_ref=seed,
-        )
     logger.info(
-        "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | theme=%s | attempts=%s | accepted=%s",
+        "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | theme=%s | attempts=%s | accepted=%s | reason=%s",
         platform,
         rubric_name,
         result.theme_key or theme.key,
         result.attempts,
         result.accepted,
+        result.decision.reason[:500].replace("\n", " "),
     )
     accepted_theme = semantic_autopost.THEMES_BY_KEY.get(result.theme_key, theme)
     return accepted_theme, result
@@ -3170,14 +3152,23 @@ async def create_naz_vk_job(
             "NAZ_VK_IMAGE_POLICY must be required or text_music"
         )
     user_id = ADMIN_ID or 0
+    for queued_draft in memory.get_unpublished_vk_jobs(user_id):
+        completed_job = vk_publish_queue.completed_naz_job(
+            NAZ_VK_QUEUE_DIR,
+            str(queued_draft.get("external_job_id") or ""),
+        )
+        if completed_job and completed_job.get("text") == queued_draft.get("content"):
+            memory.mark_vk_generated_post_published(
+                user_id,
+                int(queued_draft["id"]),
+            )
     accepted_theme_keys = memory.get_recent_semantic_theme_keys(
         user_id,
         limit=semantic_autopost.THEME_COOLDOWN,
     )
-    rejected_theme_keys = memory.get_recent_rejected_semantic_theme_keys(user_id)
     rubric = select_naz_vk_rubric(
         rubric_kind,
-        excluded_theme_keys=(*accepted_theme_keys, *rejected_theme_keys),
+        excluded_theme_keys=accepted_theme_keys,
     )
     base_instruction = (
         f"Рубрика VK: {rubric['name']}. {rubric['angle']}. {rubric['format']}. "
@@ -3259,15 +3250,7 @@ async def create_naz_vk_job(
         image_count=len(media),
         published_to_channel=False,
         semantic_theme=theme.key,
-    )
-    commit_accepted_autopost_state(
-        user_id=user_id,
-        topic=topic,
-        task="post",
-        platform="vk",
-        source_ref=source_ref,
-        theme=theme,
-        result=semantic_result,
+        external_job_id=str(job["job_id"]),
     )
     if gaming_plan:
         memory.record_content_signature(user_id, gaming_plan, topic)
@@ -5037,25 +5020,25 @@ NAZ_TELEGRAM_RUBRICS: List[Dict[str, object]] = [
 
 NAZ_VK_RUBRICS: List[Dict[str, str]] = [
     {
-        "name": "Naz Dev Log",
+        "name": "Полевая заметка Naz",
         "kind": "daily",
-        "angle": "короткая рабочая заметка о сборке, баге, проверке или дожиме AI-системы",
-        "format": "плотный VK-пост без Telegram-обрывистости: контекст, вывод, прикладной смысл",
-        "track_tags": "daily,focus,builder,systems",
+        "angle": "одна конкретная сцена, предмет, действие или встреча; выбранная смысловая ось задаёт предмет, а AI и разработка появляются только если естественно относятся к сцене",
+        "format": "связная полевая заметка в собственной форме без обязательной схемы проблема-причина-урок и без выдуманного личного опыта",
+        "track_tags": "daily,focus,warm,city",
     },
     {
-        "name": "AI без успешного успеха",
+        "name": "Маленький эксперимент",
         "kind": "daily",
-        "angle": "практический разбор AI-инструмента или привычки без хайпа",
-        "format": "объяснить человеческим языком, где польза, где ловушка, что делать дальше",
-        "track_tags": "daily,focus,warm,systems",
+        "angle": "одно небольшое проверяемое действие, выбор или наблюдение и его неожиданное конкретное последствие; не превращать результат в универсальный совет",
+        "format": "самостоятельный VK-пост с конкретикой; финалом может быть вопрос, незакрытое напряжение или частный вывод этой сцены",
+        "track_tags": "daily,focus,builder,warm",
     },
     {
-        "name": "Ошибка недели",
+        "name": "Человеческая деталь",
         "kind": "daily",
-        "angle": "одна ошибка в боте, контенте или интеграции и нормальный вывод после неё",
-        "format": "сцена, сбой, причина, дожим, вывод",
-        "track_tags": "daily,glitch,reflective,energy",
+        "angle": "один жест, привычка, место, предмет или короткий выбор, через который раскрывается выбранная смысловая ось",
+        "format": "наблюдение и развитие мысли без обязательной пользы, системной дисциплины, починки или морали",
+        "track_tags": "daily,reflective,warm,city",
     },
     {
         "name": "Игровая лаборатория VK",
