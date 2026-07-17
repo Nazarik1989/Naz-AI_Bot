@@ -63,7 +63,9 @@ class NazRealtimeAdapterTests(unittest.TestCase):
     def test_summary_is_cleaned_bounded_and_user_scoped(self) -> None:
         raw = "  Обсудили план\x00 на неделю.\n\n\nСледующий шаг — прототип.  " + ("x" * 5_000)
 
-        self.assertTrue(adapter.save_final_summary(77, raw))
+        self.assertTrue(
+            adapter.save_final_summary(77, raw, idempotency_key="session_key_123456789012345")
+        )
 
         with memory.db() as conn:
             row = conn.execute(
@@ -83,18 +85,37 @@ class NazRealtimeAdapterTests(unittest.TestCase):
     def test_unknown_user_cannot_save_summary(self) -> None:
         with patch.object(memory, "add_memory_item") as save:
             with self.assertRaises(PermissionError):
-                adapter.save_final_summary(99, "Нельзя сохранить")
+                adapter.save_final_summary(
+                    99, "Нельзя сохранить", idempotency_key="session_key_123456789012345"
+                )
         save.assert_not_called()
 
     def test_memory_setting_is_respected(self) -> None:
         memory.set_memory_enabled(77, False)
         with patch.object(memory, "add_memory_item") as save:
-            self.assertFalse(adapter.save_final_summary(77, "Не сохранять"))
+            self.assertFalse(
+                adapter.save_final_summary(
+                    77, "Не сохранять", idempotency_key="session_key_123456789012345"
+                )
+            )
         save.assert_not_called()
 
     def test_empty_summary_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            adapter.save_final_summary(77, "\x00  \n")
+            adapter.save_final_summary(
+                77, "\x00  \n", idempotency_key="session_key_123456789012345"
+            )
+
+    def test_duplicate_delivery_is_atomic_and_idempotent(self) -> None:
+        key = "session_key_123456789012345"
+        self.assertTrue(adapter.save_final_summary(77, "Первый итог", idempotency_key=key))
+        self.assertTrue(adapter.save_final_summary(77, "Второй итог", idempotency_key=key))
+        with memory.db() as conn:
+            rows = conn.execute(
+                "SELECT content FROM memory_items WHERE user_id=? AND kind='realtime_voice_summary'",
+                (77,),
+            ).fetchall()
+        self.assertEqual([row["content"] for row in rows], ["Первый итог"])
 
 
 if __name__ == "__main__":
