@@ -164,6 +164,8 @@ NAZ_VK_TIMEZONE=Europe/Moscow
 NAZ_VK_SCHEDULER=systemd
 NAZ_VK_QUEUE_DIR=/var/lib/void-vk-publisher/queue
 NAZ_VK_TRACK_STATE_FILE=/var/lib/naz-ai-bot/vk_track_rotation.json
+NAZ_VK_IMAGE_POLICY=required
+NAZ_VK_IMAGE_ATTEMPTS=2
 ```
 
 Production uses the tracked `naz-vk-producer.service` and `.timer`. The timer
@@ -173,8 +175,21 @@ JobQueue schedule, or `off` to disable both scheduler registrations. The
 standalone command itself remains available when the scheduler mode is `off`.
 
 Every VK job receives a track from the approved code-owned catalog. Daily and
-gaming producers share one persistent rotation of the last eight track queries;
-if no eligible approved track is available, no job is enqueued.
+gaming producers also read the publisher-owned global last-eight history, so
+Naz and VOID cannot reuse each other's recent tracks. If no eligible approved
+track is available, no job is enqueued. Images are required by default and
+generation is bounded by `NAZ_VK_IMAGE_ATTEMPTS`; `text_music` is the only
+explicit policy that permits a job without media.
+
+Before enabling a production timer, run the read-only preflight as root:
+
+```bash
+/opt/naz-ai-bot/.venv/bin/python -B -m naz_vk_producer --check-config
+```
+
+The check validates the canonical environment, publisher allowlist, queue write
+scope, API configuration, catalog/history readability, and the tracked
+Europe/Moscow schedule. It never generates content or writes the DB or queue.
 
 Naz creates only canonical filesystem jobs in the deployment-owned `pending`
 inbox. Browser state, VK credentials, consumption, and publication remain

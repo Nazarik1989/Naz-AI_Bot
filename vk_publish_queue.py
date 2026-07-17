@@ -79,6 +79,11 @@ def canonical_job_id(dedupe_key: str) -> str:
     return f"naz-{digest[:24]}"
 
 
+def normalize_track_query(value: str) -> str:
+    """Match the shared consumer's semantic key for global track rotation."""
+    return " ".join(re.findall(r"[0-9a-zа-яё]+", str(value).casefold()))
+
+
 def _require_pending(queue_root: Path) -> Path:
     """Return the deployment-owned inbox without listing or mutating it."""
     pending = queue_root / "pending"
@@ -96,7 +101,13 @@ def _media_size(item: MediaInput) -> int:
     return source.stat().st_size
 
 
-def validate_canonical_job(job: dict, job_dir: Path) -> None:
+def validate_canonical_job(
+    job: dict,
+    job_dir: Path,
+    *,
+    allowed_group_id: str | None = None,
+    recent_track_keys: Iterable[str] = (),
+) -> None:
     """Apply the shared VOID consumer contract to a materialized job."""
     if not isinstance(job, dict) or len(job) != 11 or frozenset(job) != JOB_FIELDS:
         raise QueueError("job must contain exactly 11 canonical fields")
@@ -104,6 +115,8 @@ def validate_canonical_job(job: dict, job_dir: Path) -> None:
         raise QueueError("invalid schema or producer")
     if not isinstance(job["target_group_id"], str) or not job["target_group_id"]:
         raise QueueError("target_group_id must be a non-empty JSON string")
+    if allowed_group_id is not None and job["target_group_id"] != str(allowed_group_id):
+        raise QueueError("target_group_id is not allowed")
     if not isinstance(job["text"], str) or not job["text"] or len(job["text"]) > MAX_TEXT_LENGTH:
         raise QueueError("invalid text")
     if (
@@ -118,8 +131,23 @@ def validate_canonical_job(job: dict, job_dir: Path) -> None:
         raise QueueError("invalid dedupe_key")
     if job["job_id"] != canonical_job_id(key):
         raise QueueError("job_id does not match dedupe_key")
+    for field in ("created_at", "not_before"):
+        value = job[field]
+        if not isinstance(value, str) or not value:
+            raise QueueError(f"invalid {field}")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise QueueError(f"invalid {field}") from exc
+        if parsed.tzinfo is None:
+            raise QueueError(f"{field} must include timezone")
+    if not isinstance(job["source_ref"], str) or not job["source_ref"]:
+        raise QueueError("source_ref is required")
+    track_key = normalize_track_query(job["track_query"])
+    if not track_key or track_key in {str(item) for item in recent_track_keys}:
+        raise QueueError("track_query was used in the shared last 8")
     media = job["media"]
-    if not isinstance(media, list) or len(media) > MAX_MEDIA_COUNT:
+    if not isinstance(media, list) or len(media) > MAX_MEDIA_COUNT or len(media) != len(set(media)):
         raise QueueError("invalid media list")
     for raw_name in media:
         if not isinstance(raw_name, str):

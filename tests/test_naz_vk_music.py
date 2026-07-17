@@ -21,6 +21,31 @@ class NazVkMusicTests(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertNotIn(selected.query, recent)
 
+    def test_consumer_history_blocks_tracks_used_by_void(self):
+        recent = [track.query for track in music.APPROVED_TRACKS if "daily" in track.tags][:8]
+        with tempfile.TemporaryDirectory() as directory:
+            shared = Path(directory) / "recent-tracks.json"
+            shared.write_text(
+                json.dumps(
+                    {
+                        "tracks": [
+                            {"key": music._normal(query)}
+                            for query in recent
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            selected = music.enqueue_with_track_rotation(
+                Path(directory) / "naz-rotation.json",
+                requested_tags=["daily"],
+                seed="shared:void-history",
+                post_topic="Практический AI",
+                shared_history_file=shared,
+                enqueue_job=lambda query: query,
+            )
+        self.assertNotIn(selected, recent)
+
     def test_rubric_category_cannot_cross_from_gaming_to_daily(self):
         selected = music.select_track(["gaming", "builder"], [], seed="gaming:builder")
         self.assertIsNotNone(selected)

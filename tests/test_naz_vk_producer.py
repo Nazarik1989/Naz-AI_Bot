@@ -2,8 +2,10 @@ import asyncio
 import importlib
 import inspect
 import sys
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
@@ -45,8 +47,6 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
         self.assertEqual(create.await_args.kwargs["source_ref"], "systemd:2026-07-14:gaming:16:30")
 
     def test_systemd_timer_has_only_requested_vk_schedule(self):
-        from pathlib import Path
-
         timer = Path("deploy/systemd/naz-vk-producer.timer").read_text(encoding="utf-8")
         calendars = [line for line in timer.splitlines() if line.startswith("OnCalendar=")]
         self.assertEqual(
@@ -56,6 +56,108 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
                 "OnCalendar=Tue,Thu,Sun *-*-* 16:30:00 Europe/Moscow",
             ],
         )
+
+    def test_service_reads_only_canonical_naz_environment(self):
+        service = Path("deploy/systemd/naz-vk-producer.service").read_text(encoding="utf-8")
+        environment_files = [
+            line for line in service.splitlines() if line.startswith("EnvironmentFile=")
+        ]
+        self.assertEqual(environment_files, ["EnvironmentFile=/opt/naz-ai-bot/.env"])
+        self.assertNotIn("/etc/naz-ai-bot/naz.env", service)
+
+    def test_check_config_is_read_only_and_complete(self):
+        import naz_vk_producer
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            queue = base / "queue"
+            for state in ("pending", "processing", "done", "failed"):
+                (queue / state).mkdir(parents=True, exist_ok=True)
+            (queue / "recent-tracks.json").write_text(
+                '{"tracks":[{"key":"already used"}]}\n',
+                encoding="utf-8",
+            )
+            consumer_env = base / "consumer.env"
+            consumer_env.write_text("VK_GROUP_ID=123\n", encoding="utf-8")
+            timer = base / "naz-vk-producer.timer"
+            timer.write_text(
+                Path("deploy/systemd/naz-vk-producer.timer").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            track_state = base / "naz-data" / "rotation.json"
+            track_state.parent.mkdir()
+            before = {
+                path.relative_to(base).as_posix(): path.read_bytes()
+                for path in base.rglob("*")
+                if path.is_file()
+            }
+            with patch.multiple(
+                naz_vk_producer.naz,
+                NAZ_VK_ENABLED=True,
+                NAZ_VK_SCHEDULER="systemd",
+                NAZ_VK_PUBLIC_ID="123",
+                NAZ_VK_QUEUE_DIR=queue,
+                NAZ_VK_TRACK_STATE_FILE=track_state,
+                NAZ_VK_TIMEZONE="Europe/Moscow",
+                NAZ_VK_DAILY_TIME="10:30",
+                NAZ_VK_GAMING_TIME="16:30",
+                OPENROUTER_API_KEY="configured",
+                IMAGE_PROVIDER="openai",
+                NAZ_VK_IMAGE_POLICY="required",
+                NAZ_VK_IMAGE_ATTEMPTS=2,
+            ), patch.object(
+                naz_vk_producer, "EXPECTED_QUEUE_DIR", queue
+            ), patch.object(
+                naz_vk_producer, "_validate_queue_permissions"
+            ) as permissions, patch.object(
+                naz_vk_producer.naz.memory, "init_db"
+            ) as init_db, patch.object(
+                naz_vk_producer.naz, "create_naz_vk_job", new=AsyncMock()
+            ) as create_job:
+                checks = naz_vk_producer.check_config(
+                    consumer_env_file=consumer_env,
+                    timer_unit_file=timer,
+                )
+            permissions.assert_called_once_with(queue)
+            init_db.assert_not_called()
+            create_job.assert_not_awaited()
+            self.assertEqual(
+                checks,
+                (
+                    "publisher allowlist",
+                    "queue write scope",
+                    "API configuration",
+                    "music catalog and histories",
+                    "bounded media policy",
+                    "Europe/Moscow schedule",
+                ),
+            )
+            after = {
+                path.relative_to(base).as_posix(): path.read_bytes()
+                for path in base.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
+
+    def test_check_config_blocks_missing_public_id(self):
+        import naz_vk_producer
+
+        with patch.object(naz_vk_producer.naz, "NAZ_VK_ENABLED", True), patch.object(
+            naz_vk_producer.naz, "NAZ_VK_SCHEDULER", "systemd"
+        ), patch.object(naz_vk_producer.naz, "NAZ_VK_PUBLIC_ID", ""):
+            with self.assertRaisesRegex(naz_vk_producer.PreflightError, "PUBLIC_ID"):
+                naz_vk_producer.check_config()
+
+    def test_check_config_cli_never_calls_producer(self):
+        import naz_vk_producer
+
+        with patch.object(
+            naz_vk_producer, "check_config", return_value=("safe",)
+        ), patch.object(
+            naz_vk_producer, "produce_one", new=AsyncMock()
+        ) as produce:
+            self.assertEqual(naz_vk_producer.main(["--check-config"]), 0)
+        produce.assert_not_awaited()
 
     def test_entrypoint_has_no_browser_or_playwright_path(self):
         import naz_vk_producer

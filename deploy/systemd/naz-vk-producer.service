@@ -9,7 +9,7 @@ User=naz
 Group=naz
 SupplementaryGroups=vkqueue
 WorkingDirectory=/opt/naz-ai-bot
-EnvironmentFile=/etc/naz-ai-bot/naz.env
+EnvironmentFile=/opt/naz-ai-bot/.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/naz-ai-bot/.venv/bin/python -B -m naz_vk_producer
 UMask=0027

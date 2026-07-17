@@ -7,6 +7,7 @@ Stores:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -155,6 +156,7 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_column(conn, "generated_posts", "semantic_theme", "TEXT NOT NULL DEFAULT ''")
 
         conn.execute(
             """
@@ -188,6 +190,25 @@ def init_db() -> None:
         )
         _ensure_column(conn, "content_signatures", "content_format", "TEXT NOT NULL DEFAULT 'text_story'")
         _ensure_column(conn, "content_signatures", "content_kind", "TEXT NOT NULL DEFAULT 'text'")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS autopost_semantic_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                character_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                semantic_theme TEXT NOT NULL,
+                central_thesis TEXT NOT NULL DEFAULT '',
+                conclusion TEXT NOT NULL DEFAULT '',
+                narrative_shape TEXT NOT NULL DEFAULT '',
+                key_meanings_json TEXT NOT NULL DEFAULT '[]',
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                source_ref TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS relationship_states (
@@ -311,6 +332,14 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_user_created ON memory_items(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON generated_posts(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signatures_user_created ON content_signatures(user_id, id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_semantic_history_user_created "
+            "ON autopost_semantic_history(user_id, id)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_semantic_history_content "
+            "ON autopost_semantic_history(user_id, content_hash)"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_delegation_contact ON delegation_invites(contact_chat_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_delegated_messages ON delegated_messages(delegation_id, id)")
         conn.execute(
@@ -761,6 +790,129 @@ def record_content_signature(user_id: int, plan: Dict[str, str], topic: str) -> 
         )
 
 
+def get_recent_semantic_theme_keys(user_id: int, limit: int = 5) -> List[str]:
+    """Return accepted Naz themes across every publishing platform."""
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT semantic_theme
+            FROM autopost_semantic_history
+            WHERE user_id = ? AND character_id = ? AND semantic_theme <> ''
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, naz_character.CHARACTER_ID, max(1, limit)),
+        ).fetchall()
+    return [str(row["semantic_theme"]) for row in reversed(rows)]
+
+
+def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dict[str, str]]:
+    """Combine semantic records with legacy drafts/posts without losing old data."""
+    init_db()
+    fetch_limit = max(8, limit * 3)
+    with db() as conn:
+        semantic_rows = conn.execute(
+            """
+            SELECT semantic_theme, content, platform, created_at, id
+            FROM autopost_semantic_history
+            WHERE user_id = ? AND character_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, naz_character.CHARACTER_ID, fetch_limit),
+        ).fetchall()
+        generated_rows = conn.execute(
+            """
+            SELECT semantic_theme, content, task, created_at, id
+            FROM generated_posts
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, fetch_limit),
+        ).fetchall()
+
+    combined: List[Dict[str, str]] = []
+    seen_hashes: set[str] = set()
+    for row in semantic_rows:
+        content = str(row["content"] or "")
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        seen_hashes.add(digest)
+        combined.append(
+            {
+                "semantic_theme": str(row["semantic_theme"] or ""),
+                "content": content,
+                "platform": str(row["platform"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "_order": f"1:{int(row['id']):020d}",
+            }
+        )
+    for row in generated_rows:
+        content = str(row["content"] or "")
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if digest in seen_hashes:
+            continue
+        combined.append(
+            {
+                "semantic_theme": str(row["semantic_theme"] or ""),
+                "content": content,
+                "platform": "vk" if "vk" in str(row["task"] or "").casefold() else "telegram",
+                "created_at": str(row["created_at"] or ""),
+                "_order": f"0:{int(row['id']):020d}",
+            }
+        )
+    combined.sort(key=lambda item: (item["created_at"], item["_order"]))
+    return [
+        {key: value for key, value in item.items() if key != "_order"}
+        for item in combined[-max(1, limit):]
+    ]
+
+
+def record_accepted_semantic_post(
+    *,
+    user_id: int,
+    platform: str,
+    semantic_theme: str,
+    central_thesis: str,
+    conclusion: str,
+    narrative_shape: str,
+    key_meanings: Iterable[str],
+    content: str,
+    source_ref: str,
+) -> None:
+    """Persist one accepted theme only after its draft/publication was committed."""
+    clean_content = str(content or "").strip()
+    clean_theme = str(semantic_theme or "").strip()
+    if not clean_content or not clean_theme:
+        raise ValueError("accepted semantic post requires content and semantic_theme")
+    digest = hashlib.sha256(clean_content.encode("utf-8")).hexdigest()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO autopost_semantic_history(
+                user_id, character_id, platform, semantic_theme, central_thesis,
+                conclusion, narrative_shape, key_meanings_json, content,
+                content_hash, source_ref, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                str(platform)[:40],
+                clean_theme[:120],
+                str(central_thesis or "")[:1000],
+                str(conclusion or "")[:1000],
+                str(narrative_shape or "")[:500],
+                json.dumps([str(item)[:300] for item in key_meanings][:8], ensure_ascii=False),
+                clean_content[:12000],
+                digest,
+                str(source_ref or "")[:1000],
+                utc_now(),
+            ),
+        )
+
+
 def load_relationship_state() -> duo_relationship.RelationshipState:
     init_db()
     with db() as conn:
@@ -1071,12 +1223,16 @@ def save_generated_post(
     content: str,
     image_count: int = 0,
     published_to_channel: bool = False,
+    semantic_theme: str = "",
 ) -> None:
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO generated_posts(user_id, expert_mode, task, topic, content, image_count, published_to_channel, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO generated_posts(
+                user_id, expert_mode, task, topic, content, image_count,
+                published_to_channel, semantic_theme, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -1086,6 +1242,7 @@ def save_generated_post(
                 content[:12000],
                 image_count,
                 int(published_to_channel),
+                str(semantic_theme or "")[:120],
                 utc_now(),
             ),
         )

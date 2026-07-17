@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -69,7 +70,7 @@ APPROVED_QUERIES = frozenset(track.query for track in APPROVED_TRACKS)
 
 
 def _normal(value: str) -> str:
-    return " ".join(value.casefold().split())
+    return " ".join(re.findall(r"[0-9a-zа-яё]+", str(value).casefold()))
 
 
 def select_track(
@@ -115,6 +116,28 @@ def _load_recent(state_file: Path) -> list[str]:
     return recent[-RECENT_TRACK_LIMIT:]
 
 
+def load_shared_recent(history_file: Path) -> list[str]:
+    """Read the consumer-owned global rotation without mutating its state."""
+    history_file = Path(history_file)
+    if not history_file.exists():
+        return []
+    if history_file.is_symlink() or not history_file.is_file():
+        raise TrackSelectionError("shared VK track history must be a regular file")
+    try:
+        payload = json.loads(history_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TrackSelectionError("shared VK track history is unreadable") from exc
+    tracks = payload.get("tracks", []) if isinstance(payload, dict) else []
+    if not isinstance(tracks, list):
+        raise TrackSelectionError("shared VK track history is invalid")
+    keys = [
+        str(item.get("key") or "")
+        for item in tracks
+        if isinstance(item, dict) and str(item.get("key") or "").strip()
+    ]
+    return keys[-RECENT_TRACK_LIMIT:]
+
+
 def _save_recent(state_file: Path, recent_queries: Iterable[str]) -> None:
     payload = {
         "schema": ROTATION_SCHEMA,
@@ -154,6 +177,7 @@ def enqueue_with_track_rotation(
     requested_tags: Iterable[str],
     seed: str,
     post_topic: str,
+    shared_history_file: Path | None = None,
     enqueue_job: Callable[[str], _T],
 ) -> _T:
     """Select, enqueue and record one track as a single cross-process operation."""
@@ -161,7 +185,8 @@ def enqueue_with_track_rotation(
     with _rotation_lock(state_file):
         state_existed = state_file.exists()
         recent = _load_recent(state_file)
-        track = select_track(requested_tags, recent, seed=seed)
+        shared_recent = load_shared_recent(shared_history_file) if shared_history_file else []
+        track = select_track(requested_tags, [*recent, *shared_recent], seed=seed)
         if track is None:
             raise TrackSelectionError("no approved VK music track is available outside the last 8")
         if _normal(track.query) == _normal(post_topic):
