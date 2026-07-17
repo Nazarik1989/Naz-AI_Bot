@@ -299,7 +299,6 @@ def correction_instruction(
         part for part in (rejected.central_thesis, rejected.conclusion, rejected.narrative_shape) if part
     )
     scene = _pick_variant(theme.scenes, f"scene|{rejected_summary}")
-    conclusion = _pick_variant(theme.conclusions, f"conclusion|{rejected_summary}")
     rejected_meanings = "; ".join(rejected.key_meanings) or "(не выделены)"
     return (
         f"{theme_instruction(theme, platform=platform, rubric_name=rubric_name)}\n"
@@ -312,7 +311,8 @@ def correction_instruction(
         f"- сюжетная форма: {rejected.narrative_shape or '(не указана)'}\n"
         f"- ключевые смыслы: {rejected_meanings}\n"
         f"Обязательная новая конкретная сцена: {scene}.\n"
-        f"Направление существенно другого вывода: {conclusion}.\n"
+        "Сформулируй существенно другой самостоятельный вывод из новой сцены и границ выбранной оси. "
+        "Не используй готовую типовую мораль оси: вывод должен принадлежать именно этому выпуску.\n"
         "Не перефразируй первый вариант, не сохраняй его сюжетный ход и не приходи к его морали другими словами."
     )
 

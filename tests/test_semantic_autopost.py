@@ -194,7 +194,9 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertIn(first_rejection.conclusion, second_prompt)
         self.assertIn(first_rejection.narrative_shape, second_prompt)
         self.assertIn("Обязательная новая конкретная сцена", second_prompt)
-        self.assertIn("существенно другого вывода", second_prompt)
+        self.assertIn("существенно другой самостоятельный вывод", second_prompt)
+        for canned_conclusion in correction_theme.conclusions:
+            self.assertNotIn(canned_conclusion, second_prompt)
 
     def test_correction_axis_excludes_initial_and_full_cooldown(self):
         recent = ["relationships", "work", "care", "memory", "conflict"]
