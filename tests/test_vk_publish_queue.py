@@ -141,7 +141,7 @@ class VkPublishQueueTests(unittest.TestCase):
                 self.enqueue(root)
             self.assertNotIn(pending, [Path(call.args[0]) for call in chmod.call_args_list])
 
-    def test_job_directory_keeps_shared_group_inheritance(self):
+    def test_job_directory_is_opened_only_after_files_are_created(self):
         with tempfile.TemporaryDirectory() as directory, patch(
             "vk_publish_queue.os.chmod", wraps=os.chmod
         ) as chmod:
@@ -155,7 +155,7 @@ class VkPublishQueueTests(unittest.TestCase):
             if Path(call.args[0]).name == job["job_id"]
             or Path(call.args[0]).name.startswith(f".{job['job_id']}-")
         ]
-        self.assertEqual(directory_modes, [0o2770, 0o2770])
+        self.assertEqual(directory_modes, [0o770])
 
     def test_enqueue_does_not_require_pending_directory_listing(self):
         with tempfile.TemporaryDirectory() as directory:
