@@ -16,7 +16,10 @@ import semantic_autopost as semantic
 import vk_publish_queue
 
 
-def rejected(reason: str = "same meaning") -> semantic.SemanticDecision:
+def rejected(
+    reason: str = "same meaning",
+    retry_theme_key: str = "",
+) -> semantic.SemanticDecision:
     return semantic.SemanticDecision(
         False,
         reason,
@@ -24,6 +27,7 @@ def rejected(reason: str = "same meaning") -> semantic.SemanticDecision:
         "без человеческой проверки автоматизация опасна",
         "сбой → проверка → правило",
         ("контроль", "проверка", "автоматизация"),
+        retry_theme_key,
     )
 
 
@@ -62,6 +66,96 @@ class SemanticAutopostTests(unittest.TestCase):
             "Показывай путь через бардак, баги, кривой код, сломанные интеграции",
             prompt,
         )
+
+    def test_autopost_generation_drops_persisted_manual_angle(self):
+        state = controller.normalize_state(
+            {
+                "suggested_angles": [
+                    {
+                        "title": "Инструкция",
+                        "instruction": "диагностика, проверка, фикс, тест",
+                    }
+                ],
+                "selected_angle_index": 0,
+            }
+        )
+        routed_state = controller.normalize_state(state)
+        with patch.object(
+            main.memory,
+            "load_state",
+            return_value=state,
+        ), patch.object(
+            main.naz_controller,
+            "controller",
+            return_value={
+                "blocked": True,
+                "state": routed_state,
+                "message": "stopped after routing",
+            },
+        ) as route, patch.object(
+            main.memory,
+            "save_state",
+        ):
+            result = asyncio.run(
+                main.generate_content(
+                    1,
+                    "новая смысловая ось",
+                    "post",
+                    save_generated=False,
+                    commit_state=False,
+                    inherit_interactive_context=False,
+                )
+            )
+
+        self.assertEqual(result, "stopped after routing")
+        controller_input_state = route.call_args.args[1]
+        self.assertEqual(controller_input_state["suggested_angles"], [])
+        self.assertEqual(controller_input_state["selected_angle_index"], 0)
+        self.assertEqual(controller_input_state["voice"], main.DEFAULT_VOICE_PROFILE)
+        self.assertEqual(controller_input_state["goal"], main.DEFAULT_CONTENT_GOAL)
+        self.assertEqual(controller_input_state["recent_topics"], [])
+        self.assertEqual(controller_input_state["best_posts"], [])
+        self.assertTrue(state["suggested_angles"])
+
+        clean_autopost_state = controller.normalize_state(controller_input_state)
+        with patch.object(
+            main.memory,
+            "load_state",
+            return_value=state,
+        ), patch.object(
+            main.naz_controller,
+            "controller",
+            return_value={
+                "blocked": False,
+                "state": clean_autopost_state,
+                "gpt_input": "autopost prompt",
+                "topic": "autopost topic",
+            },
+        ), patch.object(
+            main,
+            "build_user_memory_context",
+        ) as private_memory, patch.object(
+            main,
+            "build_messages",
+            return_value=[{"role": "user", "content": "autopost prompt"}],
+        ), patch.object(
+            main,
+            "call_gpt",
+            new=AsyncMock(return_value="готовый пост"),
+        ):
+            generated = asyncio.run(
+                main.generate_answer(
+                    1,
+                    "autopost prompt",
+                    task="post",
+                    source_topic="autopost topic",
+                    commit_state=False,
+                    inherit_interactive_context=False,
+                )
+            )
+
+        self.assertEqual(generated, "готовый пост")
+        private_memory.assert_not_called()
 
     def test_experiential_axis_owns_thesis_not_technical_rubric(self):
         body_prompt = semantic.theme_instruction(
@@ -291,6 +385,32 @@ class SemanticAutopostTests(unittest.TestCase):
             self.assertNotIn(canned_scene, second_prompt)
         for canned_conclusion in correction_theme.conclusions:
             self.assertNotIn(canned_conclusion, second_prompt)
+
+    def test_gate_selected_retry_theme_changes_only_second_generation(self):
+        generate = AsyncMock(side_effect=["Первый вариант", "Второй вариант"])
+        evaluate = AsyncMock(
+            side_effect=[
+                rejected("memory repeats legacy history", retry_theme_key="city"),
+                accepted(),
+            ]
+        )
+        result = asyncio.run(
+            semantic.generate_with_gate(
+                generate=generate,
+                evaluate=evaluate,
+                theme=semantic.THEMES_BY_KEY["memory"],
+                correction_themes={"city": semantic.THEMES_BY_KEY["city"]},
+                platform="vk",
+                rubric_name="Маленький эксперимент",
+                is_model_warning=lambda text: False,
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(result.theme_key, "city")
+        self.assertIn("(memory)", generate.await_args_list[0].args[0])
+        self.assertIn("(city)", generate.await_args_list[1].args[0])
 
     def test_correction_axis_excludes_initial_and_full_cooldown(self):
         recent = ["relationships", "work", "care", "memory", "conflict"]
