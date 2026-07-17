@@ -78,7 +78,11 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             consumer_env = base / "consumer.env"
-            consumer_env.write_text("VK_GROUP_ID=123\n", encoding="utf-8")
+            consumer_env.write_text(
+                f"VK_GROUP_ID=123\nVK_BROWSER_PROFILE_DIR={base / 'profile'}\n",
+                encoding="utf-8",
+            )
+            (base / "profile").mkdir()
             timer = base / "naz-vk-producer.timer"
             timer.write_text(
                 Path("deploy/systemd/naz-vk-producer.timer").read_text(encoding="utf-8"),
@@ -110,6 +114,8 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
             ), patch.object(
                 naz_vk_producer, "_validate_queue_permissions"
             ) as permissions, patch.object(
+                naz_vk_producer, "_validate_browser_isolation"
+            ) as browser_isolation, patch.object(
                 naz_vk_producer.naz.memory, "init_db"
             ) as init_db, patch.object(
                 naz_vk_producer.naz, "create_naz_vk_job", new=AsyncMock()
@@ -119,12 +125,14 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
                     timer_unit_file=timer,
                 )
             permissions.assert_called_once_with(queue)
+            browser_isolation.assert_called_once_with(base / "profile")
             init_db.assert_not_called()
             create_job.assert_not_awaited()
             self.assertEqual(
                 checks,
                 (
                     "publisher allowlist",
+                    "browser profile isolation",
                     "queue write scope",
                     "API configuration",
                     "music catalog and histories",
@@ -164,9 +172,15 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
 
         source = inspect.getsource(naz_vk_producer).lower()
         self.assertNotIn("playwright", source)
-        self.assertNotIn("browser_profile", source)
         self.assertNotIn("cookie", source)
         self.assertNotIn("run_polling", source)
+        service = Path("deploy/systemd/naz-vk-producer.service").read_text(encoding="utf-8")
+        writable = [
+            line for line in service.splitlines() if line.startswith("ReadWritePaths=")
+        ]
+        self.assertEqual(len(writable), 1)
+        self.assertIn("/var/lib/void-vk-publisher/queue/pending", writable[0])
+        self.assertNotIn("profile", writable[0].casefold())
 
 
 if __name__ == "__main__":

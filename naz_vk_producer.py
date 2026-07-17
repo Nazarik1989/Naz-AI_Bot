@@ -62,7 +62,7 @@ def _permission_bits(path: Path, uid: int, gids: set[int]) -> int:
     return mode & 0o7
 
 
-def _validate_queue_permissions(queue_root: Path, user_name: str = "naz") -> None:
+def _service_identity(user_name: str) -> tuple[int, set[int]]:
     if os.name == "nt":
         raise PreflightError("POSIX queue permission check is unavailable")
     import grp
@@ -78,19 +78,39 @@ def _validate_queue_permissions(queue_root: Path, user_name: str = "naz") -> Non
         for group in grp.getgrall()
         if user_name in group.gr_mem
     )
+    return user.pw_uid, gids
+
+
+def _validate_queue_permissions(queue_root: Path, user_name: str = "naz") -> None:
+    uid, gids = _service_identity(user_name)
     pending = queue_root / "pending"
     if queue_root.is_symlink() or not queue_root.is_dir():
         raise PreflightError("shared queue must be a real directory")
     if pending.is_symlink() or not pending.is_dir():
         raise PreflightError("shared pending inbox must be a real directory")
-    if _permission_bits(pending, user.pw_uid, gids) & 0o3 != 0o3:
+    if _permission_bits(pending, uid, gids) & 0o3 != 0o3:
         raise PreflightError("Naz cannot write the shared pending inbox")
-    if _permission_bits(queue_root, user.pw_uid, gids) & 0o2:
+    if _permission_bits(queue_root, uid, gids) & 0o2:
         raise PreflightError("Naz must not write the shared queue root")
     for state_name in ("processing", "done", "failed"):
         state_path = queue_root / state_name
-        if state_path.exists() and _permission_bits(state_path, user.pw_uid, gids) & 0o2:
+        if state_path.exists() and _permission_bits(state_path, uid, gids) & 0o2:
             raise PreflightError(f"Naz must not write the shared {state_name} state")
+
+
+def _validate_browser_isolation(profile_dir: Path, user_name: str = "naz") -> None:
+    if not profile_dir.is_absolute() or not profile_dir.exists():
+        raise PreflightError("publisher browser profile is missing")
+    try:
+        resolved = profile_dir.resolve(strict=True)
+    except OSError as exc:
+        raise PreflightError("publisher browser profile is unavailable") from exc
+    if not resolved.is_dir():
+        raise PreflightError("publisher browser profile must be a directory")
+    uid, gids = _service_identity(user_name)
+    chain = [resolved, *resolved.parents]
+    if all(_permission_bits(path, uid, gids) & 0o1 for path in chain):
+        raise PreflightError("Naz must not have access to the publisher browser profile")
 
 
 def _validate_schedule(timer_unit: Path) -> None:
@@ -137,11 +157,17 @@ def check_config(
     if not allowed_id or public_id != allowed_id:
         raise PreflightError("Naz target does not match the publisher allowlist")
     checks.append("publisher allowlist")
+    profile_dir = Path(consumer_env.get("VK_BROWSER_PROFILE_DIR", "").strip())
+    _validate_browser_isolation(profile_dir)
+    checks.append("browser profile isolation")
 
     queue_root = Path(naz.NAZ_VK_QUEUE_DIR)
     if queue_root != EXPECTED_QUEUE_DIR:
         raise PreflightError("Naz queue path is not canonical")
-    _validate_queue_permissions(queue_root)
+    try:
+        _validate_queue_permissions(queue_root)
+    except OSError as exc:
+        raise PreflightError("shared queue permissions are unavailable") from exc
     checks.append("queue write scope")
 
     if not naz.OPENROUTER_API_KEY:
