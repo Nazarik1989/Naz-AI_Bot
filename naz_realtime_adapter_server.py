@@ -37,17 +37,17 @@ def handle_request(payload: Any) -> dict[str, Any]:
     if operation == "final_summary":
         _exact_fields(
             payload,
-            {"protocol", "request_id", "operation", "user_id", "idempotency_key", "summary"},
+            {"protocol", "request_id", "operation", "user_id", "session_id", "summary"},
         )
         saved = adapter.save_final_summary(
             payload["user_id"],
             payload["summary"],
-            idempotency_key=payload["idempotency_key"],
+            payload["session_id"],
         )
         return {
             "request_id": request_id,
             "ok": True,
-            "receipt": f"naz:{payload['idempotency_key']}",
+            "receipt": f"naz:{payload['session_id']}",
             "saved": saved,
         }
     raise ValueError("operation is invalid")
