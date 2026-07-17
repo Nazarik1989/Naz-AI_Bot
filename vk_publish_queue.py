@@ -208,7 +208,9 @@ def enqueue(
     if final_dir.exists():
         raise DuplicateJobError(f"job {job_id} already exists in pending")
     temp_dir = Path(tempfile.mkdtemp(prefix=f".{job_id}-", dir=pending))
-    os.chmod(temp_dir, 0o770)
+    # Keep the shared inbox SGID contract so files inherit ``vkqueue`` rather
+    # than the producer's primary ``naz`` group and remain readable by publisher.
+    os.chmod(temp_dir, 0o2770)
     try:
         for item, name in zip(items, names):
             destination = temp_dir / name
@@ -247,7 +249,7 @@ def enqueue(
             if final_dir.exists() or exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
                 raise DuplicateJobError(f"job {job_id} was enqueued concurrently") from exc
             raise
-        os.chmod(final_dir, 0o770)
+        os.chmod(final_dir, 0o2770)
         return job
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
