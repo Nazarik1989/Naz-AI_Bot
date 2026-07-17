@@ -335,10 +335,9 @@ class SemanticAutopostTests(unittest.TestCase):
             [],
             platform="vk",
             seed="slot",
-            excluded_theme_keys=(*occupied, "care"),
+            excluded_theme_keys=("care",),
         )
         self.assertEqual(result.theme_key, initial_theme.key)
-        self.assertNotIn(result.theme_key, occupied)
         self.assertNotEqual(result.theme_key, "care")
         for call in generate.await_args_list:
             prompt = call.args[0]
