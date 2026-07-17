@@ -123,6 +123,10 @@ OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip()
 OPENAI_IMAGE_TIMEOUT_SECONDS = max(30, min(env_int("OPENAI_IMAGE_TIMEOUT_SECONDS", 120), 300))
 MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-4o-mini").strip()
 CONTENT_MODEL_NAME = os.getenv("CONTENT_MODEL_NAME", MODEL_NAME).strip()
+SEMANTIC_REVIEW_MODEL_NAME = os.getenv(
+    "SEMANTIC_REVIEW_MODEL_NAME",
+    MODEL_NAME,
+).strip()
 
 # Voice messages use the official OpenAI API independently from OpenRouter.
 VOICE_MESSAGES_ENABLED = env_bool("VOICE_MESSAGES_ENABLED", False)
@@ -907,6 +911,8 @@ async def generate_content(
 async def evaluate_autopost_candidate(
     candidate: str,
     recent_posts: List[Dict[str, str]],
+    *,
+    allowed_retry_themes: tuple[semantic_autopost.SemanticTheme, ...] = (),
 ) -> semantic_autopost.SemanticDecision:
     """Use a model as a meaning-level judge; invalid review output fails closed."""
     if not recent_posts:
@@ -918,7 +924,11 @@ async def evaluate_autopost_candidate(
             "",
             (),
         )
-    prompt = semantic_autopost.build_gate_prompt(candidate, recent_posts)
+    prompt = semantic_autopost.build_gate_prompt(
+        candidate,
+        recent_posts,
+        allowed_retry_themes=allowed_retry_themes,
+    )
     try:
         raw = await call_gpt(
             [
@@ -931,8 +941,8 @@ async def evaluate_autopost_candidate(
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=700,
-            model=CONTENT_MODEL_NAME,
+            max_tokens=1100,
+            model=SEMANTIC_REVIEW_MODEL_NAME,
         )
         return semantic_autopost.parse_gate_response(raw)
     except Exception as exc:  # noqa: BLE001
@@ -982,7 +992,7 @@ async def get_autopost_history_profile(
                 {"role": "user", "content": prompt},
             ],
             max_tokens=2200,
-            model=CONTENT_MODEL_NAME,
+            model=SEMANTIC_REVIEW_MODEL_NAME,
         )
         profile = semantic_autopost.parse_history_profile(
             raw,
@@ -1035,32 +1045,39 @@ async def generate_semantic_autopost_candidate(
     )
     history_context = semantic_autopost.generation_history_context(recent_posts)
     exclusion_context = semantic_autopost.history_profile_context(history_profile)
+    retry_themes = tuple(
+        item
+        for item in semantic_autopost.compatible_themes(rubric_name)
+        if item.key not in occupied and item.key != theme.key
+    )
 
     async def evaluate(candidate: str) -> semantic_autopost.SemanticDecision:
-        return await evaluate_autopost_candidate(candidate, recent_posts)
+        return await evaluate_autopost_candidate(
+            candidate,
+            recent_posts,
+            allowed_retry_themes=retry_themes,
+        )
 
     def select_retry_theme(
-        _decision: semantic_autopost.SemanticDecision,
+        decision: semantic_autopost.SemanticDecision,
     ) -> semantic_autopost.SemanticTheme | None:
-        try:
-            retry_theme = semantic_autopost.select_theme(
-                rubric_name,
-                recent_themes,
-                platform=platform,
-                seed=f"{seed}:semantic-retry",
-                excluded_theme_keys=(theme.key, *sorted(occupied)),
-            )
-        except semantic_autopost.NoSemanticThemeAvailable:
+        retry_theme = semantic_autopost.THEMES_BY_KEY.get(decision.retry_theme_key)
+        required_contract = (
+            decision.retry_scene,
+            decision.retry_thesis,
+            decision.retry_conclusion,
+            decision.retry_narrative_shape,
+        )
+        if retry_theme not in retry_themes or not all(
+            len(value.strip()) >= 8 for value in required_contract
+        ):
             logger.warning(
-                "SEMANTIC_AUTOPOST retry blocked | platform=%s | rubric=%s | initial=%s | occupied=%s",
-                platform,
-                rubric_name,
-                theme.key,
-                ",".join(sorted(occupied)),
+                "SEMANTIC_AUTOPOST invalid correction contract | requested=%s",
+                decision.retry_theme_key or "(empty)",
             )
             return None
         logger.info(
-            "SEMANTIC_AUTOPOST retry selection | platform=%s | rubric=%s | initial=%s | occupied=%s | retry=%s",
+            "SEMANTIC_AUTOPOST retry contract | platform=%s | rubric=%s | initial=%s | occupied=%s | retry=%s",
             platform,
             rubric_name,
             theme.key,

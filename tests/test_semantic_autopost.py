@@ -16,7 +16,11 @@ import semantic_autopost as semantic
 import vk_publish_queue
 
 
-def rejected(reason: str = "same meaning") -> semantic.SemanticDecision:
+def rejected(
+    reason: str = "same meaning",
+    *,
+    retry_theme_key: str = "music",
+) -> semantic.SemanticDecision:
     return semantic.SemanticDecision(
         False,
         reason,
@@ -24,6 +28,11 @@ def rejected(reason: str = "same meaning") -> semantic.SemanticDecision:
         "без человеческой проверки автоматизация опасна",
         "сбой → проверка → правило",
         ("контроль", "проверка", "автоматизация"),
+        retry_theme_key,
+        "Музыкант убирает один эффект перед записью короткого фрагмента.",
+        "Узнаваемость партии проявляется после удаления привычного украшения.",
+        "Отказ от эффекта меняет не громкость, а ответственность за исполнение.",
+        "привычный эффект → запись без него → слышимая разница",
     )
 
 
@@ -223,15 +232,36 @@ class SemanticAutopostTests(unittest.TestCase):
                 "conclusion": "полная автономность без контроля опасна",
                 "narrative_shape": "пример → риск → граница",
                 "key_meanings": ["автоматизация", "человеческий выбор", "граница"],
+                "correction": {
+                    "theme_key": "music",
+                    "scene": "Музыкант записывает один рифф без привычного эффекта.",
+                    "central_thesis": "Ограничение тембра меняет способ исполнения.",
+                    "conclusion": "Узнаваемость слышна в решении, а не в количестве обработки.",
+                    "narrative_shape": "убранный эффект → новая атака → сравнение записей",
+                },
             },
             ensure_ascii=False,
         )
         with patch.object(main, "call_gpt", new=AsyncMock(return_value=response)) as judge:
-            decision = asyncio.run(main.evaluate_autopost_candidate(candidate, history))
+            decision = asyncio.run(
+                main.evaluate_autopost_candidate(
+                    candidate,
+                    history,
+                    allowed_retry_themes=(
+                        semantic.THEMES_BY_KEY["music"],
+                        semantic.THEMES_BY_KEY["game"],
+                    ),
+                )
+            )
         self.assertFalse(decision.accepted)
+        self.assertEqual(decision.retry_theme_key, "music")
+        self.assertIn("Музыкант", decision.retry_scene)
         sent_prompt = judge.await_args.args[0][1]["content"]
         self.assertIn(history[0]["content"], sent_prompt)
         self.assertIn(candidate, sent_prompt)
+        self.assertIn("- music:", sent_prompt)
+        self.assertIn("- game:", sent_prompt)
+        self.assertEqual(judge.await_args.kwargs["model"], main.SEMANTIC_REVIEW_MODEL_NAME)
 
     def test_history_profile_requires_every_theme_and_is_cached_by_digest(self):
         history = [
@@ -328,20 +358,7 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(generate.await_count, 2)
         select_correction.assert_not_called()
-        initial_theme = semantic.select_theme(
-            "AI без успешного успеха",
-            [],
-            platform="vk",
-            seed="slot",
-        )
-        retry_theme = semantic.select_theme(
-            "AI без успешного успеха",
-            [],
-            platform="vk",
-            seed="slot:semantic-retry",
-            excluded_theme_keys=(initial_theme.key, *sorted(occupied)),
-        )
-        self.assertEqual(result.theme_key, retry_theme.key)
+        self.assertEqual(result.theme_key, "music")
         self.assertNotIn(result.theme_key, occupied)
         for call in generate.await_args_list:
             prompt = call.args[0]
@@ -439,12 +456,36 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertIn(first_rejection.central_thesis, second_prompt)
         self.assertIn(first_rejection.conclusion, second_prompt)
         self.assertIn(first_rejection.narrative_shape, second_prompt)
-        self.assertIn("Самостоятельно выбери новую конкретную сцену", second_prompt)
-        self.assertIn("существенно другой самостоятельный вывод", second_prompt)
+        self.assertIn(first_rejection.retry_scene, second_prompt)
+        self.assertIn(first_rejection.retry_thesis, second_prompt)
+        self.assertIn(first_rejection.retry_conclusion, second_prompt)
+        self.assertIn(first_rejection.retry_narrative_shape, second_prompt)
+        self.assertIn("ПОЛНЫЙ ОТКЛОНЁННЫЙ ВАРИАНТ", second_prompt)
+        self.assertIn("Первый вариант", second_prompt)
         for canned_scene in correction_theme.scenes:
             self.assertNotIn(canned_scene, second_prompt)
         for canned_conclusion in correction_theme.conclusions:
             self.assertNotIn(canned_conclusion, second_prompt)
+
+    def test_invalid_correction_contract_does_not_spend_second_generation(self):
+        generate = AsyncMock(return_value="Первый вариант")
+        evaluate = AsyncMock(return_value=rejected(retry_theme_key="unknown"))
+        result = asyncio.run(
+            semantic.generate_with_gate(
+                generate=generate,
+                evaluate=evaluate,
+                theme=semantic.THEMES_BY_KEY["care"],
+                correction_theme_selector=lambda decision: (
+                    semantic.THEMES_BY_KEY.get(decision.retry_theme_key)
+                ),
+                platform="vk",
+                rubric_name="Человеческая деталь",
+                is_model_warning=lambda text: False,
+            )
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.attempts, 1)
+        self.assertEqual(generate.await_count, 1)
 
     def test_server_uses_precomputed_history_profile_for_retry(self):
         generate = AsyncMock(side_effect=["Первый вариант", "Второй вариант"])

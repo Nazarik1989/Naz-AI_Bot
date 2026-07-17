@@ -18,6 +18,7 @@ from typing import Awaitable, Callable, Iterable, Mapping, Sequence
 THEME_COOLDOWN = 5
 SEMANTIC_HISTORY_LIMIT = 8
 MAX_GENERATIONS = 2
+SEMANTIC_PROFILE_VERSION = "v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +172,11 @@ class SemanticDecision:
     conclusion: str
     narrative_shape: str
     key_meanings: tuple[str, ...]
+    retry_theme_key: str = ""
+    retry_scene: str = ""
+    retry_thesis: str = ""
+    retry_conclusion: str = ""
+    retry_narrative_shape: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +332,7 @@ def correction_instruction(
     *,
     platform: str,
     rubric_name: str,
+    rejected_text: str = "",
 ) -> str:
     rejected_meanings = "; ".join(rejected.key_meanings) or "(не выделены)"
     return (
@@ -338,12 +345,15 @@ def correction_instruction(
         f"- вывод: {rejected.conclusion or '(не указан)'}\n"
         f"- сюжетная форма: {rejected.narrative_shape or '(не указана)'}\n"
         f"- ключевые смыслы: {rejected_meanings}\n"
-        "Самостоятельно выбери новую конкретную сцену, которой нет ни в отклонённом варианте, "
-        "ни в последних постах из anti-repeat context. Не превращай готовые примеры оси "
-        "в обязательный шаблон.\n"
-        "Сформулируй существенно другой самостоятельный вывод из новой сцены и границ выбранной оси. "
-        "Не используй готовую типовую мораль оси: вывод должен принадлежать именно этому выпуску.\n"
+        "Ниже обязательный корректирующий контракт, который уже составил семантический редактор "
+        "после сравнения со всей историей. Не заменяй его своим типовым сюжетом:\n"
+        f"- конкретная сцена: {rejected.retry_scene or '(контракт отсутствует)'}\n"
+        f"- центральный тезис: {rejected.retry_thesis or '(контракт отсутствует)'}\n"
+        f"- самостоятельный вывод: {rejected.retry_conclusion or '(контракт отсутствует)'}\n"
+        f"- сюжетный ход: {rejected.retry_narrative_shape or '(контракт отсутствует)'}\n"
+        "Раскрой именно этот контракт. Не превращай готовые примеры оси в обязательный шаблон.\n"
         "Не перефразируй первый вариант, не сохраняй его сюжетный ход и не приходи к его морали другими словами."
+        f"\n\nПОЛНЫЙ ОТКЛОНЁННЫЙ ВАРИАНТ — только отрицательный пример, не копируй:\n{rejected_text[:5000]}"
     )
 
 
@@ -377,14 +387,17 @@ def generation_history_context(
 def semantic_history_digest(
     recent_posts: Sequence[Mapping[str, str]],
 ) -> str:
-    payload = [
+    payload = {
+        "profile_version": SEMANTIC_PROFILE_VERSION,
+        "posts": [
         {
             "platform": str(post.get("platform") or ""),
             "semantic_theme": str(post.get("semantic_theme") or ""),
             "content": str(post.get("content") or ""),
         }
         for post in recent_posts[-SEMANTIC_HISTORY_LIMIT:]
-    ]
+        ],
+    }
     return sha256(
         json.dumps(
             payload,
@@ -474,6 +487,8 @@ def history_profile_context(profile: SemanticHistoryProfile) -> str:
 def build_gate_prompt(
     candidate: str,
     recent_posts: Sequence[Mapping[str, str]],
+    *,
+    allowed_retry_themes: Sequence[SemanticTheme] = (),
 ) -> str:
     history_blocks = []
     for index, post in enumerate(recent_posts[-SEMANTIC_HISTORY_LIMIT:], start=1):
@@ -481,16 +496,28 @@ def build_gate_prompt(
         content = str(post.get("content") or "")[:3500]
         history_blocks.append(f"[{index}] theme={theme}\n{content}")
     history = "\n\n".join(history_blocks) or "(история пуста)"
+    retry_catalog = "\n".join(
+        f"- {theme.key}: {theme.label}; {theme.brief}"
+        for theme in allowed_retry_themes
+    ) or "(корректирующая тема недоступна)"
     return (
         "Ты — строгий семантический редактор Naz. Сравни кандидат с последними принятыми/подготовленными "
         "постами по смыслу, а не по отдельным словам.\n"
         "Отклони кандидат, если повторяется центральный тезис или вывод, та же мысль пересказана другой "
         "лексикой, близко повторён сюжетный ход, либо почти совпадает набор ключевых смыслов. Общий голос "
         "персонажа сам по себе дублем не считается.\n"
+        "Если accepted=false, не ограничивайся диагнозом. Выбери один key только из разрешённого "
+        "каталога коррекции и составь конкретный новый контракт, который сам по себе не повторяет "
+        "ни один центральный тезис, вывод или сюжетный ход истории. Сцена должна быть наблюдаемой, "
+        "а тезис и вывод — конкретными, не словами «другой», «новый» или общими пожеланиями.\n"
         "Верни только JSON без markdown:\n"
         '{"accepted":true|false,"reason":"коротко","central_thesis":"одна мысль",'
         '"conclusion":"эмоциональный/практический вывод","narrative_shape":"сцена→поворот→вывод",'
-        '"key_meanings":["смысл 1","смысл 2"]}\n\n'
+        '"key_meanings":["смысл 1","смысл 2"],'
+        '"correction":{"theme_key":"разрешённый key или пусто при accepted=true",'
+        '"scene":"конкретная новая сцена","central_thesis":"новый тезис",'
+        '"conclusion":"новый вывод","narrative_shape":"новый сюжетный ход"}}\n\n'
+        f"РАЗРЕШЁННЫЕ ТЕМЫ КОРРЕКЦИИ:\n{retry_catalog}\n\n"
         f"ПОСЛЕДНИЕ ПОСТЫ:\n{history}\n\nКАНДИДАТ:\n{candidate[:5000]}"
     )
 
@@ -507,6 +534,9 @@ def parse_gate_response(raw: str) -> SemanticDecision:
     meanings = payload.get("key_meanings")
     if not isinstance(meanings, list):
         meanings = []
+    correction = payload.get("correction")
+    if not isinstance(correction, dict):
+        correction = {}
     return SemanticDecision(
         accepted=payload["accepted"],
         reason=str(payload.get("reason") or "")[:500],
@@ -514,6 +544,11 @@ def parse_gate_response(raw: str) -> SemanticDecision:
         conclusion=str(payload.get("conclusion") or "")[:1000],
         narrative_shape=str(payload.get("narrative_shape") or "")[:500],
         key_meanings=tuple(str(item)[:300] for item in meanings[:8] if str(item).strip()),
+        retry_theme_key=str(correction.get("theme_key") or "")[:80],
+        retry_scene=str(correction.get("scene") or "")[:1000],
+        retry_thesis=str(correction.get("central_thesis") or "")[:1000],
+        retry_conclusion=str(correction.get("conclusion") or "")[:1000],
+        retry_narrative_shape=str(correction.get("narrative_shape") or "")[:500],
     )
 
 
@@ -557,6 +592,7 @@ async def generate_with_gate(
             first_decision,
             platform=platform,
             rubric_name=rubric_name,
+            rejected_text=first_text,
         )
     )
     if is_model_warning(second_text):
