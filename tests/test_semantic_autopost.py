@@ -307,6 +307,8 @@ class SemanticAutopostTests(unittest.TestCase):
         with patch.object(
             main.memory, "get_recent_semantic_theme_keys", return_value=[]
         ), patch.object(
+            main.memory, "get_recent_rejected_semantic_theme_keys", return_value=["care"]
+        ), patch.object(
             main.memory, "get_recent_posts_for_semantic_gate", return_value=history
         ), patch.object(
             main, "evaluate_autopost_candidate", new=decisions
@@ -333,9 +335,11 @@ class SemanticAutopostTests(unittest.TestCase):
             [],
             platform="vk",
             seed="slot",
+            excluded_theme_keys=(*occupied, "care"),
         )
         self.assertEqual(result.theme_key, initial_theme.key)
         self.assertNotIn(result.theme_key, occupied)
+        self.assertNotEqual(result.theme_key, "care")
         for call in generate.await_args_list:
             prompt = call.args[0]
             self.assertIn("SEMANTIC ANTI-REPEAT CONTEXT", prompt)
@@ -345,6 +349,47 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertEqual(decisions.await_args_list[0].args[0], "Первый вариант")
         self.assertIn("duplicate", retry_prompt)
         self.assertIn(f"({initial_theme.key})", retry_prompt)
+
+    def test_two_rejections_are_remembered_without_accepting_theme(self):
+        history = [
+            {
+                "semantic_theme": "work",
+                "platform": "vk",
+                "content": "Старый опубликованный смысл.",
+            }
+        ]
+        profile = semantic.SemanticHistoryProfile("digest", ("work",), "work: занято")
+        with patch.object(
+            main.memory, "get_recent_semantic_theme_keys", return_value=["work"]
+        ), patch.object(
+            main.memory, "get_recent_rejected_semantic_theme_keys", return_value=[]
+        ), patch.object(
+            main.memory, "get_recent_posts_for_semantic_gate", return_value=history
+        ), patch.object(
+            main, "get_autopost_history_profile", new=AsyncMock(return_value=profile)
+        ), patch.object(
+            main,
+            "evaluate_autopost_candidate",
+            new=AsyncMock(side_effect=[rejected("first"), rejected("second")]),
+        ), patch.object(
+            main.memory, "record_rejected_semantic_theme"
+        ) as remember:
+            theme, result = asyncio.run(
+                main.generate_semantic_autopost_candidate(
+                    user_id=1,
+                    platform="vk",
+                    rubric_name="Человеческая деталь",
+                    seed="timer:failed",
+                    generate=AsyncMock(side_effect=["Первый", "Второй"]),
+                )
+            )
+        self.assertFalse(result.accepted)
+        remember.assert_called_once_with(
+            user_id=1,
+            platform="vk",
+            semantic_theme=theme.key,
+            source_ref="timer:failed",
+        )
 
     def test_legacy_generated_post_without_semantic_theme_remains_readable(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
@@ -409,6 +454,32 @@ class SemanticAutopostTests(unittest.TestCase):
         posts = memory.get_recent_posts_for_semantic_gate(1)
         self.assertEqual([post["content"] for post in posts], ["Не вышедший draft"])
         self.assertEqual(memory.get_recent_semantic_theme_keys(1), ["work"])
+
+    def test_rejected_theme_is_separate_and_clears_after_published_post(self):
+        memory.record_rejected_semantic_theme(
+            user_id=1,
+            platform="vk",
+            semantic_theme="memory",
+            source_ref="timer:first",
+        )
+        self.assertEqual(
+            memory.get_recent_rejected_semantic_theme_keys(1),
+            ["memory"],
+        )
+        self.assertEqual(memory.get_recent_semantic_theme_keys(1), [])
+
+        memory.save_generated_post(
+            user_id=1,
+            expert_mode="copywriter",
+            task="naz_vk_queue:daily:Человеческая деталь",
+            topic="Новая тема",
+            content="Подтверждённая публикация",
+            image_count=1,
+            published_to_channel=True,
+            semantic_theme="creativity",
+        )
+        self.assertEqual(memory.get_recent_rejected_semantic_theme_keys(1), [])
+        self.assertEqual(memory.get_recent_semantic_theme_keys(1), ["creativity"])
 
     def test_generation_stops_after_one_correction(self):
         generate = AsyncMock(side_effect=["Первый вариант", "Совсем другая сцена"])
