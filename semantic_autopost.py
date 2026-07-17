@@ -229,6 +229,7 @@ def select_correction_theme(
     initial_theme_key: str,
     platform: str,
     seed: str,
+    excluded_theme_keys: Iterable[str] = (),
 ) -> SemanticTheme:
     """Prefer a rubric-compatible axis outside the initial theme's meaning cluster."""
     recent = {
@@ -237,21 +238,36 @@ def select_correction_theme(
         if str(key).strip()
     }
     preferred = set(DIVERGENT_THEME_KEYS.get(initial_theme_key, ()))
+    excluded = {
+        str(key)
+        for key in excluded_theme_keys
+        if str(key).strip()
+    }
     candidates = [
         theme
         for theme in compatible_themes(rubric_name)
         if theme.key in preferred
         and theme.key not in recent
+        and theme.key not in excluded
         and theme.key != initial_theme_key
     ]
     if not candidates:
-        return select_theme(
-            rubric_name,
-            recent,
-            platform=platform,
-            seed=seed,
-            excluded_theme_keys=(initial_theme_key,),
-        )
+        try:
+            return select_theme(
+                rubric_name,
+                recent,
+                platform=platform,
+                seed=seed,
+                excluded_theme_keys=(initial_theme_key, *excluded),
+            )
+        except NoSemanticThemeAvailable:
+            return select_theme(
+                rubric_name,
+                recent,
+                platform=platform,
+                seed=seed,
+                excluded_theme_keys=(initial_theme_key,),
+            )
     return max(
         candidates,
         key=lambda theme: sha256(

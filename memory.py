@@ -211,6 +211,20 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS autopost_semantic_rejections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                character_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                semantic_theme TEXT NOT NULL,
+                source_ref TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, character_id, platform, semantic_theme, source_ref)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS relationship_states (
                 relationship_id TEXT PRIMARY KEY,
                 state_json TEXT NOT NULL,
@@ -805,6 +819,53 @@ def get_recent_semantic_theme_keys(user_id: int, limit: int = 5) -> List[str]:
             (user_id, naz_character.CHARACTER_ID, max(1, limit)),
         ).fetchall()
     return [str(row["semantic_theme"]) for row in reversed(rows)]
+
+
+def get_recent_rejected_semantic_theme_keys(user_id: int, limit: int = 6) -> List[str]:
+    """Return recently blocked axes separately from accepted-theme history."""
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT semantic_theme
+            FROM autopost_semantic_rejections
+            WHERE user_id = ? AND character_id = ? AND semantic_theme <> ''
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, naz_character.CHARACTER_ID, max(1, limit)),
+        ).fetchall()
+    return [str(row["semantic_theme"]) for row in reversed(rows)]
+
+
+def record_rejected_semantic_theme(
+    *,
+    user_id: int,
+    platform: str,
+    semantic_theme: str,
+    source_ref: str,
+) -> None:
+    """Persist only rejection metadata; never treat it as an accepted post."""
+    clean_theme = str(semantic_theme or "").strip()
+    if not clean_theme:
+        return
+    init_db()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO autopost_semantic_rejections(
+                user_id, character_id, platform, semantic_theme, source_ref, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                naz_character.CHARACTER_ID,
+                str(platform)[:40],
+                clean_theme[:120],
+                str(source_ref or "")[:1000],
+                utc_now(),
+            ),
+        )
 
 
 def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dict[str, str]]:

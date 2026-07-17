@@ -931,18 +931,29 @@ async def generate_semantic_autopost_candidate(
         user_id,
         limit=semantic_autopost.THEME_COOLDOWN,
     )
-    theme = semantic_autopost.select_theme(
-        rubric_name,
-        recent_themes,
-        platform=platform,
-        seed=seed,
-    )
+    rejected_themes = memory.get_recent_rejected_semantic_theme_keys(user_id)
+    try:
+        theme = semantic_autopost.select_theme(
+            rubric_name,
+            recent_themes,
+            platform=platform,
+            seed=seed,
+            excluded_theme_keys=rejected_themes,
+        )
+    except semantic_autopost.NoSemanticThemeAvailable:
+        theme = semantic_autopost.select_theme(
+            rubric_name,
+            recent_themes,
+            platform=platform,
+            seed=seed,
+        )
     correction_theme = semantic_autopost.select_correction_theme(
         rubric_name,
         recent_themes,
         initial_theme_key=theme.key,
         platform=platform,
         seed=f"{seed}:correction",
+        excluded_theme_keys=rejected_themes,
     )
     recent_posts = memory.get_recent_posts_for_semantic_gate(
         user_id,
@@ -961,6 +972,20 @@ async def generate_semantic_autopost_candidate(
         rubric_name=rubric_name,
         is_model_warning=is_warning_response,
     )
+    if result.attempts > 1:
+        memory.record_rejected_semantic_theme(
+            user_id=user_id,
+            platform=platform,
+            semantic_theme=theme.key,
+            source_ref=seed,
+        )
+    if not result.accepted:
+        memory.record_rejected_semantic_theme(
+            user_id=user_id,
+            platform=platform,
+            semantic_theme=correction_theme.key,
+            source_ref=seed,
+        )
     logger.info(
         "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | theme=%s | attempts=%s | accepted=%s",
         platform,
