@@ -63,6 +63,21 @@ class SemanticAutopostTests(unittest.TestCase):
             prompt,
         )
 
+    def test_experiential_axis_owns_thesis_not_technical_rubric(self):
+        body_prompt = semantic.theme_instruction(
+            semantic.THEMES_BY_KEY["body"],
+            platform="vk",
+            rubric_name="AI без успешного успеха",
+        )
+        work_prompt = semantic.theme_instruction(
+            semantic.THEMES_BY_KEY["work"],
+            platform="vk",
+            rubric_name="AI без успешного успеха",
+        )
+        self.assertIn("опытная ось обязана владеть центральным тезисом", body_prompt)
+        self.assertIn("не подменяет вывод универсальным советом", body_prompt)
+        self.assertNotIn("опытная ось обязана владеть центральным тезисом", work_prompt)
+
     def tearDown(self):
         self.db_patch.stop()
         self.directory.cleanup()
