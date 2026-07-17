@@ -112,7 +112,8 @@ history, preventing reuse across Naz and VOID. If no eligible approved track
 remains, the producer fails closed and does not enqueue a post. Images are
 required by default and image attempts are bounded.
 
-The oneshot service runs only `python -B -m naz_vk_producer`. Its writable
-paths are limited to Naz data/cache and the shared `pending` inbox; publisher
-profiles and private `processing`, `done`, and `failed` directories are not
-available to it.
+The oneshot service runs only `python -B -m naz_vk_producer`. Its systemd
+writable paths are limited to the Naz working/data/cache locations required by
+the existing SQLite database and the shared `pending` inbox. Unix ownership
+still keeps tracked source and `.env` root-controlled; publisher profiles and
+private `processing`, `done`, and `failed` directories are not available to it.
