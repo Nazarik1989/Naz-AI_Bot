@@ -1015,7 +1015,7 @@ async def generate_semantic_autopost_candidate(
     seed: str,
     generate,
 ) -> tuple[semantic_autopost.SemanticTheme, semantic_autopost.GenerationResult]:
-    """Profile published history, then select a server theme and allow two generations."""
+    """Try a bounded sequence of distinct plans until the semantic gate accepts one."""
     recent_themes = memory.get_recent_semantic_theme_keys(
         user_id,
         limit=semantic_autopost.THEME_COOLDOWN,
@@ -1033,14 +1033,6 @@ async def generate_semantic_autopost_candidate(
     # The eight-post profile guides generation and the gate; it is not another
     # hard theme ban. One axis can support genuinely different theses/scenes.
     blocked = set(rejected_themes)
-    theme = semantic_autopost.select_theme(
-        rubric_name,
-        recent_themes,
-        platform=platform,
-        seed=seed,
-        excluded_theme_keys=blocked,
-    )
-    card = semantic_autopost.select_card(theme.key, recent_cards)
     history_context = semantic_autopost.generation_history_context(recent_posts)
     exclusion_context = semantic_autopost.history_profile_context(history_profile)
 
@@ -1054,18 +1046,52 @@ async def generate_semantic_autopost_candidate(
             instruction = f"{instruction}\n\n{history_context}"
         return await generate(instruction)
 
-    result = await semantic_autopost.generate_with_gate(
-        generate=generate_with_history,
-        evaluate=evaluate,
-        theme=theme,
-        correction_theme=None,
-        correction_theme_selector=None,
-        platform=platform,
-        rubric_name=rubric_name,
-        is_model_warning=is_warning_response,
-        card=card,
-    )
-    if not result.accepted:
+    total_attempts = 0
+    theme: semantic_autopost.SemanticTheme | None = None
+    result: semantic_autopost.GenerationResult | None = None
+    for plan_index in range(1, semantic_autopost.MAX_RELEASE_PLANS + 1):
+        theme = semantic_autopost.select_theme(
+            rubric_name,
+            recent_themes,
+            platform=platform,
+            seed=f"{seed}:plan:{plan_index}",
+            excluded_theme_keys=blocked,
+        )
+        card = semantic_autopost.select_card(theme.key, recent_cards)
+        plan_result = await semantic_autopost.generate_with_gate(
+            generate=generate_with_history,
+            evaluate=evaluate,
+            theme=theme,
+            correction_theme=None,
+            correction_theme_selector=None,
+            platform=platform,
+            rubric_name=rubric_name,
+            is_model_warning=is_warning_response,
+            card=card,
+        )
+        total_attempts += plan_result.attempts
+        result = semantic_autopost.GenerationResult(
+            accepted=plan_result.accepted,
+            text=plan_result.text,
+            attempts=total_attempts,
+            decision=plan_result.decision,
+            theme_key=plan_result.theme_key,
+            card_key=plan_result.card_key,
+        )
+        logger.info(
+            "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | plan=%s/%s | theme=%s | card=%s | attempts=%s | accepted=%s | reason=%s",
+            platform,
+            rubric_name,
+            plan_index,
+            semantic_autopost.MAX_RELEASE_PLANS,
+            result.theme_key or theme.key,
+            result.card_key or card.key,
+            result.attempts,
+            result.accepted,
+            result.decision.reason[:500].replace("\n", " "),
+        )
+        if result.accepted:
+            return theme, result
         memory.record_rejected_semantic_theme(
             user_id=user_id,
             platform=platform,
@@ -1078,18 +1104,13 @@ async def generate_semantic_autopost_candidate(
             theme.key,
             seed,
         )
-    logger.info(
-        "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | theme=%s | card=%s | attempts=%s | accepted=%s | reason=%s",
-        platform,
-        rubric_name,
-        result.theme_key or theme.key,
-        result.card_key or card.key,
-        result.attempts,
-        result.accepted,
-        result.decision.reason[:500].replace("\n", " "),
-    )
-    accepted_theme = semantic_autopost.THEMES_BY_KEY.get(result.theme_key, theme)
-    return accepted_theme, result
+        blocked.add(theme.key)
+
+    if theme is None or result is None:
+        raise semantic_autopost.NoSemanticThemeAvailable(
+            f"no semantic release plan for rubric={rubric_name!r}"
+        )
+    return theme, result
 
 
 def commit_accepted_autopost_state(
@@ -3320,7 +3341,7 @@ async def create_naz_vk_job(
     )
     if not semantic_result.accepted:
         raise vk_publish_queue.QueueError(
-            "semantic quality gate отклонил обе генерации; VK job не создан"
+            "semantic quality gate отклонил все ограниченные планы; VK job не создан"
         )
     text = semantic_result.text
     images, _ = await generate_images_with_retries(
@@ -3777,7 +3798,7 @@ async def process_agent_content_date(
         if not semantic_result.accepted:
             await notify_admin(
                 bot,
-                f"⚠️ Agent Content {resolved_date}: semantic/safety gate отклонил две генерации; draft не сохранён.",
+                f"⚠️ Agent Content {resolved_date}: semantic/safety gate отклонил все ограниченные планы; draft не сохранён.",
             )
             mark_agent_content_seen(resolved_date, manifest_hash)
             return f"⚠️ Agent Content {resolved_date}: blocked before draft and publish."
@@ -5581,7 +5602,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         if not semantic_result.accepted:
             failure_reasons.append("semantic gate rejected both generations")
-            logger.warning("AUTOPOST semantic block after two generations")
+            logger.warning("AUTOPOST semantic block after all bounded release plans")
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
 
@@ -5682,7 +5703,7 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             failure_reasons.append("semantic gate rejected both source generations")
             await notify_admin(
                 context.bot,
-                "⚠️ Мониторинг источников пропустил слот: semantic gate отклонил две генерации.",
+                "⚠️ Мониторинг источников пропустил слот: semantic gate отклонил все ограниченные планы.",
             )
             return
         post_text = semantic_result.text

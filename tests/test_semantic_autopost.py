@@ -438,7 +438,16 @@ class SemanticAutopostTests(unittest.TestCase):
         ), patch.object(
             main,
             "evaluate_autopost_candidate",
-            new=AsyncMock(side_effect=[rejected("first"), rejected("second")]),
+            new=AsyncMock(
+                side_effect=[
+                    rejected("first"),
+                    rejected("second"),
+                    rejected("third"),
+                    rejected("fourth"),
+                    rejected("fifth"),
+                    rejected("sixth"),
+                ]
+            ),
         ), patch.object(
             main.memory, "record_rejected_semantic_theme"
         ) as remember:
@@ -448,17 +457,69 @@ class SemanticAutopostTests(unittest.TestCase):
                     platform="vk",
                     rubric_name="Человеческая деталь",
                     seed="timer:failed",
-                    generate=AsyncMock(side_effect=["Первый", "Второй"]),
+                    generate=AsyncMock(
+                        side_effect=["one", "two", "three", "four", "five", "six"]
+                    ),
                 )
             )
         self.assertFalse(result.accepted)
+        self.assertEqual(result.attempts, 6)
+        self.assertEqual(remember.call_count, 3)
+        self.assertEqual(
+            len(
+                {
+                    call.kwargs["semantic_theme"]
+                    for call in remember.call_args_list
+                }
+            ),
+            3,
+        )
+        self.assertEqual(memory.get_recent_semantic_card_keys(1), [])
+
+    def test_release_moves_to_next_plan_after_two_semantic_rejections(self):
+        generate = AsyncMock(side_effect=["one", "two", "three"])
+        decisions = AsyncMock(
+            side_effect=[rejected("first"), rejected("second"), accepted()]
+        )
+        with patch.object(
+            main.memory, "get_recent_semantic_theme_keys", return_value=["memory"]
+        ), patch.object(
+            main.memory, "get_recent_rejected_semantic_theme_keys", return_value=[]
+        ), patch.object(
+            main.memory, "get_recent_posts_for_semantic_gate", return_value=[
+                {"semantic_theme": "memory", "platform": "vk", "content": "old"}
+            ]
+        ), patch.object(
+            main,
+            "get_autopost_history_profile",
+            new=AsyncMock(
+                return_value=semantic.SemanticHistoryProfile("digest", (), "")
+            ),
+        ), patch.object(
+            main, "evaluate_autopost_candidate", new=decisions
+        ), patch.object(
+            main.memory, "record_rejected_semantic_theme"
+        ) as remember:
+            theme, result = asyncio.run(
+                main.generate_semantic_autopost_candidate(
+                    user_id=1,
+                    platform="vk",
+                    rubric_name="Человеческая деталь",
+                    seed="timer:recover",
+                    generate=generate,
+                )
+            )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.attempts, 3)
+        self.assertEqual(theme.key, "conflict")
+        self.assertEqual(result.card_key, "conflict_shared_resource")
         remember.assert_called_once_with(
             user_id=1,
             platform="vk",
-            semantic_theme=theme.key,
-            source_ref="timer:failed",
+            semantic_theme="care",
+            source_ref="timer:recover",
         )
-        self.assertEqual(memory.get_recent_semantic_card_keys(1), [])
 
     def test_legacy_generated_post_without_semantic_theme_remains_readable(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
