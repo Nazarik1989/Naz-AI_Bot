@@ -73,8 +73,8 @@ Never commit `.env` or `naz_ai_bot.sqlite3` to GitHub.
 
 ## Standalone VK producer timer
 
-Production must set the following in the separate Naz environment file
-`/etc/naz-ai-bot/naz.env`:
+Production keeps Naz settings only in the canonical application environment
+file `/opt/naz-ai-bot/.env`:
 
 ```text
 NAZ_VK_ENABLED=true
@@ -82,6 +82,8 @@ NAZ_VK_TIMEZONE=Europe/Moscow
 NAZ_VK_SCHEDULER=systemd
 NAZ_VK_QUEUE_DIR=/var/lib/void-vk-publisher/queue
 NAZ_VK_TRACK_STATE_FILE=/var/lib/naz-ai-bot/vk_track_rotation.json
+NAZ_VK_IMAGE_POLICY=required
+NAZ_VK_IMAGE_ATTEMPTS=2
 DB_PATH=/var/lib/naz-ai-bot/naz_ai_bot.sqlite3
 ```
 
@@ -95,6 +97,7 @@ sudo install -m 0644 deploy/systemd/naz-vk-producer.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now naz-vk-producer.timer
 systemctl list-timers naz-vk-producer.timer
+/opt/naz-ai-bot/.venv/bin/python -B -m naz_vk_producer --check-config
 ```
 
 The timer has an explicit Europe/Moscow daily slot at `10:30` and a gaming slot
@@ -104,9 +107,10 @@ variables inside `OnCalendar`; keep `NAZ_VK_DAILY_TIME` and
 local `NAZ_VK_SCHEDULER=telegram` mode.
 
 Every job receives a query selected from the code-owned approved music catalog.
-The shared state file rotates the last eight selected queries across daily,
-gaming, manual, Telegram-scheduled, and systemd-produced jobs. If no eligible
-approved track remains, the producer fails closed and does not enqueue a post.
+Naz checks both its own rotation state and the consumer-owned global last-eight
+history, preventing reuse across Naz and VOID. If no eligible approved track
+remains, the producer fails closed and does not enqueue a post. Images are
+required by default and image attempts are bounded.
 
 The oneshot service runs only `python -B -m naz_vk_producer`. Its writable
 paths are limited to Naz data/cache and the shared `pending` inbox; publisher

@@ -40,6 +40,45 @@ class VkPublishQueueTests(unittest.TestCase):
             self.assertIsInstance(job["target_group_id"], str)
             queue.validate_canonical_job(job, root / "pending" / job["job_id"])
 
+    def test_materialized_job_matches_shared_consumer_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = self.enqueue(root, target_group_id="allowlisted")
+            job_dir = root / "pending" / job["job_id"]
+            saved = json.loads((job_dir / "job.json").read_text("utf-8"))
+            self.assertEqual(
+                set(saved),
+                {
+                    "schema", "job_id", "producer", "target_group_id", "text",
+                    "media", "track_query", "created_at", "not_before",
+                    "dedupe_key", "source_ref",
+                },
+            )
+            queue.validate_canonical_job(
+                saved,
+                job_dir,
+                allowed_group_id="allowlisted",
+                recent_track_keys={"different normalized track"},
+            )
+            self.assertEqual(saved["producer"], "naz")
+            self.assertEqual(
+                saved["job_id"],
+                queue.canonical_job_id(saved["dedupe_key"]),
+            )
+
+    def test_shared_recent_track_is_rejected_by_contract_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = self.enqueue(root)
+            job_dir = root / "pending" / job["job_id"]
+            with self.assertRaisesRegex(queue.QueueError, "last 8"):
+                queue.validate_canonical_job(
+                    job,
+                    job_dir,
+                    allowed_group_id="123",
+                    recent_track_keys={queue.normalize_track_query(job["track_query"])},
+                )
+
     def test_atomic_enqueue_renames_completed_directory(self):
         with tempfile.TemporaryDirectory() as directory, patch("vk_publish_queue.os.replace", wraps=queue.os.replace) as replace:
             root = Path(directory)
