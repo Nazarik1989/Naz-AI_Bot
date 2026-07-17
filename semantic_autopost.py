@@ -124,6 +124,9 @@ THEMES: tuple[SemanticTheme, ...] = (
 )
 
 THEMES_BY_KEY = {theme.key: theme for theme in THEMES}
+EXPERIENTIAL_THEME_KEYS = frozenset(
+    {"city", "music", "game", "body", "domestic_absurdity", "memory"}
+)
 
 # A rubric narrows the catalogue; it does not dictate a ready-made topic.
 RUBRIC_THEME_KEYS: Mapping[str, tuple[str, ...]] = {
@@ -272,6 +275,13 @@ def platform_context(platform: str) -> str:
 
 
 def theme_instruction(theme: SemanticTheme, *, platform: str, rubric_name: str) -> str:
+    axis_ownership = ""
+    if theme.key in EXPERIENTIAL_THEME_KEYS:
+        axis_ownership = (
+            "\nЭта опытная ось обязана владеть центральным тезисом и финальным выводом. "
+            "Техническая рубрика даёт контекст или событие, но не подменяет вывод универсальным "
+            "советом о том, как правильно использовать AI, автоматизацию, инструмент или систему."
+        )
     return (
         f"{platform_context(platform)}\n"
         f"Server-side смысловая ось выпуска: {theme.label} ({theme.key}).\n"
@@ -280,6 +290,7 @@ def theme_instruction(theme: SemanticTheme, *, platform: str, rubric_name: str) 
         "Характер Naz — это точка зрения, ритм и интонация. Не делай его биографию, билдера, бардак, "
         "систему, дожим или одну из core truths обязательной темой и одинаковой моралью поста.\n"
         "У поста должны быть конкретная сцена и собственный вывод, соответствующие выбранной оси."
+        f"{axis_ownership}"
     )
 
 
