@@ -244,9 +244,17 @@ def correction_instruction(
     )
     scene = _pick_variant(theme.scenes, f"scene|{rejected_summary}")
     conclusion = _pick_variant(theme.conclusions, f"conclusion|{rejected_summary}")
+    rejected_meanings = "; ".join(rejected.key_meanings) or "(не выделены)"
     return (
         f"{theme_instruction(theme, platform=platform, rubric_name=rubric_name)}\n"
         "Это единственная корректирующая попытка. Первый вариант отклонён как смысловой повтор.\n"
+        "Семантическое резюме отклонённого варианта — это запрет на повтор мысли, "
+        "а не слова, которые нужно механически заменить:\n"
+        f"- причина отказа: {rejected.reason or '(не указана)'}\n"
+        f"- центральный тезис: {rejected.central_thesis or '(не указан)'}\n"
+        f"- вывод: {rejected.conclusion or '(не указан)'}\n"
+        f"- сюжетная форма: {rejected.narrative_shape or '(не указана)'}\n"
+        f"- ключевые смыслы: {rejected_meanings}\n"
         f"Обязательная новая конкретная сцена: {scene}.\n"
         f"Направление существенно другого вывода: {conclusion}.\n"
         "Не перефразируй первый вариант, не сохраняй его сюжетный ход и не приходи к его морали другими словами."

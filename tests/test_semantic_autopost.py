@@ -154,7 +154,8 @@ class SemanticAutopostTests(unittest.TestCase):
 
     def test_generation_stops_after_one_correction(self):
         generate = AsyncMock(side_effect=["Первый вариант", "Совсем другая сцена"])
-        evaluate = AsyncMock(side_effect=[rejected("first duplicate"), rejected("second duplicate")])
+        first_rejection = rejected("first duplicate")
+        evaluate = AsyncMock(side_effect=[first_rejection, rejected("second duplicate")])
         correction_theme = semantic.THEMES_BY_KEY["city"]
         result = asyncio.run(
             semantic.generate_with_gate(
@@ -173,6 +174,10 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertEqual(generate.await_count, 2)
         second_prompt = generate.await_args_list[1].args[0]
         self.assertIn("(city)", second_prompt)
+        self.assertIn("first duplicate", second_prompt)
+        self.assertIn(first_rejection.central_thesis, second_prompt)
+        self.assertIn(first_rejection.conclusion, second_prompt)
+        self.assertIn(first_rejection.narrative_shape, second_prompt)
         self.assertIn("Обязательная новая конкретная сцена", second_prompt)
         self.assertIn("существенно другого вывода", second_prompt)
 
