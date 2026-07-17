@@ -18,6 +18,7 @@ from typing import Awaitable, Callable, Iterable, Mapping, Sequence
 THEME_COOLDOWN = 5
 SEMANTIC_HISTORY_LIMIT = 8
 MAX_GENERATIONS = 2
+MAX_RELEASE_PLANS = 3
 
 
 @dataclass(frozen=True, slots=True)
