@@ -1039,36 +1039,6 @@ async def generate_semantic_autopost_candidate(
     async def evaluate(candidate: str) -> semantic_autopost.SemanticDecision:
         return await evaluate_autopost_candidate(candidate, recent_posts)
 
-    def select_retry_theme(
-        _decision: semantic_autopost.SemanticDecision,
-    ) -> semantic_autopost.SemanticTheme | None:
-        try:
-            retry_theme = semantic_autopost.select_theme(
-                rubric_name,
-                recent_themes,
-                platform=platform,
-                seed=f"{seed}:semantic-retry",
-                excluded_theme_keys=(theme.key, *sorted(occupied)),
-            )
-        except semantic_autopost.NoSemanticThemeAvailable:
-            logger.warning(
-                "SEMANTIC_AUTOPOST retry blocked | platform=%s | rubric=%s | initial=%s | occupied=%s",
-                platform,
-                rubric_name,
-                theme.key,
-                ",".join(sorted(occupied)),
-            )
-            return None
-        logger.info(
-            "SEMANTIC_AUTOPOST retry selection | platform=%s | rubric=%s | initial=%s | occupied=%s | retry=%s",
-            platform,
-            rubric_name,
-            theme.key,
-            ",".join(sorted(occupied)),
-            retry_theme.key,
-        )
-        return retry_theme
-
     async def generate_with_history(instruction: str) -> str:
         if exclusion_context:
             instruction = f"{instruction}\n\n{exclusion_context}"
@@ -1081,7 +1051,7 @@ async def generate_semantic_autopost_candidate(
         evaluate=evaluate,
         theme=theme,
         correction_theme=None,
-        correction_theme_selector=select_retry_theme,
+        correction_theme_selector=None,
         platform=platform,
         rubric_name=rubric_name,
         is_model_warning=is_warning_response,
