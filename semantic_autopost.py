@@ -137,6 +137,9 @@ RUBRIC_THEME_KEYS: Mapping[str, tuple[str, ...]] = {
     "Naz Dev Log": ("work", "care", "memory", "conflict", "domestic_absurdity", "practical_future", "body"),
     "AI без успешного успеха": ("work", "care", "conflict", "practical_future", "attention", "relationships", "creativity", "city", "music", "game", "body", "domestic_absurdity", "memory"),
     "Ошибка недели": ("work", "care", "conflict", "memory", "domestic_absurdity", "relationships", "practical_future", "body", "creativity"),
+    "Полевая заметка Naz": ("relationships", "city", "work", "creativity", "music", "game", "body", "domestic_absurdity", "memory", "care", "conflict", "practical_future", "attention"),
+    "Маленький эксперимент": ("relationships", "city", "work", "creativity", "music", "game", "body", "domestic_absurdity", "memory", "care", "conflict", "practical_future", "attention"),
+    "Человеческая деталь": ("relationships", "city", "work", "creativity", "music", "body", "domestic_absurdity", "memory", "care", "conflict", "attention"),
     "Игровая лаборатория VK": ("game", "relationships", "creativity", "music", "conflict", "attention", "practical_future"),
     "visual_archive": ("city", "relationships", "creativity", "music", "body", "domestic_absurdity", "memory", "attention"),
 }
@@ -341,6 +344,33 @@ def correction_instruction(
         "Сформулируй существенно другой самостоятельный вывод из новой сцены и границ выбранной оси. "
         "Не используй готовую типовую мораль оси: вывод должен принадлежать именно этому выпуску.\n"
         "Не перефразируй первый вариант, не сохраняй его сюжетный ход и не приходи к его морали другими словами."
+    )
+
+
+def generation_history_context(
+    recent_posts: Sequence[Mapping[str, str]],
+) -> str:
+    """Give the writer semantic context that was previously visible only to the gate."""
+    if not recent_posts:
+        return ""
+    history_blocks = []
+    for index, post in enumerate(recent_posts[-SEMANTIC_HISTORY_LIMIT:], start=1):
+        platform = str(post.get("platform") or "unknown")
+        theme = str(post.get("semantic_theme") or "legacy/unknown")
+        content = " ".join(str(post.get("content") or "").split())[:1400]
+        if content:
+            history_blocks.append(
+                f"[{index}] platform={platform}; theme={theme}\n{content}"
+            )
+    if not history_blocks:
+        return ""
+    return (
+        "SEMANTIC ANTI-REPEAT CONTEXT — последние принятые или подготовленные посты общего "
+        "персонажа Naz на Telegram/VK. Это не сырьё для пересказа и не примеры стиля.\n"
+        "До написания сравни будущий центральный тезис, вывод, сюжетный ход и набор ключевых "
+        "смыслов со всем списком. Выбери действительно другую мысль внутри заданной оси; "
+        "не заменяй только лексику, декорацию или метафору.\n\n"
+        + "\n\n".join(history_blocks)
     )
 
 

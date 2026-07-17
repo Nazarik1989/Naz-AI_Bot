@@ -143,6 +143,49 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertIn(history[0]["content"], sent_prompt)
         self.assertIn(candidate, sent_prompt)
 
+    def test_both_generations_see_shared_semantic_history_without_banning_axis(self):
+        history = [
+            {
+                "semantic_theme": "",
+                "platform": "telegram",
+                "content": "Старый вывод: надёжность начинается с ручной проверки.",
+            },
+            {
+                "semantic_theme": "memory",
+                "platform": "vk",
+                "content": "Старый вывод: журнал решений помогает восстановить причину.",
+            },
+        ]
+        generate = AsyncMock(side_effect=["Первый вариант", "Второй вариант"])
+        decisions = AsyncMock(side_effect=[rejected("duplicate"), accepted()])
+        with patch.object(
+            main.memory, "get_recent_semantic_theme_keys", return_value=[]
+        ), patch.object(
+            main.memory, "get_recent_posts_for_semantic_gate", return_value=history
+        ), patch.object(
+            main, "evaluate_autopost_candidate", new=decisions
+        ), patch.object(
+            main.memory, "record_rejected_semantic_theme"
+        ) as record_rejection:
+            _, result = asyncio.run(
+                main.generate_semantic_autopost_candidate(
+                    user_id=1,
+                    platform="vk",
+                    rubric_name="AI без успешного успеха",
+                    seed="slot",
+                    generate=generate,
+                )
+            )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(generate.await_count, 2)
+        for call in generate.await_args_list:
+            prompt = call.args[0]
+            self.assertIn("SEMANTIC ANTI-REPEAT CONTEXT", prompt)
+            self.assertIn(history[0]["content"], prompt)
+            self.assertIn(history[1]["content"], prompt)
+        record_rejection.assert_not_called()
+
     def test_legacy_generated_post_without_semantic_theme_remains_readable(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
         conn = sqlite3.connect(legacy_path)
@@ -181,6 +224,31 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertIn("semantic_theme", columns)
         self.assertEqual(posts[-1]["content"], "Старый пост")
         self.assertEqual(posts[-1]["semantic_theme"], "")
+
+    def test_unpublished_vk_draft_is_not_semantic_history_until_done(self):
+        common = {
+            "user_id": 1,
+            "expert_mode": "copywriter",
+            "task": "naz_vk_queue:daily:Naz Dev Log",
+            "topic": "Тема",
+            "image_count": 1,
+            "semantic_theme": "work",
+        }
+        memory.save_generated_post(
+            **common,
+            content="Не вышедший draft",
+            published_to_channel=False,
+            external_job_id="naz-0123456789abcdef01234567",
+        )
+        self.assertEqual(memory.get_recent_posts_for_semantic_gate(1), [])
+        self.assertEqual(memory.get_recent_semantic_theme_keys(1), [])
+
+        queued = memory.get_unpublished_vk_jobs(1)
+        self.assertEqual(len(queued), 1)
+        self.assertTrue(memory.mark_vk_generated_post_published(1, queued[0]["id"]))
+        posts = memory.get_recent_posts_for_semantic_gate(1)
+        self.assertEqual([post["content"] for post in posts], ["Не вышедший draft"])
+        self.assertEqual(memory.get_recent_semantic_theme_keys(1), ["work"])
 
     def test_generation_stops_after_one_correction(self):
         generate = AsyncMock(side_effect=["Первый вариант", "Совсем другая сцена"])
@@ -234,60 +302,6 @@ class SemanticAutopostTests(unittest.TestCase):
             correction.key,
             semantic.DIVERGENT_THEME_KEYS[initial.key],
         )
-
-    def test_rejected_theme_cooldown_is_persistent_but_not_accepted_history(self):
-        memory.record_rejected_semantic_theme(
-            user_id=7,
-            platform="vk",
-            semantic_theme="memory",
-            source_ref="timer:test",
-        )
-        self.assertEqual(
-            memory.get_recent_rejected_semantic_theme_keys(7),
-            ["memory"],
-        )
-        self.assertEqual(memory.get_recent_semantic_theme_keys(7), [])
-        memory.init_db()
-        self.assertEqual(
-            memory.get_recent_rejected_semantic_theme_keys(7),
-            ["memory"],
-        )
-
-    def test_rejected_theme_cooldown_keeps_distinct_axes(self):
-        for index, theme in enumerate(
-            (
-                "relationships",
-                "work",
-                "care",
-                "memory",
-                "conflict",
-                "practical_future",
-                "attention",
-                "creativity",
-                "body",
-                "music",
-                "game",
-            )
-        ):
-            memory.record_rejected_semantic_theme(
-                user_id=9,
-                platform="vk",
-                semantic_theme=theme,
-                source_ref=f"timer:{index}",
-            )
-        recent = memory.get_recent_rejected_semantic_theme_keys(9)
-        self.assertEqual(len(recent), 11)
-        self.assertIn("relationships", recent)
-        self.assertIn("game", recent)
-        memory.record_rejected_semantic_theme(
-            user_id=9,
-            platform="telegram",
-            semantic_theme="game",
-            source_ref="timer:repeat",
-        )
-        recent = memory.get_recent_rejected_semantic_theme_keys(9)
-        self.assertEqual(len(recent), 11)
-        self.assertEqual(recent[-1], "game")
 
     def test_vk_rubric_selector_skips_fully_exhausted_theme_set(self):
         dev_log_keys = {

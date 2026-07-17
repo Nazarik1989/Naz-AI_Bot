@@ -258,3 +258,29 @@ def queue_status(queue_root: Path) -> dict:
     root = Path(queue_root)
     pending = _require_pending(root)
     return {"path": str(pending), "ready": True}
+
+
+def completed_naz_job(queue_root: Path, job_id: str) -> dict | None:
+    """Confirm one known Naz job without listing any private consumer state."""
+    clean_job_id = str(job_id or "").strip()
+    if not re.fullmatch(r"naz-[0-9a-f]{24}", clean_job_id):
+        return None
+    done = Path(queue_root) / "done"
+    job_dir = done / clean_job_id
+    job_file = job_dir / "job.json"
+    if (
+        done.is_symlink()
+        or job_dir.is_symlink()
+        or not job_dir.is_dir()
+        or job_file.is_symlink()
+        or not job_file.is_file()
+    ):
+        return None
+    try:
+        job = json.loads(job_file.read_text(encoding="utf-8"))
+        validate_canonical_job(job, job_dir)
+    except (OSError, ValueError, QueueError):
+        return None
+    if job.get("producer") != PRODUCER or job.get("job_id") != clean_job_id:
+        return None
+    return job
