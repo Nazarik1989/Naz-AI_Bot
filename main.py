@@ -907,8 +907,6 @@ async def generate_content(
 async def evaluate_autopost_candidate(
     candidate: str,
     recent_posts: List[Dict[str, str]],
-    *,
-    theme_catalog: tuple[semantic_autopost.SemanticTheme, ...] = semantic_autopost.THEMES,
 ) -> semantic_autopost.SemanticDecision:
     """Use a model as a meaning-level judge; invalid review output fails closed."""
     if not recent_posts:
@@ -920,11 +918,7 @@ async def evaluate_autopost_candidate(
             "",
             (),
         )
-    prompt = semantic_autopost.build_gate_prompt(
-        candidate,
-        recent_posts,
-        theme_catalog=theme_catalog,
-    )
+    prompt = semantic_autopost.build_gate_prompt(candidate, recent_posts)
     try:
         raw = await call_gpt(
             [
@@ -948,6 +942,71 @@ async def evaluate_autopost_candidate(
         )
 
 
+async def get_autopost_history_profile(
+    user_id: int,
+    recent_posts: List[Dict[str, str]],
+) -> semantic_autopost.SemanticHistoryProfile:
+    digest = semantic_autopost.semantic_history_digest(recent_posts)
+    if not recent_posts:
+        return semantic_autopost.SemanticHistoryProfile(digest, (), "")
+
+    cached = memory.get_cached_semantic_history_profile(user_id, digest)
+    if cached is not None:
+        occupied = tuple(
+            key
+            for key in cached.get("occupied_theme_keys", [])
+            if key in semantic_autopost.THEMES_BY_KEY
+        )
+        logger.info(
+            "SEMANTIC_HISTORY_PROFILE cache=hit | digest=%s | occupied=%s",
+            digest[:12],
+            ",".join(occupied),
+        )
+        return semantic_autopost.SemanticHistoryProfile(
+            digest,
+            occupied,
+            str(cached.get("exclusion_summary") or ""),
+        )
+
+    prompt = semantic_autopost.build_history_profile_prompt(recent_posts)
+    try:
+        raw = await call_gpt(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты выполняешь только полный семантический аудит истории. "
+                        "Верни статус каждого ключа по точной JSON-схеме; не пиши новый пост."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=2200,
+            model=CONTENT_MODEL_NAME,
+        )
+        profile = semantic_autopost.parse_history_profile(
+            raw,
+            history_digest=digest,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Semantic history profile failed closed: %s", exc)
+        raise RuntimeError(
+            f"semantic history profile unavailable: {type(exc).__name__}"
+        ) from exc
+    memory.cache_semantic_history_profile(
+        user_id=user_id,
+        history_digest=profile.history_digest,
+        occupied_theme_keys=profile.occupied_theme_keys,
+        exclusion_summary=profile.exclusion_summary,
+    )
+    logger.info(
+        "SEMANTIC_HISTORY_PROFILE cache=miss | digest=%s | occupied=%s",
+        digest[:12],
+        ",".join(profile.occupied_theme_keys),
+    )
+    return profile
+
+
 async def generate_semantic_autopost_candidate(
     *,
     user_id: int,
@@ -956,37 +1015,33 @@ async def generate_semantic_autopost_candidate(
     seed: str,
     generate,
 ) -> tuple[semantic_autopost.SemanticTheme, semantic_autopost.GenerationResult]:
-    """Select the shared theme before any model call, then allow two generations."""
+    """Profile published history, then select a server theme and allow two generations."""
     recent_themes = memory.get_recent_semantic_theme_keys(
         user_id,
         limit=semantic_autopost.THEME_COOLDOWN,
-    )
-    theme = semantic_autopost.select_theme(
-        rubric_name,
-        recent_themes,
-        platform=platform,
-        seed=seed,
     )
     recent_posts = memory.get_recent_posts_for_semantic_gate(
         user_id,
         limit=semantic_autopost.SEMANTIC_HISTORY_LIMIT,
     )
+    history_profile = await get_autopost_history_profile(user_id, recent_posts)
+    occupied = set(history_profile.occupied_theme_keys)
+    theme = semantic_autopost.select_theme(
+        rubric_name,
+        recent_themes,
+        platform=platform,
+        seed=seed,
+        excluded_theme_keys=occupied,
+    )
     history_context = semantic_autopost.generation_history_context(recent_posts)
+    exclusion_context = semantic_autopost.history_profile_context(history_profile)
+
     async def evaluate(candidate: str) -> semantic_autopost.SemanticDecision:
-        return await evaluate_autopost_candidate(
-            candidate,
-            recent_posts,
-            theme_catalog=semantic_autopost.THEMES,
-        )
+        return await evaluate_autopost_candidate(candidate, recent_posts)
 
     def select_retry_theme(
-        decision: semantic_autopost.SemanticDecision,
+        _decision: semantic_autopost.SemanticDecision,
     ) -> semantic_autopost.SemanticTheme | None:
-        occupied = {
-            key
-            for key in decision.occupied_theme_keys
-            if key in semantic_autopost.THEMES_BY_KEY
-        }
         try:
             retry_theme = semantic_autopost.select_theme(
                 rubric_name,
@@ -1015,6 +1070,8 @@ async def generate_semantic_autopost_candidate(
         return retry_theme
 
     async def generate_with_history(instruction: str) -> str:
+        if exclusion_context:
+            instruction = f"{instruction}\n\n{exclusion_context}"
         if history_context:
             instruction = f"{instruction}\n\n{history_context}"
         return await generate(instruction)

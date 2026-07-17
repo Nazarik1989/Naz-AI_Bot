@@ -171,7 +171,13 @@ class SemanticDecision:
     conclusion: str
     narrative_shape: str
     key_meanings: tuple[str, ...]
-    occupied_theme_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticHistoryProfile:
+    history_digest: str
+    occupied_theme_keys: tuple[str, ...]
+    exclusion_summary: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,11 +374,106 @@ def generation_history_context(
     )
 
 
+def semantic_history_digest(
+    recent_posts: Sequence[Mapping[str, str]],
+) -> str:
+    payload = [
+        {
+            "platform": str(post.get("platform") or ""),
+            "semantic_theme": str(post.get("semantic_theme") or ""),
+            "content": str(post.get("content") or ""),
+        }
+        for post in recent_posts[-SEMANTIC_HISTORY_LIMIT:]
+    ]
+    return sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def build_history_profile_prompt(
+    recent_posts: Sequence[Mapping[str, str]],
+) -> str:
+    history_blocks = []
+    for index, post in enumerate(recent_posts[-SEMANTIC_HISTORY_LIMIT:], start=1):
+        platform = str(post.get("platform") or "unknown")
+        stored_theme = str(post.get("semantic_theme") or "legacy/unknown")
+        content = str(post.get("content") or "")[:3500]
+        history_blocks.append(
+            f"[{index}] platform={platform}; stored_theme={stored_theme}\n{content}"
+        )
+    history = "\n\n".join(history_blocks) or "(история пуста)"
+    catalog = "\n".join(
+        f"- {theme.key}: {theme.label}; {theme.brief}"
+        for theme in THEMES
+    )
+    schema_items = ",".join(
+        f'"{theme.key}":{{"occupied":true|false,"reason":"коротко"}}'
+        for theme in THEMES
+    )
+    return (
+        "Ты — отдельный семантический аудитор истории Naz. Кандидата нового поста здесь нет. "
+        "Проверь КАЖДУЮ ось каталога по последним опубликованным постам.\n"
+        "occupied=true, если центральный тезис, вывод или основной сюжетный ход хотя бы одного поста "
+        "существенно занимает эту ось. Не ориентируйся на stored_theme: legacy-метка может быть пустой "
+        "или неточной. Упоминание темы без центральной роли не делает ось занятой.\n"
+        "Обязателен ровно один статус для КАЖДОГО ключа каталога. Нельзя пропускать ключи, добавлять новые "
+        "или анализировать только самый заметный конфликт.\n"
+        "Верни только JSON без markdown по точной схеме:\n"
+        f'{{"themes":{{{schema_items}}}}}\n\n'
+        f"КАТАЛОГ:\n{catalog}\n\nПОСЛЕДНИЕ ОПУБЛИКОВАННЫЕ ПОСТЫ:\n{history}"
+    )
+
+
+def parse_history_profile(
+    raw: str,
+    *,
+    history_digest: str,
+) -> SemanticHistoryProfile:
+    value = str(raw or "").strip()
+    value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.IGNORECASE)
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("semantic history profile returned invalid JSON") from exc
+    statuses = payload.get("themes") if isinstance(payload, dict) else None
+    expected = set(THEMES_BY_KEY)
+    if not isinstance(statuses, dict) or set(statuses) != expected:
+        raise ValueError("semantic history profile must contain every theme exactly once")
+    occupied: list[str] = []
+    summary: list[str] = []
+    for theme in THEMES:
+        status = statuses.get(theme.key)
+        if not isinstance(status, dict) or not isinstance(status.get("occupied"), bool):
+            raise ValueError(f"semantic history profile has invalid status for {theme.key}")
+        reason = " ".join(str(status.get("reason") or "").split())[:300]
+        if status["occupied"]:
+            occupied.append(theme.key)
+            summary.append(f"{theme.key}: {reason or 'ось уже занята историей'}")
+    return SemanticHistoryProfile(
+        history_digest=history_digest,
+        occupied_theme_keys=tuple(occupied),
+        exclusion_summary="\n".join(summary),
+    )
+
+
+def history_profile_context(profile: SemanticHistoryProfile) -> str:
+    if not profile.occupied_theme_keys:
+        return ""
+    return (
+        "SERVER SEMANTIC EXCLUSION LEDGER — уже занятые центральные смыслы последних публикаций. "
+        "Не повторяй их под другим ярлыком, сценой или метафорой:\n"
+        f"{profile.exclusion_summary}"
+    )
+
+
 def build_gate_prompt(
     candidate: str,
     recent_posts: Sequence[Mapping[str, str]],
-    *,
-    theme_catalog: Sequence[SemanticTheme] = THEMES,
 ) -> str:
     history_blocks = []
     for index, post in enumerate(recent_posts[-SEMANTIC_HISTORY_LIMIT:], start=1):
@@ -380,25 +481,16 @@ def build_gate_prompt(
         content = str(post.get("content") or "")[:3500]
         history_blocks.append(f"[{index}] theme={theme}\n{content}")
     history = "\n\n".join(history_blocks) or "(история пуста)"
-    catalog = "\n".join(
-        f"- {theme.key}: {theme.label}; {theme.brief}"
-        for theme in theme_catalog
-    )
     return (
         "Ты — строгий семантический редактор Naz. Сравни кандидат с последними принятыми/подготовленными "
         "постами по смыслу, а не по отдельным словам.\n"
         "Отклони кандидат, если повторяется центральный тезис или вывод, та же мысль пересказана другой "
         "лексикой, близко повторён сюжетный ход, либо почти совпадает набор ключевых смыслов. Общий голос "
         "персонажа сам по себе дублем не считается.\n"
-        "Отдельно классифицируй, какие оси из каталога уже заняты ПОСЛЕДНИМИ ПОСТАМИ: ось занята, если "
-        "центральный тезис, вывод или основной сюжетный ход хотя бы одного поста существенно относится "
-        "к ней. Смотри на содержание, а не на сохранённую theme-метку. Кандидат в occupied_theme_keys "
-        "не учитывай. Не придумывай новую ось и не выбирай retry.\n"
         "Верни только JSON без markdown:\n"
         '{"accepted":true|false,"reason":"коротко","central_thesis":"одна мысль",'
         '"conclusion":"эмоциональный/практический вывод","narrative_shape":"сцена→поворот→вывод",'
-        '"key_meanings":["смысл 1","смысл 2"],"occupied_theme_keys":["key_из_каталога"]}\n\n'
-        f"КАТАЛОГ ОСЕЙ:\n{catalog}\n\n"
+        '"key_meanings":["смысл 1","смысл 2"]}\n\n'
         f"ПОСЛЕДНИЕ ПОСТЫ:\n{history}\n\nКАНДИДАТ:\n{candidate[:5000]}"
     )
 
@@ -415,9 +507,6 @@ def parse_gate_response(raw: str) -> SemanticDecision:
     meanings = payload.get("key_meanings")
     if not isinstance(meanings, list):
         meanings = []
-    occupied = payload.get("occupied_theme_keys")
-    if not isinstance(occupied, list):
-        occupied = []
     return SemanticDecision(
         accepted=payload["accepted"],
         reason=str(payload.get("reason") or "")[:500],
@@ -425,13 +514,6 @@ def parse_gate_response(raw: str) -> SemanticDecision:
         conclusion=str(payload.get("conclusion") or "")[:1000],
         narrative_shape=str(payload.get("narrative_shape") or "")[:500],
         key_meanings=tuple(str(item)[:300] for item in meanings[:8] if str(item).strip()),
-        occupied_theme_keys=tuple(
-            dict.fromkeys(
-                str(item)[:80]
-                for item in occupied[: len(THEMES)]
-                if str(item).strip()
-            )
-        ),
     )
 
 
