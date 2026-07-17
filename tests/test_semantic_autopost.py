@@ -155,11 +155,13 @@ class SemanticAutopostTests(unittest.TestCase):
     def test_generation_stops_after_one_correction(self):
         generate = AsyncMock(side_effect=["Первый вариант", "Совсем другая сцена"])
         evaluate = AsyncMock(side_effect=[rejected("first duplicate"), rejected("second duplicate")])
+        correction_theme = semantic.THEMES_BY_KEY["city"]
         result = asyncio.run(
             semantic.generate_with_gate(
                 generate=generate,
                 evaluate=evaluate,
                 theme=semantic.THEMES_BY_KEY["care"],
+                correction_theme=correction_theme,
                 platform="telegram",
                 rubric_name="Naz после смены",
                 is_model_warning=lambda text: False,
@@ -167,10 +169,30 @@ class SemanticAutopostTests(unittest.TestCase):
         )
         self.assertFalse(result.accepted)
         self.assertEqual(result.attempts, 2)
+        self.assertEqual(result.theme_key, "city")
         self.assertEqual(generate.await_count, 2)
         second_prompt = generate.await_args_list[1].args[0]
+        self.assertIn("(city)", second_prompt)
         self.assertIn("Обязательная новая конкретная сцена", second_prompt)
         self.assertIn("существенно другого вывода", second_prompt)
+
+    def test_correction_axis_excludes_initial_and_full_cooldown(self):
+        recent = ["relationships", "work", "care", "memory", "conflict"]
+        initial = semantic.select_theme(
+            "AI без магии",
+            recent,
+            platform="vk",
+            seed="slot",
+        )
+        correction = semantic.select_theme(
+            "AI без магии",
+            recent,
+            platform="vk",
+            seed="slot:correction",
+            excluded_theme_keys=(initial.key,),
+        )
+        self.assertNotEqual(initial.key, correction.key)
+        self.assertNotIn(correction.key, recent)
 
     def test_two_rejections_create_no_vk_draft_or_queue_job(self):
         theme = semantic.THEMES_BY_KEY["work"]
