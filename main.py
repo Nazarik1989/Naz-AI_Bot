@@ -908,7 +908,7 @@ async def evaluate_autopost_candidate(
     candidate: str,
     recent_posts: List[Dict[str, str]],
     *,
-    retry_themes: tuple[semantic_autopost.SemanticTheme, ...] = (),
+    theme_catalog: tuple[semantic_autopost.SemanticTheme, ...] = semantic_autopost.THEMES,
 ) -> semantic_autopost.SemanticDecision:
     """Use a model as a meaning-level judge; invalid review output fails closed."""
     if not recent_posts:
@@ -923,7 +923,7 @@ async def evaluate_autopost_candidate(
     prompt = semantic_autopost.build_gate_prompt(
         candidate,
         recent_posts,
-        retry_themes=retry_themes,
+        theme_catalog=theme_catalog,
     )
     try:
         raw = await call_gpt(
@@ -972,23 +972,47 @@ async def generate_semantic_autopost_candidate(
         limit=semantic_autopost.SEMANTIC_HISTORY_LIMIT,
     )
     history_context = semantic_autopost.generation_history_context(recent_posts)
-    recent_theme_set = {
-        str(key)
-        for key in recent_themes
-        if str(key).strip()
-    }
-    correction_themes = {
-        candidate.key: candidate
-        for candidate in semantic_autopost.compatible_themes(rubric_name)
-        if candidate.key != theme.key and candidate.key not in recent_theme_set
-    }
-
     async def evaluate(candidate: str) -> semantic_autopost.SemanticDecision:
         return await evaluate_autopost_candidate(
             candidate,
             recent_posts,
-            retry_themes=tuple(correction_themes.values()),
+            theme_catalog=semantic_autopost.THEMES,
         )
+
+    def select_retry_theme(
+        decision: semantic_autopost.SemanticDecision,
+    ) -> semantic_autopost.SemanticTheme | None:
+        occupied = {
+            key
+            for key in decision.occupied_theme_keys
+            if key in semantic_autopost.THEMES_BY_KEY
+        }
+        try:
+            retry_theme = semantic_autopost.select_theme(
+                rubric_name,
+                recent_themes,
+                platform=platform,
+                seed=f"{seed}:semantic-retry",
+                excluded_theme_keys=(theme.key, *sorted(occupied)),
+            )
+        except semantic_autopost.NoSemanticThemeAvailable:
+            logger.warning(
+                "SEMANTIC_AUTOPOST retry blocked | platform=%s | rubric=%s | initial=%s | occupied=%s",
+                platform,
+                rubric_name,
+                theme.key,
+                ",".join(sorted(occupied)),
+            )
+            return None
+        logger.info(
+            "SEMANTIC_AUTOPOST retry selection | platform=%s | rubric=%s | initial=%s | occupied=%s | retry=%s",
+            platform,
+            rubric_name,
+            theme.key,
+            ",".join(sorted(occupied)),
+            retry_theme.key,
+        )
+        return retry_theme
 
     async def generate_with_history(instruction: str) -> str:
         if history_context:
@@ -1000,7 +1024,7 @@ async def generate_semantic_autopost_candidate(
         evaluate=evaluate,
         theme=theme,
         correction_theme=None,
-        correction_themes=correction_themes,
+        correction_theme_selector=select_retry_theme,
         platform=platform,
         rubric_name=rubric_name,
         is_model_warning=is_warning_response,
