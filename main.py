@@ -65,6 +65,7 @@ import controller as naz_controller
 import character_state as naz_character
 import delegated_messaging
 import duo_relationship
+import editorial_policy
 import gaming_vertical
 import naz_vk_music
 import semantic_autopost
@@ -82,6 +83,9 @@ from prompts import (
     build_naz_direct_image_prompt,
     build_messages,
     format_roles,
+    get_expert_system_prompt,
+    get_platform_task_prompt,
+    content_platform_context,
     naz_visual_prompt_context,
 )
 
@@ -668,7 +672,7 @@ def ensure_voice_openai_client() -> OpenAI:
 
 
 async def call_gpt(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     max_tokens: int = MAX_TOKENS,
     temperature: float = TEMPERATURE,
     model: str | None = None,
@@ -864,7 +868,40 @@ async def generate_content(
     platform: str = "telegram",
     commit_state: bool = True,
     inherit_interactive_context: bool = True,
+    editorial_brief: editorial_policy.ContentBrief | None = None,
 ) -> str:
+    if editorial_brief is not None:
+        persona_rules = "\n\n".join(
+            part
+            for part in (
+                get_expert_system_prompt(DEFAULT_EXPERT_MODE, DEFAULT_VOICE_PROFILE, DEFAULT_CONTENT_GOAL),
+                content_platform_context(platform),
+                get_platform_task_prompt(task, platform),
+            )
+            if part
+        )
+        messages: List[Dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": editorial_policy.render_text_instructions(
+                    editorial_brief,
+                    persona_rules,
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Generate the publishable candidate from the immutable brief.\n"
+                    f"Attempt guidance:\n{extra_instruction.strip()}"
+                ),
+            },
+        ]
+        result = await call_gpt(
+            messages,
+            max_tokens=task_max_tokens(task),
+            model=task_model(task),
+        )
+        return result
     task_title = ACTION_TITLES.get(task, task)
     user_text = (
         f"Тема: {topic}\n\n"
@@ -945,6 +982,48 @@ async def evaluate_autopost_candidate(
         )
 
 
+async def evaluate_editorial_text_candidate(
+    brief: editorial_policy.ContentBrief,
+    candidate: str,
+) -> editorial_policy.TextGateDecision:
+    """Fail-closed text relevance validator; it never rewrites the candidate."""
+    try:
+        raw = await call_gpt(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict accept/reject editorial validator. Return only JSON "
+                        "matching the requested schema. Never rewrite, extend, or replace the topic."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": editorial_policy.build_text_gate_prompt(brief, candidate),
+                },
+            ],
+            max_tokens=350,
+            temperature=0.0,
+            model=CONTENT_MODEL_NAME,
+        )
+        return editorial_policy.parse_text_gate_response(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "EDITORIAL_TEXT_GATE post_id=%s accepted=false reason_code=validator_unavailable error_type=%s",
+            brief.post_id,
+            type(exc).__name__,
+        )
+        return editorial_policy.TextGateDecision(
+            False,
+            "validator_unavailable",
+            False,
+            False,
+            False,
+            False,
+            False,
+        )
+
+
 async def get_autopost_history_profile(
     user_id: int,
     recent_posts: List[Dict[str, str]],
@@ -1016,30 +1095,70 @@ async def generate_semantic_autopost_candidate(
     platform: str,
     rubric_name: str,
     seed: str,
+    source_type: str,
+    scheduled_slot: str,
+    context_reason: str,
+    music_required: bool,
     generate,
-) -> tuple[semantic_autopost.SemanticTheme, semantic_autopost.GenerationResult]:
-    """Try a bounded sequence of distinct plans until the semantic gate accepts one."""
+) -> tuple[
+    semantic_autopost.SemanticTheme,
+    semantic_autopost.GenerationResult,
+    editorial_policy.ContentBrief,
+]:
+    """Fix one semantic plan and one brief before any publication generation."""
     recent_themes = memory.get_recent_semantic_theme_keys(
         user_id,
         limit=semantic_autopost.THEME_COOLDOWN,
     )
     recent_cards = memory.get_recent_semantic_card_keys(user_id)
-    rejected_themes = memory.get_recent_rejected_semantic_theme_keys(
-        user_id,
-        limit=len(semantic_autopost.THEMES),
-    )
     recent_posts = memory.get_recent_posts_for_semantic_gate(
         user_id,
         limit=semantic_autopost.SEMANTIC_HISTORY_LIMIT,
     )
     history_profile = await get_autopost_history_profile(user_id, recent_posts)
-    # The eight-post profile guides generation and the gate; it is not another
-    # hard theme ban. One axis can support genuinely different theses/scenes.
-    blocked = set(rejected_themes)
     history_context = semantic_autopost.generation_history_context(recent_posts)
     exclusion_context = semantic_autopost.history_profile_context(history_profile)
 
+    theme = semantic_autopost.select_theme(
+        rubric_name,
+        recent_themes,
+        platform=platform,
+        seed=seed,
+        excluded_theme_keys=(),
+    )
+    card = semantic_autopost.select_card(theme.key, recent_cards)
+    allowed_rubrics = {
+        str(item["name"])
+        for item in (*NAZ_TELEGRAM_RUBRICS, *NAZ_VK_RUBRICS)
+    } | {
+        "content-agent",
+        "Мысли после разговора",
+        "visual_archive",
+        "source_monitor",
+    }
+    brief = editorial_policy.build_brief(
+        destination=platform,
+        scheduled_slot=scheduled_slot,
+        source_type=source_type,
+        source_reference=seed,
+        rubric=rubric_name,
+        thesis=card.thesis,
+        context_reason=context_reason,
+        visual_subject=card.scene,
+        visual_relation=(
+            f"The concrete scene '{card.scene}' exposes the tension '{card.tension}' "
+            f"and makes the fixed thesis visible without unrelated symbolism."
+        ),
+        allowed_rubrics=allowed_rubrics,
+        required_elements=(card.scene,),
+        forbidden_elements=(card.conclusion_boundary,),
+        music_required=music_required,
+    )
+
     async def evaluate(candidate: str) -> semantic_autopost.SemanticDecision:
+        relevance = await evaluate_editorial_text_candidate(brief, candidate)
+        if not relevance.accepted:
+            return semantic_autopost.blocked_decision(relevance.reason_code)
         return await evaluate_autopost_candidate(candidate, recent_posts)
 
     async def generate_with_history(instruction: str) -> str:
@@ -1047,73 +1166,29 @@ async def generate_semantic_autopost_candidate(
             instruction = f"{instruction}\n\n{exclusion_context}"
         if history_context:
             instruction = f"{instruction}\n\n{history_context}"
-        return await generate(instruction)
+        return await generate(instruction, brief)
 
-    total_attempts = 0
-    theme: semantic_autopost.SemanticTheme | None = None
-    result: semantic_autopost.GenerationResult | None = None
-    for plan_index in range(1, semantic_autopost.MAX_RELEASE_PLANS + 1):
-        theme = semantic_autopost.select_theme(
-            rubric_name,
-            recent_themes,
-            platform=platform,
-            seed=f"{seed}:plan:{plan_index}",
-            excluded_theme_keys=blocked,
-        )
-        card = semantic_autopost.select_card(theme.key, recent_cards)
-        plan_result = await semantic_autopost.generate_with_gate(
-            generate=generate_with_history,
-            evaluate=evaluate,
-            theme=theme,
-            correction_theme=None,
-            correction_theme_selector=None,
-            platform=platform,
-            rubric_name=rubric_name,
-            is_model_warning=is_warning_response,
-            card=card,
-        )
-        total_attempts += plan_result.attempts
-        result = semantic_autopost.GenerationResult(
-            accepted=plan_result.accepted,
-            text=plan_result.text,
-            attempts=total_attempts,
-            decision=plan_result.decision,
-            theme_key=plan_result.theme_key,
-            card_key=plan_result.card_key,
-        )
-        logger.info(
-            "SEMANTIC_AUTOPOST gate | platform=%s | rubric=%s | plan=%s/%s | theme=%s | card=%s | attempts=%s | accepted=%s | reason=%s",
-            platform,
-            rubric_name,
-            plan_index,
-            semantic_autopost.MAX_RELEASE_PLANS,
-            result.theme_key or theme.key,
-            result.card_key or card.key,
-            result.attempts,
-            result.accepted,
-            result.decision.reason[:500].replace("\n", " "),
-        )
-        if result.accepted:
-            return theme, result
-        memory.record_rejected_semantic_theme(
-            user_id=user_id,
-            platform=platform,
-            semantic_theme=theme.key,
-            source_ref=seed,
-        )
-        logger.info(
-            "SEMANTIC_AUTOPOST rejection remembered | platform=%s | theme=%s | source=%s",
-            platform,
-            theme.key,
-            seed,
-        )
-        blocked.add(theme.key)
-
-    if theme is None or result is None:
-        raise semantic_autopost.NoSemanticThemeAvailable(
-            f"no semantic release plan for rubric={rubric_name!r}"
-        )
-    return theme, result
+    result = await semantic_autopost.generate_with_gate(
+        generate=generate_with_history,
+        evaluate=evaluate,
+        theme=theme,
+        correction_theme=None,
+        correction_theme_selector=None,
+        platform=platform,
+        rubric_name=rubric_name,
+        is_model_warning=is_warning_response,
+        card=card,
+    )
+    logger.info(
+        "EDITORIAL_TEXT_GATE post_id=%s destination=%s rubric=%s attempts=%s accepted=%s reason_code=%s",
+        brief.post_id,
+        platform,
+        rubric_name,
+        result.attempts,
+        result.accepted,
+        "accepted" if result.accepted else "regeneration_exhausted",
+    )
+    return theme, result, brief
 
 
 def commit_accepted_autopost_state(
@@ -2025,7 +2100,17 @@ async def build_image_prompt(
     variant: int = 1,
     *,
     platform: str = "telegram",
+    editorial_brief: editorial_policy.ContentBrief | None = None,
 ) -> str:
+    if editorial_brief is not None:
+        visual_direction = naz_visual_prompt_context(editorial_brief.rubric)
+        return (
+            editorial_policy.render_visual_instructions(
+                editorial_brief,
+                visual_direction,
+            )
+            + f"\nSequence variant: {variant}. Keep the same subject and thesis."
+        )
     visual_direction = naz_visual_prompt_context(topic)
     is_material = "material" in topic.casefold() or "матери" in topic.casefold()
     text_policy = (
@@ -2319,7 +2404,12 @@ async def generate_hf_image_bytes(prompt: str, variant: int = 1) -> Optional[byt
     return None
 
 
-async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]:
+async def generate_image_bytes(
+    prompt: str,
+    variant: int = 1,
+    *,
+    allow_fallback: bool = True,
+) -> Optional[bytes]:
     """Generate through the preferred provider, then try the configured backup."""
     providers = {
         "openai": (generate_openai_image_bytes, generate_bfl_image_bytes, generate_hf_image_bytes),
@@ -2333,7 +2423,7 @@ async def generate_image_bytes(prompt: str, variant: int = 1) -> Optional[bytes]
         if image:
             return image
 
-    return await fallback_image_bytes() if ALLOW_IMAGE_FALLBACK else None
+    return await fallback_image_bytes() if allow_fallback and ALLOW_IMAGE_FALLBACK else None
 
 
 def load_brand_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -2491,6 +2581,60 @@ async def fallback_image_bytes() -> Optional[bytes]:
     return None
 
 
+async def evaluate_editorial_image(
+    brief: editorial_policy.ContentBrief,
+    image_bytes: bytes,
+) -> editorial_policy.ImageGateDecision:
+    """Inspect literal image content against the fixed brief; fail closed."""
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    try:
+        raw = await call_gpt(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict image relevance validator. Accept or reject only. "
+                        "Return exactly the requested JSON and never propose another scene."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": editorial_policy.build_image_gate_prompt(brief),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                        },
+                    ],
+                },
+            ],
+            max_tokens=450,
+            temperature=0.0,
+            model=CONTENT_MODEL_NAME,
+        )
+        return editorial_policy.parse_image_gate_response(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "EDITORIAL_IMAGE_GATE post_id=%s accepted=false reason_code=validator_unavailable error_type=%s",
+            brief.post_id,
+            type(exc).__name__,
+        )
+        return editorial_policy.ImageGateDecision(
+            False,
+            "validator_unavailable",
+            "",
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+        )
+
+
 async def generate_images_for_post(
     user_id: int,
     topic: str,
@@ -2498,9 +2642,11 @@ async def generate_images_for_post(
     count: int = 1,
     *,
     platform: str = "telegram",
+    editorial_brief: editorial_policy.ContentBrief | None = None,
 ) -> Tuple[List[bytes], str]:
     count = max(1, min(int(count), 4))
-    is_material = "material" in topic.casefold() or "матери" in topic.casefold()
+    material_key = editorial_brief.rubric if editorial_brief else topic
+    is_material = "material" in material_key.casefold() or "матери" in material_key.casefold()
     if is_material and count > 1:
         images: List[bytes] = []
         frame_prompts: List[str] = []
@@ -2511,9 +2657,25 @@ async def generate_images_for_post(
                 post_text,
                 variant=variant,
                 platform=platform,
+                editorial_brief=editorial_brief,
             )
             frame_prompts.append(frame_prompt)
-            image = await generate_image_bytes(frame_prompt, variant=variant)
+            image = await generate_image_bytes(
+                frame_prompt,
+                variant=variant,
+                allow_fallback=editorial_brief is None,
+            )
+            if image and editorial_brief is not None:
+                decision = await evaluate_editorial_image(editorial_brief, image)
+                logger.info(
+                    "EDITORIAL_IMAGE_GATE post_id=%s frame=%s accepted=%s reason_code=%s",
+                    editorial_brief.post_id,
+                    variant,
+                    decision.accepted,
+                    decision.reason_code,
+                )
+                if not decision.accepted:
+                    image = None
             if image:
                 images.append(image)
         return images, "\n---\n".join(frame_prompts)
@@ -2524,12 +2686,28 @@ async def generate_images_for_post(
         post_text,
         variant=1,
         platform=platform,
+        editorial_brief=editorial_brief,
     )
     images: List[bytes] = []
 
     # Последовательно, чтобы не ловить лишние rate limits у image providers.
     for variant in range(1, count + 1):
-        img = await generate_image_bytes(image_prompt, variant=variant)
+        img = await generate_image_bytes(
+            image_prompt,
+            variant=variant,
+            allow_fallback=editorial_brief is None,
+        )
+        if img and editorial_brief is not None:
+            decision = await evaluate_editorial_image(editorial_brief, img)
+            logger.info(
+                "EDITORIAL_IMAGE_GATE post_id=%s frame=%s accepted=%s reason_code=%s",
+                editorial_brief.post_id,
+                variant,
+                decision.accepted,
+                decision.reason_code,
+            )
+            if not decision.accepted:
+                img = None
         if img:
             images.append(img)
 
@@ -2540,9 +2718,18 @@ async def generate_two_images_for_post(user_id: int, topic: str, post_text: str)
     return await generate_images_for_post(user_id, topic, post_text, count=2)
 
 
-async def send_post_with_images(bot, chat_id: int | str, post_text: str, images: List[bytes]) -> None:
-    """Send post. If images fail, text still goes out."""
+async def send_post_with_images(
+    bot,
+    chat_id: int | str,
+    post_text: str,
+    images: List[bytes],
+    *,
+    require_images: bool = False,
+) -> None:
+    """Send a post; automated editorial jobs fail closed when media is required."""
     if not images:
+        if require_images:
+            raise RuntimeError("required editorial image is unavailable")
         await send_long_to_chat(bot, chat_id, post_text)
         return
 
@@ -2566,6 +2753,8 @@ async def send_post_with_images(bot, chat_id: int | str, post_text: str, images:
             await send_long_to_chat(bot, chat_id, post_text)
     except (TelegramError, BadRequest) as exc:
         logger.exception("Telegram image send failed: %s", exc)
+        if require_images:
+            raise RuntimeError("required editorial image could not be published") from exc
         await send_long_to_chat(bot, chat_id, post_text)
 
 
@@ -3309,6 +3498,18 @@ async def create_naz_vk_job(
             "NAZ_VK_IMAGE_POLICY must be required or text_music"
         )
     user_id = ADMIN_ID or 0
+    for receipt in memory.get_vk_publication_receipts(user_id):
+        completed_job = vk_publish_queue.completed_naz_job(
+            NAZ_VK_QUEUE_DIR,
+            str(receipt.get("job_id") or ""),
+        )
+        if completed_job:
+            memory.consume_vk_publication_receipt(
+                user_id,
+                str(receipt["job_id"]),
+                str(completed_job["text"]),
+            )
+    # One-way compatibility for jobs created before publication receipts were introduced.
     for queued_draft in memory.get_unpublished_vk_jobs(user_id):
         completed_job = vk_publish_queue.completed_naz_job(
             NAZ_VK_QUEUE_DIR,
@@ -3341,7 +3542,10 @@ async def create_naz_vk_job(
         )
         base_instruction += "\n" + gaming_vertical.prompt_context("naz", gaming_plan)
 
-    async def generate(instruction: str) -> str:
+    async def generate(
+        instruction: str,
+        brief: editorial_policy.ContentBrief,
+    ) -> str:
         return await generate_content(
             user_id,
             topic,
@@ -3351,13 +3555,18 @@ async def create_naz_vk_job(
             platform="vk",
             commit_state=False,
             inherit_interactive_context=False,
+            editorial_brief=brief,
         )
 
-    theme, semantic_result = await generate_semantic_autopost_candidate(
+    theme, semantic_result, brief = await generate_semantic_autopost_candidate(
         user_id=user_id,
         platform="vk",
         rubric_name=str(rubric["name"]),
         seed=source_ref,
+        source_type="scheduled_rubric",
+        scheduled_slot=f"vk:{rubric_kind}",
+        context_reason="This producer invocation belongs to the configured VK rubric slot.",
+        music_required=True,
         generate=generate,
     )
     if not semantic_result.accepted:
@@ -3374,6 +3583,7 @@ async def create_naz_vk_job(
         count=image_count,
         attempts=NAZ_VK_IMAGE_ATTEMPTS,
         platform="vk",
+        editorial_brief=brief,
     )
     if not images and NAZ_VK_IMAGE_POLICY == "required":
         raise vk_publish_queue.QueueError(
@@ -3406,19 +3616,18 @@ async def create_naz_vk_job(
             not_before=not_before,
             dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
             source_ref=source_ref,
+            metadata=brief.job_metadata(),
         ),
     )
-    memory.save_generated_post(
+    memory.save_vk_publication_receipt(
+        job_id=str(job["job_id"]),
         user_id=user_id,
         expert_mode=get_user_expert_mode(user_id),
         task=f"naz_vk_queue:{rubric_kind}:{rubric['name']}",
         topic=topic,
-        content=text,
         image_count=len(media),
-        published_to_channel=False,
         semantic_theme=theme.key,
         semantic_card=semantic_result.card_key,
-        external_job_id=str(job["job_id"]),
     )
     if gaming_plan:
         memory.record_content_signature(user_id, gaming_plan, topic)
@@ -3802,13 +4011,23 @@ async def process_agent_content_date(
         latest: Dict[str, object] = {}
         source_ref = f"agent_content:{date_text}:{manifest_hash}"
 
-        async def generate(instruction: str) -> str:
+        async def generate(
+            instruction: str,
+            brief: editorial_policy.ContentBrief,
+        ) -> str:
             package, risks, resolved_date = await generate_agent_content_package(
                 user_id,
                 date_text,
                 "ежедневный импорт content-agent",
                 save_generated=False,
-                extra_instruction=instruction,
+                extra_instruction=(
+                    editorial_policy.render_text_instructions(
+                        brief,
+                        "Canonical Naz persona v2.4; preserve the approved content-agent source.",
+                    )
+                    + "\n\n"
+                    + instruction
+                ),
             )
             latest.update(package=package, risks=risks, resolved_date=resolved_date)
             post_text = extract_telegram_post_from_package(package)
@@ -3817,11 +4036,15 @@ async def process_agent_content_date(
                 return "⚠️ content-agent safety blocked this candidate"
             return post_text
 
-        theme, semantic_result = await generate_semantic_autopost_candidate(
+        theme, semantic_result, brief = await generate_semantic_autopost_candidate(
             user_id=user_id,
             platform="telegram",
             rubric_name="content-agent",
             seed=source_ref,
+            source_type="explicit_admin_request",
+            scheduled_slot="manual:content-agent",
+            context_reason="An administrator explicitly requested publication of this approved content package.",
+            music_required=False,
             generate=generate,
         )
         resolved_date = str(latest.get("resolved_date") or date_text)
@@ -3830,17 +4053,27 @@ async def process_agent_content_date(
                 bot,
                 f"⚠️ Agent Content {resolved_date}: semantic/safety gate отклонил все ограниченные планы; draft не сохранён.",
             )
-            mark_agent_content_seen(resolved_date, manifest_hash)
             return f"⚠️ Agent Content {resolved_date}: blocked before draft and publish."
 
         post_text = semantic_result.text
-        images, _ = await generate_images_with_retries(user_id, f"content-agent {resolved_date}", post_text, count=CHANNEL_IMAGE_COUNT)
+        images, _ = await generate_images_with_retries(
+            user_id,
+            f"content-agent {resolved_date}",
+            post_text,
+            count=CHANNEL_IMAGE_COUNT,
+            editorial_brief=brief,
+        )
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
             await notify_admin(bot, f"⚠️ Agent Content {resolved_date}: текст готов, но картинки не собрались. Публикацию пропустил.")
-            mark_agent_content_seen(resolved_date, manifest_hash)
             return f"⚠️ Agent Content {resolved_date}: images failed."
 
-        await send_post_with_images(bot, CHANNEL_ID, post_text, images)
+        await send_post_with_images(
+            bot,
+            CHANNEL_ID,
+            post_text,
+            images,
+            require_images=True,
+        )
         memory.save_generated_post(
             user_id=user_id,
             expert_mode=get_user_expert_mode(user_id),
@@ -4219,22 +4452,36 @@ async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> No
             latest_risks: List[str] = []
             source_ref = f"void_exchange:{path.name}"
 
-            async def generate(instruction: str) -> str:
+            async def generate(
+                instruction: str,
+                brief: editorial_policy.ContentBrief,
+            ) -> str:
                 nonlocal latest_risks
                 candidate, latest_risks = await generate_void_crosspost(
                     admin_user_id,
                     void_text,
                     save_generated=False,
                     payload=payload,
-                    extra_instruction=instruction,
+                    extra_instruction=(
+                        editorial_policy.render_text_instructions(
+                            brief,
+                            "Canonical Naz persona v2.4; interpret the referenced VOID item without copying its persona.",
+                        )
+                        + "\n\n"
+                        + instruction
+                    ),
                 )
                 return candidate
 
-            theme, semantic_result = await generate_semantic_autopost_candidate(
+            theme, semantic_result, brief = await generate_semantic_autopost_candidate(
                 user_id=admin_user_id,
                 platform="telegram",
                 rubric_name="Мысли после разговора",
                 seed=source_ref,
+                source_type="continuation_with_reference",
+                scheduled_slot="exchange",
+                context_reason="This post explicitly continues the referenced approved VOID exchange item.",
+                music_required=False,
                 generate=generate,
             )
             if not semantic_result.accepted:
@@ -4246,33 +4493,26 @@ async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> No
 
             if payload.get("publish_mode", "auto") != "auto" or not CROSSPOST_EXCHANGE_AUTO_PUBLISH:
                 await notify_admin(context.bot, f"🕳 Void → Naz draft\n\n{post_text}")
-                memory.save_generated_post(
-                    user_id=admin_user_id,
-                    expert_mode=get_user_expert_mode(admin_user_id),
-                    task="exchange_void_to_naz_draft",
-                    topic=str(payload.get("topic") or "Void Entity crosspost"),
-                    content=post_text,
-                    image_count=0,
-                    published_to_channel=False,
-                    semantic_theme=theme.key,
-                )
-                commit_accepted_autopost_state(
-                    user_id=admin_user_id,
-                    topic=str(payload.get("topic") or "Void Entity crosspost"),
-                    task="void_crosspost",
-                    platform="telegram",
-                    source_ref=source_ref,
-                    theme=theme,
-                    result=semantic_result,
-                )
                 move_exchange_file(path, "void_to_naz", "processed")
                 continue
 
-            images, _ = await generate_images_with_retries(admin_user_id, "Void Entity crosspost", post_text, count=CHANNEL_IMAGE_COUNT)
+            images, _ = await generate_images_with_retries(
+                admin_user_id,
+                "Void Entity crosspost",
+                post_text,
+                count=CHANNEL_IMAGE_COUNT,
+                editorial_brief=brief,
+            )
             if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
                 raise ValueError("images required but not generated")
 
-            await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+            await send_post_with_images(
+                context.bot,
+                CHANNEL_ID,
+                post_text,
+                images,
+                require_images=True,
+            )
             memory.save_generated_post(
                 user_id=admin_user_id,
                 expert_mode=get_user_expert_mode(admin_user_id),
@@ -5347,7 +5587,7 @@ def format_autopost_profile(profile: Dict[str, str]) -> str:
     )
 
 
-AUTOPOST_IMAGE_ATTEMPTS = 2
+AUTOPOST_IMAGE_ATTEMPTS = editorial_policy.MAX_REGENERATIONS + 1
 
 
 async def notify_admin(bot, text: str) -> None:
@@ -5393,21 +5633,34 @@ async def generate_images_with_retries(
     count: int,
     attempts: int = AUTOPOST_IMAGE_ATTEMPTS,
     platform: str = "telegram",
+    editorial_brief: editorial_policy.ContentBrief | None = None,
 ) -> Tuple[List[bytes], str]:
     last_prompt = ""
-    for attempt in range(1, max(1, attempts) + 1):
+    bounded_attempts = min(
+        max(1, attempts),
+        editorial_policy.MAX_REGENERATIONS + 1,
+    )
+    for attempt in range(1, bounded_attempts + 1):
         images, image_prompt = await generate_images_for_post(
             user_id,
             topic,
             post_text,
             count=count,
             platform=platform,
+            editorial_brief=editorial_brief,
         )
         last_prompt = image_prompt
-        if images or not REQUIRE_IMAGES_FOR_CHANNEL_POSTS:
+        if editorial_brief is not None and len(images) == count:
             return images, image_prompt
-        logger.warning("Image generation retry %s/%s failed for topic=%s", attempt, attempts, topic)
-        if attempt < attempts:
+        if editorial_brief is None and (images or not REQUIRE_IMAGES_FOR_CHANNEL_POSTS):
+            return images, image_prompt
+        logger.warning(
+            "EDITORIAL_IMAGE_RETRY post_id=%s attempt=%s/%s reason_code=generation_failed",
+            editorial_brief.post_id if editorial_brief else "manual",
+            attempt,
+            bounded_attempts,
+        )
+        if attempt < bounded_attempts:
             await asyncio.sleep(3)
     return [], last_prompt
 
@@ -5458,7 +5711,10 @@ async def try_visual_archive_autopost(
     topic = visual_archive.visual_topic(candidate)
     source_ref = f"visual_archive:{candidate_id}:{slot or 'manual'}"
     try:
-        async def generate(instruction: str) -> str:
+        async def generate(
+            instruction: str,
+            brief: editorial_policy.ContentBrief,
+        ) -> str:
             return await generate_content(
                 admin_user_id,
                 topic,
@@ -5473,13 +5729,18 @@ async def try_visual_archive_autopost(
                 platform="telegram",
                 commit_state=False,
                 inherit_interactive_context=False,
+                editorial_brief=brief,
             )
 
-        theme, semantic_result = await generate_semantic_autopost_candidate(
+        theme, semantic_result, brief = await generate_semantic_autopost_candidate(
             user_id=admin_user_id,
             platform="telegram",
             rubric_name="visual_archive",
             seed=source_ref,
+            source_type="approved_backstage_seed",
+            scheduled_slot=slot or "manual",
+            context_reason="An approved visual archive seed was selected for this configured publication turn.",
+            music_required=False,
             generate=generate,
         )
         if not semantic_result.accepted:
@@ -5490,7 +5751,21 @@ async def try_visual_archive_autopost(
             return False
         post_text = semantic_result.text
         image_bytes = curated_visual_bytes(image_path)
-        await send_post_with_images(context.bot, CHANNEL_ID, post_text, [image_bytes])
+        image_decision = await evaluate_editorial_image(brief, image_bytes)
+        if not image_decision.accepted:
+            logger.warning(
+                "EDITORIAL_IMAGE_GATE post_id=%s accepted=false reason_code=%s",
+                brief.post_id,
+                image_decision.reason_code,
+            )
+            return False
+        await send_post_with_images(
+            context.bot,
+            CHANNEL_ID,
+            post_text,
+            [image_bytes],
+            require_images=True,
+        )
         memory.save_generated_post(
             user_id=admin_user_id,
             expert_mode=get_user_expert_mode(admin_user_id),
@@ -5552,7 +5827,9 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         rubric = select_naz_telegram_rubric(slot)
         topics = select_autopost_topics(admin_user_id, rubric, limit=7)
-        use_story_insight = bool(read_naz_stories()) and random.random() < AUTOPOST_INSIGHT_CHANCE
+        # Canonical stories require an explicit story source. They never replace
+        # a scheduled rubric through random selection.
+        use_story_insight = False
         rubric_task = str(rubric.get("task", "")).strip()
         task = (
             "insight"
@@ -5588,7 +5865,10 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{rubric['name']}:{topic}"
         )
 
-        async def generate(instruction: str) -> str:
+        async def generate(
+            instruction: str,
+            brief: editorial_policy.ContentBrief,
+        ) -> str:
             combined = f"{editorial_instruction}\n{instruction}"
             if use_story_insight:
                 return await generate_story_insight(
@@ -5608,6 +5888,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 platform="telegram",
                 commit_state=False,
                 inherit_interactive_context=False,
+                editorial_brief=brief,
             )
 
         logger.info(
@@ -5618,11 +5899,15 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             profile["name"],
             direction["name"],
         )
-        theme, semantic_result = await generate_semantic_autopost_candidate(
+        theme, semantic_result, brief = await generate_semantic_autopost_candidate(
             user_id=admin_user_id,
             platform="telegram",
             rubric_name=str(rubric["name"]),
             seed=source_ref,
+            source_type="scheduled_rubric",
+            scheduled_slot=slot or "manual",
+            context_reason="The configured Telegram schedule selected this rubric and its approved topic pool.",
+            music_required=False,
             generate=generate,
         )
         if not semantic_result.accepted:
@@ -5637,13 +5922,20 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{topic}. Visual direction: {editorial_plan['media']}",
             post_text,
             count=CHANNEL_IMAGE_COUNT,
+            editorial_brief=brief,
         )
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
             failure_reasons.append(f"images required but not generated for topic: {topic}")
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
 
-        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+        await send_post_with_images(
+            context.bot,
+            CHANNEL_ID,
+            post_text,
+            images,
+            require_images=True,
+        )
         saved_topic = f"{topic} | {rubric['name']} | {profile['name']}"
         saved_task = f"naz_telegram_autopost:{task}:{rubric['name']}:{profile['name']}"
         memory.save_generated_post(
@@ -5674,11 +5966,11 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         memory.save_character_state(admin_user_id, character)
         memory.apply_character_event(admin_user_id, "publish")
         logger.info(
-            "AUTOPOST done | attempts=%s | theme=%s | images=%s | prompt=%s",
+            "AUTOPOST done | post_id=%s | attempts=%s | theme=%s | images=%s",
+            brief.post_id,
             semantic_result.attempts,
             theme.key,
             len(images),
-            image_prompt,
         )
         return
     except Exception as exc:  # noqa: BLE001
@@ -5706,22 +5998,36 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         item = candidates[0]
-        rubric_name = str(item.get("rubric") or "source_monitor")
+        rubric_name = "source_monitor"
         source_ref = f"source_monitor:{source_item_key(item)}"
 
-        async def generate(instruction: str) -> str:
+        async def generate(
+            instruction: str,
+            brief: editorial_policy.ContentBrief,
+        ) -> str:
             return await generate_source_interpretation(
                 admin_user_id,
                 item,
                 save_generated=False,
-                extra_instruction=instruction,
+                extra_instruction=(
+                    editorial_policy.render_text_instructions(
+                        brief,
+                        "Canonical Naz persona v2.4; use only the cited monitored source.",
+                    )
+                    + "\n\n"
+                    + instruction
+                ),
             )
 
-        theme, semantic_result = await generate_semantic_autopost_candidate(
+        theme, semantic_result, brief = await generate_semantic_autopost_candidate(
             user_id=admin_user_id,
             platform="telegram",
             rubric_name=rubric_name,
             seed=source_ref,
+            source_type="current_event_with_source",
+            scheduled_slot="source-monitor",
+            context_reason="A fresh monitored item with an explicit source reference triggered this interpretation.",
+            music_required=False,
             generate=generate,
         )
         if not semantic_result.accepted:
@@ -5737,13 +6043,22 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             item.get("title", ""),
             post_text,
             count=CHANNEL_IMAGE_COUNT,
+            editorial_brief=brief,
         )
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            reason = f"source image failed: {item.get('title', '')}"
-            logger.warning("SOURCE_MONITOR blocked: %s", reason)
+            logger.warning(
+                "SOURCE_MONITOR blocked | post_id=%s reason_code=generation_failed",
+                brief.post_id,
+            )
             return
 
-        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+        await send_post_with_images(
+            context.bot,
+            CHANNEL_ID,
+            post_text,
+            images,
+            require_images=True,
+        )
         mark_source_seen(item)
         saved_task = f"source_monitor:{rubric_name}"
         saved_topic = str(item.get("title", ""))
@@ -5768,12 +6083,11 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             result=semantic_result,
         )
         logger.info(
-            "SOURCE_MONITOR done | %s | theme=%s | attempts=%s | images=%s | prompt=%s",
-            item.get("title", ""),
+            "SOURCE_MONITOR done | post_id=%s | theme=%s | attempts=%s | images=%s",
+            brief.post_id,
             theme.key,
             semantic_result.attempts,
             len(images),
-            image_prompt,
         )
         return
     except Exception as exc:  # noqa: BLE001
@@ -6190,12 +6504,30 @@ def validate_config() -> None:
     if missing:
         raise RuntimeError("Не хватает переменных окружения: " + ", ".join(missing))
 
+    if editorial_policy.EDITORIAL_CONTRACT_VERSION != "editorial-relevance.v1":
+        raise RuntimeError("unknown editorial contract version")
+    if editorial_policy.PERSONA_POLICY_VERSION != "naz-persona.v2.4":
+        raise RuntimeError("unknown Naz persona policy version")
+    if editorial_policy.VISUAL_CODE_VERSION != "naz-visual.v2":
+        raise RuntimeError("unknown Naz visual code version")
+    rubric_names = [
+        str(item.get("name") or "").strip()
+        for item in (*NAZ_TELEGRAM_RUBRICS, *NAZ_VK_RUBRICS)
+    ]
+    if any(not name for name in rubric_names) or len(rubric_names) != len(set(rubric_names)):
+        raise RuntimeError("Naz editorial rubric registry is invalid")
+    for rubric in (*NAZ_TELEGRAM_RUBRICS, *NAZ_VK_RUBRICS):
+        required = {str(item).casefold() for item in rubric.get("required_elements", [])}
+        forbidden = {str(item).casefold() for item in rubric.get("forbidden_elements", [])}
+        if required & forbidden:
+            raise RuntimeError("Naz rubric has conflicting required/forbidden elements")
+
     if not ADMIN_ID:
         logger.warning("ADMIN_ID is empty/0. Admin protection will block admin-only actions.")
     if not CHANNEL_ID:
         logger.warning("CHANNEL_ID is empty. Channel publishing/autoposting will be skipped.")
     if not HF_TOKEN:
-        logger.warning("HF_TOKEN is empty. Image generation will use fallback only if enabled.")
+        logger.warning("HF_TOKEN is empty. Automated editorial jobs fail closed without provider media.")
 
 
 def build_application() -> Application:

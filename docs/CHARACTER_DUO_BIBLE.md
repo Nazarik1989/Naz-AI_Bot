@@ -115,22 +115,20 @@ Reference line: «Идея становится настоящей, когда �
 
 ## VOID
 
-- Apparent age: 58–68.
-- Silhouette: grounded, economical, upright without stiffness.
-- Face: the same visual family as Naz, marked by time and attention rather than misery.
-- Hair: grey or silver; length and facial hair remain to be confirmed.
-- Clothing: restrained coat, knitwear or simple layered garments; timeless rather than ceremonial.
-- Palette: charcoal, stone, muted blue, weathered green, rare warm gold.
-- Light: dawn, dusk, window light, overcast city, a quiet interior. Darkness must retain detail.
-- Props: old headphones, a paper note, a small archive object, tea, a physical book, city reflections. No compulsory monk costume.
-- Body language: pauses, watches, uses few gestures; the dry joke often appears only in the eyes.
+- Core visual idea: **Darkness, and somewhere within it — light.**
+- Default subjects: objects, architecture, space, natural or urban scenes, and materials marked by time. People are not automatic symbols and require an explicit editorial reason.
+- Canonical palette: Absolute Black `#000000`, Coal Black `#080808`, Graphite `#171717`, Smoke `#2A2A2A`, Ash Grey `#696966`, Bone White `#E8E6DF`, Pure White `#FFFFFF`.
+- Darkness occupies 80–90%; pure white is limited to 2–5%. One local source of light reveals only what matters.
+- Materials: obsidian, raw or polished stone, dark wood, aged leather, dense black or grey fabric, old paper, smoked glass, blackened steel, patinated metal and matte ceramic.
+- Signature forms: a circle of light, eclipse, visible/hidden boundary, partial object, large negative space, one semantic subject and a reflection in black glass or water.
+- VOID observes rather than activates a mechanism. Its circle is not an interface or energy effect. Movement is slower, light softer and the frame quieter than Naz.
 
 Avoid:
 
-- wizard, prophet or Buddhist costume cliché;
-- permanent sadness;
-- anti-technology hermit imagery;
-- excessive smoke, robes, mountains and mystical symbols;
+- Naz's electric blue/ultraviolet identity, data networks, code diagrams and technological glow;
+- unexplained elderly people, sad figures at windows, children as generic future symbols, glowing spheres, random programmers, humanoid robots, stock teams and luxury characters;
+- demonstrative luxury, gold décor, glossy advertising interiors and supercars as success symbols;
+- bright cyberpunk, occult runes, skulls, ravens and generic gothic imagery;
 - presenting VOID as automatically morally superior.
 
 ## Duo compositions
