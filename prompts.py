@@ -271,6 +271,108 @@ Naz не учит успеху и не играет гуру.
 """.strip()
 
 
+NAZ_CANONICAL_PALETTE = (
+    "Deep Black #020309",
+    "Midnight Blue #070B20",
+    "Electric Blue #185CFF",
+    "Neon Cobalt #387BFF",
+    "Ultraviolet #762DFF",
+    "Electric Purple #B13CFF",
+    "Ice Silver #D7E5FF",
+)
+
+
+NAZ_CANONICAL_MATERIALS = (
+    "black optical glass and smoked glass",
+    "milled and polished titanium",
+    "blue-anodized aluminium",
+    "carbon fibre",
+    "transparent technical polymers",
+    "cold technical ceramic",
+    "precise mechanical joints",
+    "visible internal mechanisms",
+)
+
+
+NAZ_VISUAL_RUNTIME_DIRECTION = f"""
+PRIMARY CHARACTER REFERENCE: the author-approved original Naz avatar. When Naz appears,
+preserve its recognizable human face, direct gaze and human/digital boundary. The avatar
+is an identity reference, not a mandatory composition: do not force the same frontal
+portrait, split face, glowing circle or wordmark into every image.
+
+CORE IDEA: Human intelligence / Machine precision. Naz stays human at the boundary of a
+physical prototype and a digital structure. Use only the visual cues that serve the scene.
+
+PALETTE: {", ".join(NAZ_CANONICAL_PALETTE)}. The identity is primarily deep black,
+electric blue, ultraviolet and ice silver. Copper is not a brand color; natural skin warmth
+is allowed only in portraits.
+
+MATERIAL VOCABULARY: {", ".join(NAZ_CANONICAL_MATERIALS)}. Materials must have believable
+thickness, tolerances, reflections and assembly logic.
+
+LIGHT AND FORMS: deep black background, cold blue rim light, blue-violet luminous edge,
+high local contrast, subject gradually emerging from darkness, negative space and one
+dominant subject. A luminous circle or arc, meaningful human/digital division, thin
+connection mesh and minimal ice-silver NAZ marking are optional signatures, not a checklist.
+
+AVOID: golden pseudo-luxury; random circuit boards or code streams; humanoid robots without
+narrative need; overloaded HUD interfaces; cheap cyberpunk/neon; mesh on every object;
+large logos; arbitrary purple gradients without physical material logic.
+""".strip()
+
+
+MATERIAL_VISUAL_PROMPT = f"""
+MATERIAL / МАТЕРИЯ — canonical Naz material study.
+The runtime requests one frame at a time. Variant 1 is the material macro, variant 2 reveals
+the form, variant 3 shows the complete object in space during activation, and optional
+variant 4 is a short human reaction. Generate only the requested frame, never a collage or
+multi-panel layout. Across the sequence, the object must feel buildable, testable and ready
+to switch on, with visible tolerances, exact joints and functional inner mechanisms. Use the
+full canonical palette where physically justified: {", ".join(NAZ_CANONICAL_PALETTE)}.
+Use canonical materials: {", ".join(NAZ_CANONICAL_MATERIALS)}.
+Deep black background, cold blue rim light, blue-violet edge and high local contrast; the
+subject emerges gradually from darkness. One dominant object, restrained arc or circle,
+thin structural connections only where meaningful, minimal ice-silver MATERIAL / NAZ marking.
+Copper is not a brand color; portrait skin may retain natural warmth. No golden pseudo-luxury,
+random circuit boards, code streams, unnecessary humanoid robots, overloaded HUD, cheap
+cyberpunk/neon, universal mesh, large logos or arbitrary purple gradients.
+""".strip()
+
+
+MATERIAL_RUBRIC: Dict[str, str] = {
+    "name": "MATERIAL / МАТЕРИЯ",
+    "kind": "daily",
+    "angle": (
+        "прототип, материал или объект из лаборатории будущего; предмет должен ощущаться "
+        "собираемым, проверяемым и способным включиться"
+    ),
+    "format": (
+        "серия из 3 кадров: макро материала → раскрытие формы → объект в пространстве "
+        "и момент включения; одна короткая мысль Naz, минимальная маркировка MATERIAL / NAZ, "
+        "монтажный ритм под музыку"
+    ),
+    "track_tags": "daily,focus,systems,builder",
+    "image_count": "3",
+}
+
+
+def naz_visual_prompt_context(topic: str) -> str:
+    normalized = str(topic or "").casefold()
+    if "material" in normalized or "матери" in normalized:
+        return MATERIAL_VISUAL_PROMPT
+    return NAZ_VISUAL_RUNTIME_DIRECTION
+
+
+def build_naz_direct_image_prompt(topic: str) -> str:
+    return (
+        f"Create a concrete image for this Naz request: {topic}.\n\n"
+        f"{naz_visual_prompt_context(topic)}\n\n"
+        "Preserve the requested subject and mood. Apply the Naz system selectively rather "
+        "than reproducing every signature. No text, letters, logos, watermarks or UI unless "
+        "the request explicitly requires the minimal MATERIAL / NAZ marking."
+    )
+
+
 GLOBAL_RULES = """
 Постоянные правила Naz v2.4:
 - Пиши по-русски, если пользователь не попросил другой язык.
@@ -507,7 +609,7 @@ CONTENT_TASK_PROMPTS: Dict[str, str] = {
 Размер: 800-1400 знаков.
 Верни только готовый Telegram-пост без служебных заголовков.
 """.strip(),
-    "image_prompt": """
+    "image_prompt": f"""
 Сделай английский prompt для генерации изображения к готовому Telegram-посту.
 Не пересказывай тему абстрактно. Вытащи из поста конкретную визуальную сцену.
 
@@ -519,7 +621,11 @@ CONTENT_TASK_PROMPTS: Dict[str, str] = {
 - визуальная метафора;
 - стиль: cinematic editorial, realistic lighting, high detail.
 
-Запрещено: text, letters, words, logo, watermark, UI captions, charts with labels.
+Каноническая визуальная режиссура Naz (используй выборочно, а не как одинаковый шаблон):
+{NAZ_VISUAL_RUNTIME_DIRECTION}
+
+Запрещено: text, letters, words, logo, watermark, UI captions, charts with labels;
+исключение — минимальная маркировка MATERIAL / NAZ для одноимённой рубрики.
 Верни только один prompt на английском без пояснений.
 """.strip(),
 }

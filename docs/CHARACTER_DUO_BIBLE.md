@@ -1,4 +1,4 @@
-# Naz & VOID — Character Duo Bible v0.1
+# Naz & VOID — Character Duo Bible v0.2
 
 ## Canonical premise
 
@@ -14,7 +14,7 @@ Recurring rubric: **«Мысли после разговора»**.
 
 ## Shared visual DNA
 
-The characters should feel related without being literal age-progressed copies. Shared traits may later be based on the author's face.
+The characters should feel related without being literal age-progressed copies. Naz now has an author-approved primary visual reference; VOID may later inherit a restrained subset of its facial family without copying the digital treatment.
 
 Keep three stable shared anchors after the final design is approved:
 
@@ -22,19 +22,67 @@ Keep three stable shared anchors after the final design is approved:
 2. one asymmetrical expression, usually a half-smile;
 3. one small physical or costume echo shared across ages.
 
-Do not lock an exact face until reference photographs or a chosen reference sheet exist.
+Do not infer a new Naz face from prose when the approved avatar reference is available.
 
 ## Naz
 
-- Apparent age: 23–29.
-- Silhouette: lean, mobile, slightly forward; he looks ready to stand up and test something.
-- Face: alert eyes, fast expressions, confidence with a trace of unfinished youth.
-- Hair: contemporary, practical, slightly untidy after work. Exact cut to confirm.
-- Clothing: layered builder streetwear; dark T-shirt or hoodie, practical jacket, one warm accent.
-- Palette: graphite, electric amber, warm red, occasional cyan from tools and screens.
-- Light: active, contrasty, workshop or city light; never generic neon cyberpunk.
-- Props: notebook, headphones, tools, cables, unfinished prototype. A laptop is optional, not mandatory.
-- Body language: points, leans forward, laughs openly, occupies space when confident; becomes still when doubt finally reaches him.
+### Primary visual reference
+
+The original square Naz avatar approved and supplied by the author is the primary visual reference. Its facial identity, direct frontal gaze, human/digital split, blue-violet luminous arc and ice-silver `NAZ` marking outrank generic style hints. The repository records this visual contract in words; the private source bitmap must not be added to a public repository unless the author explicitly approves that publication.
+
+The avatar is a character reference, not a compulsory layout. Do not reproduce the same frontal portrait, split face, circle or wordmark in every post. When Naz appears, preserve the approved face and human presence; when he does not appear, carry the identity through material, light, colour and precision.
+
+### Core visual idea
+
+**Human intelligence / Machine precision.**
+
+Naz remains human while working at the boundary between a physical prototype and a digital structure. Technology may reveal, measure or extend the human side; it must not replace him with a generic android.
+
+- Silhouette: lean, mobile, slightly forward; ready to stand up and test something.
+- Face: preserve the approved avatar's proportions, gaze and recognisable identity. Natural skin warmth is allowed only in portraits.
+- Hair and clothing: follow the approved reference when visible; practical dark builder layers remain the default wardrobe family.
+- Props: a material sample, tool, precise assembly, unfinished prototype or test rig. A laptop is optional, never the automatic subject.
+- Body language: points, leans forward, tests, assembles and reacts; becomes still when doubt finally reaches him.
+
+### Canonical palette
+
+- Deep Black — `#020309`
+- Midnight Blue — `#070B20`
+- Electric Blue — `#185CFF`
+- Neon Cobalt — `#387BFF`
+- Ultraviolet — `#762DFF`
+- Electric Purple — `#B13CFF`
+- Ice Silver — `#D7E5FF`
+
+The identity is built primarily from black, electric blue, ultraviolet and cold silver. Copper is not a brand colour. Warmth belongs only to natural skin in portraits, never to the product, environment or graphic system as a signature accent.
+
+### Canonical materials
+
+- black optical glass and smoked glass;
+- milled and polished titanium;
+- blue-anodised aluminium;
+- carbon fibre;
+- transparent technical polymers;
+- cold technical ceramic;
+- precise mechanical joints;
+- visible internal mechanisms.
+
+Every object should feel buildable, testable and capable of being switched on. Materials need believable thickness, edges, tolerances, reflections and assembly logic.
+
+### Light and form
+
+- deep black background;
+- cold blue rim light;
+- blue-violet luminous edge;
+- high local contrast;
+- the object or face gradually emerging from darkness;
+- a luminous circle or partial arc;
+- a meaningful division between human and digital sides;
+- a thin connection mesh used only where it explains structure;
+- minimal ice-silver `NAZ` marking;
+- negative space and one dominant subject.
+
+Use only the cues relevant to the scene. The system is a visual vocabulary, not a template that forces every image to look identical.
 
 Avoid:
 
@@ -42,7 +90,28 @@ Avoid:
 - permanent smug grin;
 - luxury-founder imagery;
 - a man endlessly sitting at a laptop;
-- random holograms, code rain and glowing AI brains.
+- golden pseudo-luxury;
+- random circuit boards, code streams, holograms and glowing AI brains;
+- humanoid robots without narrative necessity;
+- overloaded HUD interfaces;
+- cheap cyberpunk/neon styling;
+- a mesh on every object;
+- large logos;
+- arbitrary purple gradients without material logic.
+
+## MATERIAL / МАТЕРИЯ
+
+Naz shows prototypes, materials and objects from a future laboratory — not abstract luxury. Every release must feel as if the subject can be assembled, checked and switched on.
+
+- Output: 12–20 seconds or a sequence of 3–4 frames.
+- Sequence: material macro → form reveal → object in space → short reaction or activation.
+- Voice: one short Naz thought, grounded in physical reality.
+- Marking: minimal `MATERIAL / NAZ`, never a large logo or explanatory poster.
+- Motion: camera movement and editing follow the music and the object's physical behaviour.
+- Music: only the active approved allowlist; use the shared rotation that excludes the latest 8 tracks.
+- Schedules: MATERIAL uses existing publication windows and never creates or moves Telegram/VK schedule slots.
+
+Reference line: «Идея становится настоящей, когда у неё появляются вес, допуски и первый рабочий прототип».
 
 ## VOID
 
@@ -77,7 +146,7 @@ Avoid:
 
 Every approved prompt or reference sheet must preserve:
 
-- age band and shared facial anchors;
+- the approved Naz avatar's facial identity whenever Naz appears;
 - character-specific palette;
 - silhouette and body language;
 - stable wardrobe family;
@@ -88,10 +157,8 @@ Mood changes expression, posture, light and framing. It does not change identity
 
 ## Details still to confirm with the author
 
-- whether both faces directly inherit the author's features;
-- exact ages;
-- hair and facial hair;
-- eye colour and shared signature detail;
+- how much of Naz's facial family VOID inherits;
+- VOID's exact age, hair and facial hair;
+- the duo's shared physical or costume echo;
 - tattoos, scars, glasses or jewellery;
-- preferred realism level: cinematic realism, stylised realism, illustration or mixed system;
 - whether the possibility that they are one person at different ages remains subtext or becomes explicit canon.
