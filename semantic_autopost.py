@@ -199,6 +199,7 @@ RUBRIC_THEME_KEYS: Mapping[str, tuple[str, ...]] = {
     "Полевая заметка Naz": ("relationships", "city", "work", "creativity", "music", "game", "body", "domestic_absurdity", "memory", "care", "conflict", "practical_future", "attention"),
     "Маленький эксперимент": ("relationships", "city", "work", "creativity", "music", "game", "body", "domestic_absurdity", "memory", "care", "conflict", "practical_future", "attention"),
     "Человеческая деталь": ("relationships", "city", "work", "creativity", "music", "body", "domestic_absurdity", "memory", "care", "conflict", "attention"),
+    "MATERIAL / МАТЕРИЯ": ("work", "creativity", "practical_future", "attention"),
     "Игровая лаборатория VK": ("game", "relationships", "creativity", "music", "conflict", "attention", "practical_future"),
     "visual_archive": ("city", "relationships", "creativity", "music", "body", "domestic_absurdity", "memory", "attention"),
 }

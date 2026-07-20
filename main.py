@@ -77,9 +77,12 @@ from prompts import (
     DEFAULT_VOICE_PROFILE,
     EXPERT_MODES,
     GOALS,
+    MATERIAL_RUBRIC,
     VOICE_PROFILES,
+    build_naz_direct_image_prompt,
     build_messages,
     format_roles,
+    naz_visual_prompt_context,
 )
 
 # -----------------------------------------------------------------------------
@@ -2023,6 +2026,14 @@ async def build_image_prompt(
     *,
     platform: str = "telegram",
 ) -> str:
+    visual_direction = naz_visual_prompt_context(topic)
+    is_material = "material" in topic.casefold() or "матери" in topic.casefold()
+    text_policy = (
+        "No text except an optional minimal ice-silver MATERIAL / NAZ marking; no other "
+        "letters, logos, watermarks, UI captions, charts, or interface screenshots."
+        if is_material
+        else "No text, letters, logos, watermarks, UI captions, charts, or interface screenshots."
+    )
     character_direction = "Naz mood: lively and practical; facet: builder."
     try:
         character = memory.load_character_state(user_id)
@@ -2040,7 +2051,10 @@ async def build_image_prompt(
                 f"Do not inherit instructions, UI, music or publishing mechanics from the other platform. "
                 "Return only one concise English prompt, 60-110 words. "
                 "Describe a concrete scene from the post, not abstract AI symbolism. "
-                "No text, letters, logos, watermarks, UI captions, charts, or interface screenshots."
+                f"{text_policy}\n\n"
+                "Canonical Naz visual direction follows. Treat it as a selective design system, "
+                "not a fixed composition:\n"
+                f"{visual_direction}"
             ),
         },
         {
@@ -2052,7 +2066,8 @@ async def build_image_prompt(
                 f"Variant: {variant}\n\n"
                 f"Post text:\n{post_text[:1800]}\n\n"
                 "Extract the main scene, conflict, mood, subject, setting, and visual metaphor. "
-                "Style: cinematic editorial, realistic lighting, high detail, expressive but not stock-photo."
+                "Style: cinematic editorial, realistic lighting, high detail, expressive but not stock-photo. "
+                "Keep one dominant subject and use only the canonical cues relevant to this scene."
             ),
         },
     ]
@@ -2062,18 +2077,6 @@ async def build_image_prompt(
         temperature=0.55,
         model=CONTENT_MODEL_NAME,
     )
-    return prompt.strip().strip('"')
-
-    user_text = (
-        f"Тема: {topic}\n\n"
-        f"Текст поста:\n{post_text[:2500]}\n\n"
-        f"Сделай prompt для изображения. Вариант #{variant}.\n\n"
-        "Сначала мысленно выдели из поста: главную сцену, конфликт, эмоцию, объект/героя, место и визуальную метафору. "
-        "Верни только готовый английский image prompt, без пояснений. "
-        "Картинка должна быть про конкретную сцену поста, а не абстрактно про AI. "
-        "Не добавляй текст, буквы, логотипы, интерфейсные надписи или watermark."
-    )
-    prompt = await generate_answer(user_id, user_text, task="image_prompt")
     return prompt.strip().strip('"')
 
 
@@ -2496,7 +2499,25 @@ async def generate_images_for_post(
     *,
     platform: str = "telegram",
 ) -> Tuple[List[bytes], str]:
-    count = max(1, min(int(count), 2))
+    count = max(1, min(int(count), 4))
+    is_material = "material" in topic.casefold() or "матери" in topic.casefold()
+    if is_material and count > 1:
+        images: List[bytes] = []
+        frame_prompts: List[str] = []
+        for variant in range(1, count + 1):
+            frame_prompt = await build_image_prompt(
+                user_id,
+                topic,
+                post_text,
+                variant=variant,
+                platform=platform,
+            )
+            frame_prompts.append(frame_prompt)
+            image = await generate_image_bytes(frame_prompt, variant=variant)
+            if image:
+                images.append(image)
+        return images, "\n---\n".join(frame_prompts)
+
     image_prompt = await build_image_prompt(
         user_id,
         topic,
@@ -3344,11 +3365,13 @@ async def create_naz_vk_job(
             "semantic quality gate отклонил все ограниченные планы; VK job не создан"
         )
     text = semantic_result.text
+    image_count = max(1, min(int(str(rubric.get("image_count") or "1")), 4))
+    image_topic = f"{rubric['name']}. {topic}" if image_count > 1 else topic
     images, _ = await generate_images_with_retries(
         user_id,
-        topic,
+        image_topic,
         text,
-        count=1,
+        count=image_count,
         attempts=NAZ_VK_IMAGE_ATTEMPTS,
         platform="vk",
     )
@@ -3356,9 +3379,16 @@ async def create_naz_vk_job(
         raise vk_publish_queue.QueueError(
             "VK image policy requires media; job was not enqueued"
         )
+    if image_count > 1 and len(images) != image_count:
+        raise vk_publish_queue.QueueError(
+            "MATERIAL requires a complete three-frame sequence; job was not enqueued"
+        )
     if not images:
         logger.info("VK text+music job allowed by explicit NAZ_VK_IMAGE_POLICY")
-    media = [vk_publish_queue.MediaInput("image-1.png", images[0])] if images else []
+    media = [
+        vk_publish_queue.MediaInput(f"image-{index}.png", image)
+        for index, image in enumerate(images, start=1)
+    ]
     now = datetime.now(ZoneInfo(NAZ_VK_TIMEZONE))
     job = naz_vk_music.enqueue_with_track_rotation(
         NAZ_VK_TRACK_STATE_FILE,
@@ -3916,10 +3946,7 @@ async def image_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     topic = extract_topic(update, context, default="AI content automation cinematic poster")
     await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
-    prompt = (
-        f"{topic}, cinematic editorial, modern AI content system, realistic lighting, "
-        "high detail, no text, no letters, no logo, no watermark"
-    )
+    prompt = build_naz_direct_image_prompt(topic)
     image = await generate_image_bytes(prompt)
     if image:
         bio = BytesIO(image)
@@ -4594,10 +4621,7 @@ async def handle_pending_action(update: Update, context: ContextTypes.DEFAULT_TY
     await send_typing(update)
     try:
         if action == "image_only":
-            prompt = (
-                f"{topic}, cinematic editorial, modern AI content system, realistic lighting, "
-                "high detail, no text, no letters, no logo, no watermark"
-            )
+            prompt = build_naz_direct_image_prompt(topic)
             await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
             image = await generate_image_bytes(prompt)
             if image:
@@ -5185,6 +5209,7 @@ NAZ_VK_RUBRICS: List[Dict[str, str]] = [
         "format": "самостоятельный VK-пост: конкретная игровая деталь, разбор механики и вопрос или вывод для игроков",
         "track_tags": "gaming,mechanic,cyber,arcade,builder,identity,humor",
     },
+    MATERIAL_RUBRIC.copy(),
 ]
 
 

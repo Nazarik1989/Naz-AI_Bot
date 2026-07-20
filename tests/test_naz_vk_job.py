@@ -106,6 +106,63 @@ class NazVkJobTests(unittest.TestCase):
             self.assertIn("gaming", next(track.tags for track in naz_vk_music.APPROVED_TRACKS if track.query == job["track_query"]))
             record.assert_called_once()
 
+    def test_material_job_enqueues_three_frames_with_shared_music_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "queue"
+            (root / "pending").mkdir(parents=True)
+            images = AsyncMock(return_value=([b"macro", b"form", b"active"], "material prompt"))
+            with patch.multiple(
+                main,
+                NAZ_VK_ENABLED=True,
+                NAZ_VK_PUBLIC_ID="123",
+                NAZ_VK_QUEUE_DIR=root,
+                NAZ_VK_TRACK_STATE_FILE=Path(directory) / "rotation.json",
+            ), patch.object(
+                main, "select_naz_vk_rubric", return_value=main.MATERIAL_RUBRIC
+            ), patch.object(
+                main, "generate_content", new=AsyncMock(return_value="Короткая мысль Naz")
+            ), patch.object(
+                main, "generate_images_with_retries", new=images
+            ):
+                job = asyncio.run(
+                    main.create_naz_vk_job(
+                        "Фрезерованный титановый прототип",
+                        source_ref="test:material",
+                    )
+                )
+            self.assertEqual(images.await_args.kwargs["count"], 3)
+            self.assertIn("MATERIAL / МАТЕРИЯ", images.await_args.args[1])
+            self.assertEqual(job["media"], ["image-1.png", "image-2.png", "image-3.png"])
+            self.assertIn(job["track_query"], naz_vk_music.APPROVED_QUERIES)
+
+    def test_incomplete_material_series_is_not_enqueued(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "queue"
+            (root / "pending").mkdir(parents=True)
+            with patch.multiple(
+                main,
+                NAZ_VK_ENABLED=True,
+                NAZ_VK_PUBLIC_ID="123",
+                NAZ_VK_QUEUE_DIR=root,
+                NAZ_VK_TRACK_STATE_FILE=Path(directory) / "rotation.json",
+            ), patch.object(
+                main, "select_naz_vk_rubric", return_value=main.MATERIAL_RUBRIC
+            ), patch.object(
+                main, "generate_content", new=AsyncMock(return_value="Короткая мысль Naz")
+            ), patch.object(
+                main,
+                "generate_images_with_retries",
+                new=AsyncMock(return_value=([b"macro", b"form"], "material prompt")),
+            ):
+                with self.assertRaisesRegex(main.vk_publish_queue.QueueError, "complete three-frame"):
+                    asyncio.run(
+                        main.create_naz_vk_job(
+                            "Титановый прототип",
+                            source_ref="test:material-partial",
+                        )
+                    )
+            self.assertEqual(list((root / "pending").iterdir()), [])
+
     def test_required_image_failure_never_creates_draft_or_queue_job(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "queue"
