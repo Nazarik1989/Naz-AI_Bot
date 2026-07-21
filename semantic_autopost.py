@@ -21,6 +21,8 @@ THEME_COOLDOWN = 5
 SEMANTIC_HISTORY_LIMIT = 8
 MAX_GENERATIONS = 2
 MAX_RELEASE_PLANS = 3
+MAX_BRIEF_PLANS = 2
+BRIEF_THESIS_SIMILARITY_THRESHOLD = 0.72
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,8 +254,181 @@ class GenerationResult:
     card_key: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class BriefNoveltyDecision:
+    accepted: bool
+    reason_code: str
+    theme_key: str
+    card_key: str
+    thesis_fingerprint: str
+    similarity_score: float
+    similarity_threshold: float
+    matched_record_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class BriefPlanSelection:
+    theme: SemanticTheme
+    card: SemanticCard
+    attempt: int
+    exclusion_fingerprints: tuple[str, ...]
+    decisions: tuple[BriefNoveltyDecision, ...]
+
+
 class NoSemanticThemeAvailable(RuntimeError):
     """All rubric-compatible themes are still inside the shared cooldown."""
+
+
+class NoNovelBriefAvailable(RuntimeError):
+    """All bounded Content Brief candidates repeat recent meaning."""
+
+    def __init__(self, decisions: Sequence[BriefNoveltyDecision]):
+        super().__init__("brief_novelty_exhausted")
+        self.reason_code = "brief_novelty_exhausted"
+        self.decisions = tuple(decisions)
+
+
+def semantic_fingerprint(value: str) -> str:
+    normalized = " ".join(str(value or "").casefold().split())
+    return sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _semantic_tokens(value: str) -> frozenset[str]:
+    return frozenset(
+        token
+        for token in re.findall(r"[a-zа-яё0-9]+", str(value or "").casefold())
+        if len(token) >= 3
+    )
+
+
+def thesis_similarity(left: str, right: str) -> float:
+    """Deterministic lexical guard; the history profile supplies semantic coverage."""
+    left_tokens = _semantic_tokens(left)
+    right_tokens = _semantic_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    shared = len(left_tokens & right_tokens)
+    containment = shared / min(len(left_tokens), len(right_tokens))
+    jaccard = shared / len(left_tokens | right_tokens)
+    return round(max(containment, jaccard), 4)
+
+
+def brief_exclusion_fingerprints(
+    recent_posts: Sequence[Mapping[str, str]],
+) -> tuple[str, ...]:
+    fingerprints: list[str] = []
+    for post in recent_posts[-SEMANTIC_HISTORY_LIMIT:]:
+        fingerprint = str(
+            post.get("thesis_fingerprint")
+            or post.get("content_fingerprint")
+            or ""
+        ).strip()
+        if not fingerprint:
+            source = str(post.get("central_thesis") or post.get("content") or "")
+            fingerprint = semantic_fingerprint(source) if source else ""
+        if fingerprint and fingerprint not in fingerprints:
+            fingerprints.append(fingerprint)
+    return tuple(fingerprints)
+
+
+def evaluate_brief_novelty(
+    *,
+    theme: SemanticTheme,
+    card: SemanticCard,
+    history_profile: SemanticHistoryProfile,
+    recent_posts: Sequence[Mapping[str, str]],
+) -> BriefNoveltyDecision:
+    thesis_fingerprint = semantic_fingerprint(card.thesis)
+    if theme.key in history_profile.occupied_theme_keys:
+        return BriefNoveltyDecision(
+            False,
+            "brief_axis_recently_occupied",
+            theme.key,
+            card.key,
+            thesis_fingerprint,
+            1.0,
+            BRIEF_THESIS_SIMILARITY_THRESHOLD,
+            f"axis:{theme.key}",
+        )
+
+    best_score = 0.0
+    matched_record_id = ""
+    for post in recent_posts[-SEMANTIC_HISTORY_LIMIT:]:
+        reference = str(post.get("central_thesis") or "").strip()
+        if not reference:
+            semantic_card = str(post.get("semantic_card") or "").strip()
+            stored_card = next(
+                (candidate for candidate in SEMANTIC_CARDS if candidate.key == semantic_card),
+                None,
+            )
+            reference = stored_card.thesis if stored_card else ""
+        if not reference:
+            continue
+        score = thesis_similarity(card.thesis, reference)
+        if score > best_score:
+            best_score = score
+            matched_record_id = str(post.get("record_id") or "")
+    accepted = best_score < BRIEF_THESIS_SIMILARITY_THRESHOLD
+    return BriefNoveltyDecision(
+        accepted,
+        "accepted" if accepted else "brief_thesis_near_duplicate",
+        theme.key,
+        card.key,
+        thesis_fingerprint,
+        best_score,
+        BRIEF_THESIS_SIMILARITY_THRESHOLD,
+        matched_record_id,
+    )
+
+
+def select_novel_brief_plan(
+    *,
+    rubric_name: str,
+    recent_theme_keys: Iterable[str],
+    recent_card_keys: Iterable[str],
+    platform: str,
+    seed: str,
+    history_profile: SemanticHistoryProfile,
+    recent_posts: Sequence[Mapping[str, str]],
+) -> BriefPlanSelection:
+    """Select at most two local brief plans before any text or image generation."""
+    recent_themes = tuple(recent_theme_keys)
+    recent_cards = tuple(recent_card_keys)
+    rejected_axes: list[str] = []
+    decisions: list[BriefNoveltyDecision] = []
+    for attempt in range(1, MAX_BRIEF_PLANS + 1):
+        excluded = () if attempt == 1 else (
+            *history_profile.occupied_theme_keys,
+            *rejected_axes,
+        )
+        try:
+            theme = select_theme(
+                rubric_name,
+                recent_themes,
+                platform=platform,
+                seed=f"{seed}:brief:{attempt}",
+                excluded_theme_keys=excluded,
+            )
+        except NoSemanticThemeAvailable:
+            break
+        card = select_card(theme.key, recent_cards)
+        decision = evaluate_brief_novelty(
+            theme=theme,
+            card=card,
+            history_profile=history_profile,
+            recent_posts=recent_posts,
+        )
+        decisions.append(decision)
+        if decision.accepted:
+            return BriefPlanSelection(
+                theme,
+                card,
+                attempt,
+                brief_exclusion_fingerprints(recent_posts),
+                tuple(decisions),
+            )
+        rejected_axes.append(theme.key)
+    raise NoNovelBriefAvailable(decisions)
 
 
 def compatible_themes(rubric_name: str) -> tuple[SemanticTheme, ...]:
