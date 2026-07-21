@@ -2655,23 +2655,22 @@ async def evaluate_editorial_image(
             model=CONTENT_MODEL_NAME,
         )
         return editorial_policy.parse_image_gate_response(raw)
+    except editorial_policy.GateResponseError as exc:
+        logger.warning(
+            "EDITORIAL_IMAGE_GATE post_id=%s accepted=false reason_code=%s field_names=%s error_type=%s",
+            brief.post_id,
+            exc.reason_code,
+            ",".join(exc.field_names) or "none",
+            type(exc).__name__,
+        )
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "EDITORIAL_IMAGE_GATE post_id=%s accepted=false reason_code=validator_unavailable error_type=%s",
             brief.post_id,
             type(exc).__name__,
         )
-        return editorial_policy.ImageGateDecision(
-            False,
-            "validator_unavailable",
-            "",
-            False,
-            False,
-            False,
-            False,
-            False,
-            True,
-        )
+        raise editorial_policy.GateResponseError("validator_unavailable") from exc
 
 
 async def generate_images_for_post(
