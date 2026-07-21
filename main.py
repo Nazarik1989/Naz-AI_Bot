@@ -1007,6 +1007,23 @@ async def evaluate_editorial_text_candidate(
             model=CONTENT_MODEL_NAME,
         )
         return editorial_policy.parse_text_gate_response(raw)
+    except editorial_policy.GateResponseError as exc:
+        logger.warning(
+            "EDITORIAL_TEXT_GATE post_id=%s accepted=false reason_code=%s field_names=%s error_type=%s",
+            brief.post_id,
+            exc.reason_code,
+            ",".join(exc.field_names) or "none",
+            type(exc).__name__,
+        )
+        return editorial_policy.TextGateDecision(
+            False,
+            exc.reason_code,
+            False,
+            False,
+            False,
+            False,
+            False,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "EDITORIAL_TEXT_GATE post_id=%s accepted=false reason_code=validator_unavailable error_type=%s",
@@ -1154,6 +1171,23 @@ async def generate_semantic_autopost_candidate(
         forbidden_elements=(card.conclusion_boundary,),
         music_required=music_required,
     )
+    logger.info(
+        "EDITORIAL_BRIEF metadata=%s",
+        json.dumps(
+            {
+                "post_id": brief.post_id,
+                "persona": brief.persona,
+                "scheduled_slot": brief.scheduled_slot,
+                "rubric": brief.rubric,
+                "source_type": brief.source_type,
+                "editorial_contract_version": brief.editorial_contract_version,
+                "persona_policy_version": brief.persona_policy_version,
+                "visual_code_version": brief.visual_code_version,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    )
 
     async def evaluate(candidate: str) -> semantic_autopost.SemanticDecision:
         relevance = await evaluate_editorial_text_candidate(brief, candidate)
@@ -1179,6 +1213,11 @@ async def generate_semantic_autopost_candidate(
         is_model_warning=is_warning_response,
         card=card,
     )
+    final_reason_code = (
+        result.decision.reason
+        if result.decision.reason in editorial_policy.REASON_CODES
+        else "text_semantic_repetition"
+    )
     logger.info(
         "EDITORIAL_TEXT_GATE post_id=%s destination=%s rubric=%s attempts=%s accepted=%s reason_code=%s",
         brief.post_id,
@@ -1186,7 +1225,7 @@ async def generate_semantic_autopost_candidate(
         rubric_name,
         result.attempts,
         result.accepted,
-        "accepted" if result.accepted else "regeneration_exhausted",
+        "accepted" if result.accepted else final_reason_code,
     )
     return theme, result, brief
 
@@ -5625,6 +5664,27 @@ async def notify_autopost_skip_once(bot, reasons: List[str]) -> None:
     )
 
 
+def autopost_reason_summary(reason_code: str) -> str:
+    summaries = {
+        "validator_unavailable": "Редакторский валидатор временно недоступен; публикация безопасно отменена.",
+        "schema_json_parse_failed": "Ответ редакторского валидатора не удалось разобрать; публикация безопасно отменена.",
+        "schema_missing_fields": "В ответе редакторского валидатора отсутствуют обязательные поля; публикация безопасно отменена.",
+        "schema_invalid_field_types": "Ответ редакторского валидатора не соответствует типам полей; публикация безопасно отменена.",
+        "schema_unknown_reason_code": "Редакторский валидатор вернул неизвестный код причины; публикация безопасно отменена.",
+        "schema_conflicting_fields": "Поля решения редакторского валидатора противоречат друг другу; публикация безопасно отменена.",
+        "text_missing_entry_context": "В тексте нет ясного входа в тему после двух ограниченных попыток.",
+        "text_unknown_conversation": "Текст выглядит продолжением неизвестного разговора после двух ограниченных попыток.",
+        "text_invented_current_event": "Текст приписывает актуальность неподтверждённому событию после двух ограниченных попыток.",
+        "text_topic_drift": "Текст ушёл от утверждённой темы после двух ограниченных попыток.",
+        "text_persona_mismatch": "Текст не соответствует голосу Naz после двух ограниченных попыток.",
+        "text_semantic_repetition": "Обе ограниченные попытки повторили недавний смысл; слот пропущен.",
+    }
+    return summaries.get(
+        reason_code,
+        "Редакторская проверка отклонила обе ограниченные попытки; слот пропущен.",
+    )
+
+
 async def generate_images_with_retries(
     user_id: int,
     topic: str,
@@ -5911,8 +5971,18 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             generate=generate,
         )
         if not semantic_result.accepted:
-            failure_reasons.append("semantic gate rejected both generations")
-            logger.warning("AUTOPOST semantic block after all bounded release plans")
+            reason_code = (
+                semantic_result.decision.reason
+                if semantic_result.decision.reason in editorial_policy.REASON_CODES
+                else "text_semantic_repetition"
+            )
+            failure_reasons.append(autopost_reason_summary(reason_code))
+            logger.warning(
+                "AUTOPOST semantic block after bounded release plans post_id=%s attempts=%s reason_code=%s",
+                brief.post_id if brief is not None else "unavailable",
+                semantic_result.attempts,
+                reason_code,
+            )
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
 
@@ -5925,7 +5995,9 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             editorial_brief=brief,
         )
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            failure_reasons.append(f"images required but not generated for topic: {topic}")
+            failure_reasons.append(
+                "Не удалось получить обязательное изображение после ограниченных попыток; слот пропущен."
+            )
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
 
@@ -6031,10 +6103,16 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             generate=generate,
         )
         if not semantic_result.accepted:
-            failure_reasons.append("semantic gate rejected both source generations")
+            reason_code = (
+                semantic_result.decision.reason
+                if semantic_result.decision.reason in editorial_policy.REASON_CODES
+                else "text_semantic_repetition"
+            )
+            failure_reasons.append(autopost_reason_summary(reason_code))
             await notify_admin(
                 context.bot,
-                "⚠️ Мониторинг источников пропустил слот: semantic gate отклонил все ограниченные планы.",
+                "⚠️ Мониторинг источников пропустил слот.\n\n"
+                + autopost_reason_summary(reason_code),
             )
             return
         post_text = semantic_result.text
