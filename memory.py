@@ -976,7 +976,8 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
     with db() as conn:
         semantic_rows = conn.execute(
             """
-            SELECT semantic_theme, content, platform, created_at, id
+            SELECT semantic_theme, semantic_card, central_thesis, content, content_hash,
+                   platform, created_at, id
             FROM autopost_semantic_history
             WHERE user_id = ? AND character_id = ? AND platform <> 'vk'
             ORDER BY id DESC
@@ -1004,6 +1005,13 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
         combined.append(
             {
                 "semantic_theme": str(row["semantic_theme"] or ""),
+                "semantic_card": str(row["semantic_card"] or ""),
+                "central_thesis": str(row["central_thesis"] or ""),
+                "thesis_fingerprint": hashlib.sha256(
+                    " ".join(str(row["central_thesis"] or "").casefold().split()).encode("utf-8")
+                ).hexdigest()[:16] if str(row["central_thesis"] or "").strip() else "",
+                "content_fingerprint": str(row["content_hash"] or digest)[:16],
+                "record_id": f"semantic:{int(row['id'])}",
                 "content": content,
                 "platform": str(row["platform"] or ""),
                 "created_at": str(row["created_at"] or ""),
@@ -1018,6 +1026,11 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
         combined.append(
             {
                 "semantic_theme": str(row["semantic_theme"] or ""),
+                "semantic_card": "",
+                "central_thesis": "",
+                "thesis_fingerprint": "",
+                "content_fingerprint": digest[:16],
+                "record_id": f"generated:{int(row['id'])}",
                 "content": content,
                 "platform": "vk" if "vk" in str(row["task"] or "").casefold() else "telegram",
                 "created_at": str(row["created_at"] or ""),

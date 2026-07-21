@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -390,7 +391,7 @@ class SemanticAutopostTests(unittest.TestCase):
         for theme in semantic.THEMES:
             self.assertIn(f'"{theme.key}"', prompt)
 
-    def test_void_style_retry_keeps_theme_and_passes_rejection_semantics(self):
+    def test_semantic_repeat_does_not_retry_text_inside_accepted_brief(self):
         history = [
             {
                 "semantic_theme": "",
@@ -438,8 +439,9 @@ class SemanticAutopostTests(unittest.TestCase):
                 )
             )
 
-        self.assertTrue(result.accepted)
-        self.assertEqual(generate.await_count, 2)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.decision.reason, "text_semantic_repetition")
+        self.assertEqual(generate.await_count, 1)
         select_correction.assert_not_called()
         initial_theme = semantic.select_theme(
             "Полевая заметка Naz",
@@ -449,15 +451,12 @@ class SemanticAutopostTests(unittest.TestCase):
             excluded_theme_keys=(),
         )
         self.assertEqual(result.theme_key, initial_theme.key)
-        for call in generate.await_args_list:
-            prompt = call.args[0]
-            self.assertIn("SEMANTIC ANTI-REPEAT CONTEXT", prompt)
-            self.assertIn(history[0]["content"], prompt)
-            self.assertIn(history[1]["content"], prompt)
-        retry_prompt = generate.await_args_list[1].args[0]
+        prompt = generate.await_args_list[0].args[0]
+        self.assertIn("SEMANTIC ANTI-REPEAT CONTEXT", prompt)
+        self.assertIn(history[0]["content"], prompt)
+        self.assertIn(history[1]["content"], prompt)
         self.assertEqual(decisions.await_args_list[0].args[0], "Первый вариант")
-        self.assertIn("duplicate", retry_prompt)
-        self.assertIn(f"({initial_theme.key})", retry_prompt)
+        self.assertIn(f"({initial_theme.key})", prompt)
 
     def test_two_rejections_are_not_persisted_without_publication(self):
         history = [
@@ -502,7 +501,7 @@ class SemanticAutopostTests(unittest.TestCase):
                 )
             )
         self.assertFalse(result.accepted)
-        self.assertEqual(result.attempts, 2)
+        self.assertEqual(result.attempts, 1)
         remember.assert_not_called()
         self.assertEqual(memory.get_recent_semantic_card_keys(1), [])
 
@@ -543,9 +542,122 @@ class SemanticAutopostTests(unittest.TestCase):
             )
 
         self.assertFalse(result.accepted)
-        self.assertEqual(result.attempts, 2)
+        self.assertEqual(result.attempts, 1)
         self.assertEqual(result.theme_key, theme.key)
         remember.assert_not_called()
+
+    def test_naz_18_repeating_first_brief_selects_second_axis(self):
+        initial = semantic.select_theme(
+            "Баг, который стал системой",
+            [],
+            platform="telegram",
+            seed="telegram:2026-07-21:18:00",
+        )
+        profile = semantic.SemanticHistoryProfile(
+            "history-fingerprint",
+            (initial.key,),
+            f"{initial.key}: occupied",
+        )
+        plan = semantic.select_novel_brief_plan(
+            rubric_name="Баг, который стал системой",
+            recent_theme_keys=[],
+            recent_card_keys=[],
+            platform="telegram",
+            seed="telegram:2026-07-21:18:00",
+            history_profile=profile,
+            recent_posts=[],
+        )
+
+        self.assertEqual(len(plan.decisions), 2)
+        self.assertEqual(plan.decisions[0].reason_code, "brief_axis_recently_occupied")
+        self.assertTrue(plan.decisions[1].accepted)
+        self.assertNotEqual(plan.theme.key, initial.key)
+        self.assertNotEqual(plan.card.thesis, semantic.select_card(initial.key, []).thesis)
+        self.assertEqual(plan.exclusion_fingerprints, ())
+
+    def test_brief_pregate_rejects_simple_thesis_paraphrase(self):
+        theme = semantic.THEMES_BY_KEY["care"]
+        card = semantic.SemanticCard(
+            "fixture",
+            "care",
+            "fixture scene",
+            "fixture tension",
+            "надёжность уважает чужое время через ясное сообщение",
+            "fixture boundary",
+        )
+        decision = semantic.evaluate_brief_novelty(
+            theme=theme,
+            card=card,
+            history_profile=semantic.SemanticHistoryProfile("digest", (), ""),
+            recent_posts=[{
+                "record_id": "semantic:42",
+                "central_thesis": "ясное сообщение уважает чужое время через надёжность",
+            }],
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.reason_code, "brief_thesis_near_duplicate")
+        self.assertEqual(decision.matched_record_id, "semantic:42")
+        self.assertGreaterEqual(
+            decision.similarity_score,
+            semantic.BRIEF_THESIS_SIMILARITY_THRESHOLD,
+        )
+
+    def test_accepted_content_brief_is_immutable_downstream(self):
+        brief = editorial_policy.build_brief(
+            destination="telegram",
+            scheduled_slot="18:00",
+            source_type="scheduled_rubric",
+            source_reference="telegram:2026-07-21:18:00",
+            rubric="Баг, который стал системой",
+            thesis="immutable fixture thesis",
+            context_reason="scheduled fixture",
+            visual_subject="one fixture object",
+            visual_relation="the object supports the thesis",
+            allowed_rubrics={"Баг, который стал системой"},
+        )
+        with self.assertRaises(FrozenInstanceError):
+            brief.thesis = "mutated downstream"
+        self.assertEqual(brief.thesis, "immutable fixture thesis")
+
+    def test_all_repeating_briefs_skip_before_text_generation(self):
+        generate = AsyncMock()
+        compatible = tuple(
+            theme.key
+            for theme in semantic.compatible_themes("Баг, который стал системой")
+        )
+        with patch.object(
+            main.memory, "get_recent_semantic_theme_keys", return_value=[]
+        ), patch.object(
+            main.memory, "get_recent_semantic_card_keys", return_value=[]
+        ), patch.object(
+            main.memory, "get_recent_posts_for_semantic_gate", return_value=[]
+        ), patch.object(
+            main,
+            "get_autopost_history_profile",
+            new=AsyncMock(
+                return_value=semantic.SemanticHistoryProfile(
+                    "history-fingerprint",
+                    compatible,
+                    "all compatible axes occupied",
+                )
+            ),
+        ):
+            with self.assertRaises(semantic.NoNovelBriefAvailable):
+                asyncio.run(
+                    main.generate_semantic_autopost_candidate(
+                        user_id=1,
+                        platform="telegram",
+                        rubric_name="Баг, который стал системой",
+                        seed="telegram:2026-07-21:18:00",
+                        source_type="scheduled_rubric",
+                        scheduled_slot="18:00",
+                        context_reason="scheduled fixture",
+                        music_required=False,
+                        generate=generate,
+                    )
+                )
+        generate.assert_not_awaited()
 
     def test_legacy_generated_post_without_semantic_theme_remains_readable(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
