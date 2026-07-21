@@ -177,6 +177,30 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertIn("не подменяет вывод универсальным советом", body_prompt)
         self.assertNotIn("опытная ось обязана владеть центральным тезисом", work_prompt)
 
+    def test_naz_10_text_gate_contract_error_does_not_consume_retry(self):
+        calls = []
+
+        async def generate(_instruction):
+            calls.append("generate")
+            return "fixture candidate"
+
+        async def evaluate(_candidate):
+            return semantic.blocked_decision("schema_unknown_reason_code")
+
+        result = asyncio.run(
+            semantic.generate_with_gate(
+                generate=generate,
+                evaluate=evaluate,
+                theme=semantic.THEMES_BY_KEY["work"],
+                platform="telegram",
+                rubric_name="Утренний дожим",
+                is_model_warning=lambda _value: False,
+            )
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.attempts, 1)
+        self.assertEqual(calls, ["generate"])
+
     def tearDown(self):
         self.relevance_patch.stop()
         self.db_patch.stop()
