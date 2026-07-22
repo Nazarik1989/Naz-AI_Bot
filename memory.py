@@ -13,7 +13,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import character_state as naz_character
 import duo_relationship
@@ -161,6 +161,28 @@ def init_db() -> None:
         _ensure_column(conn, "generated_posts", "external_job_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "generated_posts", "plan_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "generated_posts", "editorial_plan_json", "TEXT NOT NULL DEFAULT ''")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS editorial_release_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                plan_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                slot TEXT NOT NULL DEFAULT '',
+                slot_captured_at TEXT NOT NULL DEFAULT '',
+                generation_package_status TEXT NOT NULL DEFAULT 'not_run',
+                image_qa_status TEXT NOT NULL DEFAULT 'not_run',
+                telegram_chat_id TEXT NOT NULL DEFAULT '',
+                telegram_message_id TEXT NOT NULL DEFAULT '',
+                vk_job_id TEXT NOT NULL DEFAULT '',
+                vk_receipt_id TEXT NOT NULL DEFAULT '',
+                history_commit_status TEXT NOT NULL DEFAULT 'not_run',
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, plan_id, platform)
+            )
+            """
+        )
 
         conn.execute(
             """
@@ -807,9 +829,9 @@ def _record_content_signature_conn(
     user_id: int,
     plan: Dict[str, Any],
     topic: str,
-) -> None:
+) -> bool:
     plan_id = str(plan.get("plan_id", ""))[:64]
-    conn.execute(
+    inserted = conn.execute(
         """
         INSERT OR IGNORE INTO content_signatures(
             user_id, character_id, platform, facet, intent, format, content_format, content_kind,
@@ -850,12 +872,206 @@ def _record_content_signature_conn(
         """,
         (user_id, user_id),
     )
+    return inserted.rowcount == 1
 
 
 def record_content_signature(user_id: int, plan: Dict[str, Any], topic: str) -> None:
     """Record one confirmed publication; plan_id makes crossposts idempotent."""
     with db() as conn:
         _record_content_signature_conn(conn, user_id, plan, topic)
+
+
+GENERATION_PACKAGE_STATUSES = frozenset(
+    {"not_run", "accepted", "rejected", "invalid", "unavailable"}
+)
+IMAGE_QA_STATUSES = frozenset({"not_run", "accepted", "rejected", "unavailable"})
+HISTORY_COMMIT_STATUSES = frozenset(
+    {"not_run", "pending", "sending", "committed", "failed"}
+)
+
+
+def _bounded(value: Any, limit: int) -> str:
+    return str(value or "")[:limit]
+
+
+def _upsert_editorial_release_event_conn(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    plan_id: str,
+    platform: str,
+    slot: Optional[str] = None,
+    slot_captured_at: Optional[str] = None,
+    generation_package_status: Optional[str] = None,
+    image_qa_status: Optional[str] = None,
+    telegram_chat_id: Optional[str] = None,
+    telegram_message_id: Optional[str] = None,
+    vk_job_id: Optional[str] = None,
+    vk_receipt_id: Optional[str] = None,
+    history_commit_status: Optional[str] = None,
+) -> None:
+    clean_plan_id = _bounded(plan_id, 64)
+    clean_platform = _bounded(platform, 16)
+    if not clean_plan_id or clean_platform not in {"telegram", "vk"}:
+        raise ValueError("invalid editorial release identity")
+    if generation_package_status is not None and generation_package_status not in GENERATION_PACKAGE_STATUSES:
+        raise ValueError("invalid generation package status")
+    if image_qa_status is not None and image_qa_status not in IMAGE_QA_STATUSES:
+        raise ValueError("invalid image QA status")
+    if history_commit_status is not None and history_commit_status not in HISTORY_COMMIT_STATUSES:
+        raise ValueError("invalid history commit status")
+
+    row = conn.execute(
+        """
+        SELECT slot, slot_captured_at, generation_package_status, image_qa_status,
+               telegram_chat_id, telegram_message_id, vk_job_id, vk_receipt_id,
+               history_commit_status
+        FROM editorial_release_events
+        WHERE user_id=? AND plan_id=? AND platform=?
+        """,
+        (user_id, clean_plan_id, clean_platform),
+    ).fetchone()
+    values = dict(row) if row else {
+        "slot": "",
+        "slot_captured_at": "",
+        "generation_package_status": "not_run",
+        "image_qa_status": "not_run",
+        "telegram_chat_id": "",
+        "telegram_message_id": "",
+        "vk_job_id": "",
+        "vk_receipt_id": "",
+        "history_commit_status": "not_run",
+    }
+    updates = {
+        "slot": (_bounded(slot, 80) if slot is not None else None),
+        "slot_captured_at": (_bounded(slot_captured_at, 64) if slot_captured_at is not None else None),
+        "generation_package_status": generation_package_status,
+        "image_qa_status": image_qa_status,
+        "telegram_chat_id": (_bounded(telegram_chat_id, 128) if telegram_chat_id is not None else None),
+        "telegram_message_id": (_bounded(telegram_message_id, 128) if telegram_message_id is not None else None),
+        "vk_job_id": (_bounded(vk_job_id, 128) if vk_job_id is not None else None),
+        "vk_receipt_id": (_bounded(vk_receipt_id, 128) if vk_receipt_id is not None else None),
+        "history_commit_status": history_commit_status,
+    }
+    for key, value in updates.items():
+        if value is not None:
+            if key in {"slot", "slot_captured_at"} and values[key]:
+                continue
+            if (
+                values["history_commit_status"] == "committed"
+                and key in {
+                    "generation_package_status",
+                    "image_qa_status",
+                    "history_commit_status",
+                }
+                and not (key == "history_commit_status" and value == "committed")
+            ):
+                continue
+            if (
+                key == "history_commit_status"
+                and values["history_commit_status"] == "committed"
+                and value != "committed"
+            ):
+                continue
+            values[key] = value
+    conn.execute(
+        """
+        INSERT INTO editorial_release_events(
+            user_id, plan_id, platform, slot, slot_captured_at,
+            generation_package_status, image_qa_status, telegram_chat_id,
+            telegram_message_id, vk_job_id, vk_receipt_id,
+            history_commit_status, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, plan_id, platform) DO UPDATE SET
+            slot=excluded.slot,
+            slot_captured_at=excluded.slot_captured_at,
+            generation_package_status=excluded.generation_package_status,
+            image_qa_status=excluded.image_qa_status,
+            telegram_chat_id=excluded.telegram_chat_id,
+            telegram_message_id=excluded.telegram_message_id,
+            vk_job_id=excluded.vk_job_id,
+            vk_receipt_id=excluded.vk_receipt_id,
+            history_commit_status=excluded.history_commit_status,
+            updated_at=excluded.updated_at
+        """,
+        (
+            user_id,
+            clean_plan_id,
+            clean_platform,
+            values["slot"],
+            values["slot_captured_at"],
+            values["generation_package_status"],
+            values["image_qa_status"],
+            values["telegram_chat_id"],
+            values["telegram_message_id"],
+            values["vk_job_id"],
+            values["vk_receipt_id"],
+            values["history_commit_status"],
+            utc_now(),
+        ),
+    )
+
+
+def update_editorial_release_event(**values: Any) -> None:
+    """Persist bounded operational metadata; never accepts post or prompt text."""
+    with db() as conn:
+        _upsert_editorial_release_event_conn(conn, **values)
+
+
+def get_editorial_release_event(
+    user_id: int,
+    plan_id: str,
+    platform: str,
+) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT user_id, plan_id, platform, slot, slot_captured_at,
+                   generation_package_status, image_qa_status, telegram_chat_id,
+                   telegram_message_id, vk_job_id, vk_receipt_id,
+                   history_commit_status, updated_at
+            FROM editorial_release_events
+            WHERE user_id=? AND plan_id=? AND platform=?
+            """,
+            (user_id, str(plan_id), str(platform)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def claim_editorial_delivery(
+    *,
+    user_id: int,
+    plan_id: str,
+    platform: str,
+) -> str:
+    """Atomically claim one external send; never auto-retry an ambiguous send."""
+    clean_plan_id = _bounded(plan_id, 64)
+    clean_platform = _bounded(platform, 16)
+    if not clean_plan_id or clean_platform not in {"telegram", "vk"}:
+        raise ValueError("invalid editorial release identity")
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT history_commit_status FROM editorial_release_events
+            WHERE user_id=? AND plan_id=? AND platform=?
+            """,
+            (user_id, clean_plan_id, clean_platform),
+        ).fetchone()
+        status = str(row["history_commit_status"] if row else "not_run")
+        if status == "committed":
+            return "committed"
+        if status in {"sending", "failed"}:
+            return "blocked"
+        _upsert_editorial_release_event_conn(
+            conn,
+            user_id=user_id,
+            plan_id=clean_plan_id,
+            platform=clean_platform,
+            history_commit_status="sending",
+        )
+        return "claimed"
 
 
 def get_recent_semantic_theme_keys(user_id: int, limit: int = 5) -> List[str]:
@@ -1582,6 +1798,108 @@ def mark_vk_generated_post_published(user_id: int, row_id: int) -> bool:
         if isinstance(plan, dict) and str(plan.get("plan_id", "")):
             _record_content_signature_conn(conn, user_id, plan, str(row["topic"] or ""))
         return True
+
+
+def reconcile_vk_publication_receipt(
+    user_id: int,
+    receipt: Mapping[str, str],
+) -> str:
+    """Atomically promote one known VK draft from one validated receipt.
+
+    Returns ``history_inserted``, ``already_recorded`` or ``invalid_receipt``.
+    A receipt cannot select a draft by source text and cannot store queue
+    payload content in persona history.
+    """
+    job_id = _bounded(receipt.get("job_id"), 128)
+    source_ref = _bounded(receipt.get("source_ref"), 1000)
+    published_at = _bounded(receipt.get("published_at"), 64)
+    if (
+        receipt.get("schema") != "vk_publication_receipt.v1"
+        or receipt.get("producer") != "naz"
+        or not job_id
+        or not source_ref
+        or not published_at
+    ):
+        return "invalid_receipt"
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, topic, plan_id, editorial_plan_json, published_to_channel
+            FROM generated_posts
+            WHERE user_id=? AND task LIKE 'naz_vk_queue:%' AND external_job_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id, job_id),
+        ).fetchone()
+        if row is None:
+            return "invalid_receipt"
+        try:
+            plan = json.loads(str(row["editorial_plan_json"] or "{}"))
+        except json.JSONDecodeError:
+            return "invalid_receipt"
+        if (
+            not isinstance(plan, dict)
+            or not str(plan.get("plan_id", ""))
+            or str(plan.get("plan_id")) != str(row["plan_id"] or "")
+            or str(plan.get("source_ref", "")) != source_ref
+        ):
+            return "invalid_receipt"
+
+        committed = conn.execute(
+            """
+            SELECT 1 FROM editorial_release_events
+            WHERE user_id=? AND plan_id=? AND history_commit_status='committed'
+            LIMIT 1
+            """,
+            (user_id, str(plan["plan_id"])),
+        ).fetchone()
+        if bool(row["published_to_channel"]):
+            # A legacy deployment could flip the draft flag before its history
+            # write. Repair that state exactly once. The durable committed
+            # event then prevents an old receipt from resurrecting history
+            # after the normal 80-row persona-history pruning.
+            inserted = False
+            if committed is None:
+                inserted = _record_content_signature_conn(
+                    conn, user_id, plan, str(row["topic"] or "")
+                )
+            _upsert_editorial_release_event_conn(
+                conn,
+                user_id=user_id,
+                plan_id=str(plan["plan_id"]),
+                platform="vk",
+                slot=str(plan.get("slot", "")),
+                vk_job_id=job_id,
+                vk_receipt_id=job_id,
+                history_commit_status="committed",
+            )
+            return "history_inserted" if inserted else "already_recorded"
+
+        updated = conn.execute(
+            """
+            UPDATE generated_posts SET published_to_channel=1
+            WHERE id=? AND user_id=? AND published_to_channel=0
+            """,
+            (int(row["id"]), user_id),
+        )
+        if updated.rowcount != 1:
+            return "already_recorded"
+        inserted = False
+        if committed is None:
+            inserted = _record_content_signature_conn(
+                conn, user_id, plan, str(row["topic"] or "")
+            )
+        _upsert_editorial_release_event_conn(
+            conn,
+            user_id=user_id,
+            plan_id=str(plan["plan_id"]),
+            platform="vk",
+            slot=str(plan.get("slot", "")),
+            vk_job_id=job_id,
+            vk_receipt_id=job_id,
+            history_commit_status="committed",
+        )
+        return "history_inserted" if inserted else "already_recorded"
 
 
 def get_recent_generated_posts(user_id: int, task: str = "", limit: int = 3) -> List[Dict[str, str]]:

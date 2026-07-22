@@ -84,6 +84,9 @@ class EditorialContext:
     sources: tuple[EditorialSource, ...]
     rubrics: tuple[EditorialRubric, ...]
     pools: Mapping[str, tuple[str, ...]]
+    # Diversity depth belongs to the complete persona catalog, even when a
+    # route exposes only the subset compatible with the current slot.
+    persona_pool_sizes: Mapping[str, int] = field(default_factory=dict)
     semantic_cards: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     published_history: tuple[Mapping[str, Any], ...] = ()
     preferred: Mapping[str, str] = field(default_factory=dict)
@@ -158,7 +161,7 @@ def cooldown_depth(pool_size: int) -> int:
     """About 60% of a pool; the required 17-value example yields 10."""
     if pool_size <= 0:
         return 0
-    return max(1, int(pool_size * 0.60))
+    return max(1, round(pool_size * 0.60))
 
 
 def _stable_rank(plan_id: str, axis: str, value: str) -> str:
@@ -183,11 +186,19 @@ def _choose(
     values: Iterable[str],
     history: Sequence[Mapping[str, Any]],
     preferred: str = "",
+    persona_pool_size: int | None = None,
 ) -> str:
     candidates = _unique(values)
     if not candidates:
         raise EditorialPlanError(f"empty compatible pool for {axis}")
-    depth = cooldown_depth(len(candidates))
+    # Compatibility constrains what may be selected, but the diversity window
+    # belongs to the complete persona-wide pool for this axis.
+    pool_size = (
+        persona_pool_size
+        if persona_pool_size is not None and persona_pool_size > 0
+        else len(candidates)
+    )
+    depth = cooldown_depth(pool_size)
     blocked = {
         str(item.get(axis, ""))
         for item in history[-depth:]
@@ -232,6 +243,17 @@ def _axis_values(
     return constrained or tuple(context.pools.get(axis, ()))
 
 
+def _persona_pool_size(
+    context: EditorialContext,
+    axis: str,
+    fallback: int,
+) -> int:
+    explicit = context.persona_pool_sizes.get(axis)
+    if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit > 0:
+        return explicit
+    return fallback
+
+
 def story_first_eligible(source: EditorialSource) -> bool:
     """Central suitability gate; diversity never forces Story-first."""
     return bool(
@@ -266,6 +288,11 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         values=(item.name for item in compatible_rubrics),
         history=history,
         preferred=str(context.preferred.get("rubric", "")),
+        persona_pool_size=_persona_pool_size(
+            context,
+            "rubric",
+            len(_unique(item.name for item in context.rubrics)),
+        ),
     )
     rubric = next(item for item in compatible_rubrics if item.name == rubric_name)
     sources = [
@@ -278,6 +305,11 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         axis="source_ref",
         values=(item.source_ref for item in sources),
         history=history,
+        persona_pool_size=_persona_pool_size(
+            context,
+            "source_ref",
+            len(_unique(item.source_ref for item in context.sources)),
+        ),
     )
     source = next(item for item in sources if item.source_ref == source_ref)
 
@@ -288,12 +320,14 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         axis="content_format",
         values=("story_pack",) if story_first else ("text_post",),
         history=history,
+        persona_pool_size=_persona_pool_size(context, "content_format", 2),
     )
     selected["production_mode"] = _choose(
         plan_id=plan_id,
         axis="production_mode",
         values=("story_first",) if story_first else ("standard",),
         history=history,
+        persona_pool_size=_persona_pool_size(context, "production_mode", 2),
     )
     for axis in (
         "thesis_direction",
@@ -324,6 +358,11 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
             values=_axis_values(context, rubric, axis),
             history=history,
             preferred=str(context.preferred.get(axis, "")),
+            persona_pool_size=_persona_pool_size(
+                context,
+                axis,
+                len(_unique(context.pools.get(axis, ()))),
+            ),
         )
 
     selected["semantic_card"] = _choose(
@@ -335,6 +374,17 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         ),
         history=history,
         preferred=str(context.preferred.get("semantic_card", "")),
+        persona_pool_size=_persona_pool_size(
+            context,
+            "semantic_card",
+            len(
+                _unique(
+                    card
+                    for cards in context.semantic_cards.values()
+                    for card in cards
+                )
+            ),
+        ),
     )
 
     track_tags = tuple(
