@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import main as naz
 import naz_vk_music
+import scheduled_work
 import vk_publish_queue
 
 
@@ -272,12 +273,14 @@ async def produce_one(now: datetime | None = None) -> dict:
         "NAZ_VK_ONESHOT_TOPIC",
         default_topic,
     ).strip()
-    return await naz.create_naz_vk_job(
-        topic,
-        source_ref=source_ref,
-        not_before=current,
-        rubric_kind=rubric_kind,
-    )
+    with scheduled_work.work_marker(naz.NAZ_SCHEDULED_WORK_DIR, "vk_systemd_producer"):
+        return await naz.create_naz_vk_job(
+            topic,
+            source_ref=source_ref,
+            not_before=current,
+            rubric_kind=rubric_kind,
+            slot=slot,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
