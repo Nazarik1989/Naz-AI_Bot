@@ -1845,15 +1845,15 @@ def reconcile_vk_publication_receipt(
         ):
             return "invalid_receipt"
 
+        committed = conn.execute(
+            """
+            SELECT 1 FROM editorial_release_events
+            WHERE user_id=? AND plan_id=? AND history_commit_status='committed'
+            LIMIT 1
+            """,
+            (user_id, str(plan["plan_id"])),
+        ).fetchone()
         if bool(row["published_to_channel"]):
-            committed = conn.execute(
-                """
-                SELECT 1 FROM editorial_release_events
-                WHERE user_id=? AND plan_id=? AND history_commit_status='committed'
-                LIMIT 1
-                """,
-                (user_id, str(plan["plan_id"])),
-            ).fetchone()
             # A legacy deployment could flip the draft flag before its history
             # write. Repair that state exactly once. The durable committed
             # event then prevents an old receipt from resurrecting history
@@ -1884,9 +1884,11 @@ def reconcile_vk_publication_receipt(
         )
         if updated.rowcount != 1:
             return "already_recorded"
-        inserted = _record_content_signature_conn(
-            conn, user_id, plan, str(row["topic"] or "")
-        )
+        inserted = False
+        if committed is None:
+            inserted = _record_content_signature_conn(
+                conn, user_id, plan, str(row["topic"] or "")
+            )
         _upsert_editorial_release_event_conn(
             conn,
             user_id=user_id,

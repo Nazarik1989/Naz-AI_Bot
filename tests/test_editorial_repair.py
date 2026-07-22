@@ -279,6 +279,44 @@ class ReceiptSyncRepairTests(unittest.TestCase):
         self.assertEqual(vk_event["vk_receipt_id"], job_id)
         self.assertEqual(vk_event["history_commit_status"], "committed")
 
+    def test_pruned_telegram_plan_is_not_resurrected_by_delayed_vk_receipt(self):
+        plan, job_id = self._draft_and_receipt()
+        telegram_plan = dataclasses.replace(plan, platform="telegram")
+        memory.record_content_signature(77, telegram_plan.to_dict(), plan.topic)
+        memory.update_editorial_release_event(
+            user_id=77,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            slot="10:00",
+            generation_package_status="accepted",
+            image_qa_status="not_run",
+            telegram_chat_id="-10077",
+            telegram_message_id="1234",
+            history_commit_status="committed",
+        )
+        with memory.db() as conn:
+            conn.execute(
+                "DELETE FROM content_signatures WHERE user_id=? AND plan_id=?",
+                (77, plan.plan_id),
+            )
+
+        with patch.multiple(main, NAZ_VK_QUEUE_DIR=self.queue, ADMIN_ID=77):
+            result = main.sync_completed_naz_vk_jobs()
+
+        self.assertEqual(result.history_inserted, 0)
+        self.assertEqual(result.already_recorded, 1)
+        self.assertEqual(memory.get_recent_content_signatures(77), [])
+        with memory.db() as conn:
+            published = conn.execute(
+                "SELECT published_to_channel FROM generated_posts "
+                "WHERE user_id=? AND external_job_id=?",
+                (77, job_id),
+            ).fetchone()
+        self.assertEqual(published["published_to_channel"], 1)
+        vk_event = memory.get_editorial_release_event(77, plan.plan_id, "vk")
+        self.assertEqual(vk_event["vk_receipt_id"], job_id)
+        self.assertEqual(vk_event["history_commit_status"], "committed")
+
     def test_periodic_sync_registration_is_independent_of_producer_schedule(self):
         queue = SimpleNamespace(calls=[])
 
