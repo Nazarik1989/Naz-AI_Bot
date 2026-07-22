@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, Mock, patch
 import main
 import memory
 import naz_vk_music
-import editorial_policy
 
 
 class NazVkJobTests(unittest.TestCase):
@@ -20,17 +19,8 @@ class NazVkJobTests(unittest.TestCase):
         )
         self.db_patch.start()
         memory.init_db()
-        self.relevance_patch = patch.object(
-            main,
-            "evaluate_editorial_text_candidate",
-            new=AsyncMock(return_value=editorial_policy.TextGateDecision(
-                True, "accepted", True, True, False, True, True
-            )),
-        )
-        self.relevance_patch.start()
 
     def tearDown(self):
-        self.relevance_patch.stop()
         self.db_patch.stop()
         self.db_directory.cleanup()
 
@@ -48,8 +38,6 @@ class NazVkJobTests(unittest.TestCase):
                 NAZ_VK_TRACK_STATE_FILE=state,
             ), patch.object(
                 main, "generate_content", new=AsyncMock(return_value="Готовый VK-пост")
-            ), patch.object(
-                main, "select_naz_vk_rubric", return_value=main.NAZ_VK_RUBRICS[0]
             ), patch.object(
                 main, "generate_images_with_retries", new=AsyncMock(return_value=([b"png"], "prompt"))
             ):
@@ -71,8 +59,6 @@ class NazVkJobTests(unittest.TestCase):
                 NAZ_VK_TRACK_STATE_FILE=Path(directory) / "rotation.json",
             ), patch.object(
                 main, "generate_content", new=AsyncMock(return_value="Готовый VK-пост")
-            ), patch.object(
-                main, "select_naz_vk_rubric", return_value=main.NAZ_VK_RUBRICS[0]
             ), patch.object(
                 main, "generate_images_with_retries", new=AsyncMock(return_value=([b"png"], "prompt"))
             ), patch.object(

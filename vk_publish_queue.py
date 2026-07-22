@@ -15,24 +15,17 @@ import errno
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Optional, Union
+from typing import Iterable, Optional, Union
 
 from naz_vk_music import APPROVED_QUERIES
 
 
-SCHEMA_V1 = "vk_publish_job.v1"
-SCHEMA = "vk_publish_job.v2"
+SCHEMA = "vk_publish_job.v1"
 PRODUCER = "naz"
 CONSUMER_STATES = ("pending", "processing", "done", "failed")
-JOB_FIELDS_V1 = frozenset({
+JOB_FIELDS = frozenset({
     "schema", "job_id", "producer", "target_group_id", "text", "media",
     "track_query", "created_at", "not_before", "dedupe_key", "source_ref",
-})
-JOB_FIELDS = JOB_FIELDS_V1 | {"metadata"}
-METADATA_FIELDS = frozenset({
-    "editorial_contract_version", "persona_policy_version", "visual_code_version",
-    "post_id", "persona", "destination", "brief_hash", "source_type", "rubric",
-    "music_required", "reason_code",
 })
 MAX_TEXT_LENGTH = 16_000
 MAX_MEDIA_COUNT = 4
@@ -116,37 +109,10 @@ def validate_canonical_job(
     recent_track_keys: Iterable[str] = (),
 ) -> None:
     """Apply the shared VOID consumer contract to a materialized job."""
-    if not isinstance(job, dict):
-        raise QueueError("job must be a JSON object")
-    schema = job.get("schema")
-    expected_fields = JOB_FIELDS if schema == SCHEMA else JOB_FIELDS_V1
-    if schema not in {SCHEMA_V1, SCHEMA} or frozenset(job) != expected_fields:
-        raise QueueError("job fields do not match its schema")
-    if job["producer"] != PRODUCER:
+    if not isinstance(job, dict) or len(job) != 11 or frozenset(job) != JOB_FIELDS:
+        raise QueueError("job must contain exactly 11 canonical fields")
+    if job["schema"] != SCHEMA or job["producer"] != PRODUCER:
         raise QueueError("invalid schema or producer")
-    if schema == SCHEMA:
-        metadata = job["metadata"]
-        if not isinstance(metadata, dict) or frozenset(metadata) != METADATA_FIELDS:
-            raise QueueError("invalid editorial metadata")
-        string_fields = METADATA_FIELDS - {"music_required"}
-        if any(not isinstance(metadata.get(key), str) or not metadata[key] for key in string_fields):
-            raise QueueError("editorial metadata strings are required")
-        if not isinstance(metadata.get("music_required"), bool):
-            raise QueueError("editorial music_required must be boolean")
-        if metadata["editorial_contract_version"] != "editorial-relevance.v1":
-            raise QueueError("unknown editorial contract version")
-        if metadata["persona_policy_version"] != "naz-persona.v2.4":
-            raise QueueError("unknown persona policy version")
-        if metadata["visual_code_version"] != "naz-visual.v2":
-            raise QueueError("unknown visual code version")
-        if metadata["persona"] != "naz" or metadata["destination"] != "vk":
-            raise QueueError("invalid editorial identity")
-        if metadata["reason_code"] != "accepted" or not metadata["music_required"]:
-            raise QueueError("only accepted music-backed editorial jobs may be queued")
-        if not re.fullmatch(r"naz-[0-9a-f]{24}", metadata["post_id"]):
-            raise QueueError("invalid editorial post_id")
-        if not re.fullmatch(r"[0-9a-f]{64}", metadata["brief_hash"]):
-            raise QueueError("invalid editorial brief_hash")
     if not isinstance(job["target_group_id"], str) or not job["target_group_id"]:
         raise QueueError("target_group_id must be a non-empty JSON string")
     if allowed_group_id is not None and job["target_group_id"] != str(allowed_group_id):
@@ -203,7 +169,6 @@ def enqueue(
     created_at: Optional[datetime] = None,
     not_before: Optional[datetime] = None,
     dedupe_key: Optional[str] = None,
-    metadata: Mapping[str, Any] | None = None,
 ) -> dict:
     """Validate and atomically add one Naz job to ``queue_root/pending``."""
     queue_root = Path(queue_root)
@@ -258,7 +223,7 @@ def enqueue(
                 raise QueueError(f"media file exceeds {MAX_MEDIA_BYTES} bytes")
             os.chmod(destination, 0o640)
         job = {
-            "schema": SCHEMA if metadata is not None else SCHEMA_V1,
+            "schema": SCHEMA,
             "job_id": job_id,
             "producer": PRODUCER,
             "target_group_id": target_group_id,
@@ -270,12 +235,9 @@ def enqueue(
             "dedupe_key": key,
             "source_ref": source_ref,
         }
-        if metadata is not None:
-            job["metadata"] = dict(metadata)
         job_file = temp_dir / "job.json"
-        expected_fields = JOB_FIELDS if metadata is not None else JOB_FIELDS_V1
-        if frozenset(job) != expected_fields:
-            raise QueueError("job fields do not match its schema")
+        if frozenset(job) != JOB_FIELDS or len(job) != 11:
+            raise QueueError("job must contain exactly 11 canonical fields")
         job_file.write_text(
             json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )

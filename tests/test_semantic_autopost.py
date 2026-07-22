@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, patch
 
 import character_state
 import controller
-import editorial_policy
 import main
 import memory
 import prompts
@@ -49,14 +48,6 @@ class SemanticAutopostTests(unittest.TestCase):
         )
         self.db_patch.start()
         memory.init_db()
-        self.relevance_patch = patch.object(
-            main,
-            "evaluate_editorial_text_candidate",
-            new=AsyncMock(return_value=editorial_policy.TextGateDecision(
-                True, "accepted", True, True, False, True, True
-            )),
-        )
-        self.relevance_patch.start()
 
     def test_controller_keeps_character_voice_without_forcing_builder_moral(self):
         prompt = controller.build_clean_gpt_input(
@@ -178,7 +169,6 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertNotIn("опытная ось обязана владеть центральным тезисом", work_prompt)
 
     def tearDown(self):
-        self.relevance_patch.stop()
         self.db_patch.stop()
         self.directory.cleanup()
 
@@ -194,7 +184,7 @@ class SemanticAutopostTests(unittest.TestCase):
             events.append("posts")
             return []
 
-        async def generate(instruction, brief):
+        async def generate(instruction):
             events.append("generate")
             return "Новый самостоятельный текст"
 
@@ -203,16 +193,12 @@ class SemanticAutopostTests(unittest.TestCase):
         ), patch.object(
             main.memory, "get_recent_posts_for_semantic_gate", side_effect=recent_posts
         ):
-            theme, result, brief = asyncio.run(
+            theme, result = asyncio.run(
                 main.generate_semantic_autopost_candidate(
                     user_id=1,
                     platform="vk",
-                    rubric_name="Полевая заметка Naz",
+                    rubric_name="AI без успешного успеха",
                     seed="slot",
-                    source_type="scheduled_rubric",
-                    scheduled_slot="test",
-                    context_reason="contract test",
-                    music_required=True,
                     generate=generate,
                 )
             )
@@ -400,16 +386,12 @@ class SemanticAutopostTests(unittest.TestCase):
         ), patch.object(
             main.semantic_autopost, "select_correction_theme"
         ) as select_correction:
-            _, result, brief = asyncio.run(
+            _, result = asyncio.run(
                 main.generate_semantic_autopost_candidate(
                     user_id=1,
                     platform="vk",
-                    rubric_name="Полевая заметка Naz",
+                    rubric_name="AI без успешного успеха",
                     seed="slot",
-                    source_type="scheduled_rubric",
-                    scheduled_slot="test",
-                    context_reason="contract test",
-                    music_required=True,
                     generate=generate,
                 )
             )
@@ -418,13 +400,14 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertEqual(generate.await_count, 2)
         select_correction.assert_not_called()
         initial_theme = semantic.select_theme(
-            "Полевая заметка Naz",
+            "AI без успешного успеха",
             [],
             platform="vk",
             seed="slot",
-            excluded_theme_keys=(),
+            excluded_theme_keys=("care",),
         )
         self.assertEqual(result.theme_key, initial_theme.key)
+        self.assertNotEqual(result.theme_key, "care")
         for call in generate.await_args_list:
             prompt = call.args[0]
             self.assertIn("SEMANTIC ANTI-REPEAT CONTEXT", prompt)
@@ -435,7 +418,7 @@ class SemanticAutopostTests(unittest.TestCase):
         self.assertIn("duplicate", retry_prompt)
         self.assertIn(f"({initial_theme.key})", retry_prompt)
 
-    def test_two_rejections_are_not_persisted_without_publication(self):
+    def test_two_rejections_are_remembered_without_accepting_theme(self):
         history = [
             {
                 "semantic_theme": "work",
@@ -459,32 +442,45 @@ class SemanticAutopostTests(unittest.TestCase):
                 side_effect=[
                     rejected("first"),
                     rejected("second"),
+                    rejected("third"),
+                    rejected("fourth"),
+                    rejected("fifth"),
+                    rejected("sixth"),
                 ]
             ),
         ), patch.object(
             main.memory, "record_rejected_semantic_theme"
         ) as remember:
-            theme, result, brief = asyncio.run(
+            theme, result = asyncio.run(
                 main.generate_semantic_autopost_candidate(
                     user_id=1,
                     platform="vk",
                     rubric_name="Человеческая деталь",
                     seed="timer:failed",
-                    source_type="scheduled_rubric",
-                    scheduled_slot="test",
-                    context_reason="contract test",
-                    music_required=True,
-                    generate=AsyncMock(side_effect=["one", "two"]),
+                    generate=AsyncMock(
+                        side_effect=["one", "two", "three", "four", "five", "six"]
+                    ),
                 )
             )
         self.assertFalse(result.accepted)
-        self.assertEqual(result.attempts, 2)
-        remember.assert_not_called()
+        self.assertEqual(result.attempts, 6)
+        self.assertEqual(remember.call_count, 3)
+        self.assertEqual(
+            len(
+                {
+                    call.kwargs["semantic_theme"]
+                    for call in remember.call_args_list
+                }
+            ),
+            3,
+        )
         self.assertEqual(memory.get_recent_semantic_card_keys(1), [])
 
-    def test_release_never_changes_plan_after_two_semantic_rejections(self):
-        generate = AsyncMock(side_effect=["one", "two"])
-        decisions = AsyncMock(side_effect=[rejected("first"), rejected("second")])
+    def test_release_moves_to_next_plan_after_two_semantic_rejections(self):
+        generate = AsyncMock(side_effect=["one", "two", "three"])
+        decisions = AsyncMock(
+            side_effect=[rejected("first"), rejected("second"), accepted()]
+        )
         with patch.object(
             main.memory, "get_recent_semantic_theme_keys", return_value=["memory"]
         ), patch.object(
@@ -504,24 +500,26 @@ class SemanticAutopostTests(unittest.TestCase):
         ), patch.object(
             main.memory, "record_rejected_semantic_theme"
         ) as remember:
-            theme, result, brief = asyncio.run(
+            theme, result = asyncio.run(
                 main.generate_semantic_autopost_candidate(
                     user_id=1,
                     platform="vk",
                     rubric_name="Человеческая деталь",
                     seed="timer:recover",
-                    source_type="scheduled_rubric",
-                    scheduled_slot="test",
-                    context_reason="contract test",
-                    music_required=True,
                     generate=generate,
                 )
             )
 
-        self.assertFalse(result.accepted)
-        self.assertEqual(result.attempts, 2)
-        self.assertEqual(result.theme_key, theme.key)
-        remember.assert_not_called()
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.attempts, 3)
+        self.assertEqual(theme.key, "conflict")
+        self.assertEqual(result.card_key, "conflict_shared_resource")
+        remember.assert_called_once_with(
+            user_id=1,
+            platform="vk",
+            semantic_theme="care",
+            source_ref="timer:recover",
+        )
 
     def test_legacy_generated_post_without_semantic_theme_remains_readable(self):
         legacy_path = Path(self.directory.name) / "legacy.sqlite3"
@@ -721,7 +719,7 @@ class SemanticAutopostTests(unittest.TestCase):
         ), patch.object(
             main,
             "generate_semantic_autopost_candidate",
-            new=AsyncMock(return_value=(theme, result, None)),
+            new=AsyncMock(return_value=(theme, result)),
         ), patch.object(
             main.memory, "save_generated_post"
         ) as save_draft, patch.object(
@@ -755,7 +753,7 @@ class SemanticAutopostTests(unittest.TestCase):
         ), patch.object(
             main,
             "generate_semantic_autopost_candidate",
-            new=AsyncMock(return_value=(theme, result, None)),
+            new=AsyncMock(return_value=(theme, result)),
         ), patch.object(
             main, "send_post_with_images", new=AsyncMock()
         ) as publish, patch.object(
