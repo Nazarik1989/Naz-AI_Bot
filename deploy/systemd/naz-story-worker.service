@@ -1,0 +1,29 @@
+[Unit]
+Description=Naz Story-first private media worker (one transition)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=naz
+Group=naz
+WorkingDirectory=/opt/naz-ai-bot
+EnvironmentFile=/opt/naz-ai-bot/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/naz-ai-bot/.venv/bin/python -B -m naz_story_worker --once
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/var/lib/naz-ai-bot

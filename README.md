@@ -2,6 +2,10 @@
 
 AI content generation and publishing agent built with Python and OpenRouter.
 
+Private Story-first media generation is documented in
+[`docs/STORY_FIRST_RUNBOOK.md`](docs/STORY_FIRST_RUNBOOK.md). It is disabled by
+default and has no social autopublishing path.
+
 ## Overview
 
 NAZ AI is an AI-powered assistant designed to generate content, prompts and ideas for creators and communities.

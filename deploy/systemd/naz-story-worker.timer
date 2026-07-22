@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll the Naz Story-first private media queue
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+Persistent=false
+Unit=naz-story-worker.service
+
+[Install]
+WantedBy=timers.target

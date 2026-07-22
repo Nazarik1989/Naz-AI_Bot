@@ -3830,17 +3830,17 @@ async def process_agent_content_date(
     )
     if plan.production_mode == "story_first":
         pack_dir = await asyncio.to_thread(
-            story_first_dry_run,
+            queue_story_first_pack,
             plan,
             tuple(source_row.get("safe_facts", ())),
         )
         await notify_admin(
             bot,
-            f"📦 Agent Content {resolved_date}: Story-first dry-run подготовлен идемпотентно для plan_id {plan.plan_id}. Renderer unavailable; публичная публикация отключена.",
+            f"📦 Agent Content {resolved_date}: Story-first pack атомарно поставлен в очередь для plan_id {plan.plan_id}. Долгая генерация выполняется отдельным worker; публичная публикация отключена.",
         )
         mark_agent_content_seen(resolved_date, manifest_hash)
-        logger.info("STORY_FIRST dry-run ready | plan_id=%s | path=%s", plan.plan_id, pack_dir)
-        return f"✅ Agent Content {resolved_date}: Story-first dry-run ready; renderer unavailable."
+        logger.info("STORY_FIRST queued | plan_id=%s | path=%s", plan.plan_id, pack_dir)
+        return f"✅ Agent Content {resolved_date}: Story-first pack queued."
 
     try:
         package = await generate_scheduled_package(
@@ -5538,12 +5538,20 @@ async def generate_scheduled_package(
     raise ScheduledTechnicalFailure("generation_package_unavailable")
 
 
-def story_first_dry_run(
+def queue_story_first_pack(
     plan: editorial_orchestrator.EditorialPlan,
     safe_facts: tuple[str, ...],
 ) -> Path:
     pack = story_production.plan_story_pack(plan, safe_facts)
-    return story_production.persist_dry_run(pack, NAZ_STORY_PACK_ROOT)
+    return story_production.persist_story_queue(pack, NAZ_STORY_PACK_ROOT)
+
+
+def story_first_dry_run(
+    plan: editorial_orchestrator.EditorialPlan,
+    safe_facts: tuple[str, ...],
+) -> Path:
+    """Compatibility alias for callers introduced with the v1 planner."""
+    return queue_story_first_pack(plan, safe_facts)
 
 
 def chronicle_source_row(

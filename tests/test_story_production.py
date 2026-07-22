@@ -118,7 +118,26 @@ class StoryFirstTests(unittest.TestCase):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
         self.assertIsNone(pack.music_plan["selected_track"])
         self.assertTrue(pack.music_plan["allowlist_required"])
-        self.assertTrue(pack.music_plan["shared_last_8_required"])
+        self.assertFalse(pack.music_plan["consume_publication_rotation"])
+
+    def test_every_reel_cut_has_a_real_reframe(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        for edit in pack.reel_edits:
+            self.assertTrue(all(shot["crop_change_required"] for shot in edit.shots))
+            self.assertTrue(all(shot["reel_crop"] for shot in edit.shots))
+            self.assertTrue(all(str(shot["source"]).endswith("_clean.mp4") for shot in edit.shots))
+
+    def test_one_invalid_reel_fragment_rejects_the_entire_edit(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        edit = pack.reel_edits[0]
+        shots = [dict(shot) for shot in edit.shots]
+        shots[-1]["duration_seconds"] = 2.1
+        broken = dataclasses.replace(
+            pack,
+            reel_edits=(dataclasses.replace(edit, shots=tuple(shots)), pack.reel_edits[1]),
+        )
+        with self.assertRaises(story.StoryPlanError):
+            story.validate_story_pack(broken)
 
     def test_continuity_violation_is_a_qa_failure(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
