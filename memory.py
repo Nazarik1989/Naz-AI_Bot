@@ -162,22 +162,6 @@ def init_db() -> None:
 
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS vk_publication_receipts (
-                job_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                expert_mode TEXT NOT NULL,
-                task TEXT NOT NULL,
-                topic TEXT NOT NULL,
-                semantic_theme TEXT NOT NULL DEFAULT '',
-                semantic_card TEXT NOT NULL DEFAULT '',
-                image_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        conn.execute(
-            """
             CREATE TABLE IF NOT EXISTS character_states (
                 user_id INTEGER PRIMARY KEY,
                 character_id TEXT NOT NULL,
@@ -976,8 +960,7 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
     with db() as conn:
         semantic_rows = conn.execute(
             """
-            SELECT semantic_theme, semantic_card, central_thesis, content, content_hash,
-                   platform, created_at, id
+            SELECT semantic_theme, content, platform, created_at, id
             FROM autopost_semantic_history
             WHERE user_id = ? AND character_id = ? AND platform <> 'vk'
             ORDER BY id DESC
@@ -1005,13 +988,6 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
         combined.append(
             {
                 "semantic_theme": str(row["semantic_theme"] or ""),
-                "semantic_card": str(row["semantic_card"] or ""),
-                "central_thesis": str(row["central_thesis"] or ""),
-                "thesis_fingerprint": hashlib.sha256(
-                    " ".join(str(row["central_thesis"] or "").casefold().split()).encode("utf-8")
-                ).hexdigest()[:16] if str(row["central_thesis"] or "").strip() else "",
-                "content_fingerprint": str(row["content_hash"] or digest)[:16],
-                "record_id": f"semantic:{int(row['id'])}",
                 "content": content,
                 "platform": str(row["platform"] or ""),
                 "created_at": str(row["created_at"] or ""),
@@ -1026,11 +1002,6 @@ def get_recent_posts_for_semantic_gate(user_id: int, limit: int = 8) -> List[Dic
         combined.append(
             {
                 "semantic_theme": str(row["semantic_theme"] or ""),
-                "semantic_card": "",
-                "central_thesis": "",
-                "thesis_fingerprint": "",
-                "content_fingerprint": digest[:16],
-                "record_id": f"generated:{int(row['id'])}",
                 "content": content,
                 "platform": "vk" if "vk" in str(row["task"] or "").casefold() else "telegram",
                 "created_at": str(row["created_at"] or ""),
@@ -1534,83 +1505,6 @@ def get_unpublished_vk_jobs(user_id: int, limit: int = 100) -> List[Dict[str, An
             (user_id, max(1, limit)),
         ).fetchall()
     return [dict(row) for row in rows]
-
-
-def save_vk_publication_receipt(
-    *,
-    job_id: str,
-    user_id: int,
-    expert_mode: str,
-    task: str,
-    topic: str,
-    semantic_theme: str,
-    semantic_card: str,
-    image_count: int,
-) -> None:
-    """Remember queue identity without storing unpublished post text."""
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO vk_publication_receipts(
-                job_id, user_id, expert_mode, task, topic, semantic_theme,
-                semantic_card, image_count, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(job_id)[:120], user_id, expert_mode, task, topic[:1000],
-                str(semantic_theme)[:120], str(semantic_card)[:160],
-                int(image_count), utc_now(),
-            ),
-        )
-
-
-def get_vk_publication_receipts(user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
-    init_db()
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT job_id, expert_mode, task, topic, semantic_theme, semantic_card, image_count
-            FROM vk_publication_receipts
-            WHERE user_id = ?
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            (user_id, max(1, limit)),
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def consume_vk_publication_receipt(user_id: int, job_id: str, content: str) -> bool:
-    """Move one confirmed publication into memory atomically after consumer success."""
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT expert_mode, task, topic, semantic_theme, semantic_card, image_count
-            FROM vk_publication_receipts
-            WHERE user_id = ? AND job_id = ?
-            """,
-            (user_id, str(job_id)),
-        ).fetchone()
-        if row is None:
-            return False
-        conn.execute(
-            """
-            INSERT INTO generated_posts(
-                user_id, expert_mode, task, topic, content, image_count,
-                published_to_channel, semantic_theme, semantic_card, external_job_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-            """,
-            (
-                user_id, row["expert_mode"], row["task"], row["topic"],
-                str(content)[:12000], row["image_count"], row["semantic_theme"],
-                row["semantic_card"], str(job_id)[:120], utc_now(),
-            ),
-        )
-        conn.execute(
-            "DELETE FROM vk_publication_receipts WHERE user_id = ? AND job_id = ?",
-            (user_id, str(job_id)),
-        )
-    return True
 
 
 def mark_vk_generated_post_published(user_id: int, row_id: int) -> bool:
