@@ -65,9 +65,12 @@ import controller as naz_controller
 import character_state as naz_character
 import delegated_messaging
 import duo_relationship
+import editorial_orchestrator
 import gaming_vertical
+import naz_editorial_catalog
 import naz_vk_music
 import semantic_autopost
+import story_production
 import visual_archive
 import vk_publish_queue
 from prompts import (
@@ -200,6 +203,9 @@ AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
 AGENT_CONTENT_RANDOM_SYNC = env_bool("AGENT_CONTENT_RANDOM_SYNC", True)
 AGENT_CONTENT_REUSE_SEEN = env_bool("AGENT_CONTENT_REUSE_SEEN", True)
 AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_content_seen.json").strip())
+NAZ_STORY_PACK_ROOT = Path(
+    os.getenv("NAZ_STORY_PACK_ROOT", "/var/lib/naz-ai-bot/story-packs").strip()
+)
 CROSSPOST_EXCHANGE_ENABLED = env_bool("CROSSPOST_EXCHANGE_ENABLED", True)
 CROSSPOST_EXCHANGE_AUTO_PUBLISH = env_bool("CROSSPOST_EXCHANGE_AUTO_PUBLISH", True)
 CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
@@ -2498,6 +2504,7 @@ async def generate_images_for_post(
     count: int = 1,
     *,
     platform: str = "telegram",
+    editorial_visual_brief: str = "",
 ) -> Tuple[List[bytes], str]:
     count = max(1, min(int(count), 4))
     is_material = "material" in topic.casefold() or "матери" in topic.casefold()
@@ -2505,12 +2512,14 @@ async def generate_images_for_post(
         images: List[bytes] = []
         frame_prompts: List[str] = []
         for variant in range(1, count + 1):
-            frame_prompt = await build_image_prompt(
-                user_id,
-                topic,
-                post_text,
-                variant=variant,
-                platform=platform,
+            frame_prompt = (
+                f"{naz_visual_prompt_context(topic)}\n\n{editorial_visual_brief}\n\n"
+                f"MATERIAL frame {variant} of {count}; preserve the same subject and scene continuity. "
+                "No text except optional minimal MATERIAL / NAZ marking."
+                if editorial_visual_brief
+                else await build_image_prompt(
+                    user_id, topic, post_text, variant=variant, platform=platform,
+                )
             )
             frame_prompts.append(frame_prompt)
             image = await generate_image_bytes(frame_prompt, variant=variant)
@@ -2518,12 +2527,13 @@ async def generate_images_for_post(
                 images.append(image)
         return images, "\n---\n".join(frame_prompts)
 
-    image_prompt = await build_image_prompt(
-        user_id,
-        topic,
-        post_text,
-        variant=1,
-        platform=platform,
+    image_prompt = (
+        f"{naz_visual_prompt_context(topic)}\n\n{editorial_visual_brief}\n\n"
+        "Render the concrete planned scene only. No unrelated people, stock scene, text, logo, UI or watermark."
+        if editorial_visual_brief
+        else await build_image_prompt(
+            user_id, topic, post_text, variant=1, platform=platform,
+        )
     )
     images: List[bytes] = []
 
@@ -3319,54 +3329,41 @@ async def create_naz_vk_job(
                 user_id,
                 int(queued_draft["id"]),
             )
-    accepted_theme_keys = memory.get_recent_semantic_theme_keys(
-        user_id,
-        limit=semantic_autopost.THEME_COOLDOWN,
-    )
-    rubric = select_naz_vk_rubric(
-        rubric_kind,
-        excluded_theme_keys=accepted_theme_keys,
-    )
-    base_instruction = (
-        f"Рубрика VK: {rubric['name']}. {rubric['angle']}. {rubric['format']}. "
-        "Верни только готовый текст публикации; не выбирай группу и не добавляй служебные поля."
-    )
-    gaming_plan = None
-    if rubric_kind == "gaming":
-        gaming_plan = gaming_vertical.plan_gaming_content(
-            "naz",
-            topic,
-            memory.get_recent_content_signatures(user_id),
-            platform="vk",
-        )
-        base_instruction += "\n" + gaming_vertical.prompt_context("naz", gaming_plan)
-
-    async def generate(instruction: str) -> str:
-        return await generate_content(
-            user_id,
-            topic,
-            "post",
-            save_generated=False,
-            extra_instruction=f"{base_instruction}\n{instruction}",
-            platform="vk",
-            commit_state=False,
-            inherit_interactive_context=False,
-        )
-
-    theme, semantic_result = await generate_semantic_autopost_candidate(
+    rubric_rows = [dict(rubric) for rubric in NAZ_VK_RUBRICS if rubric.get("kind") == rubric_kind]
+    if not rubric_rows:
+        raise vk_publish_queue.QueueError(f"неизвестный тип VK-рубрики: {rubric_kind}")
+    for rubric in rubric_rows:
+        rubric["key"] = naz_editorial_catalog.rubric_key(str(rubric["name"]))
+    character = naz_character.apply_event(memory.load_character_state(user_id), "new_topic")
+    plan = scheduled_plan(
         user_id=user_id,
         platform="vk",
-        rubric_name=str(rubric["name"]),
+        slot=rubric_kind,
         seed=source_ref,
-        generate=generate,
+        rubric_rows=rubric_rows,
+        source_rows=(
+            {
+                "source_ref": source_ref,
+                "topic": topic,
+                "source_type": "scheduled_topic",
+            },
+        ),
+        character=character,
     )
-    if not semantic_result.accepted:
+    try:
+        package = await generate_scheduled_package(plan, character)
+    except ScheduledTechnicalFailure as exc:
         raise vk_publish_queue.QueueError(
-            "semantic quality gate отклонил все ограниченные планы; VK job не создан"
-        )
-    text = semantic_result.text
+            "model returned an invalid generation package twice; VK job was not created"
+        ) from exc
+    except ScheduledContentReject as exc:
+        raise vk_publish_queue.QueueError(
+            f"local quality gate rejected the planned release: {exc}"
+        ) from exc
+    text = package.final_text
+    rubric = next(item for item in rubric_rows if str(item["name"]) == plan.rubric)
     image_count = max(1, min(int(str(rubric.get("image_count") or "1")), 4))
-    image_topic = f"{rubric['name']}. {topic}" if image_count > 1 else topic
+    image_topic = f"{plan.rubric}. {plan.topic}" if image_count > 1 else plan.topic
     images, _ = await generate_images_with_retries(
         user_id,
         image_topic,
@@ -3374,6 +3371,7 @@ async def create_naz_vk_job(
         count=image_count,
         attempts=NAZ_VK_IMAGE_ATTEMPTS,
         platform="vk",
+        editorial_visual_brief=editorial_orchestrator.package_visual_brief(plan, package),
     )
     if not images and NAZ_VK_IMAGE_POLICY == "required":
         raise vk_publish_queue.QueueError(
@@ -3392,9 +3390,9 @@ async def create_naz_vk_job(
     now = datetime.now(ZoneInfo(NAZ_VK_TIMEZONE))
     job = naz_vk_music.enqueue_with_track_rotation(
         NAZ_VK_TRACK_STATE_FILE,
-        requested_tags=str(rubric["track_tags"]).split(","),
-        seed=source_ref,
-        post_topic=topic,
+        requested_tags=plan.track_tags,
+        seed=plan.plan_id,
+        post_topic=plan.topic,
         shared_history_file=NAZ_VK_QUEUE_DIR / "recent-tracks.json",
         enqueue_job=lambda track_query: vk_publish_queue.enqueue(
             NAZ_VK_QUEUE_DIR,
@@ -3406,22 +3404,25 @@ async def create_naz_vk_job(
             not_before=not_before,
             dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
             source_ref=source_ref,
+            plan_id=plan.plan_id,
+            editorial=safe_vk_editorial_metadata(plan),
         ),
     )
+    plan_dict = plan.to_dict()
     memory.save_generated_post(
         user_id=user_id,
         expert_mode=get_user_expert_mode(user_id),
-        task=f"naz_vk_queue:{rubric_kind}:{rubric['name']}",
-        topic=topic,
+        task=f"naz_vk_queue:{rubric_kind}:{plan.rubric}",
+        topic=plan.topic,
         content=text,
         image_count=len(media),
         published_to_channel=False,
-        semantic_theme=theme.key,
-        semantic_card=semantic_result.card_key,
+        semantic_theme=plan.semantic_theme,
+        semantic_card=plan.semantic_card,
         external_job_id=str(job["job_id"]),
+        plan_id=plan.plan_id,
+        editorial_plan=plan_dict,
     )
-    if gaming_plan:
-        memory.record_content_signature(user_id, gaming_plan, topic)
     return job
 
 
@@ -3508,7 +3509,6 @@ async def gaming_command(update: Update, context: ContextTypes.DEFAULT_TYPE, *, 
             "post",
             extra_instruction=gaming_vertical.prompt_context("naz", plan),
         )
-        memory.record_content_signature(update.effective_user.id, plan, topic)
         await reply_long(update, result, CONTENT_KEYBOARD)
         await update.message.reply_text(
             f"🎮 {plan['intent']} · {plan['format']} · {plan['commercial_angle']}\n"
@@ -3798,86 +3798,122 @@ async def process_agent_content_date(
     if not force and seen.get(date_text) == manifest_hash:
         return f"ℹ️ Agent Content {date_text}: manifest не изменился, пропускаю."
 
-    if publish:
-        latest: Dict[str, object] = {}
-        source_ref = f"agent_content:{date_text}:{manifest_hash}"
-
-        async def generate(instruction: str) -> str:
-            package, risks, resolved_date = await generate_agent_content_package(
-                user_id,
-                date_text,
-                "ежедневный импорт content-agent",
-                save_generated=False,
-                extra_instruction=instruction,
-            )
-            latest.update(package=package, risks=risks, resolved_date=resolved_date)
-            post_text = extract_telegram_post_from_package(package)
-            safety_text = extract_safety_note(package)
-            if risks or "НЕ ПУБЛИКОВАТЬ АВТОМАТИЧЕСКИ" in safety_text.upper() or not post_text:
-                return "⚠️ content-agent safety blocked this candidate"
-            return post_text
-
-        theme, semantic_result = await generate_semantic_autopost_candidate(
-            user_id=user_id,
-            platform="telegram",
-            rubric_name="content-agent",
-            seed=source_ref,
-            generate=generate,
+    safe_context, risks, resolved_date = collect_agent_materials(
+        date_text, "ежедневный импорт content-agent"
+    )
+    if not safe_context:
+        return f"⚠️ Agent Content: нет безопасных материалов за {date_text}."
+    source_ref = f"agent_content:{resolved_date}:{manifest_hash}"
+    character = naz_character.apply_event(memory.load_character_state(user_id), "new_topic")
+    source_row = chronicle_source_row(
+        source_ref=source_ref,
+        safe_context=safe_context,
+        risks=risks,
+        topic=f"рабочая хроника Naz {resolved_date}",
+    )
+    plan = scheduled_plan(
+        user_id=user_id,
+        platform="telegram",
+        slot="agent_content_sync",
+        seed=source_ref,
+        rubric_rows=(
+            {
+                "key": "agent_content",
+                "name": "Рабочая хроника Naz",
+                "kind": "work_chronicle",
+                "angle": "turn a verified work episode into one coherent release without exposing private material",
+                "track_tags": "daily,focus,builder,reflective",
+            },
+        ),
+        source_rows=(source_row,),
+        character=character,
+    )
+    if plan.production_mode == "story_first":
+        pack_dir = await asyncio.to_thread(
+            story_first_dry_run,
+            plan,
+            tuple(source_row.get("safe_facts", ())),
         )
-        resolved_date = str(latest.get("resolved_date") or date_text)
-        if not semantic_result.accepted:
-            await notify_admin(
-                bot,
-                f"⚠️ Agent Content {resolved_date}: semantic/safety gate отклонил все ограниченные планы; draft не сохранён.",
-            )
-            mark_agent_content_seen(resolved_date, manifest_hash)
-            return f"⚠️ Agent Content {resolved_date}: blocked before draft and publish."
+        await notify_admin(
+            bot,
+            f"📦 Agent Content {resolved_date}: Story-first dry-run подготовлен идемпотентно для plan_id {plan.plan_id}. Renderer unavailable; публичная публикация отключена.",
+        )
+        mark_agent_content_seen(resolved_date, manifest_hash)
+        logger.info("STORY_FIRST dry-run ready | plan_id=%s | path=%s", plan.plan_id, pack_dir)
+        return f"✅ Agent Content {resolved_date}: Story-first dry-run ready; renderer unavailable."
 
-        post_text = semantic_result.text
-        images, _ = await generate_images_with_retries(user_id, f"content-agent {resolved_date}", post_text, count=CHANNEL_IMAGE_COUNT)
-        if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            await notify_admin(bot, f"⚠️ Agent Content {resolved_date}: текст готов, но картинки не собрались. Публикацию пропустил.")
-            mark_agent_content_seen(resolved_date, manifest_hash)
-            return f"⚠️ Agent Content {resolved_date}: images failed."
+    try:
+        package = await generate_scheduled_package(
+            plan,
+            character,
+            source_material=safe_context,
+        )
+    except ScheduledTechnicalFailure:
+        await notify_admin(
+            bot,
+            f"⚠️ Agent Content {resolved_date}: модель дважды вернула технически непригодный пакет. Черновик и публичный DIAG не созданы.",
+        )
+        return f"⚠️ Agent Content {resolved_date}: technical generation failure."
+    except ScheduledContentReject as exc:
+        await notify_admin(
+            bot,
+            f"⚠️ Agent Content {resolved_date}: локальная quality-проверка отклонила пакет ({exc}). История не изменена.",
+        )
+        return f"⚠️ Agent Content {resolved_date}: local quality reject."
 
-        await send_post_with_images(bot, CHANNEL_ID, post_text, images)
+    plan_dict = plan.to_dict()
+    if not publish:
         memory.save_generated_post(
             user_id=user_id,
             expert_mode=get_user_expert_mode(user_id),
-            task="agent_content_auto_publish",
-            topic=f"content-agent {resolved_date}",
-            content=post_text,
-            image_count=len(images),
-            published_to_channel=True,
-            semantic_theme=theme.key,
-        )
-        queue_naz_post_for_void(post_text, source="agent_content_auto_publish", topic=f"content-agent {resolved_date}")
-        commit_accepted_autopost_state(
-            user_id=user_id,
-            topic=f"content-agent {resolved_date}",
             task="agent_content_editor",
-            platform="telegram",
-            source_ref=source_ref,
-            theme=theme,
-            result=semantic_result,
+            topic=plan.topic,
+            content=package.final_text,
+            image_count=0,
+            published_to_channel=False,
+            semantic_theme=plan.semantic_theme,
+            semantic_card=plan.semantic_card,
+            plan_id=plan.plan_id,
+            editorial_plan=plan_dict,
+        )
+        await notify_admin(
+            bot,
+            f"📥 Agent Content {resolved_date}: orchestrated draft готов для plan_id {plan.plan_id}.\n\n"
+            f"{package.final_text[:3200]}\n\nДля публикации: /publish_agent_content {resolved_date}",
         )
         mark_agent_content_seen(resolved_date, manifest_hash)
-        return f"✅ Agent Content {resolved_date}: imported and published."
+        return f"✅ Agent Content {resolved_date}: orchestrated draft imported."
 
-    package, risks, resolved_date = await generate_agent_content_package(
+    images, _ = await generate_images_with_retries(
         user_id,
-        date_text,
-        "ежедневный импорт content-agent",
-        save_generated=True,
+        f"{plan.rubric}. {plan.topic}",
+        package.final_text,
+        count=CHANNEL_IMAGE_COUNT,
+        editorial_visual_brief=editorial_orchestrator.package_visual_brief(plan, package),
     )
-    await notify_admin(
-        bot,
-        f"📥 Agent Content {resolved_date}: новый/изменённый пакет импортирован.\n\n"
-        f"{package[:3200]}\n\n"
-        f"Для публикации: /publish_agent_content {resolved_date}",
+    if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+        await notify_admin(bot, f"⚠️ Agent Content {resolved_date}: planned visual failed. Publication skipped; history unchanged.")
+        return f"⚠️ Agent Content {resolved_date}: images failed."
+    await send_post_with_images(bot, CHANNEL_ID, package.final_text, images)
+    memory.save_generated_post(
+        user_id=user_id,
+        expert_mode=get_user_expert_mode(user_id),
+        task="agent_content_auto_publish",
+        topic=plan.topic,
+        content=package.final_text,
+        image_count=len(images),
+        published_to_channel=True,
+        semantic_theme=plan.semantic_theme,
+        semantic_card=plan.semantic_card,
+        plan_id=plan.plan_id,
+        editorial_plan=plan_dict,
     )
+    memory.record_content_signature(user_id, plan_dict, plan.topic)
+    memory.save_character_state(user_id, character)
+    memory.apply_character_event(user_id, "publish")
+    queue_naz_post_for_void(package.final_text, source="agent_content_auto_publish", topic=plan.topic)
     mark_agent_content_seen(resolved_date, manifest_hash)
-    return f"✅ Agent Content {resolved_date}: imported draft."
+    return f"✅ Agent Content {resolved_date}: imported and published."
 
 
 async def sync_agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5385,6 +5421,168 @@ async def notify_autopost_skip_once(bot, reasons: List[str]) -> None:
     )
 
 
+class ScheduledTechnicalFailure(RuntimeError):
+    """The model failed the generation package contract twice."""
+
+
+class ScheduledContentReject(RuntimeError):
+    """A local non-diversity safety/quality check rejected generated content."""
+
+
+def scheduled_plan(
+    *,
+    user_id: int,
+    platform: str,
+    slot: str,
+    seed: str,
+    rubric_rows: Iterable[Dict[str, Any]],
+    source_rows: Iterable[Dict[str, Any]],
+    character: naz_character.CharacterState,
+    crosspost_plan_id: str = "",
+) -> editorial_orchestrator.EditorialPlan:
+    """The sole creative decision entrypoint for scheduled Naz routes."""
+    context = naz_editorial_catalog.build_context(
+        platform=platform,
+        slot=slot,
+        seed=seed,
+        rubric_rows=rubric_rows,
+        source_rows=source_rows,
+        published_history=memory.get_recent_content_signatures(user_id, limit=160),
+        character=character,
+        crosspost_plan_id=crosspost_plan_id,
+    )
+    return editorial_orchestrator.plan_release(context)
+
+
+def safe_vk_editorial_metadata(plan: editorial_orchestrator.EditorialPlan) -> Dict[str, Any]:
+    """Bounded non-private metadata carried by the shared VK queue."""
+    return {
+        "persona": plan.persona,
+        "platform": plan.platform,
+        "slot": plan.slot,
+        "rubric": plan.rubric,
+        "source_type": plan.source_type,
+        "purpose": plan.purpose,
+        "semantic_theme": plan.semantic_theme,
+        "semantic_card": plan.semantic_card,
+        "structure": plan.structure,
+        "visual_mode": plan.visual_mode,
+        "track_tags": list(plan.track_tags),
+        "orchestrator_version": plan.orchestrator_version,
+        "content_policy_version": plan.content_policy_version,
+        "visual_policy_version": plan.visual_policy_version,
+        "music_policy_version": plan.music_policy_version,
+    }
+
+
+def scheduled_package_quality_check(
+    plan: editorial_orchestrator.EditorialPlan,
+    package: editorial_orchestrator.GenerationPackage,
+) -> tuple[bool, str]:
+    text = package.final_text.strip()
+    if is_warning_response(text):
+        return False, "model_warning"
+    lowered = text.casefold()
+    if any(marker in lowered for marker in ("diag:", "traceback", "internal exception", "editorial plan", "plan_id")):
+        return False, "internal_metadata"
+    if plan.platform == "telegram" and not 450 <= len(text) <= 1800:
+        return False, "telegram_length"
+    if plan.platform == "vk" and not 450 <= len(text) <= 1900:
+        return False, "vk_length"
+    if package.visual_relation_to_thesis.casefold() in {"n/a", "none", "unrelated"}:
+        return False, "visual_relevance"
+    return True, "ok"
+
+
+async def generate_scheduled_package(
+    plan: editorial_orchestrator.EditorialPlan,
+    character: naz_character.CharacterState,
+    *,
+    source_material: str = "",
+) -> editorial_orchestrator.GenerationPackage:
+    """One generation call plus one schema-only retry with the immutable plan."""
+    technical_reason = ""
+    for attempt in range(2):
+        prompt = editorial_orchestrator.generation_prompt(
+            plan,
+            persona_direction=naz_editorial_catalog.persona_direction(character),
+            source_material=source_material,
+            technical_retry_reason=technical_reason,
+        )
+        raw = await call_gpt(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Execute the supplied Naz EditorialPlan exactly once. Return strict JSON only. "
+                        "Never reveal internal planning, private data, diagnostics or secrets."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1900,
+            temperature=0.65,
+            model=CONTENT_MODEL_NAME,
+        )
+        try:
+            package = editorial_orchestrator.parse_generation_package(raw, plan)
+        except editorial_orchestrator.GenerationPackageError as exc:
+            technical_reason = str(exc)
+            if attempt == 0:
+                continue
+            raise ScheduledTechnicalFailure("generation_package_invalid_twice") from exc
+        ok, reason = scheduled_package_quality_check(plan, package)
+        if not ok:
+            raise ScheduledContentReject(reason)
+        return package
+    raise ScheduledTechnicalFailure("generation_package_unavailable")
+
+
+def story_first_dry_run(
+    plan: editorial_orchestrator.EditorialPlan,
+    safe_facts: tuple[str, ...],
+) -> Path:
+    pack = story_production.plan_story_pack(plan, safe_facts)
+    return story_production.persist_dry_run(pack, NAZ_STORY_PACK_ROOT)
+
+
+def chronicle_source_row(
+    *,
+    source_ref: str,
+    safe_context: str,
+    risks: Iterable[str],
+    topic: str,
+) -> Dict[str, Any]:
+    """Extract objective evidence; plan_release owns the suitability decision."""
+    chunks = [
+        " ".join(item.split())[:420]
+        for item in re.split(r"(?<=[.!?])\s+|\n+", safe_context)
+        if len(" ".join(item.split())) >= 24
+        and "[REDACTED]" not in item
+        and not re.search(r"(?i)(token|api[_ -]?key|password|secret|private message)", item)
+    ]
+    facts = tuple(dict.fromkeys(chunks))[:7]
+    folded = safe_context.casefold()
+    action_stems = ("сделал", "добавил", "исправил", "запустил", "проверил", "изменил", "собрал", "failed", "fixed", "tested", "built")
+    process_stems = ("шаг", "сначала", "затем", "после", "до ", "лог", "тест", "сбор", "deploy", "build", "retry")
+    result_stems = ("результат", "стало", "получилось", "заработал", "исчез", "нашли", "вывод", "result", "worked", "changed")
+    causal_stems = ("потому", "поэтому", "из-за", "после", "привел", "привёл", "because", "therefore", "then")
+    risk_values = tuple(str(item).casefold() for item in risks)
+    return {
+        "source_ref": source_ref,
+        "topic": topic,
+        "source_type": "work_chronicle",
+        "safe_facts": facts,
+        "source_verified": bool(source_ref and facts),
+        "concrete_action": any(stem in folded for stem in action_stems),
+        "visualizable_process": any(stem in folded for stem in process_stems),
+        "causal_bits": min(7, sum(1 for item in facts if any(stem in item.casefold() for stem in (*action_stems, *causal_stems)))),
+        "real_result": any(stem in folded for stem in result_stems),
+        "contains_secrets": any("secret" in item or "token" in item or "credential" in item for item in risk_values),
+        "contains_private_data": any("private" in item or "personal" in item or "персон" in item for item in risk_values),
+    }
+
+
 async def generate_images_with_retries(
     user_id: int,
     topic: str,
@@ -5393,6 +5591,7 @@ async def generate_images_with_retries(
     count: int,
     attempts: int = AUTOPOST_IMAGE_ATTEMPTS,
     platform: str = "telegram",
+    editorial_visual_brief: str = "",
 ) -> Tuple[List[bytes], str]:
     last_prompt = ""
     for attempt in range(1, max(1, attempts) + 1):
@@ -5402,6 +5601,7 @@ async def generate_images_with_retries(
             post_text,
             count=count,
             platform=platform,
+            editorial_visual_brief=editorial_visual_brief,
         )
         last_prompt = image_prompt
         if images or not REQUIRE_IMAGES_FOR_CHANNEL_POSTS:
@@ -5544,108 +5744,88 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     slot = str(job_data.get("slot", "")) if isinstance(job_data, dict) else ""
     logger.info("NAZ_TELEGRAM_AUTO_LOOP started | slot=%s", slot or "manual")
 
-    visual_result = await try_visual_archive_autopost(context, admin_user_id, slot)
-    if visual_result is not None:
-        return
-
     failure_reasons: List[str] = []
     try:
-        rubric = select_naz_telegram_rubric(slot)
-        topics = select_autopost_topics(admin_user_id, rubric, limit=7)
-        use_story_insight = bool(read_naz_stories()) and random.random() < AUTOPOST_INSIGHT_CHANCE
-        rubric_task = str(rubric.get("task", "")).strip()
-        task = (
-            "insight"
-            if use_story_insight
-            else (rubric_task if rubric_task in get_autopost_tasks() else random.choice(get_autopost_tasks()))
-        )
-        profile = rubric.get("profile")
-        if not isinstance(profile, dict):
-            profile = random.choice(AUTOPOST_PROFILES)
-        direction = random.choice(AUTOPOST_EDITORIAL_DIRECTIONS)
-        topic = "инсайт из опыта запуска Naz_AI_Bot" if use_story_insight else topics[0]
         character = naz_character.apply_event(
             memory.load_character_state(admin_user_id),
             "new_topic",
         )
-        recent_signatures = memory.get_recent_content_signatures(admin_user_id, limit=16)
-        editorial_plan = naz_character.plan_content(
-            character,
-            recent_signatures,
-            topic=topic,
-            platform="telegram",
-        )
-        editorial_instruction = (
-            f"Рубрика Naz: {rubric['name']}.\n"
-            f"Слот расписания Naz Telegram: {slot or 'ручной запуск'}.\n"
-            + format_autopost_direction(direction)
-            + format_autopost_profile(profile)
-            + "\n"
-            + naz_character.prompt_context(character, editorial_plan)
-        )
-        source_ref = (
-            f"telegram:{current_bot_date()}:{slot or 'manual'}:"
-            f"{rubric['name']}:{topic}"
-        )
-
-        async def generate(instruction: str) -> str:
-            combined = f"{editorial_instruction}\n{instruction}"
-            if use_story_insight:
-                return await generate_story_insight(
-                    admin_user_id,
-                    topic,
-                    save_generated=False,
-                    extra_instruction=combined,
-                    commit_state=False,
-                    inherit_interactive_context=False,
+        eligible_rubrics = [
+            rubric
+            for rubric in NAZ_TELEGRAM_RUBRICS
+            if not slot or slot in [str(item) for item in rubric.get("slots", [])]
+        ] or list(NAZ_TELEGRAM_RUBRICS)
+        rubric_rows: List[Dict[str, Any]] = []
+        source_rows: List[Dict[str, Any]] = []
+        for rubric in eligible_rubrics:
+            row = dict(rubric)
+            key = naz_editorial_catalog.rubric_key(str(row["name"]))
+            row["key"] = key
+            profile = row.get("profile")
+            if isinstance(profile, dict):
+                row["angle"] = " | ".join(
+                    str(profile.get(item, "")) for item in ("angle", "format", "voice")
                 )
-            return await generate_content(
-                admin_user_id,
-                topic,
-                task,
-                save_generated=False,
-                extra_instruction=combined,
-                platform="telegram",
-                commit_state=False,
-                inherit_interactive_context=False,
-            )
-
-        logger.info(
-            "NAZ_TELEGRAM_AUTO_LOOP semantic generation | slot=%s | rubric=%s | task=%s | profile=%s | direction=%s",
-            slot or "manual",
-            rubric["name"],
-            task,
-            profile["name"],
-            direction["name"],
-        )
-        theme, semantic_result = await generate_semantic_autopost_candidate(
+            rubric_rows.append(row)
+            for index, topic_value in enumerate(row.get("topics", AUTOPOST_TOPICS)):
+                source_rows.append(
+                    {
+                        "source_ref": f"naz-topic:{key}:{index}",
+                        "topic": str(topic_value),
+                        "source_type": "catalog",
+                        "rubric_keys": (key,),
+                    }
+                )
+        seed = f"telegram:{current_bot_date()}:{slot or 'scheduled'}"
+        plan = scheduled_plan(
             user_id=admin_user_id,
             platform="telegram",
-            rubric_name=str(rubric["name"]),
-            seed=source_ref,
-            generate=generate,
+            slot=slot or "scheduled",
+            seed=seed,
+            rubric_rows=rubric_rows,
+            source_rows=source_rows,
+            character=character,
         )
-        if not semantic_result.accepted:
-            failure_reasons.append("semantic gate rejected both generations")
-            logger.warning("AUTOPOST semantic block after all bounded release plans")
+        logger.info(
+            "NAZ_TELEGRAM_AUTO_LOOP orchestrated generation | slot=%s | plan_id=%s | rubric=%s",
+            slot or "manual",
+            plan.plan_id,
+            plan.rubric,
+        )
+        try:
+            package = await generate_scheduled_package(plan, character)
+        except ScheduledTechnicalFailure:
+            failure_reasons.append("generation package remained technically invalid after one retry")
+            await notify_admin(
+                context.bot,
+                "⚠️ Naz не выпустил scheduled-пост: модель дважды вернула технически непригодный пакет. План сохранён неизменным; публичный DIAG не создан.",
+            )
+            return
+        except ScheduledContentReject as exc:
+            failure_reasons.append(f"local quality reject: {exc}")
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
 
-        post_text = semantic_result.text
+        post_text = package.final_text
+        visual_brief = editorial_orchestrator.package_visual_brief(plan, package)
+        selected_rubric = next(row for row in rubric_rows if str(row["name"]) == plan.rubric)
+        image_count = max(1, min(int(str(selected_rubric.get("image_count") or CHANNEL_IMAGE_COUNT)), 4))
         images, image_prompt = await generate_images_with_retries(
             admin_user_id,
-            f"{topic}. Visual direction: {editorial_plan['media']}",
+            f"{plan.rubric}. {plan.topic}",
             post_text,
-            count=CHANNEL_IMAGE_COUNT,
+            count=image_count,
+            editorial_visual_brief=visual_brief,
         )
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
-            failure_reasons.append(f"images required but not generated for topic: {topic}")
+            failure_reasons.append("images required but not generated for the planned subject")
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
 
         await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
-        saved_topic = f"{topic} | {rubric['name']} | {profile['name']}"
-        saved_task = f"naz_telegram_autopost:{task}:{rubric['name']}:{profile['name']}"
+        plan_dict = plan.to_dict()
+        saved_topic = f"{plan.topic} | {plan.rubric}"
+        saved_task = f"naz_telegram_autopost:{plan.mode}:{plan.rubric}"
         memory.save_generated_post(
             user_id=admin_user_id,
             expert_mode=get_user_expert_mode(admin_user_id),
@@ -5654,29 +5834,23 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             content=post_text,
             image_count=len(images),
             published_to_channel=True,
-            semantic_theme=theme.key,
+            semantic_theme=plan.semantic_theme,
+            semantic_card=plan.semantic_card,
+            plan_id=plan.plan_id,
+            editorial_plan=plan_dict,
         )
         queue_naz_post_for_void(
             post_text,
             source=saved_task,
             topic=saved_topic,
         )
-        memory.record_content_signature(admin_user_id, editorial_plan, topic)
-        commit_accepted_autopost_state(
-            user_id=admin_user_id,
-            topic=topic,
-            task=task,
-            platform="telegram",
-            source_ref=source_ref,
-            theme=theme,
-            result=semantic_result,
-        )
+        memory.record_content_signature(admin_user_id, plan_dict, plan.topic)
         memory.save_character_state(admin_user_id, character)
         memory.apply_character_event(admin_user_id, "publish")
         logger.info(
-            "AUTOPOST done | attempts=%s | theme=%s | images=%s | prompt=%s",
-            semantic_result.attempts,
-            theme.key,
+            "AUTOPOST done | plan_id=%s | theme=%s | images=%s | prompt=%s",
+            plan.plan_id,
+            plan.semantic_theme,
             len(images),
             image_prompt,
         )
@@ -5705,38 +5879,74 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("SOURCE_MONITOR skipped: no fresh candidates")
             return
 
-        item = candidates[0]
-        rubric_name = str(item.get("rubric") or "source_monitor")
-        source_ref = f"source_monitor:{source_item_key(item)}"
-
-        async def generate(instruction: str) -> str:
-            return await generate_source_interpretation(
-                admin_user_id,
-                item,
-                save_generated=False,
-                extra_instruction=instruction,
+        character = naz_character.apply_event(
+            memory.load_character_state(admin_user_id), "new_topic"
+        )
+        rubric_names = list(
+            dict.fromkeys(str(item.get("rubric") or "Source Monitor") for item in candidates[:12])
+        )
+        rubric_rows = [
+            {
+                "key": naz_editorial_catalog.rubric_key(name),
+                "name": name,
+                "kind": "source_monitor",
+                "angle": "interpret one verified source without inventing facts or merely summarizing it",
+                "track_tags": "daily,focus,reflective",
+            }
+            for name in rubric_names
+        ]
+        source_rows = []
+        source_by_ref: Dict[str, Dict[str, Any]] = {}
+        for item in candidates[:12]:
+            ref = f"source_monitor:{source_item_key(item)}"
+            rubric_key = naz_editorial_catalog.rubric_key(str(item.get("rubric") or "Source Monitor"))
+            source_rows.append(
+                {
+                    "source_ref": ref,
+                    "topic": str(item.get("title") or "Fresh monitored source"),
+                    "source_type": "documented_source",
+                    "rubric_keys": (rubric_key,),
+                    "source_verified": bool(str(item.get("url") or "").startswith("http")),
+                }
             )
-
-        theme, semantic_result = await generate_semantic_autopost_candidate(
+            source_by_ref[ref] = item
+        plan = scheduled_plan(
             user_id=admin_user_id,
             platform="telegram",
-            rubric_name=rubric_name,
-            seed=source_ref,
-            generate=generate,
+            slot="source_monitor",
+            seed=f"source_monitor:{current_bot_date()}",
+            rubric_rows=rubric_rows,
+            source_rows=source_rows,
+            character=character,
         )
-        if not semantic_result.accepted:
-            failure_reasons.append("semantic gate rejected both source generations")
+        item = source_by_ref[plan.source_ref]
+        source_material = (
+            f"Title: {item.get('title', '')}\n"
+            f"Summary: {item.get('summary', '')}\n"
+            f"Source: {item.get('source_name', '')}\n"
+            f"URL: {item.get('url', '')}"
+        )
+        try:
+            package = await generate_scheduled_package(
+                plan, character, source_material=source_material
+            )
+        except ScheduledTechnicalFailure:
             await notify_admin(
                 context.bot,
-                "⚠️ Мониторинг источников пропустил слот: semantic gate отклонил все ограниченные планы.",
+                "⚠️ Мониторинг источников Naz не выпустил пост: модель дважды вернула технически непригодный пакет. Публичный DIAG не создан.",
             )
             return
-        post_text = semantic_result.text
+        except ScheduledContentReject as exc:
+            failure_reasons.append(f"local quality reject: {exc}")
+            await notify_autopost_skip_once(context.bot, failure_reasons)
+            return
+        post_text = package.final_text
         images, image_prompt = await generate_images_with_retries(
             admin_user_id,
-            item.get("title", ""),
+            f"{plan.rubric}. {plan.topic}",
             post_text,
             count=CHANNEL_IMAGE_COUNT,
+            editorial_visual_brief=editorial_orchestrator.package_visual_brief(plan, package),
         )
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
             reason = f"source image failed: {item.get('title', '')}"
@@ -5745,8 +5955,9 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
         mark_source_seen(item)
-        saved_task = f"source_monitor:{rubric_name}"
-        saved_topic = str(item.get("title", ""))
+        saved_task = f"source_monitor:{plan.rubric}"
+        saved_topic = plan.topic
+        plan_dict = plan.to_dict()
         memory.save_generated_post(
             user_id=admin_user_id,
             expert_mode=get_user_expert_mode(admin_user_id),
@@ -5755,23 +5966,19 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             content=post_text,
             image_count=len(images),
             published_to_channel=True,
-            semantic_theme=theme.key,
+            semantic_theme=plan.semantic_theme,
+            semantic_card=plan.semantic_card,
+            plan_id=plan.plan_id,
+            editorial_plan=plan_dict,
         )
         queue_naz_post_for_void(post_text, source=saved_task, topic=saved_topic)
-        commit_accepted_autopost_state(
-            user_id=admin_user_id,
-            topic=saved_topic,
-            task="source_interpretation",
-            platform="telegram",
-            source_ref=source_ref,
-            theme=theme,
-            result=semantic_result,
-        )
+        memory.record_content_signature(admin_user_id, plan_dict, saved_topic)
+        memory.save_character_state(admin_user_id, character)
+        memory.apply_character_event(admin_user_id, "publish")
         logger.info(
-            "SOURCE_MONITOR done | %s | theme=%s | attempts=%s | images=%s | prompt=%s",
-            item.get("title", ""),
-            theme.key,
-            semantic_result.attempts,
+            "SOURCE_MONITOR done | plan_id=%s | theme=%s | images=%s | prompt=%s",
+            plan.plan_id,
+            plan.semantic_theme,
             len(images),
             image_prompt,
         )
