@@ -149,7 +149,21 @@ def build_context(
     published_history: Iterable[Mapping[str, Any]],
     character: character_state.CharacterState,
     crosspost_plan_id: str = "",
+    persona_rubric_rows: Iterable[Mapping[str, Any]] | None = None,
+    persona_source_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> EditorialContext:
+    rubric_rows = tuple(rubric_rows)
+    source_rows = tuple(source_rows)
+    complete_rubric_rows = (
+        tuple(persona_rubric_rows)
+        if persona_rubric_rows is not None
+        else rubric_rows
+    )
+    complete_source_rows = (
+        tuple(persona_source_rows)
+        if persona_source_rows is not None
+        else source_rows
+    )
     rubrics: list[EditorialRubric] = []
     for row in rubric_rows:
         name = str(row.get("name") or "Naz release")
@@ -201,6 +215,28 @@ def build_context(
     )
     preferred_energy = "driven" if character.energy >= 72 else "measured"
     preferred_humor = "dry" if character.facet in {"tech_hooligan", "showman"} else "self-directed"
+    persona_pool_sizes = {
+        axis: len(dict.fromkeys(str(value) for value in values if str(value)))
+        for axis, values in BASE_POOLS.items()
+    }
+    persona_pool_sizes.update(
+        {
+            "rubric": len(
+                dict.fromkeys(
+                    str(row.get("name") or "Naz release")
+                    for row in (complete_rubric_rows or rubric_rows)
+                )
+            ),
+            "source_ref": len(
+                dict.fromkeys(
+                    str(row.get("source_ref") or f"catalog:{index}")
+                    for index, row in enumerate(complete_source_rows or source_rows)
+                )
+            ),
+            "content_format": 2,
+            "production_mode": 2,
+        }
+    )
     return EditorialContext(
         persona="naz",
         platform=platform,
@@ -209,6 +245,7 @@ def build_context(
         sources=sources,
         rubrics=tuple(rubrics),
         pools=BASE_POOLS,
+        persona_pool_sizes=persona_pool_sizes,
         semantic_cards=SEMANTIC_CARDS,
         published_history=tuple(published_history),
         preferred={
