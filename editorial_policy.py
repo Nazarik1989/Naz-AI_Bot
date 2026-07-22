@@ -65,10 +65,6 @@ REASON_CODES = frozenset(
         "text_invented_current_event",
         "text_topic_drift",
         "text_persona_mismatch",
-        "text_semantic_repetition",
-        "brief_axis_recently_occupied",
-        "brief_thesis_near_duplicate",
-        "brief_novelty_exhausted",
         "image_subject_mismatch",
         "image_thesis_mismatch",
         "image_unexplained_people",
@@ -125,10 +121,6 @@ NON_RETRYABLE_GATE_REASON_CODES = frozenset(
         "schema_invalid_field_types",
         "schema_unknown_reason_code",
         "schema_conflicting_fields",
-        "text_semantic_repetition",
-        "brief_axis_recently_occupied",
-        "brief_thesis_near_duplicate",
-        "brief_novelty_exhausted",
     }
 )
 
@@ -208,7 +200,6 @@ class ContentBrief:
     forbidden_elements: tuple[str, ...]
     visual_code_version: str
     music_required: bool
-    exclusion_fingerprints: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -353,7 +344,6 @@ def build_brief(
     required_elements: Iterable[str] = (),
     forbidden_elements: Iterable[str] = (),
     music_required: bool = False,
-    exclusion_fingerprints: Iterable[str] = (),
 ) -> ContentBrief:
     merged_forbidden = tuple(
         dict.fromkeys((*DEFAULT_FORBIDDEN_VISUAL_ELEMENTS, *tuple(forbidden_elements)))
@@ -378,13 +368,6 @@ def build_brief(
         forbidden_elements=merged_forbidden,
         visual_code_version=VISUAL_CODE_VERSION,
         music_required=bool(music_required),
-        exclusion_fingerprints=tuple(
-            dict.fromkeys(
-                str(item).strip()
-                for item in exclusion_fingerprints
-                if str(item).strip()
-            )
-        ),
     )
     return validate_brief(brief, allowed_rubrics=allowed_rubrics)
 

@@ -1136,60 +1136,14 @@ async def generate_semantic_autopost_candidate(
     history_context = semantic_autopost.generation_history_context(recent_posts)
     exclusion_context = semantic_autopost.history_profile_context(history_profile)
 
-    try:
-        brief_plan = semantic_autopost.select_novel_brief_plan(
-            rubric_name=rubric_name,
-            recent_theme_keys=recent_themes,
-            recent_card_keys=recent_cards,
-            platform=platform,
-            seed=seed,
-            history_profile=history_profile,
-            recent_posts=recent_posts,
-        )
-    except semantic_autopost.NoNovelBriefAvailable as exc:
-        for attempt, decision in enumerate(exc.decisions, start=1):
-            logger.info(
-                "EDITORIAL_BRIEF_NOVELTY attempt=%s accepted=false reason_code=%s "
-                "theme=%s card=%s thesis_fingerprint=%s similarity_score=%.4f "
-                "similarity_threshold=%.4f matched_record_id=%s history_fingerprint=%s",
-                attempt,
-                decision.reason_code,
-                decision.theme_key,
-                decision.card_key,
-                decision.thesis_fingerprint,
-                decision.similarity_score,
-                decision.similarity_threshold,
-                decision.matched_record_id or "none",
-                history_profile.history_digest[:16],
-            )
-        logger.warning(
-            "EDITORIAL_BRIEF_NOVELTY accepted=false reason_code=%s attempts=%s "
-            "history_fingerprint=%s",
-            exc.reason_code,
-            len(exc.decisions),
-            history_profile.history_digest[:16],
-        )
-        raise
-    for attempt, decision in enumerate(brief_plan.decisions, start=1):
-        logger.info(
-            "EDITORIAL_BRIEF_NOVELTY attempt=%s accepted=%s reason_code=%s "
-            "theme=%s card=%s thesis_fingerprint=%s similarity_score=%.4f "
-            "similarity_threshold=%.4f matched_record_id=%s history_fingerprint=%s "
-            "exclusion_fingerprints=%s",
-            attempt,
-            str(decision.accepted).lower(),
-            decision.reason_code,
-            decision.theme_key,
-            decision.card_key,
-            decision.thesis_fingerprint,
-            decision.similarity_score,
-            decision.similarity_threshold,
-            decision.matched_record_id or "none",
-            history_profile.history_digest[:16],
-            ",".join(brief_plan.exclusion_fingerprints) or "none",
-        )
-    theme = brief_plan.theme
-    card = brief_plan.card
+    theme = semantic_autopost.select_theme(
+        rubric_name,
+        recent_themes,
+        platform=platform,
+        seed=seed,
+        excluded_theme_keys=(),
+    )
+    card = semantic_autopost.select_card(theme.key, recent_cards)
     allowed_rubrics = {
         str(item["name"])
         for item in (*NAZ_TELEGRAM_RUBRICS, *NAZ_VK_RUBRICS)
@@ -1216,7 +1170,6 @@ async def generate_semantic_autopost_candidate(
         required_elements=(card.scene,),
         forbidden_elements=(card.conclusion_boundary,),
         music_required=music_required,
-        exclusion_fingerprints=brief_plan.exclusion_fingerprints,
     )
     logger.info(
         "EDITORIAL_BRIEF metadata=%s",
@@ -1240,17 +1193,7 @@ async def generate_semantic_autopost_candidate(
         relevance = await evaluate_editorial_text_candidate(brief, candidate)
         if not relevance.accepted:
             return semantic_autopost.blocked_decision(relevance.reason_code)
-        semantic_decision = await evaluate_autopost_candidate(candidate, recent_posts)
-        if semantic_decision.accepted:
-            return semantic_decision
-        return semantic_autopost.SemanticDecision(
-            False,
-            "text_semantic_repetition",
-            semantic_decision.central_thesis,
-            semantic_decision.conclusion,
-            semantic_decision.narrative_shape,
-            semantic_decision.key_meanings,
-        )
+        return await evaluate_autopost_candidate(candidate, recent_posts)
 
     async def generate_with_history(instruction: str) -> str:
         if exclusion_context:
@@ -5733,8 +5676,7 @@ def autopost_reason_summary(reason_code: str) -> str:
         "text_invented_current_event": "Текст приписывает актуальность неподтверждённому событию после двух ограниченных попыток.",
         "text_topic_drift": "Текст ушёл от утверждённой темы после двух ограниченных попыток.",
         "text_persona_mismatch": "Текст не соответствует голосу Naz после двух ограниченных попыток.",
-        "text_semantic_repetition": "Принятый смысловой план повторил недавний смысл; перефразирование не запускалось, слот пропущен.",
-        "brief_novelty_exhausted": "Все ограниченные варианты смыслового плана повторили недавние смыслы; слот пропущен до генерации текста и изображения.",
+        "text_semantic_repetition": "Обе ограниченные попытки повторили недавний смысл; слот пропущен.",
     }
     return summaries.get(
         reason_code,
@@ -6016,22 +5958,17 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             profile["name"],
             direction["name"],
         )
-        try:
-            theme, semantic_result, brief = await generate_semantic_autopost_candidate(
-                user_id=admin_user_id,
-                platform="telegram",
-                rubric_name=str(rubric["name"]),
-                seed=source_ref,
-                source_type="scheduled_rubric",
-                scheduled_slot=slot or "manual",
-                context_reason="The configured Telegram schedule selected this rubric and its approved topic pool.",
-                music_required=False,
-                generate=generate,
-            )
-        except semantic_autopost.NoNovelBriefAvailable:
-            failure_reasons.append(autopost_reason_summary("brief_novelty_exhausted"))
-            await notify_autopost_skip_once(context.bot, failure_reasons)
-            return
+        theme, semantic_result, brief = await generate_semantic_autopost_candidate(
+            user_id=admin_user_id,
+            platform="telegram",
+            rubric_name=str(rubric["name"]),
+            seed=source_ref,
+            source_type="scheduled_rubric",
+            scheduled_slot=slot or "manual",
+            context_reason="The configured Telegram schedule selected this rubric and its approved topic pool.",
+            music_required=False,
+            generate=generate,
+        )
         if not semantic_result.accepted:
             reason_code = (
                 semantic_result.decision.reason
