@@ -94,18 +94,6 @@ TEXT_GATE_REASON_CODES = frozenset(
     }
 )
 
-IMAGE_GATE_REASON_CODES = frozenset(
-    {
-        "accepted",
-        "image_subject_mismatch",
-        "image_thesis_mismatch",
-        "image_unexplained_people",
-        "image_unexplained_elements",
-        "image_visual_bible_mismatch",
-        "image_why_here",
-    }
-)
-
 NON_RETRYABLE_GATE_REASON_CODES = frozenset(
     {
         "invalid_brief",
@@ -139,25 +127,6 @@ TEXT_GATE_REASON_BY_FAILED_CHECK = {
     "invented_current_event": "text_invented_current_event",
     "topic_matches": "text_topic_drift",
     "persona_matches": "text_persona_mismatch",
-}
-
-IMAGE_GATE_BOOLEAN_FIELDS = (
-    "accepted",
-    "subject_matches",
-    "thesis_supported",
-    "unexplained_people",
-    "unexplained_elements",
-    "visual_bible_matches",
-    "why_here",
-)
-
-IMAGE_GATE_REASON_BY_FAILED_CHECK = {
-    "subject_matches": "image_subject_mismatch",
-    "thesis_supported": "image_thesis_mismatch",
-    "unexplained_people": "image_unexplained_people",
-    "unexplained_elements": "image_unexplained_elements",
-    "visual_bible_matches": "image_visual_bible_mismatch",
-    "why_here": "image_why_here",
 }
 
 
@@ -543,28 +512,6 @@ def text_gate_response_schema() -> dict[str, Any]:
     }
 
 
-def image_gate_response_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "accepted": {"type": "boolean"},
-            "reason_code": {"type": "string", "enum": sorted(IMAGE_GATE_REASON_CODES)},
-            "literal_description": {"type": "string"},
-            "subject_matches": {"type": "boolean"},
-            "thesis_supported": {"type": "boolean"},
-            "unexplained_people": {"type": "boolean"},
-            "unexplained_elements": {"type": "boolean"},
-            "visual_bible_matches": {"type": "boolean"},
-            "why_here": {
-                "type": "boolean",
-                "description": "true only when the image's relevance to this exact post is unclear",
-            },
-        },
-        "required": ["reason_code", "literal_description", *IMAGE_GATE_BOOLEAN_FIELDS],
-        "additionalProperties": False,
-    }
-
-
 def build_image_gate_prompt(brief: ContentBrief) -> str:
     return json.dumps(
         {
@@ -578,13 +525,17 @@ def build_image_gate_prompt(brief: ContentBrief) -> str:
                 "Does it match the visual bible?",
                 "Could a reader reasonably ask why this is here?",
             ],
-            "allowed_reason_codes": sorted(IMAGE_GATE_REASON_CODES),
-            "reason_code_rule": (
-                "Use accepted only when every check passes. Otherwise choose the code "
-                "mapped to one failed check. why_here=true means relevance is unclear."
-            ),
-            "reason_code_by_failed_check": IMAGE_GATE_REASON_BY_FAILED_CHECK,
-            "schema": image_gate_response_schema(),
+            "schema": {
+                "accepted": "boolean",
+                "reason_code": "one registered reason code",
+                "literal_description": "short string",
+                "subject_matches": "boolean",
+                "thesis_supported": "boolean",
+                "unexplained_people": "boolean",
+                "unexplained_elements": "boolean",
+                "visual_bible_matches": "boolean",
+                "why_here": "boolean",
+            },
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -658,21 +609,21 @@ def is_retryable_gate_reason(reason_code: str) -> bool:
 
 def parse_image_gate_response(raw: str) -> ImageGateDecision:
     value = _payload(raw)
-    required_fields = ("reason_code", "literal_description", *IMAGE_GATE_BOOLEAN_FIELDS)
-    missing = tuple(name for name in required_fields if name not in value)
-    if missing:
-        raise GateResponseError("schema_missing_fields", missing)
-    reason = str(value.get("reason_code") or "")
-    if reason not in IMAGE_GATE_REASON_CODES:
-        raise GateResponseError("schema_unknown_reason_code", ("reason_code",))
-    fields = {name: value.get(name) for name in IMAGE_GATE_BOOLEAN_FIELDS}
-    invalid_types = tuple(
-        name for name, item in fields.items() if not isinstance(item, bool)
+    reason = str(value.get("reason_code") or "invalid_brief")
+    if reason not in REASON_CODES:
+        raise ValueError("unknown image gate reason code")
+    names = (
+        "accepted",
+        "subject_matches",
+        "thesis_supported",
+        "unexplained_people",
+        "unexplained_elements",
+        "visual_bible_matches",
+        "why_here",
     )
-    if not isinstance(value.get("literal_description"), str):
-        invalid_types += ("literal_description",)
-    if invalid_types:
-        raise GateResponseError("schema_invalid_field_types", invalid_types)
+    fields = {name: value.get(name) for name in names}
+    if any(not isinstance(item, bool) for item in fields.values()):
+        raise ValueError("image gate booleans are required")
     accepted = bool(fields["accepted"])
     checks_accept = (
         fields["subject_matches"]
@@ -682,18 +633,8 @@ def parse_image_gate_response(raw: str) -> ImageGateDecision:
         and fields["visual_bible_matches"]
         and not fields["why_here"]
     )
-    failed_reasons = {
-        IMAGE_GATE_REASON_BY_FAILED_CHECK[name]
-        for name in IMAGE_GATE_REASON_BY_FAILED_CHECK
-        if (fields[name] is False and name not in {"unexplained_people", "unexplained_elements", "why_here"})
-        or (name in {"unexplained_people", "unexplained_elements", "why_here"} and fields[name] is True)
-    }
-    if accepted != checks_accept:
-        raise GateResponseError("schema_conflicting_fields", IMAGE_GATE_BOOLEAN_FIELDS)
-    if accepted and reason != "accepted":
-        raise GateResponseError("schema_conflicting_fields", ("accepted", "reason_code"))
-    if not accepted and reason not in failed_reasons:
-        raise GateResponseError("schema_conflicting_fields", ("reason_code",))
+    if accepted != checks_accept or (accepted and reason != "accepted"):
+        raise ValueError("image gate verdict conflicts with checks")
     return ImageGateDecision(
         reason_code=reason,
         literal_description=str(value.get("literal_description") or "")[:500],

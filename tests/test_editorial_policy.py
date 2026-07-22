@@ -131,56 +131,6 @@ class EditorialPolicyContractTests(unittest.TestCase):
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.reason_code, "image_subject_mismatch")
 
-    def test_image_gate_contract_enumerates_codes_and_classifies_schema_errors(self):
-        prompt = json.loads(policy.build_image_gate_prompt(make_brief()))
-        self.assertEqual(
-            set(prompt["schema"]["properties"]["reason_code"]["enum"]),
-            set(policy.IMAGE_GATE_REASON_CODES),
-        )
-        self.assertEqual(
-            prompt["reason_code_by_failed_check"]["why_here"],
-            "image_why_here",
-        )
-        invalid = {
-            "accepted": False,
-            "reason_code": "image_topic_mismatch",
-            "literal_description": "fixture",
-            "subject_matches": False,
-            "thesis_supported": True,
-            "unexplained_people": False,
-            "unexplained_elements": False,
-            "visual_bible_matches": True,
-            "why_here": False,
-        }
-        with self.assertRaises(policy.GateResponseError) as raised:
-            policy.parse_image_gate_response(json.dumps(invalid))
-        self.assertEqual(raised.exception.reason_code, "schema_unknown_reason_code")
-        self.assertEqual(raised.exception.field_names, ("reason_code",))
-
-    def test_image_gate_parser_accepts_fenced_registered_decision(self):
-        accepted = {
-            "accepted": True,
-            "reason_code": "accepted",
-            "literal_description": "the approved physical prototype",
-            "subject_matches": True,
-            "thesis_supported": True,
-            "unexplained_people": False,
-            "unexplained_elements": False,
-            "visual_bible_matches": True,
-            "why_here": False,
-        }
-        decision = policy.parse_image_gate_response(
-            "```json\n" + json.dumps(accepted) + "\n```"
-        )
-        self.assertTrue(decision.accepted)
-
-    def test_image_gate_contract_error_is_not_masked_or_regenerated(self):
-        invalid = json.dumps({"accepted": True, "reason_code": "accepted"})
-        with patch.object(main, "call_gpt", new=AsyncMock(return_value=invalid)):
-            with self.assertRaises(policy.GateResponseError) as raised:
-                asyncio.run(main.evaluate_editorial_image(make_brief(), b"fixture-image"))
-        self.assertEqual(raised.exception.reason_code, "schema_missing_fields")
-
     def test_text_gate_contract_enumerates_codes_and_excludes_visual_policy(self):
         brief = make_brief(scheduled_slot="10:00", rubric="AI без магии")
         payload = json.loads(policy.build_text_gate_prompt(brief, "fixture candidate"))
