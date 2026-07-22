@@ -706,9 +706,7 @@ class SemanticAutopostTests(unittest.TestCase):
             )
         )
 
-    def test_two_rejections_create_no_vk_draft_or_queue_job(self):
-        theme = semantic.THEMES_BY_KEY["work"]
-        result = semantic.GenerationResult(False, "", 2, rejected("duplicate twice"))
+    def test_local_quality_rejection_creates_no_vk_draft_or_queue_job(self):
         root = Path(self.directory.name) / "queue"
         (root / "pending").mkdir(parents=True)
         with patch.multiple(
@@ -718,8 +716,8 @@ class SemanticAutopostTests(unittest.TestCase):
             NAZ_VK_QUEUE_DIR=root,
         ), patch.object(
             main,
-            "generate_semantic_autopost_candidate",
-            new=AsyncMock(return_value=(theme, result)),
+            "generate_scheduled_package",
+            new=AsyncMock(side_effect=main.ScheduledContentReject("local_quality")),
         ), patch.object(
             main.memory, "save_generated_post"
         ) as save_draft, patch.object(
@@ -734,9 +732,7 @@ class SemanticAutopostTests(unittest.TestCase):
         enqueue.assert_not_called()
         self.assertEqual(list((root / "pending").iterdir()), [])
 
-    def test_two_rejections_do_not_publish_telegram_or_save_draft(self):
-        theme = semantic.THEMES_BY_KEY["work"]
-        result = semantic.GenerationResult(False, "", 2, rejected("duplicate twice"))
+    def test_local_quality_rejection_does_not_publish_telegram_or_save_draft(self):
         context = SimpleNamespace(
             job=SimpleNamespace(data={"slot": "10:00"}),
             bot=SimpleNamespace(),
@@ -752,8 +748,8 @@ class SemanticAutopostTests(unittest.TestCase):
             main, "read_naz_stories", return_value=""
         ), patch.object(
             main,
-            "generate_semantic_autopost_candidate",
-            new=AsyncMock(return_value=(theme, result)),
+            "generate_scheduled_package",
+            new=AsyncMock(side_effect=main.ScheduledContentReject("local_quality")),
         ), patch.object(
             main, "send_post_with_images", new=AsyncMock()
         ) as publish, patch.object(

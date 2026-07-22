@@ -23,10 +23,12 @@ from naz_vk_music import APPROVED_QUERIES
 SCHEMA = "vk_publish_job.v1"
 PRODUCER = "naz"
 CONSUMER_STATES = ("pending", "processing", "done", "failed")
-JOB_FIELDS = frozenset({
+REQUIRED_JOB_FIELDS = frozenset({
     "schema", "job_id", "producer", "target_group_id", "text", "media",
     "track_query", "created_at", "not_before", "dedupe_key", "source_ref",
 })
+OPTIONAL_JOB_FIELDS = frozenset({"plan_id", "editorial"})
+JOB_FIELDS = REQUIRED_JOB_FIELDS | OPTIONAL_JOB_FIELDS
 MAX_TEXT_LENGTH = 16_000
 MAX_MEDIA_COUNT = 4
 MAX_MEDIA_BYTES = 15 * 1024 * 1024
@@ -109,8 +111,12 @@ def validate_canonical_job(
     recent_track_keys: Iterable[str] = (),
 ) -> None:
     """Apply the shared VOID consumer contract to a materialized job."""
-    if not isinstance(job, dict) or len(job) != 11 or frozenset(job) != JOB_FIELDS:
-        raise QueueError("job must contain exactly 11 canonical fields")
+    if (
+        not isinstance(job, dict)
+        or not REQUIRED_JOB_FIELDS.issubset(job)
+        or not frozenset(job).issubset(JOB_FIELDS)
+    ):
+        raise QueueError("job contains unknown or missing canonical fields")
     if job["schema"] != SCHEMA or job["producer"] != PRODUCER:
         raise QueueError("invalid schema or producer")
     if not isinstance(job["target_group_id"], str) or not job["target_group_id"]:
@@ -143,6 +149,26 @@ def validate_canonical_job(
             raise QueueError(f"{field} must include timezone")
     if not isinstance(job["source_ref"], str) or not job["source_ref"]:
         raise QueueError("source_ref is required")
+    if "editorial" in job and "plan_id" not in job:
+        raise QueueError("editorial metadata requires plan_id")
+    if "plan_id" in job:
+        if not isinstance(job["plan_id"], str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,64}", job["plan_id"]):
+            raise QueueError("invalid plan_id")
+        editorial = job.get("editorial")
+        if not isinstance(editorial, dict) or len(editorial) > 32:
+            raise QueueError("invalid editorial metadata")
+        if any(
+            not isinstance(key, str)
+            or not re.fullmatch(r"[A-Za-z0-9_]{1,64}", key)
+            or not isinstance(value, (str, list))
+            or (isinstance(value, str) and len(value) > 1000)
+            or (
+                isinstance(value, list)
+                and (len(value) > 16 or any(not isinstance(item, str) or len(item) > 200 for item in value))
+            )
+            for key, value in editorial.items()
+        ):
+            raise QueueError("editorial metadata must be string/list only")
     track_key = normalize_track_query(job["track_query"])
     if not track_key or track_key in {str(item) for item in recent_track_keys}:
         raise QueueError("track_query was used in the shared last 8")
@@ -169,6 +195,8 @@ def enqueue(
     created_at: Optional[datetime] = None,
     not_before: Optional[datetime] = None,
     dedupe_key: Optional[str] = None,
+    plan_id: str = "",
+    editorial: Optional[dict] = None,
 ) -> dict:
     """Validate and atomically add one Naz job to ``queue_root/pending``."""
     queue_root = Path(queue_root)
@@ -235,9 +263,12 @@ def enqueue(
             "dedupe_key": key,
             "source_ref": source_ref,
         }
+        if plan_id:
+            job["plan_id"] = str(plan_id)
+            job["editorial"] = dict(editorial or {})
         job_file = temp_dir / "job.json"
-        if frozenset(job) != JOB_FIELDS or len(job) != 11:
-            raise QueueError("job must contain exactly 11 canonical fields")
+        if not REQUIRED_JOB_FIELDS.issubset(job) or not frozenset(job).issubset(JOB_FIELDS):
+            raise QueueError("job contains unknown or missing canonical fields")
         job_file.write_text(
             json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )

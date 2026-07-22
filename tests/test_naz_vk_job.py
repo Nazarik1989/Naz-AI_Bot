@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import main
 import memory
 import naz_vk_music
+import editorial_orchestrator
 
 
 class NazVkJobTests(unittest.TestCase):
@@ -19,8 +20,49 @@ class NazVkJobTests(unittest.TestCase):
         )
         self.db_patch.start()
         memory.init_db()
+        original_scheduled_plan = main.scheduled_plan
+
+        def deterministic_plan(**kwargs):
+            rows = list(kwargs["rubric_rows"])
+            source = dict(list(kwargs["source_rows"])[0])
+            source_ref = str(source.get("source_ref", ""))
+            if "material" in source_ref:
+                selected = next(
+                    row for row in rows
+                    if "material" in str(row["name"]).casefold()
+                    or "матери" in str(row["name"]).casefold()
+                )
+            else:
+                selected = rows[0]
+            selected = dict(selected)
+            key = main.naz_editorial_catalog.rubric_key(str(selected["name"]))
+            selected["key"] = key
+            source["rubric_keys"] = (key,)
+            return original_scheduled_plan(
+                **{**kwargs, "rubric_rows": [selected], "source_rows": [source]}
+            )
+
+        self.plan_patch = patch.object(main, "scheduled_plan", side_effect=deterministic_plan)
+        self.plan_patch.start()
+
+        async def generated_package(plan, character, **kwargs):
+            return editorial_orchestrator.GenerationPackage(
+                final_text="Готовый VK-пост " + "с конкретной сценой и выводом. " * 18,
+                concrete_scene="Конкретный предмет меняет состояние после действия.",
+                visual_subject="Тот же конкретный предмет.",
+                visual_relation_to_thesis="Изменение предмета показывает выбранный тезис.",
+                image_prompt_seed="Тот же предмет после конкретного действия.",
+                track_tags=plan.track_tags,
+            )
+
+        self.generation_patch = patch.object(
+            main, "generate_scheduled_package", new=AsyncMock(side_effect=generated_package)
+        )
+        self.generation_patch.start()
 
     def tearDown(self):
+        self.generation_patch.stop()
+        self.plan_patch.stop()
         self.db_patch.stop()
         self.db_directory.cleanup()
 
@@ -99,12 +141,10 @@ class NazVkJobTests(unittest.TestCase):
                         rubric_kind="gaming",
                     )
                 )
-            instruction = generate.await_args.kwargs["extra_instruction"]
-            self.assertIn("Игровая лаборатория VK", instruction)
-            self.assertIn("Игровая вертикаль", instruction)
+            generate.assert_not_awaited()
             self.assertIn(job["track_query"], naz_vk_music.APPROVED_QUERIES)
             self.assertIn("gaming", next(track.tags for track in naz_vk_music.APPROVED_TRACKS if track.query == job["track_query"]))
-            record.assert_called_once()
+            record.assert_not_called()
 
     def test_material_job_enqueues_three_frames_with_shared_music_rotation(self):
         with tempfile.TemporaryDirectory() as directory:

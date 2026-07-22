@@ -159,6 +159,8 @@ def init_db() -> None:
         _ensure_column(conn, "generated_posts", "semantic_theme", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "generated_posts", "semantic_card", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "generated_posts", "external_job_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "generated_posts", "plan_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "generated_posts", "editorial_plan_json", "TEXT NOT NULL DEFAULT ''")
 
         conn.execute(
             """
@@ -192,6 +194,13 @@ def init_db() -> None:
         )
         _ensure_column(conn, "content_signatures", "content_format", "TEXT NOT NULL DEFAULT 'text_story'")
         _ensure_column(conn, "content_signatures", "content_kind", "TEXT NOT NULL DEFAULT 'text'")
+        _ensure_column(conn, "content_signatures", "plan_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "content_signatures", "source_ref", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "content_signatures", "editorial_plan_json", "TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_signatures_published_plan "
+            "ON content_signatures(user_id, character_id, plan_id) WHERE plan_id <> ''"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS autopost_semantic_history (
@@ -771,7 +780,8 @@ def get_recent_content_signatures(user_id: int, limit: int = 12) -> List[Dict[st
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT platform, facet, intent, format, content_format, content_kind, hook, media, topic, created_at
+            SELECT platform, facet, intent, format, content_format, content_kind, hook, media,
+                   topic, plan_id, source_ref, editorial_plan_json, created_at
             FROM content_signatures
             WHERE user_id = ? AND character_id = ?
             ORDER BY id DESC
@@ -779,45 +789,73 @@ def get_recent_content_signatures(user_id: int, limit: int = 12) -> List[Dict[st
             """,
             (user_id, naz_character.CHARACTER_ID, max(1, limit)),
         ).fetchall()
-    return [dict(row) for row in reversed(rows)]
+    result: List[Dict[str, Any]] = []
+    for row in reversed(rows):
+        item: Dict[str, Any] = dict(row)
+        try:
+            payload = json.loads(str(item.pop("editorial_plan_json", "") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict):
+            item.update(payload)
+        result.append(item)
+    return result
 
 
-def record_content_signature(user_id: int, plan: Dict[str, str], topic: str) -> None:
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO content_signatures(
-                user_id, character_id, platform, facet, intent, format, content_format, content_kind,
-                hook, media, topic, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+def _record_content_signature_conn(
+    conn: sqlite3.Connection,
+    user_id: int,
+    plan: Dict[str, Any],
+    topic: str,
+) -> None:
+    plan_id = str(plan.get("plan_id", ""))[:64]
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO content_signatures(
+            user_id, character_id, platform, facet, intent, format, content_format, content_kind,
+            hook, media, topic, plan_id, source_ref, editorial_plan_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            naz_character.CHARACTER_ID,
+            str(plan.get("platform", "telegram")),
+            str(plan.get("facet", "explorer")),
+            str(plan.get("purpose", plan.get("intent", "исследовать"))),
+            str(plan.get("structure", plan.get("format", "маленькая история"))),
+            str(plan.get("content_format", "text_story")),
             (
-                user_id,
-                naz_character.CHARACTER_ID,
-                str(plan.get("platform", "telegram")),
-                str(plan.get("facet", "explorer")),
-                str(plan.get("intent", "исследовать")),
-                str(plan.get("format", "маленькая история")),
-                str(plan.get("content_format", "text_story")),
-                str(plan.get("content_kind", "text")),
-                str(plan.get("hook", "наблюдение")),
-                str(plan.get("media", "редакционная иллюстрация")),
-                topic[:1000],
-                utc_now(),
+                "video"
+                if str(plan.get("production_mode", "")) == "story_first"
+                else str(plan.get("content_kind", "text"))
             ),
+            str(plan.get("hook", "наблюдение")),
+            str(plan.get("visual_mode", plan.get("media", "редакционная иллюстрация"))),
+            topic[:1000],
+            plan_id,
+            str(plan.get("source_ref", ""))[:1000],
+            json.dumps(plan, ensure_ascii=False, separators=(",", ":"))[:16000],
+            utc_now(),
+        ),
+    )
+    conn.execute(
+        """
+        DELETE FROM content_signatures
+        WHERE user_id = ? AND id NOT IN (
+            SELECT id FROM content_signatures
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 80
         )
-        conn.execute(
-            """
-            DELETE FROM content_signatures
-            WHERE user_id = ? AND id NOT IN (
-                SELECT id FROM content_signatures
-                WHERE user_id = ?
-                ORDER BY id DESC
-                LIMIT 80
-            )
-            """,
-            (user_id, user_id),
-        )
+        """,
+        (user_id, user_id),
+    )
+
+
+def record_content_signature(user_id: int, plan: Dict[str, Any], topic: str) -> None:
+    """Record one confirmed publication; plan_id makes crossposts idempotent."""
+    with db() as conn:
+        _record_content_signature_conn(conn, user_id, plan, topic)
 
 
 def get_recent_semantic_theme_keys(user_id: int, limit: int = 5) -> List[str]:
@@ -1463,15 +1501,18 @@ def save_generated_post(
     semantic_theme: str = "",
     semantic_card: str = "",
     external_job_id: str = "",
+    plan_id: str = "",
+    editorial_plan: Optional[Dict[str, Any]] = None,
 ) -> None:
     with db() as conn:
         conn.execute(
             """
             INSERT INTO generated_posts(
                 user_id, expert_mode, task, topic, content, image_count,
-                published_to_channel, semantic_theme, semantic_card, external_job_id, created_at
+                published_to_channel, semantic_theme, semantic_card, external_job_id,
+                plan_id, editorial_plan_json, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -1484,6 +1525,8 @@ def save_generated_post(
                 str(semantic_theme or "")[:120],
                 str(semantic_card or "")[:160],
                 str(external_job_id or "")[:120],
+                str(plan_id or "")[:64],
+                json.dumps(editorial_plan or {}, ensure_ascii=False, separators=(",", ":"))[:16000],
                 utc_now(),
             ),
         )
@@ -1495,7 +1538,7 @@ def get_unpublished_vk_jobs(user_id: int, limit: int = 100) -> List[Dict[str, An
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT id, external_job_id, content
+            SELECT id, external_job_id, content, topic, plan_id, editorial_plan_json
             FROM generated_posts
             WHERE user_id = ? AND task LIKE 'naz_vk_queue:%'
               AND published_to_channel = 0 AND external_job_id <> ''
@@ -1510,6 +1553,17 @@ def get_unpublished_vk_jobs(user_id: int, limit: int = 100) -> List[Dict[str, An
 def mark_vk_generated_post_published(user_id: int, row_id: int) -> bool:
     """Promote one queued VK draft only after its exact job is confirmed done."""
     with db() as conn:
+        row = conn.execute(
+            """
+            SELECT topic, editorial_plan_json
+            FROM generated_posts
+            WHERE id = ? AND user_id = ? AND task LIKE 'naz_vk_queue:%'
+              AND published_to_channel = 0
+            """,
+            (int(row_id), user_id),
+        ).fetchone()
+        if row is None:
+            return False
         updated = conn.execute(
             """
             UPDATE generated_posts
@@ -1519,9 +1573,15 @@ def mark_vk_generated_post_published(user_id: int, row_id: int) -> bool:
             """,
             (int(row_id), user_id),
         )
-    if updated.rowcount != 1:
-        return False
-    return True
+        if updated.rowcount != 1:
+            return False
+        try:
+            plan = json.loads(str(row["editorial_plan_json"] or "{}"))
+        except json.JSONDecodeError:
+            plan = {}
+        if isinstance(plan, dict) and str(plan.get("plan_id", "")):
+            _record_content_signature_conn(conn, user_id, plan, str(row["topic"] or ""))
+        return True
 
 
 def get_recent_generated_posts(user_id: int, task: str = "", limit: int = 3) -> List[Dict[str, str]]:
