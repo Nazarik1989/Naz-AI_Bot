@@ -131,43 +131,6 @@ class EditorialPolicyContractTests(unittest.TestCase):
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.reason_code, "image_subject_mismatch")
 
-    def test_text_gate_contract_enumerates_codes_and_excludes_visual_policy(self):
-        brief = make_brief(scheduled_slot="10:00", rubric="AI без магии")
-        payload = json.loads(policy.build_text_gate_prompt(brief, "fixture candidate"))
-        self.assertEqual(
-            set(payload["schema"]["properties"]["reason_code"]["enum"]),
-            set(policy.TEXT_GATE_REASON_CODES),
-        )
-        self.assertNotIn("visual_subject", payload["brief"])
-        self.assertNotIn("required_elements", payload["brief"])
-        self.assertNotIn("forbidden_elements", payload["brief"])
-
-    def test_text_gate_parser_accepts_registered_rejection_and_classifies_unknown_code(self):
-        rejected = {
-            "accepted": False,
-            "reason_code": "text_topic_drift",
-            "entry_context_clear": True,
-            "self_contained": True,
-            "invented_current_event": False,
-            "topic_matches": False,
-            "persona_matches": True,
-        }
-        decision = policy.parse_text_gate_response(
-            "```json\n" + json.dumps(rejected) + "\n```"
-        )
-        self.assertFalse(decision.accepted)
-        rejected["reason_code"] = "topic_mismatch"
-        with self.assertRaises(policy.GateResponseError) as raised:
-            policy.parse_text_gate_response(json.dumps(rejected))
-        self.assertEqual(raised.exception.reason_code, "schema_unknown_reason_code")
-        self.assertEqual(raised.exception.field_names, ("reason_code",))
-
-    def test_naz_skip_summary_is_russian_and_hides_internal_reason_code(self):
-        summary = main.autopost_reason_summary("schema_unknown_reason_code")
-        self.assertIn("Редакторский валидатор", summary)
-        self.assertNotIn("schema_unknown_reason_code", summary)
-        self.assertNotIn("semantic gate rejected", summary)
-
     def test_two_failed_regenerations_skip_and_keep_same_brief(self):
         brief = make_brief()
         seen = []

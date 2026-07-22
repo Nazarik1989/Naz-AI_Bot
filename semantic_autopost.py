@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Awaitable, Callable, Iterable, Mapping, Sequence
 
-import editorial_policy
-
 
 THEME_COOLDOWN = 5
 SEMANTIC_HISTORY_LIMIT = 8
@@ -640,10 +638,6 @@ async def generate_with_gate(
     if first_decision.accepted:
         return GenerationResult(
             True, first_text, 1, first_decision, theme.key, card.key if card else ""
-        )
-    if not editorial_policy.is_retryable_gate_reason(first_decision.reason):
-        return GenerationResult(
-            False, "", 1, first_decision, theme.key, card.key if card else ""
         )
 
     if correction_theme is not None:

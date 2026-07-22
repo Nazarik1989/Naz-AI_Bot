@@ -219,8 +219,6 @@ class NazVkJobTests(unittest.TestCase):
                 NAZ_VK_TRACK_STATE_FILE=Path(directory) / "rotation.json",
                 NAZ_VK_IMAGE_POLICY="text_music",
             ), patch.object(
-                main, "select_naz_vk_rubric", return_value=main.NAZ_VK_RUBRICS[0]
-            ), patch.object(
                 main, "generate_content", new=AsyncMock(return_value="Готовый VK-пост")
             ), patch.object(
                 main, "generate_images_with_retries", new=AsyncMock(return_value=([], "prompt"))
