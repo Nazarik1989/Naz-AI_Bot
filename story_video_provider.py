@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import shutil
@@ -11,10 +13,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+from PIL import Image, ImageOps, UnidentifiedImageError
+
 
 RUNWAY_API_VERSION = "2024-11-06"
 DEFAULT_RUNWAY_BASE_URL = "https://api.dev.runwayml.com/v1"
 TERMINAL_FAILURES = {"failed", "cancelled", "canceled"}
+RUNWAY_VIDEO_MODELS = frozenset({"gen4_turbo", "gen4.5"})
+RUNWAY_MODEL_DURATIONS: Mapping[str, frozenset[int]] = {
+    "gen4_turbo": frozenset({5, 10}),
+    "gen4.5": frozenset(range(2, 11)),
+}
+RUNWAY_PORTRAIT_SIZE = (720, 1280)
+RUNWAY_DATA_URI_BASE64_LIMIT = 5 * 1024 * 1024
+_REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+_REFERENCE_BACKGROUND = (2, 3, 9)
 
 
 class ProviderError(RuntimeError):
@@ -100,7 +113,10 @@ class RunwayVideoProvider:
         if not api_key.strip():
             raise ProviderError("video_api_key_missing")
         self._api_key = api_key.strip()
-        self.model = model.strip() or "gen4.5"
+        normalized_model = model.strip().casefold()
+        if normalized_model not in RUNWAY_VIDEO_MODELS:
+            raise ProviderError("video_model_unsupported")
+        self.model = normalized_model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self._transport = transport or UrllibTransport()
@@ -127,22 +143,68 @@ class RunwayVideoProvider:
         return _json_object(raw) if raw else {}
 
     @staticmethod
-    def _reference_data_uri(path: Path) -> str:
-        import base64
-
-        suffix = path.suffix.casefold()
-        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix)
-        if mime is None or not path.is_file():
+    def _portrait_reference_bytes(path: Path) -> bytes:
+        candidate = Path(path)
+        if candidate.suffix.casefold() not in _REFERENCE_SUFFIXES or not candidate.is_file():
             raise ProviderError("approved_reference_invalid")
-        if path.stat().st_size > 8 * 1024 * 1024:
+
+        try:
+            with Image.open(candidate) as opened:
+                opened.load()
+                source = ImageOps.exif_transpose(opened).convert("RGB")
+        except (OSError, UnidentifiedImageError, ValueError):
+            raise ProviderError("approved_reference_invalid") from None
+
+        contained = ImageOps.contain(
+            source,
+            RUNWAY_PORTRAIT_SIZE,
+            method=Image.Resampling.LANCZOS,
+        )
+        portrait = Image.new("RGB", RUNWAY_PORTRAIT_SIZE, _REFERENCE_BACKGROUND)
+        portrait.paste(
+            contained,
+            (
+                (RUNWAY_PORTRAIT_SIZE[0] - contained.width) // 2,
+                (RUNWAY_PORTRAIT_SIZE[1] - contained.height) // 2,
+            ),
+        )
+        output = io.BytesIO()
+        try:
+            portrait.save(
+                output,
+                format="JPEG",
+                quality=90,
+                optimize=True,
+                progressive=True,
+            )
+        except (OSError, ValueError):
+            raise ProviderError("approved_reference_invalid") from None
+        finally:
+            source.close()
+            contained.close()
+            portrait.close()
+        return output.getvalue()
+
+    @classmethod
+    def _reference_data_uri(cls, path: Path) -> str:
+        encoded = base64.b64encode(cls._portrait_reference_bytes(path))
+        if len(encoded) > RUNWAY_DATA_URI_BASE64_LIMIT:
             raise ProviderError("approved_reference_too_large")
-        return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+        return f"data:image/jpeg;base64,{encoded.decode('ascii')}"
+
+    def _validate_duration(self, duration_seconds: object) -> int:
+        if type(duration_seconds) is not int or duration_seconds not in RUNWAY_MODEL_DURATIONS[self.model]:
+            raise ProviderError("video_duration_unsupported")
+        return duration_seconds
 
     def submit(self, request: SceneRequest) -> ProviderJob:
+        duration = self._validate_duration(request.duration_seconds)
+        if self.model == "gen4_turbo" and request.reference_path is None:
+            raise ProviderError("video_prompt_image_required")
         payload: dict[str, Any] = {
             "model": self.model,
             "promptText": request.prompt,
-            "duration": request.duration_seconds,
+            "duration": duration,
             "ratio": "720:1280",
         }
         endpoint = "/text_to_video"
@@ -235,13 +297,21 @@ class FakeVideoProvider:
         self.jobs[external_job_id] = ProviderJob(external_job_id, "terminal_failed", failure_code="provider_timeout")
 
 
-def provider_from_environment(env: Mapping[str, str] | None = None) -> VideoProvider:
+def provider_from_environment(
+    env: Mapping[str, str] | None = None,
+    *,
+    model_override: str | None = None,
+) -> VideoProvider:
     values = os.environ if env is None else env
     name = values.get("NAZ_VIDEO_PROVIDER", "disabled").strip().casefold()
     if name == "runway":
         return RunwayVideoProvider(
             api_key=values.get("NAZ_VIDEO_API_KEY", ""),
-            model=values.get("NAZ_VIDEO_MODEL", "gen4.5"),
+            model=(
+                model_override
+                if model_override is not None
+                else values.get("NAZ_VIDEO_MODEL", "gen4.5")
+            ),
             base_url=values.get("NAZ_VIDEO_BASE_URL", DEFAULT_RUNWAY_BASE_URL),
             timeout_seconds=float(values.get("NAZ_VIDEO_HTTP_TIMEOUT_SECONDS", "30")),
         )

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from story_audio_evidence import beat_evidence_is_valid, rhythmic_window_is_valid
+
 
 class MediaError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -47,6 +49,12 @@ class LicensedTrack:
     license: str
     source: str
     checksum: str
+    duration_seconds: float = 600.0
+    tags: tuple[str, ...] = ()
+    lane: str = ""
+    beats_per_bar: int = 4
+    beat_evidence: tuple[bool, ...] = ()
+    evidence_required: bool = False
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -203,11 +211,14 @@ class MediaComposer:
 
     def compose_reel(
         self, *, pack_root: Path, shots: Sequence[Mapping[str, Any]], destination: Path,
-        track: LicensedTrack,
+        track: LicensedTrack, track_start_seconds: float = 0.0,
+        segment_beat_grid: Sequence[float] | None = None,
     ) -> MediaProbe:
         if not shots or not track.path.is_file() or checksum(track.path) != track.checksum:
             raise MediaError("licensed_music_invalid")
         if not track.license.strip() or not track.source.strip() or track.bpm <= 0 or len(track.beat_grid) < 2:
+            raise MediaError("licensed_music_metadata_invalid")
+        if track_start_seconds < 0:
             raise MediaError("licensed_music_metadata_invalid")
         inputs: list[str] = []
         filters: list[str] = []
@@ -237,18 +248,35 @@ class MediaComposer:
         for shot in shots[:-1]:
             elapsed += float(shot["duration_seconds"])
             boundaries.append(elapsed)
-        if any(min(abs(cut - beat) for beat in track.beat_grid) > beat_tolerance for cut in boundaries):
+        active_grid = tuple(segment_beat_grid) if segment_beat_grid is not None else track.beat_grid
+        if len(active_grid) < 2 or any(
+            min(abs(cut - beat) for beat in active_grid) > beat_tolerance
+            for cut in boundaries
+        ):
             raise MediaError("reel_cuts_not_on_beat_grid")
+        if not 12.0 <= total <= 20.0 or track_start_seconds + total > track.duration_seconds + 0.02:
+            raise MediaError("licensed_music_segment_invalid")
+        if not rhythmic_window_is_valid(
+            beat_grid=track.beat_grid,
+            beat_evidence=track.beat_evidence,
+            evidence_required=track.evidence_required,
+            start_seconds=track_start_seconds,
+            duration_seconds=total,
+        ):
+            raise MediaError("licensed_music_segment_invalid")
         filters.append("".join(f"[v{i}]" for i in range(len(shots))) + f"concat=n={len(shots)}:v=1:a=0[outv]")
         temporary = self._temporary(destination)
         try:
             self._run([
-                self.ffmpeg, "-nostdin", "-y", "-v", "error", *inputs, "-stream_loop", "-1", "-i", str(track.path),
+                self.ffmpeg, "-nostdin", "-y", "-v", "error", *inputs,
+                "-ss", str(round(track_start_seconds, 3)), "-i", str(track.path),
                 "-filter_complex", ";".join(filters), "-map", "[outv]", "-map", f"{len(shots)}:a:0",
                 "-t", str(round(total, 3)), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
                 "-movflags", "+faststart", "-shortest", str(temporary),
             ])
             probe = self.probe(temporary, require_story_duration=False)
+            if not 12.0 <= probe.duration_seconds <= 20.05:
+                raise MediaError("licensed_music_segment_invalid")
             os.replace(temporary, destination)
             return probe
         finally:
@@ -284,10 +312,70 @@ def load_music_library(path: Path, *, pack_root: Path | None = None) -> list[Lic
                 else:
                     step = 60.0 / bpm
                     beat_grid = tuple(round(index * step, 6) for index in range(int(600 / step) + 1))
+                duration_seconds = float(
+                    row.get("duration_seconds")
+                    or (beat_grid[-1] if beat_grid else 600.0)
+                    or 600.0
+                )
+                if duration_seconds < 12 or beat_grid[-1] > duration_seconds + 0.001:
+                    continue
+                expected_checksum = str(row.get("checksum", "")).strip()
+                actual_checksum = checksum(track_path)
+                if expected_checksum and expected_checksum != actual_checksum:
+                    continue
+                beat_evidence: tuple[bool, ...] = ()
+                evidence_required = False
+                if row.get("schema") == "naz-story-audio-track-v1":
+                    rights = row.get("rights")
+                    audio_analysis = row.get("audio_analysis")
+                    raw_evidence = row.get("beat_evidence")
+                    if not isinstance(raw_evidence, list):
+                        continue
+                    beat_evidence = tuple(raw_evidence)
+                    evidence_required = True
+                    if not (
+                        isinstance(rights, dict)
+                        and rights.get("origin") == "text_to_audio"
+                        and rights.get("provider") == "stability-ai"
+                        and rights.get("third_party_audio_input") is False
+                        and rights.get("artist_or_track_reference") is False
+                        and str(rights.get("model", "")) == "stable-audio-3"
+                        and bool(expected_checksum)
+                        and expected_checksum == actual_checksum
+                        and row.get("beat_grid_source")
+                        == "actual-audio-derived-beat-track-v1"
+                        and row.get("beat_evidence_source")
+                        == "actual-audio-derived-onset-match-v1"
+                        and beat_evidence_is_valid(beat_grid, beat_evidence)
+                        and isinstance(audio_analysis, dict)
+                        and audio_analysis.get("source")
+                        == "actual-audio-derived-beat-track-v1"
+                        and bool(str(audio_analysis.get("analyzer", "")).strip())
+                        and 0.2 <= float(audio_analysis.get("confidence")) <= 1.0
+                        and 0.25 <= float(audio_analysis.get("peak_prominence")) <= 1.0
+                        and 0.25
+                        <= float(audio_analysis.get("onset_alignment_fraction"))
+                        <= 1.0
+                        and 0.25
+                        <= float(audio_analysis.get("grid_onset_coverage"))
+                        <= 1.0
+                        and abs(
+                            float(audio_analysis.get("grid_onset_coverage"))
+                            - sum(beat_evidence) / float(len(beat_evidence))
+                        )
+                        <= 0.000001
+                    ):
+                        continue
                 result.append(LicensedTrack(
                     track_id=str(row.get("track_id") or track_path.stem),
                     path=track_path.resolve(), bpm=bpm, beat_grid=beat_grid,
-                    license=license_name, source=source, checksum=checksum(track_path),
+                    license=license_name, source=source, checksum=actual_checksum,
+                    duration_seconds=duration_seconds,
+                    tags=tuple(str(item) for item in row.get("tags", ()) if str(item).strip()),
+                    lane=str(row.get("lane", "")).strip(),
+                    beats_per_bar=int(row.get("beats_per_bar", 4)),
+                    beat_evidence=beat_evidence,
+                    evidence_required=evidence_required,
                 ))
             except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
                 continue
@@ -309,6 +397,10 @@ def load_music_library(path: Path, *, pack_root: Path | None = None) -> list[Lic
                 track_id=str(row["track_id"]), path=track_path, bpm=float(row["bpm"]),
                 beat_grid=tuple(float(value) for value in row["beat_grid"]),
                 license=str(row["license"]), source=str(row["source"]), checksum=str(row["checksum"]),
+                duration_seconds=float(row.get("duration_seconds", 600.0)),
+                tags=tuple(str(value) for value in row.get("tags", ())),
+                lane=str(row.get("lane", "")),
+                beats_per_bar=int(row.get("beats_per_bar", 4)),
             )
             if item.path.is_file() and checksum(item.path) == item.checksum and item.license and item.source:
                 result.append(item)

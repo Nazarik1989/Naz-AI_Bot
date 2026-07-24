@@ -7,6 +7,7 @@ both the feature flag and an explicit provider are configured.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -19,7 +20,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import story_production
+from story_audio_evidence import eligible_segment_starts
 from story_media_composer import MediaComposer, MediaError, checksum, load_music_library
+from story_pack_lock import AdvisoryFileLock, StoryPackLock, StoryPackLockError
 from story_video_provider import ProviderError, SceneRequest, VideoProvider, provider_from_environment
 
 
@@ -28,7 +31,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 SAFE_FAILURE_CODES = {
     "approved_reference_invalid", "approved_reference_too_large", "cyrillic_font_missing",
     "daily_job_limit_reached", "daily_seconds_limit_reached", "licensed_music_invalid",
-    "licensed_music_metadata_invalid", "media_codec_invalid", "media_duration_invalid",
+    "licensed_music_metadata_invalid", "licensed_music_segment_invalid",
+    "media_codec_invalid", "media_duration_invalid", "music_rotation_state_invalid",
     "media_frame_rate_invalid", "media_missing_or_empty", "media_motion_not_detected",
     "media_pixel_format_invalid", "media_probe_invalid", "media_resolution_invalid",
     "media_tool_failed", "media_tool_unavailable_or_timed_out", "overlay_text_unsafe",
@@ -40,7 +44,27 @@ SAFE_FAILURE_CODES = {
     "provider_timeout", "provider_transport_error", "reel_crop_missing",
     "reel_cuts_not_on_beat_grid", "reel_fragment_duration_invalid", "reel_fragment_out_of_source",
     "unsafe_media_path", "video_api_key_missing", "video_provider_disabled", "video_provider_unknown",
+    "provider_reference_required", "video_auto_fallback_forbidden",
+    "video_duration_unsupported", "video_model_priority_invalid",
+    "video_model_route_mismatch", "video_model_unsupported", "video_prompt_image_required",
+    "story_manifest_contract_stale", "provider_submit_outcome_ambiguous",
 }
+CANONICAL_PRIMARY_MODEL = "gen4_turbo"
+CANONICAL_SECONDARY_MODEL = "gen4.5"
+CANONICAL_MODEL_PRIORITY = (CANONICAL_PRIMARY_MODEL, CANONICAL_SECONDARY_MODEL)
+SECONDARY_ESCALATION_CODES = frozenset({
+    "video_prompt_image_required",
+    "provider_terminal_failure",
+})
+DEFINITIVE_SUBMIT_FAILURE_CODES = frozenset({
+    "approved_reference_invalid",
+    "approved_reference_too_large",
+    "provider_prompt_unsafe",
+    "provider_request_rejected",
+    "video_duration_unsupported",
+    "video_model_unsupported",
+    "video_prompt_image_required",
+})
 
 
 def _bool(value: str | None, default: bool = False) -> bool:
@@ -77,6 +101,18 @@ class WorkerConfig:
     daily_job_limit: int
     daily_seconds_limit: int
     media_timeout_seconds: int
+    primary_model: str = CANONICAL_PRIMARY_MODEL
+    secondary_model: str = CANONICAL_SECONDARY_MODEL
+    model_priority: tuple[str, ...] = CANONICAL_MODEL_PRIORITY
+    auto_fallback: bool = False
+    music_rotation_state_path: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceSelection:
+    path: Path
+    role: str
+    body_guidance: str = ""
 
 
 def load_config(env: Mapping[str, str] | None = None) -> WorkerConfig:
@@ -86,12 +122,30 @@ def load_config(env: Mapping[str, str] | None = None) -> WorkerConfig:
         or values.get("NAZ_VIDEO_REFERENCE_PATH", "").strip()
     )
     music = values.get("NAZ_STORY_MUSIC_LIBRARY", "").strip()
+    music_rotation = values.get(
+        "NAZ_STORY_MUSIC_ROTATION_STATE",
+        "/var/lib/naz-ai-bot/story_music_rotation.json",
+    ).strip()
     font = values.get("NAZ_STORY_FONT_PATH", "").strip()
+    primary_model = (
+        values.get("NAZ_VIDEO_PRIMARY_MODEL", "").strip()
+        or values.get("NAZ_VIDEO_MODEL", "").strip()
+        or CANONICAL_PRIMARY_MODEL
+    )
+    secondary_model = (
+        values.get("NAZ_VIDEO_SECONDARY_MODEL", CANONICAL_SECONDARY_MODEL).strip()
+        or CANONICAL_SECONDARY_MODEL
+    )
+    priority = tuple(
+        item.strip() for item in values.get(
+            "NAZ_VIDEO_MODEL_PRIORITY", f"{primary_model},{secondary_model}"
+        ).split(",") if item.strip()
+    )
     return WorkerConfig(
         pack_root=Path(values.get("NAZ_STORY_PACK_ROOT", "/var/lib/naz-ai-bot/story-packs")).expanduser().resolve(),
         render_enabled=_bool(values.get("NAZ_STORY_RENDER_ENABLED"), False),
         provider_name=values.get("NAZ_VIDEO_PROVIDER", "disabled").strip().casefold(),
-        model=values.get("NAZ_VIDEO_MODEL", "gen4.5").strip(),
+        model=primary_model,
         reference_path=Path(reference).expanduser().resolve() if reference else None,
         music_library_path=Path(music).expanduser().resolve() if music else None,
         ffmpeg=values.get("NAZ_FFMPEG_BIN", "ffmpeg").strip(),
@@ -104,6 +158,12 @@ def load_config(env: Mapping[str, str] | None = None) -> WorkerConfig:
         daily_job_limit=_int(values, "NAZ_VIDEO_DAILY_JOB_LIMIT", 7, 1, 49),
         daily_seconds_limit=_int(values, "NAZ_VIDEO_DAILY_SECONDS_LIMIT", 56, 4, 392),
         media_timeout_seconds=_int(values, "NAZ_MEDIA_TIMEOUT_SECONDS", 180, 10, 900),
+        primary_model=primary_model, secondary_model=secondary_model,
+        model_priority=priority,
+        auto_fallback=_bool(values.get("NAZ_VIDEO_AUTO_FALLBACK"), False),
+        music_rotation_state_path=(
+            Path(music_rotation).expanduser().resolve() if music_rotation else None
+        ),
     )
 
 
@@ -118,13 +178,28 @@ def check_config(config: WorkerConfig, env: Mapping[str, str] | None = None) -> 
             issues.append("video_provider_unknown")
         if not values.get("NAZ_VIDEO_API_KEY", "").strip():
             issues.append("video_api_key_missing")
+        if config.auto_fallback:
+            issues.append("video_auto_fallback_forbidden")
+        if (
+            config.primary_model != CANONICAL_PRIMARY_MODEL
+            or config.secondary_model != CANONICAL_SECONDARY_MODEL
+            or config.model_priority != CANONICAL_MODEL_PRIORITY
+        ):
+            issues.append("video_model_priority_invalid")
     if shutil.which(config.ffmpeg) is None:
         issues.append("ffmpeg_unavailable")
     if shutil.which(config.ffprobe) is None:
         issues.append("ffprobe_unavailable")
     if config.font_path is None or not config.font_path.is_file():
         issues.append("cyrillic_font_missing")
-    reference_status = "available" if _approved_reference_path(config.reference_path) else "unavailable"
+    references = _reference_catalog(config.reference_path)
+    reference_status = (
+        "available"
+        if references.get("frontal_identity") and references.get("three_quarter_identity")
+        else "partial"
+        if references
+        else "unavailable"
+    )
     music_status = (
         "available"
         if config.music_library_path
@@ -136,28 +211,15 @@ def check_config(config: WorkerConfig, env: Mapping[str, str] | None = None) -> 
     return {
         "ok": not issues, "render_enabled": config.render_enabled,
         "provider": config.provider_name, "model": config.model,
+        "primary_model": config.primary_model, "secondary_model": config.secondary_model,
+        "automatic_fallback": config.auto_fallback,
         "reference": reference_status, "music_library": music_status,
         "issues": sorted(set(issues)), "live_api_called": False,
     }
 
 
-class PackLock:
-    def __init__(self, pack_dir: Path) -> None:
-        self.path = pack_dir / ".worker.lock"
-        self.fd: int | None = None
-
-    def __enter__(self) -> "PackLock":
-        try:
-            self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError as exc:
-            raise RuntimeError("pack_locked") from exc
-        os.write(self.fd, str(os.getpid()).encode("ascii"))
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-        self.path.unlink(missing_ok=True)
+class PackLock(StoryPackLock):
+    """Backward-compatible name for the shared crash-safe pack lock."""
 
 
 def _failure_code(exc: BaseException) -> str:
@@ -204,7 +266,9 @@ def _scene_plan(payload: Mapping[str, Any], scene_id: str) -> Mapping[str, Any]:
 def _set_pack_status(payload: dict[str, Any]) -> None:
     scenes = [str(row.get("state")) for row in payload.get("scene_jobs", [])]
     reels = [str(row.get("state")) for row in payload.get("reel_jobs", [])]
-    if scenes and all(state == "completed" for state in scenes):
+    if "awaiting_secondary_approval" in scenes:
+        payload["pack_status"] = "awaiting_secondary_approval"
+    elif scenes and all(state == "completed" for state in scenes):
         if reels and all(state == "completed" for state in reels):
             payload["pack_status"] = "completed"
             delivery = payload.setdefault(
@@ -216,43 +280,203 @@ def _set_pack_status(payload: dict[str, Any]) -> None:
             payload["pack_status"] = "blocked_music"
         else:
             payload["pack_status"] = "composing_reels"
-    elif any(state in {"terminal_failed", "blocked_reference"} for state in scenes):
+    elif any(
+        state in {"terminal_failed", "blocked_reference", "submit_ambiguous"}
+        for state in scenes
+    ):
         payload["pack_status"] = "partially_blocked"
-    elif any(state in {"submitted", "in_progress", "downloaded", "composed"} for state in scenes):
+    elif any(
+        state in {"submitting", "submitted", "in_progress", "downloaded", "composed"}
+        for state in scenes
+    ):
         payload["pack_status"] = "in_progress"
     else:
         payload["pack_status"] = "queued"
 
 
 def _approved_reference_path(path: Path | None) -> Path | None:
-    if path is None:
+    """Compatibility helper returning the canonical frontal reference."""
+    catalog = _reference_catalog(path)
+    selected = catalog.get("frontal_identity") or catalog.get("three_quarter_identity")
+    return selected.path if selected else None
+
+
+def _safe_reference_file(root: Path, filename: str) -> Path | None:
+    raw = str(filename).strip()
+    if not raw or Path(raw).name != raw:
         return None
+    candidate = (root / raw).resolve()
+    if candidate.parent != root or candidate == PROJECT_ROOT or PROJECT_ROOT in candidate.parents:
+        return None
+    if not candidate.is_file() or candidate.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".webp"}:
+        return None
+    return candidate
+
+
+def _reference_catalog(path: Path | None) -> dict[str, ReferenceSelection]:
+    if path is None:
+        return {}
     candidate = path.expanduser().resolve()
     if candidate == PROJECT_ROOT or PROJECT_ROOT in candidate.parents:
-        return None
+        return {}
     if candidate.is_file() and candidate.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}:
-        return candidate
+        selection = ReferenceSelection(candidate, "frontal_identity")
+        return {"frontal_identity": selection, "three_quarter_identity": selection}
     if not candidate.is_dir():
-        return None
-    images = [
-        item for item in candidate.iterdir()
-        if item.is_file() and item.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}
-    ]
-    if not images:
-        return None
-    return sorted(
-        images,
-        key=lambda item: (0 if item.stem.casefold() == "naz-primary" else 1, item.name.casefold()),
-    )[0]
+        return {}
+    profile_path = candidate / "naz-reference-profile.json"
+    rows: Mapping[str, Any] = {}
+    body_guidance = ""
+    if profile_path.is_file():
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            if not isinstance(profile, dict):
+                return {}
+            if profile.get("schema") != "naz-reference-profile.v1" or profile.get("persona") != "naz":
+                return {}
+            rows = profile.get("reference_files", {})
+            body = profile.get("body_profile", {})
+            if not isinstance(rows, dict) or not isinstance(body, dict):
+                return {}
+            if any(
+                not isinstance(rows.get(name), str)
+                for name in ("primary", "secondary")
+            ):
+                return {}
+            if body and (
+                type(body.get("height_cm")) is not int
+                or type(body.get("weight_kg")) is not int
+                or not isinstance(body.get("build"), str)
+                or not isinstance(body.get("visual_guidance"), str)
+            ):
+                return {}
+            height = int(body.get("height_cm", 0))
+            weight = int(body.get("weight_kg", 0))
+            build = " ".join(body.get("build", "").split())[:80]
+            guidance = " ".join(body.get("visual_guidance", "").split())[:300]
+            if body and not (
+                140 <= height <= 220
+                and 45 <= weight <= 160
+                and build
+                and guidance
+            ):
+                return {}
+            if body:
+                body_guidance = (
+                    f"Adult man, {height} cm, {weight} kg, {build}. {guidance}"
+                )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+    else:
+        rows = {"primary": "naz-primary.jpg", "secondary": "naz-secondary.jpg"}
+    primary = _safe_reference_file(candidate, str(rows.get("primary", "")))
+    secondary = _safe_reference_file(candidate, str(rows.get("secondary", "")))
+    result: dict[str, ReferenceSelection] = {}
+    if primary:
+        result["frontal_identity"] = ReferenceSelection(primary, "frontal_identity")
+    if secondary:
+        result["three_quarter_identity"] = ReferenceSelection(
+            secondary, "three_quarter_identity", body_guidance
+        )
+    return result
 
 
-def _reference_for(scene: Mapping[str, Any], config: WorkerConfig, provider: VideoProvider) -> Path | None:
+def _reference_for(
+    scene: Mapping[str, Any], config: WorkerConfig, provider: VideoProvider,
+) -> ReferenceSelection | None:
     if not bool(scene.get("requires_naz_reference")):
         return None
-    reference = _approved_reference_path(config.reference_path)
+    role = str(scene.get("reference_role") or "frontal_identity")
+    reference = _reference_catalog(config.reference_path).get(role)
     if not provider.supports_reference or reference is None:
         raise ProviderError("approved_reference_invalid")
     return reference
+
+
+def _model_route(job: dict[str, Any], config: WorkerConfig) -> dict[str, Any]:
+    route = job.setdefault("model_route", {})
+    if not isinstance(route, dict):
+        raise RuntimeError("video_model_route_mismatch")
+    primary = str(route.get("primary_model") or config.primary_model)
+    secondary = str(route.get("secondary_model") or config.secondary_model)
+    if primary != CANONICAL_PRIMARY_MODEL or secondary != CANONICAL_SECONDARY_MODEL:
+        raise RuntimeError("video_model_route_mismatch")
+    if str(route.get("tier") or "primary") not in {"primary", "secondary"}:
+        raise RuntimeError("video_model_route_mismatch")
+    route.setdefault("tier", "primary")
+    route["primary_model"] = primary
+    route["secondary_model"] = secondary
+    route.setdefault("primary_failure_code", None)
+    route.setdefault("secondary_requested_at", None)
+    route.setdefault("secondary_approved_at", None)
+    return route
+
+
+def _selected_model(job: dict[str, Any], config: WorkerConfig) -> str | None:
+    if str(job.get("state")) == "awaiting_secondary_approval":
+        return None
+    route = _model_route(job, config)
+    if str(route.get("tier")) == "secondary":
+        if (
+            not route.get("secondary_requested_at")
+            or not route.get("secondary_approved_at")
+            or route.get("primary_failure_code") not in SECONDARY_ESCALATION_CODES
+        ):
+            raise RuntimeError("video_model_route_mismatch")
+        return str(route["secondary_model"])
+    return str(route["primary_model"])
+
+
+def _request_secondary(
+    job: dict[str, Any], payload: dict[str, Any], code: str,
+    config: WorkerConfig, provider: VideoProvider,
+) -> bool:
+    """Persist a manual escalation request; never construct/call secondary."""
+    route = _model_route(job, config)
+    if (
+        code not in SECONDARY_ESCALATION_CODES
+        or config.auto_fallback
+        or provider.name != "runway"
+        or provider.model != str(route.get("primary_model"))
+        or str(route.get("secondary_model")) == provider.model
+        or route.get("secondary_approved_at")
+    ):
+        return False
+    external_id = str(job.get("external_job_id") or "")
+    if external_id:
+        history = job.setdefault("provider_job_history", [])
+        if external_id not in history:
+            history.append(external_id)
+    now = datetime.now(timezone.utc).isoformat()
+    route.update({
+        "tier": "primary", "primary_failure_code": code,
+        "secondary_requested_at": now, "secondary_approved_at": None,
+    })
+    job.update({
+        "state": "awaiting_secondary_approval", "external_job_id": None,
+        "provider_status": "primary_failed", "failure_code": code,
+    })
+    payload["pack_status"] = "awaiting_secondary_approval"
+    return True
+
+
+def _request_secondary_for_text_only_scenes(
+    payload: dict[str, Any], config: WorkerConfig, provider: VideoProvider,
+) -> None:
+    """Batch the known Turbo incompatibilities into one admin confirmation."""
+    scenes = {
+        str(scene.get("scene_id")): scene for scene in payload.get("scenes", [])
+    }
+    for candidate in payload.get("scene_jobs", []):
+        scene = scenes.get(str(candidate.get("scene_id")), {})
+        if (
+            not bool(scene.get("requires_naz_reference"))
+            and str(candidate.get("state")) in {"planned", "queued", "retryable_failed"}
+            and not candidate.get("external_job_id")
+        ):
+            _request_secondary(
+                candidate, payload, "video_prompt_image_required", config, provider
+            )
 
 
 def _mark_failure(job: dict[str, Any], exc: BaseException, config: WorkerConfig) -> None:
@@ -266,13 +490,41 @@ def _mark_failure(job: dict[str, Any], exc: BaseException, config: WorkerConfig)
         job["state"] = "terminal_failed"
 
 
+def _mark_submit_ambiguous(
+    job: dict[str, Any], payload: dict[str, Any], manifest: Path,
+) -> None:
+    intent = job.get("submit_intent")
+    if isinstance(intent, dict):
+        intent.update({
+            "state": "ambiguous",
+            "failure_code": "provider_submit_outcome_ambiguous",
+        })
+    job.update({
+        "state": "submit_ambiguous",
+        "provider_status": "submit_outcome_ambiguous",
+        "failure_code": "provider_submit_outcome_ambiguous",
+        "external_job_id": None,
+    })
+    _set_pack_status(payload)
+    _write(manifest, payload)
+
+
 def _process_scene(
     *, payload: dict[str, Any], job: dict[str, Any], manifest: Path,
     config: WorkerConfig, provider: VideoProvider, composer: MediaComposer,
 ) -> None:
     scene = _scene_plan(payload, str(job["scene_id"]))
     state = str(job.get("state", "queued"))
-    if state in {"completed", "terminal_failed", "blocked_reference"}:
+    if state in {
+        "completed", "terminal_failed", "blocked_reference", "awaiting_secondary_approval",
+        "submit_ambiguous",
+    }:
+        return
+    if state == "submitting":
+        # The process may have died after the POST left the host.  Without an
+        # external id there is no safe way to distinguish accepted from lost,
+        # so this intent is blocked permanently instead of being submitted twice.
+        _mark_submit_ambiguous(job, payload, manifest)
         return
     if state == "composed":
         clean = composer.safe_output(manifest.parent, str(job["clean_path"]))
@@ -300,6 +552,10 @@ def _process_scene(
             _set_pack_status(payload)
             _write(manifest, payload)
             return
+        if provider.model == "gen4_turbo" and reference is None:
+            _request_secondary_for_text_only_scenes(payload, config, provider)
+            _write(manifest, payload)
+            return
         jobs, seconds = _budget_usage(config.pack_root)
         planned = int(job["planned_duration_seconds"])
         if jobs >= config.daily_job_limit or jobs + 1 > config.daily_job_limit:
@@ -310,23 +566,83 @@ def _process_scene(
             job["failure_code"] = "daily_seconds_limit_reached"
             _write(manifest, payload)
             return
+        prompt = str(scene["provider_prompt"])
+        if reference and reference.body_guidance:
+            prompt += (
+                " Body continuity for this medium or wide Naz shot: "
+                + reference.body_guidance
+            )
         try:
-            submitted = provider.submit(SceneRequest(
-                scene_id=str(job["scene_id"]), prompt=story_production.validate_provider_prompt(str(scene["provider_prompt"])),
-                duration_seconds=planned, reference_path=reference,
-            ))
-        except (ProviderError, story_production.StoryPlanError) as exc:
-            job["attempts"] = int(job.get("attempts", 0)) + 1
+            request = SceneRequest(
+                scene_id=str(job["scene_id"]),
+                prompt=story_production.validate_provider_prompt(prompt),
+                duration_seconds=planned,
+                reference_path=reference.path if reference else None,
+            )
+        except story_production.StoryPlanError as exc:
             _mark_failure(job, exc, config)
             _set_pack_status(payload)
             _write(manifest, payload)
             return
+        attempt_number = int(job.get("attempts", 0)) + 1
+        created_at = datetime.now(timezone.utc).isoformat()
+        previous_intent = job.get("submit_intent")
+        if isinstance(previous_intent, dict):
+            job.setdefault("submit_intent_history", []).append(dict(previous_intent))
+        intent_id = hashlib.sha256(
+            f"{payload.get('plan_id')}|{job.get('scene_id')}|{provider.model}|"
+            f"{attempt_number}|{created_at}".encode("utf-8")
+        ).hexdigest()[:24]
+        job.update({
+            "state": "submitting", "external_job_id": None,
+            "provider_status": "submit_intent_persisted", "submitted_at": created_at,
+            "attempts": attempt_number, "failure_code": None,
+            "submit_intent": {
+                "intent_id": intent_id, "model": provider.model,
+                "created_at": created_at, "state": "submitting", "failure_code": None,
+            },
+        })
+        attempts = job.setdefault("model_attempts", {})
+        attempts[provider.model] = int(attempts.get(provider.model, 0)) + 1
+        payload["provider"] = {"name": provider.name, "model": provider.model}
+        _set_pack_status(payload)
+        _write(manifest, payload)  # Durable before the paid POST leaves the host.
+        try:
+            submitted = provider.submit(request)
+            if not str(submitted.external_job_id).strip():
+                raise ProviderError("provider_job_id_missing", retryable=True)
+        except (ProviderError, story_production.StoryPlanError) as exc:
+            code = _failure_code(exc)
+            if code not in DEFINITIVE_SUBMIT_FAILURE_CODES:
+                _mark_submit_ambiguous(job, payload, manifest)
+                return
+            intent = job.get("submit_intent")
+            if isinstance(intent, dict):
+                intent.update({"state": "rejected", "failure_code": code})
+            if code == "video_prompt_image_required":
+                _request_secondary(job, payload, code, config, provider)
+                _write(manifest, payload)
+                return
+            _mark_failure(job, exc, config)
+            if job.get("state") == "terminal_failed":
+                _request_secondary(job, payload, code, config, provider)
+            _set_pack_status(payload)
+            _write(manifest, payload)
+            return
+        except Exception:
+            _mark_submit_ambiguous(job, payload, manifest)
+            return
+        intent = job.get("submit_intent")
+        if isinstance(intent, dict):
+            intent.update({
+                "state": "accepted", "external_job_id": submitted.external_job_id,
+                "failure_code": None,
+            })
         job.update({
             "state": "submitted", "external_job_id": submitted.external_job_id,
             "provider_status": submitted.status, "submitted_at": datetime.now(timezone.utc).isoformat(),
-            "attempts": int(job.get("attempts", 0)) + 1, "failure_code": None,
+            "failure_code": None,
         })
-        payload["provider"] = {"name": provider.name, "model": provider.model}
         _set_pack_status(payload)
         _write(manifest, payload)  # External ID is durable before any poll.
         return
@@ -349,6 +665,8 @@ def _process_scene(
             return
         job.setdefault("provider_job_history", []).append(external_id)
         _mark_failure(job, ProviderError("provider_timeout", retryable=True), config)
+        if job.get("state") == "terminal_failed":
+            _request_secondary(job, payload, "provider_timeout", config, provider)
         _set_pack_status(payload)
         _write(manifest, payload)
         return
@@ -361,7 +679,10 @@ def _process_scene(
             _write(manifest, payload)
             return
         if current.status == "terminal_failed":
-            _mark_failure(job, ProviderError(current.failure_code or "provider_terminal_failure"), config)
+            code = current.failure_code or "provider_terminal_failure"
+            job["state"] = "terminal_failed"
+            job["failure_code"] = code
+            _request_secondary(job, payload, code, config, provider)
             _set_pack_status(payload)
             _write(manifest, payload)
             return
@@ -393,15 +714,163 @@ def _process_scene(
             job["state"] = "in_progress"
         else:
             job["state"] = "terminal_failed"
+            _request_secondary(job, payload, _failure_code(exc), config, provider)
     except MediaError as exc:
         # A completed provider task can be downloaded/composed again without a
         # second submit. Bound local retries independently from provider jobs.
         job["compose_attempts"] = int(job.get("compose_attempts", 0)) + 1
         job["failure_code"] = _failure_code(exc)
         job["state"] = "submitted" if job["compose_attempts"] <= config.max_retries else "terminal_failed"
+        if job["state"] == "terminal_failed":
+            _request_secondary(job, payload, _failure_code(exc), config, provider)
     if job.get("failure_code"):
         _set_pack_status(payload)
         _write(manifest, payload)
+
+
+MUSIC_ROTATION_SCHEMA = "naz-story-music-rotation-v1"
+
+
+class MusicRotationLock:
+    def __init__(self, state_path: Path) -> None:
+        self.lock = AdvisoryFileLock(
+            state_path.with_suffix(state_path.suffix + ".lock")
+        )
+
+    def __enter__(self) -> "MusicRotationLock":
+        try:
+            self.lock.__enter__()
+        except StoryPackLockError as exc:
+            raise MediaError("music_rotation_state_invalid") from exc
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.lock.__exit__()
+
+
+def _rotation_path(config: WorkerConfig) -> Path:
+    return (
+        config.music_rotation_state_path
+        or (config.pack_root / ".story_music_rotation.json")
+    ).expanduser().resolve()
+
+
+def _load_music_rotation(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"schema": MUSIC_ROTATION_SCHEMA, "recent": [], "reservations": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MediaError("music_rotation_state_invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != MUSIC_ROTATION_SCHEMA
+        or not isinstance(payload.get("recent"), list)
+        or not isinstance(payload.get("reservations"), dict)
+    ):
+        raise MediaError("music_rotation_state_invalid")
+    payload["recent"] = [str(item) for item in payload["recent"]][-8:]
+    payload["reservations"] = {
+        str(key): str(value) for key, value in payload["reservations"].items()
+    }
+    return payload
+
+
+def _music_tags(payload: Mapping[str, Any]) -> set[str]:
+    result: set[str] = set()
+    for raw in payload.get("music_plan", {}).get("tags", []):
+        result.update(
+            item.strip().casefold()
+            for item in str(raw).split(",")
+            if item.strip()
+        )
+    return result
+
+
+def _reserve_track(
+    *, tracks: list[Any], tags: set[str], state_path: Path, reservation_id: str,
+    duration_seconds: float,
+) -> Any:
+    with MusicRotationLock(state_path):
+        state = _load_music_rotation(state_path)
+        by_id = {track.track_id: track for track in tracks}
+        existing = state["reservations"].get(reservation_id)
+        if existing in by_id:
+            selected = by_id[existing]
+            if not eligible_segment_starts(
+                beat_grid=selected.beat_grid,
+                beat_evidence=selected.beat_evidence,
+                evidence_required=selected.evidence_required,
+                track_duration_seconds=selected.duration_seconds,
+                segment_duration_seconds=duration_seconds,
+                beats_per_bar=selected.beats_per_bar,
+            ):
+                raise MediaError("licensed_music_segment_invalid")
+            return selected
+        recent = list(state["recent"])
+        reserved = set(state["reservations"].values())
+
+        def rank(track: Any) -> tuple[int, int, int, str]:
+            overlap = len(tags.intersection(set(track.tags)))
+            is_recent = track.track_id in recent
+            recent_index = recent.index(track.track_id) if is_recent else -1
+            return (1 if is_recent else 0, -overlap, recent_index, track.track_id)
+
+        candidates = [
+            track for track in tracks
+            if (
+                track.track_id not in reserved
+                and eligible_segment_starts(
+                    beat_grid=track.beat_grid,
+                    beat_evidence=track.beat_evidence,
+                    evidence_required=track.evidence_required,
+                    track_duration_seconds=track.duration_seconds,
+                    segment_duration_seconds=duration_seconds,
+                    beats_per_bar=track.beats_per_bar,
+                )
+            )
+        ]
+        if not candidates:
+            raise MediaError("licensed_music_segment_invalid")
+        selected = min(candidates, key=rank)
+        state["reservations"][reservation_id] = selected.track_id
+        story_production.atomic_json(state_path, state)
+        return selected
+
+
+def _complete_track_rotation(state_path: Path, reservation_id: str, track_id: str) -> None:
+    with MusicRotationLock(state_path):
+        state = _load_music_rotation(state_path)
+        if state["reservations"].get(reservation_id) not in {None, track_id}:
+            raise MediaError("music_rotation_state_invalid")
+        state["reservations"].pop(reservation_id, None)
+        recent = [item for item in state["recent"] if item != track_id]
+        recent.append(track_id)
+        state["recent"] = recent[-8:]
+        story_production.atomic_json(state_path, state)
+
+
+def _segment_grid(track: Any, *, duration_seconds: float, seed: str) -> tuple[float, tuple[float, ...]]:
+    candidates = eligible_segment_starts(
+        beat_grid=track.beat_grid,
+        beat_evidence=track.beat_evidence,
+        evidence_required=track.evidence_required,
+        track_duration_seconds=track.duration_seconds,
+        segment_duration_seconds=duration_seconds,
+        beats_per_bar=track.beats_per_bar,
+    )
+    if not candidates:
+        raise MediaError("licensed_music_segment_invalid")
+    index = int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12], 16) % len(candidates)
+    start = candidates[index]
+    grid = tuple(
+        round(float(beat) - start, 6)
+        for beat in track.beat_grid
+        if start - 0.001 <= float(beat) <= start + duration_seconds + 0.6
+    )
+    if not grid or abs(grid[0]) > 0.01:
+        raise MediaError("licensed_music_segment_invalid")
+    return round(start, 6), grid
 
 
 def _align_shots(shots: list[dict[str, Any]], beat_grid: tuple[float, ...], payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -419,6 +888,8 @@ def _align_shots(shots: list[dict[str, Any]], beat_grid: tuple[float, ...], payl
         item["duration_seconds"] = round(end - elapsed, 3)
         aligned.append(item)
         elapsed = end
+    if not 12.0 <= elapsed <= 20.0:
+        raise MediaError("licensed_music_segment_invalid")
     return aligned
 
 
@@ -433,26 +904,65 @@ def _compose_reels(payload: dict[str, Any], manifest: Path, config: WorkerConfig
         _set_pack_status(payload)
         _write(manifest, payload)
         return
-    track = tracks[0]
-    payload["music_plan"]["selected_track"] = {
-        "track_id": track.track_id, "path": str(track.path), "bpm": track.bpm,
-        "beat_grid": list(track.beat_grid), "license": track.license,
-        "source": track.source, "checksum": track.checksum,
-        "publication_rotation_consumed": False,
-    }
+    tracks_by_id = {track.track_id: track for track in tracks}
+    rotation_path = _rotation_path(config)
+    tags = _music_tags(payload)
     edits = {str(row["edit_id"]): row for row in payload.get("reel_edits", [])}
     for reel in payload.get("reel_jobs", []):
         if reel.get("state") == "completed":
             continue
         try:
             edit = edits[str(reel["edit_id"])]
-            shots = _align_shots([dict(row) for row in edit["shots"]], track.beat_grid, payload)
+            reservation_id = f"{payload.get('plan_id')}:{reel['edit_id']}"
+            planned_duration = sum(float(row["duration_seconds"]) for row in edit["shots"])
+            selection = reel.get("music_selection")
+            if isinstance(selection, dict):
+                track = tracks_by_id.get(str(selection.get("track_id")))
+                if track is None or selection.get("checksum") != track.checksum:
+                    raise MediaError("licensed_music_invalid")
+                start_seconds = float(selection["start_seconds"])
+                segment_grid = tuple(float(item) for item in selection["segment_beat_grid"])
+            else:
+                track = _reserve_track(
+                    tracks=tracks, tags=tags, state_path=rotation_path,
+                    reservation_id=reservation_id,
+                    duration_seconds=planned_duration,
+                )
+                start_seconds, segment_grid = _segment_grid(
+                    track, duration_seconds=planned_duration,
+                    seed=reservation_id,
+                )
+                reel["music_selection"] = {
+                    "track_id": track.track_id, "checksum": track.checksum,
+                    "start_seconds": start_seconds,
+                    "segment_beat_grid": list(segment_grid),
+                    "reservation_id": reservation_id,
+                }
+                _write(manifest, payload)
+            shots = _align_shots(
+                [dict(row) for row in edit["shots"]], segment_grid, payload
+            )
             destination = composer.safe_output(manifest.parent, str(reel["path"]))
-            probe = composer.compose_reel(pack_root=manifest.parent, shots=shots, destination=destination, track=track)
+            probe = composer.compose_reel(
+                pack_root=manifest.parent, shots=shots, destination=destination,
+                track=track, track_start_seconds=start_seconds,
+                segment_beat_grid=segment_grid,
+            )
+            _complete_track_rotation(rotation_path, reservation_id, track.track_id)
             reel.update({
                 "state": "completed", "actual_edl": shots, "media_probe": probe.to_dict(),
                 "checksum": checksum(destination), "failure_code": None,
             })
+            selected = {
+                "track_id": track.track_id, "bpm": track.bpm,
+                "lane": track.lane, "start_seconds": start_seconds,
+                "license": track.license, "source": track.source,
+                "checksum": track.checksum,
+                "publication_rotation_consumed": False,
+                "story_rotation_consumed": True,
+            }
+            payload["music_plan"]["selected_track"] = selected
+            payload["music_plan"].setdefault("selected_tracks", []).append(selected)
         except MediaError as exc:
             reel.update({"state": "blocked_music", "failure_code": _failure_code(exc)})
         _set_pack_status(payload)
@@ -460,32 +970,69 @@ def _compose_reels(payload: dict[str, Any], manifest: Path, config: WorkerConfig
 
 
 def process_pack(
-    plan_id: str, *, config: WorkerConfig, provider: VideoProvider,
-    composer: MediaComposer | None = None,
+    plan_id: str, *, config: WorkerConfig, provider: VideoProvider | None = None,
+    composer: MediaComposer | None = None, env: Mapping[str, str] | None = None,
 ) -> str:
     if not config.render_enabled:
         return "render_disabled"
+    if (
+        config.primary_model != CANONICAL_PRIMARY_MODEL
+        or config.secondary_model != CANONICAL_SECONDARY_MODEL
+        or config.model_priority != CANONICAL_MODEL_PRIORITY
+    ):
+        raise RuntimeError("video_model_priority_invalid")
     pack_dir = (config.pack_root / plan_id).resolve()
     if config.pack_root not in pack_dir.parents:
         raise RuntimeError("unsafe_plan_id")
     manifest = pack_dir / "story_manifest.json"
-    payload = story_production.read_manifest(manifest)
-    if payload.get("schema") == story_production.LEGACY_STORY_SCHEMA:
-        return "legacy_manifest_read_only"
-    if str(payload.get("approval", {}).get("status")) != "approved":
-        return "awaiting_approval"
-    if len(payload.get("scene_jobs", [])) > config.max_scene_jobs:
-        raise RuntimeError("scene_job_limit_exceeded")
-    media = composer or MediaComposer(
-        ffmpeg=config.ffmpeg, ffprobe=config.ffprobe, font_path=config.font_path,
-        timeout_seconds=config.media_timeout_seconds,
-    )
+    if config.auto_fallback:
+        raise RuntimeError("video_auto_fallback_forbidden")
     with PackLock(pack_dir):
+        payload = story_production.read_manifest(manifest)
+        if payload.get("schema") == story_production.LEGACY_STORY_SCHEMA:
+            return "legacy_manifest_read_only"
+        if not story_production.manifest_has_current_production_contract(payload):
+            raise RuntimeError("story_manifest_contract_stale")
+        if str(payload.get("approval", {}).get("status")) != "approved":
+            return "awaiting_approval"
+        if len(payload.get("scene_jobs", [])) > config.max_scene_jobs:
+            raise RuntimeError("scene_job_limit_exceeded")
+        if any(
+            str(job.get("state", "")) == "submit_ambiguous"
+            for job in payload.get("scene_jobs", [])
+        ):
+            return "submit_ambiguous"
         # Concurrency=1: resume the first non-terminal job only.
         for job in payload.get("scene_jobs", []):
-            if job.get("state") not in {"completed", "terminal_failed", "blocked_reference"}:
-                _process_scene(payload=payload, job=job, manifest=manifest, config=config, provider=provider, composer=media)
+            state = str(job.get("state", ""))
+            if state == "submitting":
+                _mark_submit_ambiguous(job, payload, manifest)
+                return "submit_ambiguous"
+            if state not in story_production.TERMINAL_SCENE_STATES:
+                model = _selected_model(job, config)
+                if model is None:
+                    _set_pack_status(payload)
+                    _write(manifest, payload)
+                    return "awaiting_secondary_approval"
+                active_provider = provider or provider_from_environment(
+                    env, model_override=model
+                )
+                if active_provider.name == "runway" and active_provider.model != model:
+                    raise RuntimeError("video_model_route_mismatch")
+                media = composer or MediaComposer(
+                    ffmpeg=config.ffmpeg, ffprobe=config.ffprobe,
+                    font_path=config.font_path,
+                    timeout_seconds=config.media_timeout_seconds,
+                )
+                _process_scene(
+                    payload=payload, job=job, manifest=manifest, config=config,
+                    provider=active_provider, composer=media,
+                )
                 return str(job.get("state"))
+        media = composer or MediaComposer(
+            ffmpeg=config.ffmpeg, ffprobe=config.ffprobe, font_path=config.font_path,
+            timeout_seconds=config.media_timeout_seconds,
+        )
         _compose_reels(payload, manifest, config, media)
         return str(payload.get("pack_status"))
 
@@ -499,8 +1046,40 @@ def _queued_plan_ids(root: Path) -> list[str]:
             payload = story_production.read_manifest(manifest)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if payload.get("schema") == story_production.STORY_SCHEMA and payload.get("pack_status") != "completed":
+        if not story_production.manifest_has_current_production_contract(payload):
+            continue
+        if str(payload.get("approval", {}).get("status")) != "approved":
+            continue
+        if any(
+            str(job.get("state", "")) == "submit_ambiguous"
+            for job in payload.get("scene_jobs", [])
+        ):
+            continue
+        if payload.get("pack_status") in {
+            "awaiting_approval", "awaiting_secondary_approval", "superseded", "completed",
+        }:
+            continue
+        scene_jobs = payload.get("scene_jobs", [])
+        first_pending = next(
+            (
+                str(job.get("state", ""))
+                for job in scene_jobs
+                if str(job.get("state", ""))
+                not in story_production.TERMINAL_SCENE_STATES
+            ),
+            None,
+        )
+        if first_pending in {
+            "planned", "queued", "submitting", "submitted", "in_progress", "downloaded",
+            "composed", "retryable_failed",
+        }:
             result.append(str(payload.get("plan_id")))
+            continue
+        if first_pending == "awaiting_secondary_approval":
+            continue
+        if scene_jobs and all(job.get("state") == "completed" for job in scene_jobs):
+            if any(job.get("state") != "completed" for job in payload.get("reel_jobs", [])):
+                result.append(str(payload.get("plan_id")))
     return result
 
 
@@ -528,8 +1107,10 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
         print(json.dumps({"status": "render_disabled", "live_api_called": False}))
         return 0
     try:
-        provider = provider_from_environment(env)
-        status = process_pack(plan_ids[0], config=config, provider=provider) if plan_ids else "queue_empty"
+        status = (
+            process_pack(plan_ids[0], config=config, env=env)
+            if plan_ids else "queue_empty"
+        )
     except (ProviderError, RuntimeError, OSError, json.JSONDecodeError) as exc:
         LOGGER.error("story worker stopped: %s", _failure_code(exc))
         print(json.dumps({"status": "failed", "reason_code": _failure_code(exc)}))

@@ -27,13 +27,17 @@ DRAMATURGIC_ROLES = (
     "hook", "problem", "hypothesis", "test", "result", "solution", "conclusion",
 )
 SHOT_SIZES = ("wide", "medium", "close", "macro")
+REFERENCE_ROLES = ("none", "frontal_identity", "three_quarter_identity")
 REEL_CROPS = ("tight-center", "left-detail", "right-detail", "wide-center")
 CAMERA_MOTIONS = ("slow push", "controlled pan", "handheld follow", "locked with real subject motion")
 SAFE_ZONES = ("upper-middle", "middle-left", "lower-middle above platform controls")
-TERMINAL_SCENE_STATES = {"completed", "terminal_failed", "blocked_reference"}
+TERMINAL_SCENE_STATES = {
+    "completed", "terminal_failed", "blocked_reference", "submit_ambiguous",
+}
 SCENE_STATES = {
     "planned", "queued", "submitted", "in_progress", "downloaded", "composed",
     "completed", "retryable_failed", "terminal_failed", "blocked_reference",
+    "awaiting_secondary_approval", "submitting", "submit_ambiguous",
 }
 _SECRET_RE = re.compile(
     r"(?i)(?:token|api[_ -]?key|password|secret|authorization|bearer|private message|"
@@ -70,6 +74,7 @@ class ScenePlan:
     copyright_warning: bool
     suggested_interactive_sticker: str
     requires_naz_reference: bool
+    reference_role: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,8 +155,19 @@ def _requires_reference(subject: str) -> bool:
 
 
 def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fact: str) -> ScenePlan:
-    duration = 4 + (_rank(plan.plan_id, f"duration:{index}") % 5)
+    # Both configured Runway tiers accept a five-second master.  Keeping the
+    # provider master fixed also makes Reel timing and credit accounting exact.
+    duration = 5
     subject = plan.visual_subject_direction
+    shot_size = SHOT_SIZES[_rank(plan.plan_id, f"shot:{index}") % len(SHOT_SIZES)]
+    requires_reference = _requires_reference(subject)
+    reference_role = (
+        "three_quarter_identity"
+        if requires_reference and shot_size in {"wide", "medium"}
+        else "frontal_identity"
+        if requires_reference
+        else "none"
+    )
     setting = f"A real Naz work chronology setting tied to fact {index + 1}"
     standalone = f"{role}: {fact}"[:180]
     overlay = standalone[:72]
@@ -185,7 +201,7 @@ def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fa
         subject=subject, setting=setting,
         start_state="before the documented action changes the situation",
         end_state="after the documented result is physically visible",
-        shot_size=SHOT_SIZES[_rank(plan.plan_id, f"shot:{index}") % len(SHOT_SIZES)],
+        shot_size=shot_size,
         camera_motion=CAMERA_MOTIONS[_rank(plan.plan_id, f"motion:{index}") % len(CAMERA_MOTIONS)],
         duration_seconds=duration, clean_prompt=clean_prompt, provider_prompt=provider_prompt,
         story_overlay=overlay,
@@ -194,7 +210,7 @@ def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fa
         source_fact_ref=f"{plan.source_ref}#fact-{index + 1}", footage_type="generative",
         continuity_constraints=continuity, secret_warning=False, copyright_warning=False,
         suggested_interactive_sticker="question" if role in {"hypothesis", "test"} else "none",
-        requires_naz_reference=_requires_reference(subject),
+        requires_naz_reference=requires_reference, reference_role=reference_role,
     )
 
 
@@ -203,12 +219,18 @@ def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: boo
     order.sort(key=lambda index: _rank(plan.plan_id, f"reel:{short}:{index}"))
     if order == list(range(len(scenes))):
         order = order[1:] + order[:1]
-    if short:
-        order = order[: max(3, len(order) - 1)]
+    # Four-on-the-floor and half-time grids can pull a nominal two-second cut
+    # slightly earlier.  A 14-second short target still remains >=12 seconds
+    # after beat alignment across the approved BPM lanes.
+    target_seconds = 14.0 if short else 16.0
+    shot_count = int(target_seconds / 2.0)
+    # Reuse CLEAN masters deliberately when a pack has fewer cuts than the
+    # target Reel.  The crop, in-point and framing still change per fragment.
+    order = [order[index % len(order)] for index in range(shot_count)]
     shots: list[dict[str, Any]] = []
     for position, scene_index in enumerate(order):
         scene = scenes[scene_index]
-        length = round(0.4 + ((_rank(plan.plan_id, f"cut:{short}:{position}") % 17) / 10), 1)
+        length = 2.0
         source_shot_size = scene.shot_size
         source_index = SHOT_SIZES.index(source_shot_size)
         reel_shot_size = SHOT_SIZES[
@@ -224,7 +246,7 @@ def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: boo
             "source_scene_id": scene.scene_id,
             "source": f"stories/{scene.scene_id}_clean.mp4",
             "in_seconds": round(0.2 * (position % 4), 1),
-            "duration_seconds": min(2.0, length),
+            "duration_seconds": length,
             "story_shot_size": scene.shot_size,
             "source_shot_size": source_shot_size,
             "reel_shot_size": reel_shot_size,
@@ -312,8 +334,8 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
     if pack.renderer not in {"available", RENDERER_UNAVAILABLE}:
         raise StoryPlanError("unknown renderer status")
     for scene in pack.scenes:
-        if not 4 <= scene.duration_seconds <= 8:
-            raise StoryPlanError("Story duration must be 4..8 seconds")
+        if scene.duration_seconds != 5:
+            raise StoryPlanError("Story duration must be exactly 5 seconds")
         if scene.secret_warning or _SECRET_RE.search(scene.clean_prompt):
             raise StoryPlanError("secret warning in scene")
         if "9:16" not in scene.clean_prompt or "Real motion" not in scene.clean_prompt:
@@ -329,6 +351,9 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
             raise StoryPlanError("Reel needs its own hook, conclusion and EDL")
         if not all(0.4 <= float(item["duration_seconds"]) <= 2.0 for item in edit.shots):
             raise StoryPlanError("every Reel fragment must be 0.4..2.0 seconds")
+        total_duration = sum(float(item["duration_seconds"]) for item in edit.shots)
+        if not 12.0 <= total_duration <= 20.0:
+            raise StoryPlanError("Reel duration must be 12..20 seconds")
         for item in edit.shots:
             source_size = str(item.get("source_shot_size", ""))
             reel_size = str(item.get("reel_shot_size", ""))
@@ -422,46 +447,139 @@ def _duration_in_range(value: Any, minimum: float, maximum: float) -> bool:
     return minimum <= duration <= maximum
 
 
-def _manifest_has_current_reel_contract(payload: Mapping[str, Any]) -> bool:
+def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool:
+    """Return whether a v2 manifest is safe for the current paid worker.
+
+    This deliberately checks the persisted production envelope, not just the
+    editorial plan.  Old v2 manifests can still be inspected or repaired by a
+    dry-run, but cannot be approved or reach a provider accidentally.
+    """
+    if payload.get("schema") != STORY_SCHEMA:
+        return False
     scenes = payload.get("scenes")
     edits = payload.get("reel_edits")
-    if not isinstance(scenes, list) or not isinstance(edits, list):
+    scene_jobs = payload.get("scene_jobs")
+    reel_jobs = payload.get("reel_jobs")
+    model_policy = payload.get("model_policy")
+    if not all(isinstance(value, list) for value in (scenes, edits, scene_jobs, reel_jobs)):
         return False
-    if not 4 <= len(scenes) <= 7 or not edits:
+    if not 4 <= len(scenes) <= 7 or payload.get("scene_count") != len(scenes) or not edits:
+        return False
+    if not isinstance(model_policy, dict) or (
+        model_policy.get("primary_tier") != "primary"
+        or model_policy.get("secondary_tier") != "secondary"
+        or model_policy.get("automatic_fallback") is not False
+    ):
         return False
     scene_ids = [str(item.get("scene_id", "")) for item in scenes if isinstance(item, dict)]
-    if len(scene_ids) != len(scenes) or len(set(scene_ids)) != len(scene_ids):
+    if len(scene_ids) != len(scenes) or not all(scene_ids) or len(set(scene_ids)) != len(scene_ids):
         return False
+    scenes_by_id = {str(item["scene_id"]): item for item in scenes}
     for scene in scenes:
+        requires_reference = scene.get("requires_naz_reference")
+        role = str(scene.get("reference_role", ""))
+        shot_size = str(scene.get("shot_size", ""))
         if (
-            str(scene.get("shot_size", "")) not in SHOT_SIZES
-            or not _duration_in_range(scene.get("duration_seconds"), 4, 8)
+            shot_size not in SHOT_SIZES
+            or not _duration_in_range(scene.get("duration_seconds"), 5, 5)
+            or not isinstance(requires_reference, bool)
+            or role not in REFERENCE_ROLES
         ):
             return False
+        if (
+            requires_reference and role not in {"frontal_identity", "three_quarter_identity"}
+        ) or (not requires_reference and role != "none"):
+            return False
+    if len(scene_jobs) != len(scenes):
+        return False
+    job_ids = [str(item.get("scene_id", "")) for item in scene_jobs if isinstance(item, dict)]
+    if (
+        len(job_ids) != len(scene_jobs)
+        or not all(job_ids)
+        or set(job_ids) != set(scene_ids)
+        or len(set(job_ids)) != len(job_ids)
+    ):
+        return False
+    route_fields = {
+        "tier", "primary_model", "secondary_model", "primary_failure_code",
+        "secondary_requested_at", "secondary_approved_at",
+    }
+    for job in scene_jobs:
+        scene_id = str(job.get("scene_id", ""))
+        scene = scenes_by_id[scene_id]
+        route = job.get("model_route")
+        state = str(job.get("state", ""))
+        submit_intent = job.get("submit_intent")
+        if (
+            state not in SCENE_STATES
+            or not _duration_in_range(job.get("planned_duration_seconds"), 5, 5)
+            or job.get("requires_naz_reference") is not scene["requires_naz_reference"]
+            or str(job.get("reference_role", "")) != str(scene["reference_role"])
+            or str(job.get("clean_path", "")) != f"stories/{scene_id}_clean.mp4"
+            or str(job.get("story_path", "")) != f"stories/{scene_id}_story.mp4"
+            or "submit_intent" not in job
+            or submit_intent is not None and not isinstance(submit_intent, dict)
+            or state in {"submitting", "submit_ambiguous"}
+            and not isinstance(submit_intent, dict)
+            or not isinstance(route, dict)
+            or not route_fields.issubset(route)
+            or route.get("tier") not in {"primary", "secondary"}
+        ):
+            return False
+    edit_ids: list[str] = []
     for edit in edits:
         if not isinstance(edit, dict) or not isinstance(edit.get("shots"), list):
             return False
+        edit_id = str(edit.get("edit_id", ""))
+        if not edit_id or not str(edit.get("hook", "")) or not str(edit.get("conclusion", "")):
+            return False
+        edit_ids.append(edit_id)
         shots = edit["shots"]
         if len(shots) < 3:
             return False
+        total_duration = 0.0
         for shot in shots:
             if not isinstance(shot, dict):
                 return False
             if not _duration_in_range(shot.get("duration_seconds"), 0.4, 2.0):
                 return False
+            total_duration += float(shot["duration_seconds"])
             if (
                 str(shot.get("source_shot_size", "")) not in SHOT_SIZES
                 or str(shot.get("reel_shot_size", "")) not in SHOT_SIZES
                 or not str(shot.get("source_scene_id", ""))
                 or not str(shot.get("crop_scale_instruction", ""))
                 or str(shot.get("source_scene_id", "")) not in scene_ids
+                or not bool(shot.get("crop_change_required"))
+                or str(shot.get("reel_crop", "")) not in REEL_CROPS
+                or not str(shot.get("source", "")).endswith("_clean.mp4")
             ):
                 return False
+        if not 12.0 <= total_duration <= 20.0:
+            return False
         if not any(shot["source_shot_size"] != shot["reel_shot_size"] for shot in shots):
             return False
         if [str(shot["source_scene_id"]) for shot in shots] == scene_ids[: len(shots)]:
             return False
+    if len(set(edit_ids)) != len(edit_ids) or len(reel_jobs) != len(edits):
+        return False
+    reel_job_ids = [str(item.get("edit_id", "")) for item in reel_jobs if isinstance(item, dict)]
+    if len(reel_job_ids) != len(reel_jobs) or set(reel_job_ids) != set(edit_ids):
+        return False
+    for job in reel_jobs:
+        edit_id = str(job.get("edit_id", ""))
+        if (
+            str(job.get("state", "")) not in {"planned", "blocked_music", "completed"}
+            or str(job.get("path", "")) != f"reels/{edit_id}.mp4"
+            or not {"media_probe", "checksum", "failure_code"}.issubset(job)
+        ):
+            return False
     return True
+
+
+def _manifest_has_current_reel_contract(payload: Mapping[str, Any]) -> bool:
+    """Compatibility alias for callers that used the old private checker."""
+    return manifest_has_current_production_contract(payload)
 
 
 def _preserve_render_statuses(payload: dict[str, Any], existing: Mapping[str, Any]) -> None:
@@ -496,6 +614,10 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
         "renderer": {"status": "awaiting_approval", "name": "ffmpeg"},
         "composer": {"status": "planned", "name": "ffmpeg"},
         "provider": {"name": None, "model": None},
+        "model_policy": {
+            "primary_tier": "primary", "secondary_tier": "secondary",
+            "automatic_fallback": False,
+        },
         "visual_identity_qa": {"status": "not_run", "blocking": False},
     })
     payload["scene_jobs"] = [{
@@ -509,6 +631,13 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
         "technical_qa": {"status": "not_run"},
         "visual_identity_qa": {"status": "not_run", "blocking": False},
         "failure_code": None, "requires_naz_reference": scene.requires_naz_reference,
+        "reference_role": scene.reference_role,
+        "submit_intent": None,
+        "model_route": {
+            "tier": "primary", "primary_model": None, "secondary_model": None,
+            "primary_failure_code": None, "secondary_requested_at": None,
+            "secondary_approved_at": None,
+        },
     } for scene in pack.scenes]
     payload["reel_jobs"] = [{
         "edit_id": edit.edit_id, "state": "planned",
@@ -562,7 +691,7 @@ def persist_dry_run(pack: StoryPackPlan, storage_root: Path) -> Path:
         existing = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(existing, dict) or existing.get("plan_id") != pack.plan_id:
             raise StoryPlanError("stored manifest plan_id mismatch")
-        if _manifest_has_current_reel_contract(existing):
+        if manifest_has_current_production_contract(existing):
             return pack_dir
     (pack_dir / "stories").mkdir(parents=True, exist_ok=True)
     (pack_dir / "reels").mkdir(parents=True, exist_ok=True)
