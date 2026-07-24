@@ -29,6 +29,7 @@ SCHEDULED_WORK_LABELS = frozenset(
         "crosspost_exchange",
         "source_monitor",
         "agent_content_sync",
+        "story_private_delivery",
         "vk_embedded_producer",
         "vk_systemd_producer",
         "vk_receipt_sync",
