@@ -22,6 +22,7 @@ from typing import Mapping, Protocol
 
 DEFAULT_STABILITY_BASE_URL = "https://api.stability.ai"
 STABLE_AUDIO_MODEL = "stable-audio-3"
+STABILITY_USER_AGENT = "NazAudioLibrary/1.0"
 TEXT_TO_AUDIO_PATH = "/v2beta/audio/stable-audio/text-to-audio"
 AUDIO_RESULTS_PATH = "/v2beta/audio/results"
 DEFAULT_MAX_RESPONSE_BYTES = 192 * 1024 * 1024
@@ -353,6 +354,9 @@ class StableAudioProvider:
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Accept": "audio/*",
+            # Stability's edge rejects urllib's generic default user agent on
+            # some hosts.  Keep this deterministic and free of host/user data.
+            "User-Agent": STABILITY_USER_AGENT,
         }
         if content_type is not None:
             headers["Content-Type"] = content_type

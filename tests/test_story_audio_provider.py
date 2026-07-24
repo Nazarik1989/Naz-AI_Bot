@@ -131,6 +131,7 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(call["url"], "https://api.stability.ai" + TEXT_TO_AUDIO_PATH)
         self.assertEqual(call["headers"]["Authorization"], "Bearer secret-stability-key")
         self.assertEqual(call["headers"]["Accept"], "audio/*")
+        self.assertEqual(call["headers"]["User-Agent"], "NazAudioLibrary/1.0")
         boundary, fields = multipart_fields(call)
         self.assertTrue(boundary.startswith("----NazStableAudio"))
         self.assertEqual(fields, {
@@ -242,6 +243,7 @@ class PollTests(unittest.TestCase):
         self.assertEqual(call["url"], "https://api.stability.ai" + AUDIO_RESULTS_PATH + "/" + JOB_ID)
         self.assertIsNone(call["body"])
         self.assertNotIn("Content-Type", call["headers"])
+        self.assertEqual(call["headers"]["User-Agent"], "NazAudioLibrary/1.0")
 
     def test_completed_mp3_is_validated_and_returned(self):
         transport = FakeTransport([completed()])
