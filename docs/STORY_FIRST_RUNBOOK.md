@@ -19,6 +19,9 @@ administrator's private chat automatically; there is no manual download step.
 - `--check-config` and `--dry-run` make no provider calls.
 - One scene is active per worker invocation. Limits are at most seven scenes,
   two retries, seven paid jobs and 56 generated seconds per UTC day by default.
+- `NAZ_VIDEO_AUTO_FALLBACK=true` is rejected. Gen-4.5 is never submitted until
+  the administrator confirms the pending escalation with the existing
+  `Подтвердить генерацию` button.
 - No Story/Reel autopublication exists. Completed media is delivered only to
   the configured administrator's private bot chat. VK music last-8 state is
   not read or consumed.
@@ -44,9 +47,11 @@ production without separate approval. Configure the exact font file through
 `NAZ_STORY_FONT_PATH`.
 
 Runway is the initial production adapter because it exposes asynchronous
-submit/retrieve/cancel tasks and downloadable video outputs. Configuration is
-explicit (`runway`, model `gen4.5`, the official API base URL), so another
-provider can implement the same `VideoProvider` contract. OpenAI Videos/Sora is
+submit/retrieve/cancel tasks and downloadable video outputs. The fixed priority
+is `gen4_turbo,gen4.5`: Turbo is the primary five-second image-to-video route;
+Gen-4.5 is the separately confirmed secondary route and may also handle
+object-only text-to-video scenes. An incompatible object-only Turbo scene is
+stopped before the API call. OpenAI Videos/Sora is
 not used: the official OpenAI deprecation notice schedules removal of the
 Videos API and Sora 2 model aliases on 24 September 2026 and lists no
 replacement.
@@ -54,11 +59,13 @@ replacement.
 ## Private inputs
 
 `NAZ_VIDEO_REFERENCE_DIR` must point outside Git to the private folder with
-approved Naz references. Name the canonical avatar `naz-primary.png` (or use
-JPG/JPEG/WebP) so it is selected first; otherwise the first image by filename
-is used. The legacy `NAZ_VIDEO_REFERENCE_PATH` remains supported. A face scene
-becomes `blocked_reference` if no image is available or the provider cannot
-accept a reference; object-only scenes remain eligible.
+`naz-primary.jpg`, `naz-secondary.jpg`, and `naz-reference-profile.json`.
+Primary is the frontal identity reference; secondary is the three-quarter
+identity reference. Exactly one is used per Naz scene. They are never sent as
+Runway first/last keyframes. Height/build guidance from the private profile is
+added only to medium/wide Naz shots and is ignored for close-ups, macro and
+object-only scenes. Inputs are normalized in memory to a valid 720×1280 first
+frame; private binaries and the profile stay outside Git.
 
 `NAZ_STORY_MUSIC_LIBRARY` may point to a private music folder. Each audio file
 must have a same-name JSON sidecar, for example `track.m4a.json`:
@@ -86,6 +93,30 @@ allowlist format remains supported:
 
 Missing or invalid music leaves CLEAN/STORY media intact and sets Reel state
 to `blocked_music`.
+
+### Initial generated music library
+
+Stable Audio 3.0 is used only by a bounded manual library command. It is not
+called by the Story timer and never receives an uploaded song or copyrighted
+reference. The catalog contains exactly eight original instrumental masters:
+three Midnight Wave, three Dark Melodic House, and two Emotional Future Garage.
+
+```bash
+python -m naz_audio_library --check-config
+python -m naz_audio_library --plan
+python -m naz_audio_library --generate-initial-library \
+  --max-new-tracks 8 --confirm-paid-calls 8
+```
+
+The last command additionally requires `NAZ_AUDIO_GENERATION_ENABLED=true`.
+Each successful master receives a strict private sidecar with checksum, actual
+duration, tempo and confidence-gated beat grid derived from decoded audio,
+model/provider, generation receipt and rights provenance. Full
+prompts and credentials are not written. An interrupted asynchronous job is
+polled by its durable generation ID; the POST is never repeated implicitly.
+The composer cuts a 12–20 second Reel segment locally on the beat grid. Track
+selection uses the private Story rotation state and does not consume Telegram
+or VK publication rotation.
 
 ## Safe private E2E
 

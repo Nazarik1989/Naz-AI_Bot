@@ -213,6 +213,7 @@ AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_co
 NAZ_STORY_PACK_ROOT = Path(
     os.getenv("NAZ_STORY_PACK_ROOT", "/var/lib/naz-ai-bot/story-packs").strip()
 )
+NAZ_STORY_RENDER_ENABLED = env_bool("NAZ_STORY_RENDER_ENABLED", False)
 NAZ_STORY_PRIVATE_DELIVERY_ENABLED = env_bool("NAZ_STORY_PRIVATE_DELIVERY_ENABLED", True)
 NAZ_STORY_DELIVERY_INTERVAL_SECONDS = max(
     30, env_int("NAZ_STORY_DELIVERY_INTERVAL_SECONDS", 60)
@@ -5051,6 +5052,12 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if not is_admin(user_id):
             await update.message.reply_text("🔒 Reels Maker доступен только администратору.", reply_markup=CONTENT_KEYBOARD)
             return True
+        if text == BTN_REELS_CONFIRM and not NAZ_STORY_RENDER_ENABLED:
+            await update.message.reply_text(
+                "Генерация пока безопасно выключена: подготовка приватной медиабиблиотеки не завершена.",
+                reply_markup=REELS_KEYBOARD,
+            )
+            return True
         manifest = await asyncio.to_thread(story_pack_control.latest_manifest, NAZ_STORY_PACK_ROOT)
         if manifest is None:
             await update.message.reply_text("Нового плана Reels пока нет.", reply_markup=REELS_KEYBOARD)
@@ -5058,9 +5065,16 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         try:
             if text == BTN_REELS_CONFIRM:
                 result = await asyncio.to_thread(
-                    story_pack_control.approve_pack, NAZ_STORY_PACK_ROOT, manifest.parent.name,
+                    story_pack_control.confirm_generation,
+                    NAZ_STORY_PACK_ROOT,
+                    manifest.parent.name,
                 )
-                note = "\n\n✅ Генерация подтверждена." if result == "approved" else "\n\nℹ️ Генерация уже подтверждена."
+                if result == "approved":
+                    note = "\n\n✅ Генерация основной моделью подтверждена."
+                elif result == "secondary_approved":
+                    note = "\n\n✅ Повтор проблемной сцены в Gen-4.5 подтверждён."
+                else:
+                    note = "\n\nℹ️ Сейчас дополнительного подтверждения не требуется."
             elif text == BTN_REELS_VARIANT:
                 new_dir = await asyncio.to_thread(
                     story_pack_control.create_next_variant,

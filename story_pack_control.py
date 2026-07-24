@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -11,6 +10,7 @@ from typing import Any, Iterator, Mapping
 
 from editorial_orchestrator import EditorialPlan
 import story_production
+from story_pack_lock import StoryPackLock, StoryPackLockError
 
 
 _PLAN_ID_RE = re.compile(r"^[a-f0-9]{24}$")
@@ -21,6 +21,7 @@ PACK_STATUS_RU = {
     "composing_reels": "собираются Reels",
     "blocked_music": "Stories готовы, нужна лицензированная музыка",
     "partially_blocked": "часть сцен заблокирована",
+    "awaiting_secondary_approval": "нужно подтверждение повтора в Gen-4.5",
     "completed": "готов",
     "superseded": "заменён другим вариантом",
 }
@@ -29,6 +30,7 @@ SCENE_STATUS_RU = {
     "in_progress": "создаётся", "downloaded": "скачано", "composed": "собрано",
     "completed": "готово", "retryable_failed": "временная ошибка",
     "terminal_failed": "ошибка", "blocked_reference": "нужен референс Naz",
+    "awaiting_secondary_approval": "ожидает подтверждения Gen-4.5",
 }
 
 
@@ -79,21 +81,11 @@ def latest_manifest(root: Path, *, approval_status: str | None = None) -> Path |
 
 @contextmanager
 def _manifest_lock(path: Path) -> Iterator[None]:
-    lock = path.parent / ".control.lock"
-    descriptor: int | None = None
     try:
-        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
+        with StoryPackLock(path.parent):
+            yield
+    except StoryPackLockError as exc:
         raise story_production.StoryPlanError("story pack control is busy") from exc
-    try:
-        os.write(descriptor, str(os.getpid()).encode("ascii"))
-        os.close(descriptor)
-        descriptor = None
-        yield
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        lock.unlink(missing_ok=True)
 
 
 def approve_pack(root: Path, plan_id: str) -> str:
@@ -101,6 +93,8 @@ def approve_pack(root: Path, plan_id: str) -> str:
     path = manifest_path(root, plan_id)
     with _manifest_lock(path):
         payload = story_production.read_manifest(path)
+        if not story_production.manifest_has_current_production_contract(payload):
+            raise story_production.StoryPlanError("story_manifest_contract_stale")
         approval = payload.get("approval")
         if not isinstance(approval, dict):
             raise story_production.StoryPlanError("story approval contract missing")
@@ -123,6 +117,62 @@ def approve_pack(root: Path, plan_id: str) -> str:
         payload["updated_at"] = _now()
         story_production.atomic_json(path, payload)
         return "approved"
+
+
+def confirm_generation(root: Path, plan_id: str) -> str:
+    """Context-aware confirmation with no provider/API call.
+
+    The first press approves the pack.  A later press approves only secondary
+    retries that are already waiting; it never pre-approves future failures.
+    """
+    path = manifest_path(root, plan_id)
+    with _manifest_lock(path):
+        payload = story_production.read_manifest(path)
+        if not story_production.manifest_has_current_production_contract(payload):
+            raise story_production.StoryPlanError("story_manifest_contract_stale")
+        approval = payload.get("approval")
+        if not isinstance(approval, dict):
+            raise story_production.StoryPlanError("story approval contract missing")
+        status = str(approval.get("status", ""))
+        if status == "awaiting_approval":
+            if payload.get("pack_status") != "awaiting_approval":
+                raise story_production.StoryPlanError("story pack cannot be approved in current state")
+            if any(job.get("external_job_id") for job in payload.get("scene_jobs", [])):
+                raise story_production.StoryPlanError("story pack already has provider jobs")
+            approval.update({"status": "approved", "approved_at": _now()})
+            payload["pack_status"] = "queued"
+            payload["renderer"] = {"status": "queued", "name": "ffmpeg"}
+            for job in payload.get("scene_jobs", []):
+                if job.get("state") == "planned":
+                    job["state"] = "queued"
+            for output in payload.get("expected_outputs", {}).get("stories", []):
+                if output.get("status") == "planned":
+                    output["status"] = "queued"
+            result = "approved"
+        elif status == "approved":
+            pending = [
+                job for job in payload.get("scene_jobs", [])
+                if job.get("state") == "awaiting_secondary_approval"
+            ]
+            if not pending:
+                return "already_approved"
+            confirmed_at = _now()
+            for job in pending:
+                route = job.get("model_route")
+                if not isinstance(route, dict) or not route.get("secondary_requested_at"):
+                    raise story_production.StoryPlanError("secondary model route missing")
+                route.update({"tier": "secondary", "secondary_approved_at": confirmed_at})
+                job.update({
+                    "state": "queued", "external_job_id": None,
+                    "provider_status": None, "failure_code": None,
+                })
+            payload["pack_status"] = "queued"
+            result = "secondary_approved"
+        else:
+            raise story_production.StoryPlanError("story pack cannot be approved in current state")
+        payload["updated_at"] = _now()
+        story_production.atomic_json(path, payload)
+        return result
 
 
 def create_next_variant(root: Path, plan_id: str) -> Path:

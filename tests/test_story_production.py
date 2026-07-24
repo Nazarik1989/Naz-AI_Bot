@@ -80,7 +80,7 @@ class StoryFirstTests(unittest.TestCase):
             self.assertTrue(scene.story_overlay)
             self.assertTrue(scene.text_safe_zone)
             self.assertIn(pack.continuity_id, " ".join(scene.continuity_constraints))
-            self.assertTrue(4 <= scene.duration_seconds <= 8)
+            self.assertEqual(scene.duration_seconds, 5)
         for edit in pack.reel_edits:
             self.assertTrue(edit.hook)
             self.assertTrue(edit.conclusion)
@@ -89,6 +89,7 @@ class StoryFirstTests(unittest.TestCase):
                 [scene.scene_id for scene in pack.scenes][: len(edit.shots)],
             )
             self.assertTrue(all(0.4 <= float(shot["duration_seconds"]) <= 2.0 for shot in edit.shots))
+            self.assertTrue(12.0 <= sum(float(shot["duration_seconds"]) for shot in edit.shots) <= 20.0)
             self.assertTrue(
                 any(
                     shot["source_shot_size"] != shot["reel_shot_size"]
@@ -100,6 +101,29 @@ class StoryFirstTests(unittest.TestCase):
                 self.assertIn(shot["reel_shot_size"], story.SHOT_SIZES)
                 self.assertTrue(shot["source_scene_id"])
                 self.assertTrue(shot["crop_scale_instruction"])
+
+    def test_naz_reference_roles_follow_shot_semantics(self):
+        plan = dataclasses.replace(
+            planned(),
+            visual_subject_direction="the canonical Naz presence because the thesis concerns him",
+        )
+        pack = story.plan_story_pack(plan, SAFE_FACTS)
+        for scene in pack.scenes:
+            self.assertTrue(scene.requires_naz_reference)
+            expected = (
+                "three_quarter_identity"
+                if scene.shot_size in {"wide", "medium"}
+                else "frontal_identity"
+            )
+            self.assertEqual(scene.reference_role, expected)
+
+    def test_object_only_scenes_never_receive_naz_reference(self):
+        plan = dataclasses.replace(
+            planned(), visual_subject_direction="an object-only scene with no invented human hero"
+        )
+        pack = story.plan_story_pack(plan, SAFE_FACTS)
+        self.assertTrue(all(not scene.requires_naz_reference for scene in pack.scenes))
+        self.assertTrue(all(scene.reference_role == "none" for scene in pack.scenes))
 
     def test_every_reel_fragment_must_be_between_point_four_and_two_seconds(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
@@ -181,6 +205,30 @@ class StoryFirstTests(unittest.TestCase):
                 "generated",
             )
             self.assertEqual(list(pack_dir.rglob("*.mp4")), [])
+
+    def test_public_current_contract_rejects_stale_v2_shapes(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        with tempfile.TemporaryDirectory() as root:
+            manifest = story.persist_dry_run(pack, Path(root)) / "story_manifest.json"
+            current = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertTrue(story.manifest_has_current_production_contract(current))
+
+        stale_duration = json.loads(json.dumps(current))
+        stale_duration["scenes"][0]["duration_seconds"] = 4
+        self.assertFalse(story.manifest_has_current_production_contract(stale_duration))
+
+        short_reel = json.loads(json.dumps(current))
+        short_reel["reel_edits"][0]["shots"] = short_reel["reel_edits"][0]["shots"][:3]
+        self.assertFalse(story.manifest_has_current_production_contract(short_reel))
+
+        for missing_contract in ("model_policy", "model_route"):
+            stale_model = json.loads(json.dumps(current))
+            if missing_contract == "model_policy":
+                stale_model.pop("model_policy")
+            else:
+                stale_model["scene_jobs"][0].pop("model_route")
+            with self.subTest(missing_contract=missing_contract):
+                self.assertFalse(story.manifest_has_current_production_contract(stale_model))
 
     def test_repeated_dry_run_is_idempotent_and_creates_no_fake_video(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)

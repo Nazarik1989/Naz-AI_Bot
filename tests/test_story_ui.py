@@ -38,6 +38,8 @@ class StoryMenuTests(unittest.TestCase):
             update = fake_update(1, main.BTN_REELS_CONFIRM)
             with patch.object(main, "ADMIN_ID", 1), patch.object(
                 main, "NAZ_STORY_PACK_ROOT", Path(root)
+            ), patch.object(
+                main, "NAZ_STORY_RENDER_ENABLED", True
             ):
                 handled = asyncio.run(main.handle_menu_button(
                     update, SimpleNamespace(), main.BTN_REELS_CONFIRM
@@ -46,6 +48,24 @@ class StoryMenuTests(unittest.TestCase):
             payload = story.read_manifest(Path(root) / pack.plan_id / "story_manifest.json")
             self.assertEqual(payload["approval"]["status"], "approved")
             self.assertTrue(all(not job["external_job_id"] for job in payload["scene_jobs"]))
+
+    def test_confirm_button_does_not_queue_when_rendering_is_disabled(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            story.persist_story_queue(pack, Path(root))
+            update = fake_update(1, main.BTN_REELS_CONFIRM)
+            with patch.object(main, "ADMIN_ID", 1), patch.object(
+                main, "NAZ_STORY_PACK_ROOT", Path(root)
+            ), patch.object(
+                main, "NAZ_STORY_RENDER_ENABLED", False
+            ):
+                handled = asyncio.run(main.handle_menu_button(
+                    update, SimpleNamespace(), main.BTN_REELS_CONFIRM
+                ))
+            self.assertTrue(handled)
+            payload = story.read_manifest(Path(root) / pack.plan_id / "story_manifest.json")
+            self.assertEqual(payload["approval"]["status"], "awaiting_approval")
+            self.assertIn("выключена", update.message.reply_text.await_args.args[0])
 
     def test_contact_reels_button_keeps_text_script_flow(self):
         update = fake_update(77, main.BTN_REELS)
