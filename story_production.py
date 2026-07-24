@@ -26,7 +26,7 @@ RENDERER_UNAVAILABLE = "unavailable"
 DRAMATURGIC_ROLES = (
     "hook", "problem", "hypothesis", "test", "result", "solution", "conclusion",
 )
-SHOT_SIZES = ("macro", "close", "medium", "wide", "over-shoulder")
+SHOT_SIZES = ("wide", "medium", "close", "macro")
 REEL_CROPS = ("tight-center", "left-detail", "right-detail", "wide-center")
 CAMERA_MOTIONS = ("slow push", "controlled pan", "handheld follow", "locked with real subject motion")
 SAFE_ZONES = ("upper-middle", "middle-left", "lower-middle above platform controls")
@@ -205,15 +205,29 @@ def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: boo
     for position, scene_index in enumerate(order):
         scene = scenes[scene_index]
         length = round(0.4 + ((_rank(plan.plan_id, f"cut:{short}:{position}") % 17) / 10), 1)
+        source_shot_size = scene.shot_size
+        source_index = SHOT_SIZES.index(source_shot_size)
+        reel_shot_size = SHOT_SIZES[
+            (source_index + 1 + (_rank(plan.plan_id, f"reframe:{short}:{position}") % 3))
+            % len(SHOT_SIZES)
+        ]
         crop = REEL_CROPS[_rank(plan.plan_id, f"crop:{short}:{position}") % len(REEL_CROPS)]
         if position == 0 and crop == "wide-center":
             crop = "tight-center"
         shots.append({
             "scene_id": scene.scene_id,
+            "shot_size": reel_shot_size,
+            "source_scene_id": scene.scene_id,
             "source": f"stories/{scene.scene_id}_clean.mp4",
             "in_seconds": round(0.2 * (position % 4), 1),
             "duration_seconds": min(2.0, length),
             "story_shot_size": scene.shot_size,
+            "source_shot_size": source_shot_size,
+            "reel_shot_size": reel_shot_size,
+            "crop_scale_instruction": (
+                f"Reframe and scale the CLEAN {source_shot_size} master to a "
+                f"{reel_shot_size} Reel fragment; preserve the documented action."
+            ),
             "reel_crop": crop,
             "crop_change_required": True,
         })
@@ -279,9 +293,27 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
         if not edit.hook or not edit.conclusion or len(edit.shots) < 3:
             raise StoryPlanError("Reel needs its own hook, conclusion and EDL")
         if not all(0.4 <= float(item["duration_seconds"]) <= 2.0 for item in edit.shots):
-            raise StoryPlanError("every Reel cut must be 0.4..2.0 seconds")
+            raise StoryPlanError("every Reel fragment must be 0.4..2.0 seconds")
+        for item in edit.shots:
+            source_size = str(item.get("source_shot_size", ""))
+            reel_size = str(item.get("reel_shot_size", ""))
+            if source_size not in SHOT_SIZES or reel_size not in SHOT_SIZES:
+                raise StoryPlanError("Reel shot sizes must use the canonical enum")
+            if not str(item.get("source_scene_id", "")) or not str(
+                item.get("crop_scale_instruction", "")
+            ):
+                raise StoryPlanError("Reel fragment source and crop/scale instruction are required")
+            if str(item["source_scene_id"]) not in {
+                scene.scene_id for scene in pack.scenes
+            }:
+                raise StoryPlanError("Reel fragment references an unknown CLEAN scene")
+        if not any(
+            item["source_shot_size"] != item["reel_shot_size"]
+            for item in edit.shots
+        ):
+            raise StoryPlanError("Reel must change shot size for at least one fragment")
         sequential = [scene.scene_id for scene in pack.scenes][: len(edit.shots)]
-        actual = [str(item["scene_id"]) for item in edit.shots]
+        actual = [str(item["source_scene_id"]) for item in edit.shots]
         if actual == sequential:
             raise StoryPlanError("Reel cannot be a sequential Story concatenation")
         if not any(bool(item.get("crop_change_required")) and item.get("reel_crop") for item in edit.shots):
@@ -347,6 +379,75 @@ def update_manifest(path: Path, mutator: Callable[[dict[str, Any]], None]) -> di
     return payload
 
 
+def _duration_in_range(value: Any, minimum: float, maximum: float) -> bool:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return False
+    return minimum <= duration <= maximum
+
+
+def _manifest_has_current_reel_contract(payload: Mapping[str, Any]) -> bool:
+    scenes = payload.get("scenes")
+    edits = payload.get("reel_edits")
+    if not isinstance(scenes, list) or not isinstance(edits, list):
+        return False
+    if not 4 <= len(scenes) <= 7 or not edits:
+        return False
+    scene_ids = [str(item.get("scene_id", "")) for item in scenes if isinstance(item, dict)]
+    if len(scene_ids) != len(scenes) or len(set(scene_ids)) != len(scene_ids):
+        return False
+    for scene in scenes:
+        if (
+            str(scene.get("shot_size", "")) not in SHOT_SIZES
+            or not _duration_in_range(scene.get("duration_seconds"), 4, 8)
+        ):
+            return False
+    for edit in edits:
+        if not isinstance(edit, dict) or not isinstance(edit.get("shots"), list):
+            return False
+        shots = edit["shots"]
+        if len(shots) < 3:
+            return False
+        for shot in shots:
+            if not isinstance(shot, dict):
+                return False
+            if not _duration_in_range(shot.get("duration_seconds"), 0.4, 2.0):
+                return False
+            if (
+                str(shot.get("source_shot_size", "")) not in SHOT_SIZES
+                or str(shot.get("reel_shot_size", "")) not in SHOT_SIZES
+                or not str(shot.get("source_scene_id", ""))
+                or not str(shot.get("crop_scale_instruction", ""))
+                or str(shot.get("source_scene_id", "")) not in scene_ids
+            ):
+                return False
+        if not any(shot["source_shot_size"] != shot["reel_shot_size"] for shot in shots):
+            return False
+        if [str(shot["source_scene_id"]) for shot in shots] == scene_ids[: len(shots)]:
+            return False
+    return True
+
+
+def _preserve_render_statuses(payload: dict[str, Any], existing: Mapping[str, Any]) -> None:
+    previous_outputs = existing.get("expected_outputs")
+    current_outputs = payload.get("expected_outputs")
+    if not isinstance(previous_outputs, dict) or not isinstance(current_outputs, dict):
+        return
+    previous_stories = previous_outputs.get("stories")
+    current_stories = current_outputs.get("stories")
+    if not isinstance(previous_stories, list) or not isinstance(current_stories, list):
+        return
+    statuses = {
+        str(item.get("clean", "")): str(item.get("status", ""))
+        for item in previous_stories
+        if isinstance(item, dict) and item.get("clean") and item.get("status")
+    }
+    for item in current_stories:
+        if isinstance(item, dict) and str(item.get("clean", "")) in statuses:
+            item["status"] = statuses[str(item["clean"])]
+
+
 def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     payload = pack.to_dict()
@@ -410,5 +511,29 @@ def persist_story_queue(pack: StoryPackPlan, storage_root: Path) -> Path:
 
 
 def persist_dry_run(pack: StoryPackPlan, storage_root: Path) -> Path:
-    """Backward-compatible name; persists a real v2 queue but makes no API call."""
-    return persist_story_queue(pack, storage_root)
+    """Repair/read legacy dry-runs without creating fake media or provider jobs."""
+    root = Path(storage_root).expanduser().resolve()
+    pack_dir = (root / pack.plan_id).resolve()
+    if root not in pack_dir.parents:
+        raise StoryPlanError("unsafe pack path")
+    manifest = pack_dir / "story_manifest.json"
+    existing: Mapping[str, Any] | None = None
+    if manifest.is_file():
+        existing = json.loads(manifest.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict) or existing.get("plan_id") != pack.plan_id:
+            raise StoryPlanError("stored manifest plan_id mismatch")
+        if _manifest_has_current_reel_contract(existing):
+            return pack_dir
+    (pack_dir / "stories").mkdir(parents=True, exist_ok=True)
+    (pack_dir / "reels").mkdir(parents=True, exist_ok=True)
+    payload = _production_payload(pack)
+    if existing is not None:
+        _preserve_render_statuses(payload, existing)
+    atomic_json(manifest, payload)
+    caption = (
+        f"# Caption pack\n\nPlan ID: {pack.plan_id}\nContinuity ID: {pack.continuity_id}\n\n"
+        f"Main: {pack.caption_plan['main']}\n\nShort: {pack.caption_plan['short']}\n"
+    )
+    if not (pack_dir / "caption_pack.md").exists():
+        _atomic_create_text(pack_dir / "caption_pack.md", caption)
+    return pack_dir

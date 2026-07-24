@@ -15,7 +15,7 @@ import errno
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 from naz_vk_music import APPROVED_QUERIES
 
@@ -35,6 +35,12 @@ MAX_MEDIA_BYTES = 15 * 1024 * 1024
 MAX_TRACK_QUERY_LENGTH = 300
 MAX_DEDUPE_KEY_LENGTH = 256
 _SAFE_DEDUPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+PUBLICATION_RECEIPT_SCHEMA = "vk_publication_receipt.v1"
+PUBLICATION_RECEIPTS_DIRNAME = "published"
+PUBLICATION_RECEIPT_FIELDS = frozenset(
+    {"schema", "job_id", "producer", "source_ref", "published_at"}
+)
+_RECEIPT_JOB_ID = re.compile(r"^(?:naz|void)-[0-9a-f]{24}$")
 
 
 class QueueError(RuntimeError):
@@ -293,6 +299,64 @@ def queue_status(queue_root: Path) -> dict:
     root = Path(queue_root)
     pending = _require_pending(root)
     return {"path": str(pending), "ready": True}
+
+
+def publication_receipts(
+    queue_root: Path,
+    *,
+    producer: str = PRODUCER,
+) -> tuple[list[dict[str, str]], int]:
+    """Read validated publication receipts without inspecting job payloads.
+
+    Invalid individual receipt files are counted and skipped. A structurally
+    unsafe receipt directory is a queue error and is never traversed.
+    """
+    if producer not in {"naz", "void"}:
+        raise QueueError("unknown publication receipt producer")
+    receipts_dir = Path(queue_root) / PUBLICATION_RECEIPTS_DIRNAME
+    if not receipts_dir.exists():
+        return [], 0
+    if receipts_dir.is_symlink() or not receipts_dir.is_dir():
+        raise QueueError("publication receipt directory is unavailable")
+
+    receipts: list[dict[str, str]] = []
+    invalid = 0
+    for path in sorted(receipts_dir.glob("*.json")):
+        if path.is_symlink() or not path.is_file():
+            invalid += 1
+            continue
+        try:
+            value: Any = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or set(value) != PUBLICATION_RECEIPT_FIELDS:
+                raise ValueError("invalid receipt fields")
+            if value["schema"] != PUBLICATION_RECEIPT_SCHEMA:
+                raise ValueError("invalid receipt schema")
+            job_id = value["job_id"]
+            receipt_producer = value["producer"]
+            source_ref = value["source_ref"]
+            published_at = value["published_at"]
+            if (
+                not isinstance(job_id, str)
+                or not _RECEIPT_JOB_ID.fullmatch(job_id)
+                or path.stem != job_id
+                or receipt_producer not in {"naz", "void"}
+                or not isinstance(source_ref, str)
+                or not source_ref
+                or len(source_ref) > 1000
+                or not isinstance(published_at, str)
+            ):
+                raise ValueError("invalid receipt value")
+            timestamp = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                raise ValueError("receipt timestamp needs timezone")
+        except (OSError, ValueError, TypeError):
+            invalid += 1
+            continue
+        if receipt_producer == producer:
+            receipts.append(
+                {key: str(value[key]) for key in PUBLICATION_RECEIPT_FIELDS}
+            )
+    return receipts, invalid
 
 
 def completed_naz_job(queue_root: Path, job_id: str) -> dict | None:

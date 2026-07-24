@@ -89,6 +89,59 @@ class StoryFirstTests(unittest.TestCase):
                 [scene.scene_id for scene in pack.scenes][: len(edit.shots)],
             )
             self.assertTrue(all(0.4 <= float(shot["duration_seconds"]) <= 2.0 for shot in edit.shots))
+            self.assertTrue(
+                any(
+                    shot["source_shot_size"] != shot["reel_shot_size"]
+                    for shot in edit.shots
+                )
+            )
+            for shot in edit.shots:
+                self.assertIn(shot["source_shot_size"], story.SHOT_SIZES)
+                self.assertIn(shot["reel_shot_size"], story.SHOT_SIZES)
+                self.assertTrue(shot["source_scene_id"])
+                self.assertTrue(shot["crop_scale_instruction"])
+
+    def test_every_reel_fragment_must_be_between_point_four_and_two_seconds(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        edit = pack.reel_edits[0]
+        for index in (0, len(edit.shots) // 2, len(edit.shots) - 1):
+            shots = [dict(item) for item in edit.shots]
+            shots[index]["duration_seconds"] = 9.0
+            broken_edit = dataclasses.replace(edit, shots=tuple(shots))
+            broken = dataclasses.replace(
+                pack,
+                reel_edits=(broken_edit, *pack.reel_edits[1:]),
+            )
+            with self.subTest(index=index), self.assertRaises(story.StoryPlanError):
+                story.validate_story_pack(broken)
+
+    def test_reel_without_shot_size_change_is_rejected(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        edit = pack.reel_edits[0]
+        shots = []
+        for item in edit.shots:
+            shot = dict(item)
+            shot["reel_shot_size"] = shot["source_shot_size"]
+            shot["shot_size"] = shot["source_shot_size"]
+            shots.append(shot)
+        broken_edit = dataclasses.replace(edit, shots=tuple(shots))
+        broken = dataclasses.replace(pack, reel_edits=(broken_edit, *pack.reel_edits[1:]))
+        with self.assertRaises(story.StoryPlanError):
+            story.validate_story_pack(broken)
+
+    def test_sequential_story_concatenation_is_rejected_even_when_reframed(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        edit = pack.reel_edits[0]
+        shots = []
+        for item, scene in zip(edit.shots, pack.scenes):
+            shot = dict(item)
+            shot["scene_id"] = scene.scene_id
+            shot["source_scene_id"] = scene.scene_id
+            shots.append(shot)
+        broken_edit = dataclasses.replace(edit, shots=tuple(shots))
+        broken = dataclasses.replace(pack, reel_edits=(broken_edit, *pack.reel_edits[1:]))
+        with self.assertRaises(story.StoryPlanError):
+            story.validate_story_pack(broken)
 
     def test_partial_renderer_failure_is_preserved_for_resume(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
@@ -103,6 +156,31 @@ class StoryFirstTests(unittest.TestCase):
             current = json.loads((resumed / "story_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(current["expected_outputs"]["stories"][0]["status"], "generated")
             self.assertEqual(current["expected_outputs"]["stories"][1]["status"], "renderer_failed")
+
+    def test_legacy_manifest_is_upgraded_without_losing_render_status(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        with tempfile.TemporaryDirectory() as root:
+            pack_dir = story.persist_dry_run(pack, Path(root))
+            manifest = pack_dir / "story_manifest.json"
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["expected_outputs"]["stories"][0]["status"] = "generated"
+            for edit in payload["reel_edits"]:
+                for shot in edit["shots"]:
+                    shot.pop("source_scene_id", None)
+                    shot.pop("source_shot_size", None)
+                    shot.pop("reel_shot_size", None)
+                    shot.pop("crop_scale_instruction", None)
+                    shot["shot_size"] = "over-shoulder"
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+            story.persist_dry_run(pack, Path(root))
+            upgraded = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertTrue(story._manifest_has_current_reel_contract(upgraded))
+            self.assertEqual(
+                upgraded["expected_outputs"]["stories"][0]["status"],
+                "generated",
+            )
+            self.assertEqual(list(pack_dir.rglob("*.mp4")), [])
 
     def test_repeated_dry_run_is_idempotent_and_creates_no_fake_video(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)

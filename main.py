@@ -23,7 +23,9 @@ import random
 import re
 import tempfile
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+from functools import wraps
 from html import unescape
 from io import BytesIO
 from pathlib import Path
@@ -69,6 +71,7 @@ import editorial_orchestrator
 import gaming_vertical
 import naz_editorial_catalog
 import naz_vk_music
+import scheduled_work
 import semantic_autopost
 import story_production
 import visual_archive
@@ -197,6 +200,9 @@ NAZ_VK_TRACK_STATE_FILE = Path(
 )
 NAZ_VK_IMAGE_POLICY = os.getenv("NAZ_VK_IMAGE_POLICY", "required").strip().lower()
 NAZ_VK_IMAGE_ATTEMPTS = max(1, min(env_int("NAZ_VK_IMAGE_ATTEMPTS", 2), 3))
+NAZ_VK_RECEIPT_SYNC_INTERVAL_SECONDS = max(
+    60, env_int("NAZ_VK_RECEIPT_SYNC_INTERVAL_SECONDS", 300)
+)
 AGENT_CONTENT_SYNC_ENABLED = env_bool("AGENT_CONTENT_SYNC_ENABLED", True)
 AGENT_CONTENT_SYNC_TIMES = os.getenv("AGENT_CONTENT_SYNC_TIMES", "23:57").strip()
 AGENT_CONTENT_AUTO_PUBLISH = env_bool("AGENT_CONTENT_AUTO_PUBLISH", False)
@@ -205,6 +211,16 @@ AGENT_CONTENT_REUSE_SEEN = env_bool("AGENT_CONTENT_REUSE_SEEN", True)
 AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_content_seen.json").strip())
 NAZ_STORY_PACK_ROOT = Path(
     os.getenv("NAZ_STORY_PACK_ROOT", "/var/lib/naz-ai-bot/story-packs").strip()
+)
+NAZ_SCHEDULED_WORK_DIR = Path(
+    os.getenv(
+        "NAZ_SCHEDULED_WORK_DIR",
+        (
+            "/var/lib/naz-ai-bot"
+            if os.name != "nt"
+            else str(Path(tempfile.gettempdir()) / "naz-ai-bot-scheduled-work")
+        ),
+    ).strip()
 )
 CROSSPOST_EXCHANGE_ENABLED = env_bool("CROSSPOST_EXCHANGE_ENABLED", True)
 CROSSPOST_EXCHANGE_AUTO_PUBLISH = env_bool("CROSSPOST_EXCHANGE_AUTO_PUBLISH", True)
@@ -215,6 +231,47 @@ REQUIRE_IMAGES_FOR_CHANNEL_POSTS = env_bool("REQUIRE_IMAGES_FOR_CHANNEL_POSTS", 
 CHANNEL_IMAGE_COUNT = max(1, min(env_int("CHANNEL_IMAGE_COUNT", 1), 2))
 ALLOW_IMAGE_FALLBACK = env_bool("ALLOW_IMAGE_FALLBACK", True)
 ADMIN_ONLY_CONTENT = env_bool("ADMIN_ONLY_CONTENT", True)
+
+
+def resolved_naz_schedule_snapshot() -> Dict[str, object]:
+    return scheduled_work.resolved_schedule_snapshot(
+        telegram_timezone=BOT_TIMEZONE,
+        telegram_times=AUTOPOST_TIMES,
+        vk_timezone=NAZ_VK_TIMEZONE,
+        vk_daily_time=NAZ_VK_DAILY_TIME,
+        vk_gaming_time=NAZ_VK_GAMING_TIME,
+    )
+
+
+def resolved_naz_deploy_schedule_snapshot() -> Dict[str, object]:
+    """Return the canonical preflight schema with schedule values only."""
+    telegram = resolved_naz_schedule_snapshot()["telegram"]
+    return {
+        "naz.telegram": {
+            "daily_times": tuple(telegram["slots"]),
+            "weekly_times": (),
+        },
+        "naz.vk": {
+            "daily_times": (NAZ_VK_DAILY_TIME,),
+            "weekly_times": (((1, 3, 6), NAZ_VK_GAMING_TIME),),
+        },
+    }
+
+
+def active_naz_scheduled_work() -> tuple[dict[str, object], ...]:
+    return scheduled_work.active_work(NAZ_SCHEDULED_WORK_DIR)
+
+
+def scheduled_work_marker(label: str):
+    """Decorator exposing safe in-flight state to coordinated deploy checks."""
+    def decorate(function):
+        @wraps(function)
+        async def wrapped(*args, **kwargs):
+            with scheduled_work.work_marker(NAZ_SCHEDULED_WORK_DIR, label):
+                return await function(*args, **kwargs)
+        return wrapped
+
+    return decorate
 
 MAX_TOKENS = env_int("MAX_TOKENS", 900)
 TEMPERATURE = env_float("TEMPERATURE", 0.8)
@@ -610,16 +667,24 @@ async def reply_long(update: Update, text: str, keyboard: ReplyKeyboardMarkup | 
             return
 
 
-async def send_long_to_chat(bot, chat_id: str | int, text: str) -> None:
+async def send_long_to_chat(bot, chat_id: str | int, text: str) -> List[Any]:
+    sent: List[Any] = []
     for chunk in split_telegram_text(text):
         for attempt in range(2):
             try:
-                await bot.send_message(chat_id=chat_id, text=chunk, disable_web_page_preview=True)
+                sent.append(
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=chunk,
+                        disable_web_page_preview=True,
+                    )
+                )
                 break
             except (TimedOut, NetworkError):
                 if attempt == 1:
                     raise
                 await asyncio.sleep(2)
+    return sent
 
 
 def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
@@ -1540,6 +1605,35 @@ async def generate_source_interpretation(
     return result
 
 
+PERSONAL_DATA_PATTERNS = [
+    (
+        "email address",
+        re.compile(r"\b[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]+\.[A-Z]{2,24}\b", re.I),
+    ),
+    (
+        "phone number",
+        re.compile(r"(?<!\w)(?:\+?\d[\s().-]*){10,15}(?!\w)"),
+    ),
+    ("social handle", re.compile(r"(?<!\w)@[A-Za-z0-9_]{5,32}\b")),
+    (
+        "street address",
+        re.compile(
+            r"\b(?:address|street|avenue|road|улиц[аы]?|ул\.|проспект|дом|квартир[аы]?)"
+            r"\s+[A-Za-zА-Яа-яЁё0-9][^\n,;]{2,80}",
+            re.I,
+        ),
+    ),
+    (
+        "medical detail",
+        re.compile(
+            r"\b(?:medical\s+(?:record|appointment)|patient\s+id|diagnos(?:is|ed)|"
+            r"медицинск\w*\s+карт\w*|диагноз\w*|пациент\w*|при[её]м\s+у\s+врач\w*)\b",
+            re.I,
+        ),
+    ),
+]
+
+
 SENSITIVE_PATTERNS = [
     ("telegram bot token", re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{25,}\b")),
     ("openai/openrouter key", re.compile(r"\b(?:sk-or-v1|sk-proj|sk)-[A-Za-z0-9_-]{16,}\b")),
@@ -1547,7 +1641,7 @@ SENSITIVE_PATTERNS = [
     ("secret env name", re.compile(r"\b(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CLIENT_SECRET)\b", re.I)),
     ("ssh/ip detail", re.compile(r"\b(?:ssh\s+\S+@|(?:\d{1,3}\.){3}\d{1,3})\b", re.I)),
     ("internal url", re.compile(r"\b(?:https?://)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)[^\s]*", re.I)),
-]
+] + PERSONAL_DATA_PATTERNS
 
 
 def detect_content_risks(text: str) -> List[str]:
@@ -2550,12 +2644,40 @@ async def generate_two_images_for_post(user_id: int, topic: str, post_text: str)
     return await generate_images_for_post(user_id, topic, post_text, count=2)
 
 
-async def send_post_with_images(bot, chat_id: int | str, post_text: str, images: List[bytes]) -> None:
+@dataclass(frozen=True, slots=True)
+class TelegramPublicationReceipt:
+    chat_id: str
+    message_id: str
+
+
+def _telegram_publication_receipt(
+    result: Any,
+    fallback_chat_id: int | str,
+) -> TelegramPublicationReceipt:
+    if isinstance(result, (list, tuple)):
+        message = result[0] if result else None
+    else:
+        message = result
+    chat_value = getattr(message, "chat_id", None)
+    if chat_value is None and getattr(message, "chat", None) is not None:
+        chat_value = getattr(message.chat, "id", None)
+    message_value = getattr(message, "message_id", None)
+    return TelegramPublicationReceipt(
+        chat_id=str(chat_value if chat_value is not None else fallback_chat_id)[:128],
+        message_id=str(message_value if isinstance(message_value, int) else "")[:128],
+    )
+
+
+async def send_post_with_images(
+    bot,
+    chat_id: int | str,
+    post_text: str,
+    images: List[bytes],
+) -> TelegramPublicationReceipt:
     """Send post. If images fail, text still goes out."""
     if not images:
-        await send_long_to_chat(bot, chat_id, post_text)
-        return
-
+        sent = await send_long_to_chat(bot, chat_id, post_text)
+        return _telegram_publication_receipt(sent, chat_id)
     caption_limit = 1000
     caption = post_text if len(post_text) <= caption_limit else "🖼 Иллюстрации к посту"
 
@@ -2566,17 +2688,40 @@ async def send_post_with_images(bot, chat_id: int | str, post_text: str, images:
                 bio = BytesIO(img)
                 bio.name = f"naz_image_{idx}.png"
                 media.append(InputMediaPhoto(media=bio, caption=caption if idx == 1 else None))
-            await bot.send_media_group(chat_id=chat_id, media=media)
+            primary_result = await bot.send_media_group(chat_id=chat_id, media=media)
         else:
             bio = BytesIO(images[0])
             bio.name = "naz_image.png"
-            await bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+            primary_result = await bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
 
         if len(post_text) > caption_limit:
             await send_long_to_chat(bot, chat_id, post_text)
+        return _telegram_publication_receipt(primary_result, chat_id)
     except (TelegramError, BadRequest) as exc:
         logger.exception("Telegram image send failed: %s", exc)
-        await send_long_to_chat(bot, chat_id, post_text)
+        sent = await send_long_to_chat(bot, chat_id, post_text)
+        return _telegram_publication_receipt(sent, chat_id)
+
+
+async def send_observed_scheduled_post(
+    *,
+    bot,
+    chat_id: int | str,
+    post_text: str,
+    images: List[bytes],
+    user_id: int,
+    plan_id: str,
+) -> TelegramPublicationReceipt:
+    try:
+        return await send_post_with_images(bot, chat_id, post_text, images)
+    except Exception:
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan_id,
+            platform="telegram",
+            history_commit_status="failed",
+        )
+        raise
 
 
 # -----------------------------------------------------------------------------
@@ -3303,12 +3448,47 @@ async def vk_queue_status_command(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SyncResult:
+    receipts_seen: int = 0
+    history_inserted: int = 0
+    already_recorded: int = 0
+    invalid_receipts: int = 0
+
+
+def sync_completed_naz_vk_jobs() -> SyncResult:
+    """Reconcile only validated consumer publication receipts."""
+    receipts, invalid_receipts = vk_publish_queue.publication_receipts(
+        NAZ_VK_QUEUE_DIR,
+        producer="naz",
+    )
+    inserted = 0
+    already = 0
+    invalid = invalid_receipts
+    user_id = ADMIN_ID or 0
+    for receipt in receipts:
+        status = memory.reconcile_vk_publication_receipt(user_id, receipt)
+        if status == "history_inserted":
+            inserted += 1
+        elif status == "already_recorded":
+            already += 1
+        else:
+            invalid += 1
+    return SyncResult(
+        receipts_seen=len(receipts),
+        history_inserted=inserted,
+        already_recorded=already,
+        invalid_receipts=invalid,
+    )
+
+
 async def create_naz_vk_job(
     topic: str,
     *,
     source_ref: str,
     not_before: Optional[datetime] = None,
     rubric_kind: str = "daily",
+    slot: str = "",
 ) -> dict:
     if not NAZ_VK_ENABLED:
         raise vk_publish_queue.QueueError("NAZ_VK_ENABLED выключен")
@@ -3319,16 +3499,6 @@ async def create_naz_vk_job(
             "NAZ_VK_IMAGE_POLICY must be required or text_music"
         )
     user_id = ADMIN_ID or 0
-    for queued_draft in memory.get_unpublished_vk_jobs(user_id):
-        completed_job = vk_publish_queue.completed_naz_job(
-            NAZ_VK_QUEUE_DIR,
-            str(queued_draft.get("external_job_id") or ""),
-        )
-        if completed_job and completed_job.get("text") == queued_draft.get("content"):
-            memory.mark_vk_generated_post_published(
-                user_id,
-                int(queued_draft["id"]),
-            )
     rubric_rows = [dict(rubric) for rubric in NAZ_VK_RUBRICS if rubric.get("kind") == rubric_kind]
     if not rubric_rows:
         raise vk_publish_queue.QueueError(f"неизвестный тип VK-рубрики: {rubric_kind}")
@@ -3338,7 +3508,7 @@ async def create_naz_vk_job(
     plan = scheduled_plan(
         user_id=user_id,
         platform="vk",
-        slot=rubric_kind,
+        slot=slot or rubric_kind,
         seed=source_ref,
         rubric_rows=rubric_rows,
         source_rows=(
@@ -3349,18 +3519,50 @@ async def create_naz_vk_job(
             },
         ),
         character=character,
+        persona_rubric_rows=NAZ_VK_RUBRICS,
+    )
+    memory.update_editorial_release_event(
+        user_id=user_id,
+        plan_id=plan.plan_id,
+        platform="vk",
+        slot=plan.slot,
+        slot_captured_at=memory.utc_now(),
+        generation_package_status="not_run",
+        image_qa_status="not_run",
+        history_commit_status="pending",
     )
     try:
         package = await generate_scheduled_package(plan, character)
     except ScheduledTechnicalFailure as exc:
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="vk",
+            generation_package_status="invalid",
+            history_commit_status="not_run",
+        )
         raise vk_publish_queue.QueueError(
             "model returned an invalid generation package twice; VK job was not created"
         ) from exc
     except ScheduledContentReject as exc:
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="vk",
+            generation_package_status="rejected",
+            history_commit_status="not_run",
+        )
         raise vk_publish_queue.QueueError(
             f"local quality gate rejected the planned release: {exc}"
         ) from exc
     text = package.final_text
+    memory.update_editorial_release_event(
+        user_id=user_id,
+        plan_id=plan.plan_id,
+        platform="vk",
+        generation_package_status="accepted",
+        image_qa_status="not_run",
+    )
     rubric = next(item for item in rubric_rows if str(item["name"]) == plan.rubric)
     image_count = max(1, min(int(str(rubric.get("image_count") or "1")), 4))
     image_topic = f"{plan.rubric}. {plan.topic}" if image_count > 1 else plan.topic
@@ -3374,10 +3576,22 @@ async def create_naz_vk_job(
         editorial_visual_brief=editorial_orchestrator.package_visual_brief(plan, package),
     )
     if not images and NAZ_VK_IMAGE_POLICY == "required":
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="vk",
+            history_commit_status="not_run",
+        )
         raise vk_publish_queue.QueueError(
             "VK image policy requires media; job was not enqueued"
         )
     if image_count > 1 and len(images) != image_count:
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="vk",
+            history_commit_status="not_run",
+        )
         raise vk_publish_queue.QueueError(
             "MATERIAL requires a complete three-frame sequence; job was not enqueued"
         )
@@ -3388,26 +3602,43 @@ async def create_naz_vk_job(
         for index, image in enumerate(images, start=1)
     ]
     now = datetime.now(ZoneInfo(NAZ_VK_TIMEZONE))
-    job = naz_vk_music.enqueue_with_track_rotation(
-        NAZ_VK_TRACK_STATE_FILE,
-        requested_tags=plan.track_tags,
-        seed=plan.plan_id,
-        post_topic=plan.topic,
-        shared_history_file=NAZ_VK_QUEUE_DIR / "recent-tracks.json",
-        enqueue_job=lambda track_query: vk_publish_queue.enqueue(
-            NAZ_VK_QUEUE_DIR,
-            target_group_id=NAZ_VK_PUBLIC_ID,
-            text=text,
-            media=media,
-            track_query=track_query,
-            created_at=now,
-            not_before=not_before,
-            dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
-            source_ref=source_ref,
+    try:
+        job = naz_vk_music.enqueue_with_track_rotation(
+            NAZ_VK_TRACK_STATE_FILE,
+            requested_tags=plan.track_tags,
+            seed=plan.plan_id,
+            post_topic=plan.topic,
+            shared_history_file=NAZ_VK_QUEUE_DIR / "recent-tracks.json",
+            enqueue_job=lambda track_query: vk_publish_queue.enqueue(
+                NAZ_VK_QUEUE_DIR,
+                target_group_id=NAZ_VK_PUBLIC_ID,
+                text=text,
+                media=media,
+                track_query=track_query,
+                created_at=now,
+                not_before=not_before,
+                dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
+                source_ref=source_ref,
+                plan_id=plan.plan_id,
+                editorial={
+                    **safe_vk_editorial_metadata(plan),
+                    "generation_package_status": "accepted",
+                    "image_qa_status": "not_run",
+                },
+            ),
+        )
+    except vk_publish_queue.DuplicateJobError:
+        # The canonical existing job remains authoritative and may still be
+        # awaiting its publication receipt.
+        raise
+    except Exception:
+        memory.update_editorial_release_event(
+            user_id=user_id,
             plan_id=plan.plan_id,
-            editorial=safe_vk_editorial_metadata(plan),
-        ),
-    )
+            platform="vk",
+            history_commit_status="failed",
+        )
+        raise
     plan_dict = plan.to_dict()
     memory.save_generated_post(
         user_id=user_id,
@@ -3422,6 +3653,13 @@ async def create_naz_vk_job(
         external_job_id=str(job["job_id"]),
         plan_id=plan.plan_id,
         editorial_plan=plan_dict,
+    )
+    memory.update_editorial_release_event(
+        user_id=user_id,
+        plan_id=plan.plan_id,
+        platform="vk",
+        vk_job_id=str(job["job_id"]),
+        history_commit_status="pending",
     )
     return job
 
@@ -3828,6 +4066,16 @@ async def process_agent_content_date(
         source_rows=(source_row,),
         character=character,
     )
+    memory.update_editorial_release_event(
+        user_id=user_id,
+        plan_id=plan.plan_id,
+        platform="telegram",
+        slot=plan.slot,
+        slot_captured_at=memory.utc_now(),
+        generation_package_status="not_run",
+        image_qa_status="not_run",
+        history_commit_status="pending" if publish else "not_run",
+    )
     if plan.production_mode == "story_first":
         pack_dir = await asyncio.to_thread(
             queue_story_first_pack,
@@ -3849,12 +4097,26 @@ async def process_agent_content_date(
             source_material=safe_context,
         )
     except ScheduledTechnicalFailure:
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            generation_package_status="invalid",
+            history_commit_status="not_run",
+        )
         await notify_admin(
             bot,
             f"⚠️ Agent Content {resolved_date}: модель дважды вернула технически непригодный пакет. Черновик и публичный DIAG не созданы.",
         )
         return f"⚠️ Agent Content {resolved_date}: technical generation failure."
     except ScheduledContentReject as exc:
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            generation_package_status="rejected",
+            history_commit_status="not_run",
+        )
         await notify_admin(
             bot,
             f"⚠️ Agent Content {resolved_date}: локальная quality-проверка отклонила пакет ({exc}). История не изменена.",
@@ -3862,6 +4124,13 @@ async def process_agent_content_date(
         return f"⚠️ Agent Content {resolved_date}: local quality reject."
 
     plan_dict = plan.to_dict()
+    memory.update_editorial_release_event(
+        user_id=user_id,
+        plan_id=plan.plan_id,
+        platform="telegram",
+        generation_package_status="accepted",
+        image_qa_status="not_run",
+    )
     if not publish:
         memory.save_generated_post(
             user_id=user_id,
@@ -3892,9 +4161,22 @@ async def process_agent_content_date(
         editorial_visual_brief=editorial_orchestrator.package_visual_brief(plan, package),
     )
     if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            history_commit_status="not_run",
+        )
         await notify_admin(bot, f"⚠️ Agent Content {resolved_date}: planned visual failed. Publication skipped; history unchanged.")
         return f"⚠️ Agent Content {resolved_date}: images failed."
-    await send_post_with_images(bot, CHANNEL_ID, package.final_text, images)
+    receipt = await send_observed_scheduled_post(
+        bot=bot,
+        chat_id=CHANNEL_ID,
+        post_text=package.final_text,
+        images=images,
+        user_id=user_id,
+        plan_id=plan.plan_id,
+    )
     memory.save_generated_post(
         user_id=user_id,
         expert_mode=get_user_expert_mode(user_id),
@@ -3909,6 +4191,14 @@ async def process_agent_content_date(
         editorial_plan=plan_dict,
     )
     memory.record_content_signature(user_id, plan_dict, plan.topic)
+    memory.update_editorial_release_event(
+        user_id=user_id,
+        plan_id=plan.plan_id,
+        platform="telegram",
+        telegram_chat_id=receipt.chat_id,
+        telegram_message_id=receipt.message_id,
+        history_commit_status="committed",
+    )
     memory.save_character_state(user_id, character)
     memory.apply_character_event(user_id, "publish")
     queue_naz_post_for_void(package.final_text, source="agent_content_auto_publish", topic=plan.topic)
@@ -3966,7 +4256,7 @@ async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             image_count=len(images),
             published_to_channel=False,
         )
-        logger.info("Image prompt: %s", image_prompt)
+        logger.info("Image generation completed | image_count=%s", len(images))
     except Exception as exc:  # noqa: BLE001
         logger.exception("imagepost failed")
         await reply_long(update, f"⚠️ Image-post не собрался. Причина: {exc}", CONTENT_KEYBOARD)
@@ -4338,8 +4628,333 @@ async def process_void_to_naz_exchange(context: ContextTypes.DEFAULT_TYPE) -> No
                 logger.exception("Exchange failed file move failed | file=%s", path)
 
 
+def _crosspost_plan_id(payload: Dict[str, Any], source_ref: str) -> str:
+    candidate = str(payload.get("plan_id") or payload.get("thought_id") or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9._:-]{8,64}", candidate):
+        return candidate
+    return hashlib.sha256(f"naz|crosspost|{source_ref}".encode("utf-8")).hexdigest()[:24]
+
+
+def _exchange_file_ref(path: Path) -> str:
+    return hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:12]
+
+
+_CROSSPOST_MEANING_LEXICON = (
+    ("attention", ("attention", "вниман")),
+    ("boundaries", ("boundar", "границ")),
+    ("choice", ("choice", "выбор")),
+    ("consequence", ("consequence", "последств")),
+    ("control", ("control", "контрол")),
+    ("craft", ("craft", "ремесл", "мастерств")),
+    ("failure", ("failure", "ошиб", "сбой")),
+    ("human cost", ("human cost", "цена для человека", "человеческ")),
+    ("memory", ("memory", "памят")),
+    ("responsibility", ("responsib", "ответствен")),
+    ("relationship", ("relationship", "отношен")),
+    ("silence", ("silence", "тишин", "молчан")),
+    ("technology", ("technolog", "технолог", "систем", "алгорит")),
+    ("time", ("time", "врем")),
+    ("trust", ("trust", "довер")),
+    ("uncertainty", ("uncertain", "неопредел", "сомнен")),
+    ("work", ("work", "работ", "проект")),
+)
+
+
+def _bounded_crosspost_source(payload: Dict[str, Any], source_text: str) -> str:
+    """Build a closed-vocabulary semantic digest with no private excerpts."""
+    folded = " ".join(
+        f"{payload.get('topic') or ''} {source_text}".casefold().split()
+    )
+    meanings = [
+        label
+        for label, stems in _CROSSPOST_MEANING_LEXICON
+        if any(stem in folded for stem in stems)
+    ][:8]
+    if not meanings:
+        meanings = ["uncertainty", "human consequence"]
+    return (
+        "Private conversation source. No quotation or personal detail is available.\n"
+        f"Safe semantic meanings: {', '.join(meanings)}.\n"
+        "Create a standalone Naz reflection with a new concrete public scene and conclusion."
+    )
+
+
+def _crosspost_publication_privacy_risks(text: str) -> tuple[str, ...]:
+    """Return labels only; callers never log matching private values."""
+    return tuple(label for label, pattern in PERSONAL_DATA_PATTERNS if pattern.search(text))
+
+
+async def process_void_to_naz_scheduled_exchange(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Scheduled crosspost route through EditorialPlan and GenerationPackage."""
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        return
+    if not CHANNEL_ID:
+        logger.warning("Exchange skipped: CHANNEL_ID empty")
+        return
+
+    ensure_exchange_dirs()
+    admin_user_id = ADMIN_ID or 0
+    inbox = sorted(exchange_dir("void_to_naz", "inbox").glob("*.json"))
+    for path in inbox[:CROSSPOST_EXCHANGE_MAX_PER_RUN]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid Void exchange payload")
+            if payload.get("source") == "naz_ai_bot":
+                move_exchange_file(path, "void_to_naz", "processed")
+                continue
+            source_text = str(
+                payload.get("text") or payload.get("post") or payload.get("thought") or ""
+            ).strip()
+            if len(source_text) < 40:
+                raise ValueError("empty or too short Void payload")
+            source_topic = str(payload.get("topic") or "")
+            if detect_content_risks(f"{source_topic}\n{source_text}"):
+                raise ValueError("Void exchange source failed private-data safety policy")
+            source_ref = (
+                "void_exchange:"
+                + hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:24]
+            )
+            crosspost_plan_id = _crosspost_plan_id(payload, source_ref)
+            previous_delivery = memory.get_editorial_release_event(
+                admin_user_id, crosspost_plan_id, "telegram"
+            )
+            previous_status = str(
+                (previous_delivery or {}).get("history_commit_status") or ""
+            )
+            if previous_status == "committed":
+                move_exchange_file(path, "void_to_naz", "processed")
+                logger.info(
+                    "Exchange already committed | void_to_naz | plan_id=%s",
+                    crosspost_plan_id,
+                )
+                continue
+            if previous_status in {"sending", "failed"}:
+                raise RuntimeError("crosspost delivery state requires audit")
+            if payload.get("schema") == "private_thought.v1":
+                valid, reason = duo_relationship.validate_private_thought_payload(payload)
+                if not valid or payload.get("receiver") != "naz":
+                    raise ValueError(reason or "private thought is addressed to another persona")
+                memory.save_private_thought(payload, status="received")
+            if isinstance(payload.get("relationship_snapshot"), dict):
+                memory.save_relationship_state(
+                    duo_relationship.normalize_state(payload["relationship_snapshot"])
+                )
+            memory.apply_relationship_event(
+                "challenge",
+                topic=str(payload.get("topic") or "private conversation")[:200],
+            )
+
+            # The private topic remains transient grounding only. Persisted
+            # plan/draft metadata carries a generic safe label.
+            topic = "Private conversation with VOID"
+            character = naz_character.apply_event(
+                memory.load_character_state(admin_user_id), "new_topic"
+            )
+            plan = scheduled_plan(
+                user_id=admin_user_id,
+                platform="telegram",
+                slot="crosspost_exchange",
+                seed=source_ref,
+                rubric_rows=(
+                    {
+                        "key": "void_exchange",
+                        "name": "Thought after a conversation",
+                        "kind": "crosspost",
+                        "angle": "create an original Naz reflection after a private VOID conversation",
+                        "track_tags": "daily,reflective,dialogue",
+                    },
+                ),
+                source_rows=(
+                    {
+                        "source_ref": source_ref,
+                        "topic": topic,
+                        "source_type": "private_crosspost",
+                        "rubric_keys": ("void_exchange",),
+                    },
+                ),
+                character=character,
+                crosspost_plan_id=crosspost_plan_id,
+            )
+            publish = (
+                payload.get("publish_mode", "auto") == "auto"
+                and CROSSPOST_EXCHANGE_AUTO_PUBLISH
+            )
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                slot=plan.slot,
+                slot_captured_at=memory.utc_now(),
+                generation_package_status="not_run",
+                image_qa_status="not_run",
+                history_commit_status="pending" if publish else "not_run",
+            )
+            try:
+                package = await generate_scheduled_package(
+                    plan,
+                    character,
+                    source_material=_bounded_crosspost_source(payload, source_text),
+                )
+            except ScheduledTechnicalFailure:
+                memory.update_editorial_release_event(
+                    user_id=admin_user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    generation_package_status="invalid",
+                    history_commit_status="not_run",
+                )
+                raise
+            except ScheduledContentReject:
+                memory.update_editorial_release_event(
+                    user_id=admin_user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    generation_package_status="rejected",
+                    history_commit_status="not_run",
+                )
+                raise
+            if _crosspost_publication_privacy_risks(package.final_text):
+                memory.update_editorial_release_event(
+                    user_id=admin_user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    generation_package_status="rejected",
+                    history_commit_status="not_run",
+                )
+                raise ScheduledContentReject("crosspost privacy policy")
+            original, originality_reason = duo_relationship.reflection_is_original(
+                redact_sensitive_text(source_text), package.final_text
+            )
+            if not original:
+                memory.update_editorial_release_event(
+                    user_id=admin_user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    generation_package_status="rejected",
+                    history_commit_status="not_run",
+                )
+                raise ScheduledContentReject(
+                    f"crosspost originality: {originality_reason}"
+                )
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                generation_package_status="accepted",
+                image_qa_status="not_run",
+            )
+            plan_dict = plan.to_dict()
+
+            if not publish:
+                await notify_admin(
+                    context.bot,
+                    f"VOID to Naz draft\n\n{package.final_text}",
+                )
+                memory.save_generated_post(
+                    user_id=admin_user_id,
+                    expert_mode=get_user_expert_mode(admin_user_id),
+                    task="exchange_void_to_naz_draft",
+                    topic=topic,
+                    content=package.final_text,
+                    image_count=0,
+                    published_to_channel=False,
+                    semantic_theme=plan.semantic_theme,
+                    semantic_card=plan.semantic_card,
+                    plan_id=plan.plan_id,
+                    editorial_plan=plan_dict,
+                )
+                move_exchange_file(path, "void_to_naz", "processed")
+                continue
+
+            images, _ = await generate_images_with_retries(
+                admin_user_id,
+                topic,
+                package.final_text,
+                count=CHANNEL_IMAGE_COUNT,
+                editorial_visual_brief=editorial_orchestrator.package_visual_brief(
+                    plan, package
+                ),
+            )
+            if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+                memory.update_editorial_release_event(
+                    user_id=admin_user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    history_commit_status="not_run",
+                )
+                raise ValueError("images required but not generated")
+            delivery_claim = memory.claim_editorial_delivery(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+            )
+            if delivery_claim == "committed":
+                move_exchange_file(path, "void_to_naz", "processed")
+                continue
+            if delivery_claim != "claimed":
+                raise RuntimeError("crosspost delivery state requires audit")
+            try:
+                receipt = await send_post_with_images(
+                    context.bot, CHANNEL_ID, package.final_text, images
+                )
+            except Exception:
+                memory.update_editorial_release_event(
+                    user_id=admin_user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    history_commit_status="failed",
+                )
+                raise
+            memory.save_generated_post(
+                user_id=admin_user_id,
+                expert_mode=get_user_expert_mode(admin_user_id),
+                task="exchange_void_to_naz",
+                topic=topic,
+                content=package.final_text,
+                image_count=len(images),
+                published_to_channel=True,
+                semantic_theme=plan.semantic_theme,
+                semantic_card=plan.semantic_card,
+                plan_id=plan.plan_id,
+                editorial_plan=plan_dict,
+            )
+            memory.record_content_signature(admin_user_id, plan_dict, topic)
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                telegram_chat_id=receipt.chat_id,
+                telegram_message_id=receipt.message_id,
+                history_commit_status="committed",
+            )
+            memory.save_character_state(admin_user_id, character)
+            memory.apply_character_event(admin_user_id, "publish")
+            move_exchange_file(path, "void_to_naz", "processed")
+            logger.info(
+                "Exchange published | void_to_naz | plan_id=%s | image_qa_status=not_run",
+                plan.plan_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Exchange void_to_naz failed | file_ref=%s | %s",
+                _exchange_file_ref(path),
+                exc,
+            )
+            try:
+                move_exchange_file(path, "void_to_naz", "failed")
+            except Exception:
+                logger.exception(
+                    "Exchange failed file move failed | file_ref=%s",
+                    _exchange_file_ref(path),
+                )
+
+
+@scheduled_work_marker("crosspost_exchange")
 async def crosspost_exchange_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await process_void_to_naz_exchange(context)
+    await process_void_to_naz_scheduled_exchange(context)
 
 
 # -----------------------------------------------------------------------------
@@ -5439,8 +6054,24 @@ def scheduled_plan(
     source_rows: Iterable[Dict[str, Any]],
     character: naz_character.CharacterState,
     crosspost_plan_id: str = "",
+    persona_rubric_rows: Optional[Iterable[Dict[str, Any]]] = None,
+    persona_source_rows: Optional[Iterable[Dict[str, Any]]] = None,
 ) -> editorial_orchestrator.EditorialPlan:
     """The sole creative decision entrypoint for scheduled Naz routes."""
+    rubric_rows = tuple(rubric_rows)
+    source_rows = tuple(source_rows)
+    if persona_rubric_rows is None or persona_source_rows is None:
+        if platform == "telegram":
+            telegram_rubrics, telegram_sources = naz_telegram_editorial_catalog_rows()
+            if persona_rubric_rows is None:
+                persona_rubric_rows = (*telegram_rubrics, *rubric_rows)
+            if persona_source_rows is None:
+                persona_source_rows = (*telegram_sources, *source_rows)
+        elif platform == "vk":
+            if persona_rubric_rows is None:
+                persona_rubric_rows = NAZ_VK_RUBRICS
+            if persona_source_rows is None:
+                persona_source_rows = source_rows
     context = naz_editorial_catalog.build_context(
         platform=platform,
         slot=slot,
@@ -5450,8 +6081,37 @@ def scheduled_plan(
         published_history=memory.get_recent_content_signatures(user_id, limit=160),
         character=character,
         crosspost_plan_id=crosspost_plan_id,
+        persona_rubric_rows=persona_rubric_rows,
+        persona_source_rows=persona_source_rows,
     )
     return editorial_orchestrator.plan_release(context)
+
+
+def naz_telegram_editorial_catalog_rows(
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Resolve the complete Telegram catalog before a slot constrains it."""
+    rubric_rows: List[Dict[str, Any]] = []
+    source_rows: List[Dict[str, Any]] = []
+    for rubric in NAZ_TELEGRAM_RUBRICS:
+        row = dict(rubric)
+        key = naz_editorial_catalog.rubric_key(str(row["name"]))
+        row["key"] = key
+        profile = row.get("profile")
+        if isinstance(profile, dict):
+            row["angle"] = " | ".join(
+                str(profile.get(item, "")) for item in ("angle", "format", "voice")
+            )
+        rubric_rows.append(row)
+        for index, topic_value in enumerate(row.get("topics", AUTOPOST_TOPICS)):
+            source_rows.append(
+                {
+                    "source_ref": f"naz-topic:{key}:{index}",
+                    "topic": str(topic_value),
+                    "source_type": "catalog",
+                    "rubric_keys": (key,),
+                }
+            )
+    return rubric_rows, source_rows
 
 
 def safe_vk_editorial_metadata(plan: editorial_orchestrator.EditorialPlan) -> Dict[str, Any]:
@@ -5737,6 +6397,7 @@ async def try_visual_archive_autopost(
         return False
 
 
+@scheduled_work_marker("telegram_autopost")
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHANNEL_ID:
         logger.warning("AUTOPOST skipped: CHANNEL_ID empty")
@@ -5750,6 +6411,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     job_data = context.job.data if context.job else {}
     slot = str(job_data.get("slot", "")) if isinstance(job_data, dict) else ""
+    slot_captured_at = memory.utc_now()
     logger.info("NAZ_TELEGRAM_AUTO_LOOP started | slot=%s", slot or "manual")
 
     failure_reasons: List[str] = []
@@ -5763,27 +6425,17 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             for rubric in NAZ_TELEGRAM_RUBRICS
             if not slot or slot in [str(item) for item in rubric.get("slots", [])]
         ] or list(NAZ_TELEGRAM_RUBRICS)
-        rubric_rows: List[Dict[str, Any]] = []
-        source_rows: List[Dict[str, Any]] = []
-        for rubric in eligible_rubrics:
-            row = dict(rubric)
-            key = naz_editorial_catalog.rubric_key(str(row["name"]))
-            row["key"] = key
-            profile = row.get("profile")
-            if isinstance(profile, dict):
-                row["angle"] = " | ".join(
-                    str(profile.get(item, "")) for item in ("angle", "format", "voice")
-                )
-            rubric_rows.append(row)
-            for index, topic_value in enumerate(row.get("topics", AUTOPOST_TOPICS)):
-                source_rows.append(
-                    {
-                        "source_ref": f"naz-topic:{key}:{index}",
-                        "topic": str(topic_value),
-                        "source_type": "catalog",
-                        "rubric_keys": (key,),
-                    }
-                )
+        persona_rubric_rows, persona_source_rows = naz_telegram_editorial_catalog_rows()
+        eligible_names = {str(rubric["name"]) for rubric in eligible_rubrics}
+        rubric_rows = [
+            row for row in persona_rubric_rows if str(row["name"]) in eligible_names
+        ]
+        eligible_keys = {str(row["key"]) for row in rubric_rows}
+        source_rows = [
+            row
+            for row in persona_source_rows
+            if eligible_keys.intersection(str(key) for key in row.get("rubric_keys", ()))
+        ]
         seed = f"telegram:{current_bot_date()}:{slot or 'scheduled'}"
         plan = scheduled_plan(
             user_id=admin_user_id,
@@ -5793,6 +6445,18 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             rubric_rows=rubric_rows,
             source_rows=source_rows,
             character=character,
+            persona_rubric_rows=persona_rubric_rows,
+            persona_source_rows=persona_source_rows,
+        )
+        memory.update_editorial_release_event(
+            user_id=admin_user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            slot=plan.slot,
+            slot_captured_at=slot_captured_at,
+            generation_package_status="not_run",
+            image_qa_status="not_run",
+            history_commit_status="pending",
         )
         logger.info(
             "NAZ_TELEGRAM_AUTO_LOOP orchestrated generation | slot=%s | plan_id=%s | rubric=%s",
@@ -5803,6 +6467,13 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             package = await generate_scheduled_package(plan, character)
         except ScheduledTechnicalFailure:
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                generation_package_status="invalid",
+                history_commit_status="not_run",
+            )
             failure_reasons.append("generation package remained technically invalid after one retry")
             await notify_admin(
                 context.bot,
@@ -5810,11 +6481,25 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         except ScheduledContentReject as exc:
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                generation_package_status="rejected",
+                history_commit_status="not_run",
+            )
             failure_reasons.append(f"local quality reject: {exc}")
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
 
         post_text = package.final_text
+        memory.update_editorial_release_event(
+            user_id=admin_user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            generation_package_status="accepted",
+            image_qa_status="not_run",
+        )
         visual_brief = editorial_orchestrator.package_visual_brief(plan, package)
         selected_rubric = next(row for row in rubric_rows if str(row["name"]) == plan.rubric)
         image_count = max(1, min(int(str(selected_rubric.get("image_count") or CHANNEL_IMAGE_COUNT)), 4))
@@ -5826,11 +6511,24 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             editorial_visual_brief=visual_brief,
         )
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                history_commit_status="not_run",
+            )
             failure_reasons.append("images required but not generated for the planned subject")
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
 
-        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+        receipt = await send_observed_scheduled_post(
+            bot=context.bot,
+            chat_id=CHANNEL_ID,
+            post_text=post_text,
+            images=images,
+            user_id=admin_user_id,
+            plan_id=plan.plan_id,
+        )
         plan_dict = plan.to_dict()
         saved_topic = f"{plan.topic} | {plan.rubric}"
         saved_task = f"naz_telegram_autopost:{plan.mode}:{plan.rubric}"
@@ -5853,14 +6551,21 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             topic=saved_topic,
         )
         memory.record_content_signature(admin_user_id, plan_dict, plan.topic)
+        memory.update_editorial_release_event(
+            user_id=admin_user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            telegram_chat_id=receipt.chat_id,
+            telegram_message_id=receipt.message_id,
+            history_commit_status="committed",
+        )
         memory.save_character_state(admin_user_id, character)
         memory.apply_character_event(admin_user_id, "publish")
         logger.info(
-            "AUTOPOST done | plan_id=%s | theme=%s | images=%s | prompt=%s",
+            "AUTOPOST done | plan_id=%s | theme=%s | images=%s | image_qa_status=not_run",
             plan.plan_id,
             plan.semantic_theme,
             len(images),
-            image_prompt,
         )
         return
     except Exception as exc:  # noqa: BLE001
@@ -5869,6 +6574,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Последний уровень защиты: бот не должен падать из-за автопоста.
 
 
+@scheduled_work_marker("source_monitor")
 async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHANNEL_ID:
         logger.warning("SOURCE_MONITOR skipped: CHANNEL_ID empty")
@@ -5878,6 +6584,7 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     admin_user_id = ADMIN_ID or 0
+    slot_captured_at = memory.utc_now()
     logger.info("SOURCE_MONITOR started")
 
     failure_reasons: List[str] = []
@@ -5927,6 +6634,16 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             source_rows=source_rows,
             character=character,
         )
+        memory.update_editorial_release_event(
+            user_id=admin_user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            slot=plan.slot,
+            slot_captured_at=slot_captured_at,
+            generation_package_status="not_run",
+            image_qa_status="not_run",
+            history_commit_status="pending",
+        )
         item = source_by_ref[plan.source_ref]
         source_material = (
             f"Title: {item.get('title', '')}\n"
@@ -5939,16 +6656,37 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 plan, character, source_material=source_material
             )
         except ScheduledTechnicalFailure:
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                generation_package_status="invalid",
+                history_commit_status="not_run",
+            )
             await notify_admin(
                 context.bot,
                 "⚠️ Мониторинг источников Naz не выпустил пост: модель дважды вернула технически непригодный пакет. Публичный DIAG не создан.",
             )
             return
         except ScheduledContentReject as exc:
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                generation_package_status="rejected",
+                history_commit_status="not_run",
+            )
             failure_reasons.append(f"local quality reject: {exc}")
             await notify_autopost_skip_once(context.bot, failure_reasons)
             return
         post_text = package.final_text
+        memory.update_editorial_release_event(
+            user_id=admin_user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            generation_package_status="accepted",
+            image_qa_status="not_run",
+        )
         images, image_prompt = await generate_images_with_retries(
             admin_user_id,
             f"{plan.rubric}. {plan.topic}",
@@ -5957,11 +6695,24 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             editorial_visual_brief=editorial_orchestrator.package_visual_brief(plan, package),
         )
         if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+            memory.update_editorial_release_event(
+                user_id=admin_user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                history_commit_status="not_run",
+            )
             reason = f"source image failed: {item.get('title', '')}"
             logger.warning("SOURCE_MONITOR blocked: %s", reason)
             return
 
-        await send_post_with_images(context.bot, CHANNEL_ID, post_text, images)
+        receipt = await send_observed_scheduled_post(
+            bot=context.bot,
+            chat_id=CHANNEL_ID,
+            post_text=post_text,
+            images=images,
+            user_id=admin_user_id,
+            plan_id=plan.plan_id,
+        )
         mark_source_seen(item)
         saved_task = f"source_monitor:{plan.rubric}"
         saved_topic = plan.topic
@@ -5981,14 +6732,21 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         queue_naz_post_for_void(post_text, source=saved_task, topic=saved_topic)
         memory.record_content_signature(admin_user_id, plan_dict, saved_topic)
+        memory.update_editorial_release_event(
+            user_id=admin_user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            telegram_chat_id=receipt.chat_id,
+            telegram_message_id=receipt.message_id,
+            history_commit_status="committed",
+        )
         memory.save_character_state(admin_user_id, character)
         memory.apply_character_event(admin_user_id, "publish")
         logger.info(
-            "SOURCE_MONITOR done | plan_id=%s | theme=%s | images=%s | prompt=%s",
+            "SOURCE_MONITOR done | plan_id=%s | theme=%s | images=%s | image_qa_status=not_run",
             plan.plan_id,
             plan.semantic_theme,
             len(images),
-            image_prompt,
         )
         return
     except Exception as exc:  # noqa: BLE001
@@ -5996,6 +6754,7 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await notify_admin(context.bot, f"⚠️ SOURCE_MONITOR failed: {type(exc).__name__}: {exc}")
 
 
+@scheduled_work_marker("agent_content_sync")
 async def agent_content_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     admin_user_id = ADMIN_ID or 0
     if not admin_user_id:
@@ -6117,6 +6876,7 @@ def setup_naz_vk_schedule(application: Application) -> None:
         logger.warning("Naz VK enabled, but its schedule has no valid times")
 
 
+@scheduled_work_marker("vk_embedded_producer")
 async def naz_vk_queue_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if NAZ_VK_SCHEDULER != "telegram" or not (NAZ_VK_ENABLED and NAZ_VK_AUTO_ON):
         return
@@ -6130,13 +6890,55 @@ async def naz_vk_queue_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         else "Naz VK: практическая заметка об AI, разработке или контент-системах"
     )
     try:
-        job = await create_naz_vk_job(topic, source_ref=source_ref, rubric_kind=rubric_kind)
+        job = await create_naz_vk_job(
+            topic,
+            source_ref=source_ref,
+            rubric_kind=rubric_kind,
+            slot=slot,
+        )
         logger.info("Naz VK job queued | job_id=%s | kind=%s | slot=%s", job["job_id"], rubric_kind, slot)
     except vk_publish_queue.DuplicateJobError:
         logger.info("Naz VK schedule cooldown: slot already queued | %s", source_ref)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Naz VK enqueue failed | slot=%s", slot)
         await notify_admin(context.bot, f"⚠️ Не удалось поставить задание VK ({slot}) в очередь: {exc}")
+
+
+@scheduled_work_marker("vk_receipt_sync")
+async def naz_vk_receipt_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        result = sync_completed_naz_vk_jobs()
+    except (OSError, vk_publish_queue.QueueError):
+        logger.exception("Naz VK receipt sync unavailable")
+        return
+    logger.info(
+        "Naz VK receipt sync | receipts_seen=%s | history_inserted=%s | "
+        "already_recorded=%s | invalid_receipts=%s",
+        result.receipts_seen,
+        result.history_inserted,
+        result.already_recorded,
+        result.invalid_receipts,
+    )
+
+
+def setup_naz_vk_receipt_sync(application: Application) -> None:
+    """Register receipt reconciliation independently of producer creation."""
+    if not NAZ_VK_ENABLED:
+        logger.info("Naz VK receipt sync disabled")
+        return
+    if not application.job_queue:
+        logger.warning("Naz VK receipt sync JobQueue is unavailable")
+        return
+    application.job_queue.run_repeating(
+        naz_vk_receipt_sync_job,
+        interval=NAZ_VK_RECEIPT_SYNC_INTERVAL_SECONDS,
+        first=15,
+        name="naz_vk_receipt_sync",
+    )
+    logger.info(
+        "Naz VK receipt sync scheduled | interval=%ss",
+        NAZ_VK_RECEIPT_SYNC_INTERVAL_SECONDS,
+    )
 
 
 def setup_source_monitoring(application: Application) -> None:
@@ -6495,6 +7297,7 @@ def build_application() -> Application:
 
     setup_autoposting(application)
     setup_naz_vk_schedule(application)
+    setup_naz_vk_receipt_sync(application)
     setup_source_monitoring(application)
     setup_agent_content_sync(application)
     setup_crosspost_exchange(application)
