@@ -255,6 +255,18 @@ class PollTests(unittest.TestCase):
         self.assertEqual(job.artifact.output_format, "mp3")
         self.assertEqual(job.artifact.seed, 343940597)
         self.assertEqual(job.artifact.finish_reason, "SUCCESS")
+
+    def test_real_audio_result_shape_uses_http_200_completion_evidence(self):
+        transport = FakeTransport([HttpResponse(
+            200,
+            {"Content-Type": "audio/mpeg", "x-request-id": "request-fixture"},
+            MP3_BYTES,
+        )])
+        job = provider(transport).poll(JOB_ID)
+        self.assertEqual(job.status, "completed")
+        self.assertEqual(job.artifact.finish_reason, "HTTP_200_AUDIO")
+        self.assertIsNone(job.artifact.seed)
+        self.assertEqual(job.artifact.request_id, "request-fixture")
         self.assertEqual(job.artifact.request_id, "request-fixture")
         self.assertEqual([call["method"] for call in transport.calls], ["GET"])
 
@@ -283,11 +295,17 @@ class PollTests(unittest.TestCase):
     def test_finish_reason_and_seed_are_strictly_validated(self):
         bad_finish = completed()
         bad_finish = HttpResponse(200, {**bad_finish.headers, "finish-reason": "CONTENT_FILTERED"}, MP3_BYTES)
+        empty_finish = completed()
+        empty_finish = HttpResponse(200, {**empty_finish.headers, "finish-reason": " "}, MP3_BYTES)
         bad_seed = completed()
         bad_seed = HttpResponse(200, {**bad_seed.headers, "seed": "not-a-number"}, MP3_BYTES)
+        oversized_seed = completed()
+        oversized_seed = HttpResponse(200, {**oversized_seed.headers, "seed": "4294967295"}, MP3_BYTES)
         for response, code in [
             (bad_finish, "audio_result_finish_reason_invalid"),
+            (empty_finish, "audio_result_finish_reason_invalid"),
             (bad_seed, "audio_result_seed_invalid"),
+            (oversized_seed, "audio_result_seed_invalid"),
         ]:
             with self.subTest(code=code), self.assertRaises(AudioProviderError) as raised:
                 provider(FakeTransport([response])).poll(JOB_ID)

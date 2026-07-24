@@ -35,6 +35,11 @@ RETRYABLE_LOCAL_ANALYSIS_CODES = frozenset({
     "audio_analysis_process_failed",
     "audio_analysis_output_too_large",
 })
+REVALIDATABLE_RECEIPT_CODES = frozenset({
+    "audio_result_finish_reason_invalid", "audio_result_seed_invalid",
+})
+AUDIO_COMPLETION_EVIDENCE = frozenset({"SUCCESS", "HTTP_200_AUDIO"})
+AUDIO_RESULT_CONTRACT = "audio-result.v2"
 
 
 class AudioLibraryError(RuntimeError):
@@ -361,8 +366,16 @@ def read_valid_sidecar(root: Path, spec: AudioTrackSpec) -> dict[str, Any] | Non
             and bool(str(rights.get("generated_at", "")).strip())
             and isinstance(generation, dict)
             and generation.get("output_format") == spec.output_format
-            and generation.get("finish_reason") == "SUCCESS"
-            and isinstance(generation.get("seed"), int)
+            and generation.get("finish_reason") in AUDIO_COMPLETION_EVIDENCE
+            and type(generation.get("seed")) is int
+            and generation.get("seed") == spec.seed
+            and (
+                generation.get("seed_source") in {"provider_header", "request"}
+                or (
+                    "seed_source" not in generation
+                    and generation.get("finish_reason") == "SUCCESS"
+                )
+            )
             and row.get("beat_grid_source") == "actual-audio-derived-beat-track-v1"
             and row.get("beat_evidence_source") == "actual-audio-derived-onset-match-v1"
             and beat_evidence_is_valid(row.get("beat_grid", ()), row.get("beat_evidence", ()))
@@ -441,19 +454,22 @@ def _artifact_bytes(artifact: Any) -> bytes:
 
 def _write_completed_artifact(
     root: Path, spec: AudioTrackSpec, artifact: Any, *, provider: AudioProvider,
-    analyzer: AudioAnalyzer,
+    analyzer: AudioAnalyzer, requested_seed: int,
 ) -> dict[str, Any]:
     raw = _artifact_bytes(artifact)
     artifact_format = str(getattr(artifact, "output_format", spec.output_format)).strip().casefold()
     content_type = str(getattr(artifact, "content_type", "")).partition(";")[0].strip().casefold()
     finish_reason = str(getattr(artifact, "finish_reason", "")).strip()
-    seed = getattr(artifact, "seed", None)
+    provider_seed = getattr(artifact, "seed", None)
+    seed = requested_seed if provider_seed is None else provider_seed
+    seed_source = "request" if provider_seed is None else "provider_header"
     expected_content_types = {"mp3": {"audio/mpeg", "audio/mp3"}, "wav": {"audio/wav", "audio/x-wav"}}
     if (
         artifact_format != spec.output_format
         or content_type not in expected_content_types.get(artifact_format, set())
-        or finish_reason != "SUCCESS"
+        or finish_reason not in AUDIO_COMPLETION_EVIDENCE
         or not isinstance(seed, int)
+        or seed != requested_seed
         or not _valid_artifact_bytes(raw, artifact_format)
     ):
         raise AudioLibraryError("audio_artifact_invalid")
@@ -538,6 +554,7 @@ def _write_completed_artifact(
         "generation": {
             "output_format": artifact_format,
             "seed": seed,
+            "seed_source": seed_source,
             "finish_reason": finish_reason,
             "request_id": request_id or None,
         },
@@ -560,6 +577,26 @@ def _poll_job(
     *, root: Path, state: dict[str, Any], spec: AudioTrackSpec,
     job: dict[str, Any], provider: AudioProvider, analyzer: AudioAnalyzer,
 ) -> str:
+    if job.get("result_contract_version") != AUDIO_RESULT_CONTRACT:
+        job["result_contract_version"] = AUDIO_RESULT_CONTRACT
+        # The one-time recovery marker must be durable before the GET so a
+        # crash cannot make one invalid receipt spin forever.
+        save_generation_state(root, state)
+    if job.get("request_fingerprint") != spec.prompt_sha256:
+        job.update({"state": "blocked", "reason_code": "audio_request_fingerprint_mismatch", "updated_at": _utc_now()})
+        save_generation_state(root, state)
+        return "blocked"
+    requested_seed = job.get("requested_seed")
+    if requested_seed is None:
+        # v1 journals written before requested_seed was persisted are safe to
+        # migrate only when their immutable prompt fingerprint still matches.
+        requested_seed = spec.seed
+        job["requested_seed"] = requested_seed
+        save_generation_state(root, state)
+    if type(requested_seed) is not int or requested_seed != spec.seed:
+        job.update({"state": "blocked", "reason_code": "audio_requested_seed_mismatch", "updated_at": _utc_now()})
+        save_generation_state(root, state)
+        return "blocked"
     raw_job_id = job.get("external_job_id")
     external_job_id = raw_job_id.strip() if isinstance(raw_job_id, str) else ""
     if not external_job_id:
@@ -591,7 +628,7 @@ def _poll_job(
     try:
         _write_completed_artifact(
             root, spec, getattr(provider_job, "artifact", None),
-            provider=provider, analyzer=analyzer,
+            provider=provider, analyzer=analyzer, requested_seed=requested_seed,
         )
     except AudioLibraryError as exc:
         state_name = "analysis_pending" if exc.code in RETRYABLE_LOCAL_ANALYSIS_CODES else "failed"
@@ -644,6 +681,15 @@ def generate_initial_library(
         polled_now = 0
         for spec in INITIAL_TRACK_SPECS:
             job = jobs.get(spec.track_id)
+            if (
+                isinstance(job, dict)
+                and job.get("state") == "failed"
+                and job.get("reason_code") in REVALIDATABLE_RECEIPT_CODES
+                and job.get("result_contract_version") != AUDIO_RESULT_CONTRACT
+                and bool(str(job.get("external_job_id", "")).strip())
+            ):
+                job.update({"state": "submitted", "reason_code": None, "updated_at": _utc_now()})
+                save_generation_state(root, state)
             if isinstance(job, dict) and job.get("state") in {
                 "submitted", "submitting", "analysis_pending",
             }:
@@ -678,6 +724,8 @@ def generate_initial_library(
                 "external_job_id": None,
                 "submission_attempts": 1,
                 "request_fingerprint": spec.prompt_sha256,
+                "requested_seed": spec.seed,
+                "result_contract_version": AUDIO_RESULT_CONTRACT,
                 "submitted_at": _utc_now(),
                 "updated_at": _utc_now(),
                 "reason_code": None,

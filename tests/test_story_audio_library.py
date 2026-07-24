@@ -51,12 +51,14 @@ class FakeAudioProvider:
         return self.jobs[external_job_id]
 
     def complete(self, external_job_id, *, data=None):
+        request_index = int(external_job_id.rsplit("-", 1)[-1]) - 1
         self.jobs[external_job_id] = SimpleNamespace(
             external_job_id=external_job_id,
             status="completed",
             artifact=SimpleNamespace(
                 data=data or mp3_bytes(), content_type="audio/mpeg",
-                output_format="mp3", seed=7, finish_reason="SUCCESS",
+                output_format="mp3", seed=self.submissions[request_index].seed,
+                finish_reason="SUCCESS",
                 request_id=f"request-{external_job_id}",
             ),
         )
@@ -171,6 +173,13 @@ class DurableGenerationTests(unittest.TestCase):
             )
             self.assertEqual(first["submitted_now"], 8)
             self.assertEqual(len(provider.submissions), 8)
+            state = load_generation_state(Path(root))
+            for spec in INITIAL_TRACK_SPECS:
+                self.assertEqual(state["jobs"][spec.track_id]["requested_seed"], spec.seed)
+                self.assertEqual(
+                    state["jobs"][spec.track_id]["result_contract_version"],
+                    "audio-result.v2",
+                )
             second = generate_initial_library(
                 root=Path(root), provider=provider,
                 confirmed_paid_calls=8, max_new_tracks=8,
@@ -199,6 +208,179 @@ class DurableGenerationTests(unittest.TestCase):
             self.assertEqual(resumed["polled_now"], 1)
             self.assertEqual(resumed["ready_count"], 1)
             self.assertEqual(len(provider.submissions), 1)
+
+    def test_legacy_v1_success_sidecar_without_seed_source_remains_readable(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            provider = FakeAudioProvider()
+            generate_initial_library(
+                root=root_path, provider=provider,
+                confirmed_paid_calls=1, max_new_tracks=1,
+                analyzer=FakeAudioAnalyzer(),
+            )
+            provider.complete(next(iter(provider.jobs)))
+            generate_initial_library(
+                root=root_path, provider=provider,
+                confirmed_paid_calls=0, max_new_tracks=0,
+                analyzer=FakeAudioAnalyzer(),
+            )
+            first = INITIAL_TRACK_SPECS[0]
+            metadata = sidecar_path(root_path, first)
+            row = json.loads(metadata.read_text(encoding="utf-8"))
+            row["generation"].pop("seed_source")
+            metadata.write_text(json.dumps(row), encoding="utf-8")
+
+            self.assertIsNotNone(read_valid_sidecar(root_path, first))
+
+    def test_headerless_http_200_receipt_recovers_old_validation_failure_without_post(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            provider = FakeAudioProvider()
+            generate_initial_library(
+                root=root_path, provider=provider,
+                confirmed_paid_calls=1, max_new_tracks=1,
+                analyzer=FakeAudioAnalyzer(),
+            )
+            job_id = next(iter(provider.jobs))
+            provider.complete(job_id)
+            provider.jobs[job_id].artifact = SimpleNamespace(
+                data=mp3_bytes(), content_type="audio/mpeg", output_format="mp3",
+                seed=None, finish_reason="HTTP_200_AUDIO", request_id="request-fixture",
+            )
+            state = load_generation_state(root_path)
+            first = INITIAL_TRACK_SPECS[0]
+            state["jobs"][first.track_id].update({
+                "state": "failed",
+                "reason_code": "audio_result_finish_reason_invalid",
+            })
+            state["jobs"][first.track_id].pop("requested_seed", None)
+            state["jobs"][first.track_id].pop("result_contract_version", None)
+            save_generation_state(root_path, state)
+
+            resumed = generate_initial_library(
+                root=root_path, provider=provider,
+                confirmed_paid_calls=0, max_new_tracks=0,
+                analyzer=FakeAudioAnalyzer(),
+            )
+
+            self.assertEqual(resumed["submitted_now"], 0)
+            self.assertEqual(resumed["polled_now"], 1)
+            self.assertEqual(resumed["ready_count"], 1)
+            self.assertEqual(len(provider.submissions), 1)
+            sidecar = read_valid_sidecar(root_path, first)
+            self.assertIsNotNone(sidecar)
+            self.assertEqual(sidecar["generation"]["seed"], first.seed)
+            self.assertEqual(sidecar["generation"]["seed_source"], "request")
+            self.assertEqual(sidecar["generation"]["finish_reason"], "HTTP_200_AUDIO")
+            self.assertEqual(
+                load_generation_state(root_path)["jobs"][first.track_id]["result_contract_version"],
+                "audio-result.v2",
+            )
+
+    def test_all_eight_legacy_receipts_recover_with_eight_gets_and_zero_posts(self):
+        class CatalogAnalyzer(FakeAudioAnalyzer):
+            def analyze(self, path):
+                self.paths.append(Path(path))
+                spec = next(
+                    item for item in INITIAL_TRACK_SPECS
+                    if item.track_id in Path(path).name
+                )
+                duration = float(spec.duration_seconds) - 0.1
+                step = 60.0 / float(spec.bpm)
+                grid = tuple(
+                    round(0.1 + index * step, 6)
+                    for index in range(int((duration - 0.1) / step) + 1)
+                )
+                return AudioAnalysis(
+                    duration, float(spec.bpm), grid,
+                    beat_evidence=tuple(True for _ in grid),
+                    analyzer="catalog-fixture-analyzer-v1",
+                )
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            provider = FakeAudioProvider()
+            generate_initial_library(
+                root=root_path, provider=provider,
+                confirmed_paid_calls=8, max_new_tracks=8,
+                analyzer=FakeAudioAnalyzer(),
+            )
+            for job_id in tuple(provider.jobs):
+                provider.complete(job_id)
+                provider.jobs[job_id].artifact = SimpleNamespace(
+                    data=mp3_bytes(job_id.encode("ascii")[-1:]),
+                    content_type="audio/mpeg", output_format="mp3",
+                    seed=None, finish_reason="HTTP_200_AUDIO",
+                    request_id=f"request-{job_id}",
+                )
+            state = load_generation_state(root_path)
+            for spec in INITIAL_TRACK_SPECS:
+                state["jobs"][spec.track_id].update({
+                    "state": "failed",
+                    "reason_code": "audio_result_finish_reason_invalid",
+                })
+                state["jobs"][spec.track_id].pop("requested_seed", None)
+                state["jobs"][spec.track_id].pop("result_contract_version", None)
+            save_generation_state(root_path, state)
+
+            resumed = generate_initial_library(
+                root=root_path, provider=provider,
+                confirmed_paid_calls=0, max_new_tracks=0,
+                analyzer=CatalogAnalyzer(),
+            )
+
+            self.assertEqual(resumed["submitted_now"], 0)
+            self.assertEqual(resumed["polled_now"], 8)
+            self.assertEqual(resumed["ready_count"], 8)
+            self.assertEqual(len(provider.submissions), 8)
+
+    def test_failed_revalidation_is_attempted_only_once_without_post(self):
+        class StillInvalidProvider(FakeAudioProvider):
+            def __init__(self):
+                super().__init__()
+                self.poll_calls = 0
+
+            def poll(self, external_job_id):
+                self.poll_calls += 1
+                error = AudioLibraryError("audio_result_finish_reason_invalid")
+                error.retryable = False
+                raise error
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            first = INITIAL_TRACK_SPECS[0]
+            state = {
+                "schema": GENERATION_STATE_SCHEMA,
+                "updated_at": "2026-07-24T00:00:00+00:00",
+                "jobs": {
+                    first.track_id: {
+                        "track_id": first.track_id,
+                        "state": "failed",
+                        "external_job_id": "existing-receipt",
+                        "submission_attempts": 1,
+                        "request_fingerprint": first.prompt_sha256,
+                        "reason_code": "audio_result_finish_reason_invalid",
+                    },
+                },
+            }
+            save_generation_state(root_path, state)
+            provider = StillInvalidProvider()
+
+            first_run = generate_initial_library(
+                root=root_path, provider=provider,
+                confirmed_paid_calls=0, max_new_tracks=0,
+                analyzer=FakeAudioAnalyzer(),
+            )
+            second_run = generate_initial_library(
+                root=root_path, provider=provider,
+                confirmed_paid_calls=0, max_new_tracks=0,
+                analyzer=FakeAudioAnalyzer(),
+            )
+
+            self.assertEqual(first_run["polled_now"], 1)
+            self.assertEqual(second_run["polled_now"], 0)
+            self.assertEqual(provider.poll_calls, 1)
+            self.assertEqual(provider.submissions, [])
 
     def test_terminal_poll_error_is_not_polled_forever(self):
         class TerminalPollError(RuntimeError):

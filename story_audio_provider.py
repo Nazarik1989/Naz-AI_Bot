@@ -74,7 +74,7 @@ class AudioArtifact:
     data: bytes
     content_type: str
     output_format: str
-    seed: int
+    seed: int | None
     finish_reason: str
     request_id: str | None = None
 
@@ -487,16 +487,19 @@ class StableAudioProvider:
         if not valid:
             raise AudioProviderError("audio_result_file_invalid")
 
-        finish_reason = (_header(response.headers, "finish-reason") or "").strip()
-        if finish_reason != "SUCCESS":
+        raw_finish_reason = _header(response.headers, "finish-reason")
+        finish_reason = raw_finish_reason.strip() if raw_finish_reason is not None else "HTTP_200_AUDIO"
+        if raw_finish_reason is not None and finish_reason != "SUCCESS":
             raise AudioProviderError("audio_result_finish_reason_invalid")
-        raw_seed = (_header(response.headers, "seed") or "").strip()
-        try:
-            seed = int(raw_seed)
-        except ValueError:
-            raise AudioProviderError("audio_result_seed_invalid") from None
-        if not 0 <= seed <= MAX_SEED:
-            raise AudioProviderError("audio_result_seed_invalid")
+        raw_seed = _header(response.headers, "seed")
+        seed: int | None = None
+        if raw_seed is not None:
+            try:
+                seed = int(raw_seed.strip())
+            except ValueError:
+                raise AudioProviderError("audio_result_seed_invalid") from None
+            if not 0 <= seed <= MAX_SEED:
+                raise AudioProviderError("audio_result_seed_invalid")
         request_id = _header(response.headers, "x-request-id")
         return AudioArtifact(
             data=response.body,
