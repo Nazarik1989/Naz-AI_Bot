@@ -81,7 +81,10 @@ class WorkerConfig:
 
 def load_config(env: Mapping[str, str] | None = None) -> WorkerConfig:
     values = os.environ if env is None else env
-    reference = values.get("NAZ_VIDEO_REFERENCE_PATH", "").strip()
+    reference = (
+        values.get("NAZ_VIDEO_REFERENCE_DIR", "").strip()
+        or values.get("NAZ_VIDEO_REFERENCE_PATH", "").strip()
+    )
     music = values.get("NAZ_STORY_MUSIC_LIBRARY", "").strip()
     font = values.get("NAZ_STORY_FONT_PATH", "").strip()
     return WorkerConfig(
@@ -121,8 +124,13 @@ def check_config(config: WorkerConfig, env: Mapping[str, str] | None = None) -> 
         issues.append("ffprobe_unavailable")
     if config.font_path is None or not config.font_path.is_file():
         issues.append("cyrillic_font_missing")
-    reference_status = "available" if config.reference_path and config.reference_path.is_file() else "unavailable"
-    music_status = "available" if config.music_library_path and config.music_library_path.is_file() else "unavailable"
+    reference_status = "available" if _approved_reference_path(config.reference_path) else "unavailable"
+    music_status = (
+        "available"
+        if config.music_library_path
+        and load_music_library(config.music_library_path, pack_root=config.pack_root)
+        else "unavailable"
+    )
     if config.reference_path and (config.reference_path == PROJECT_ROOT or PROJECT_ROOT in config.reference_path.parents):
         issues.append("approved_reference_inside_repository")
     return {
@@ -199,6 +207,11 @@ def _set_pack_status(payload: dict[str, Any]) -> None:
     if scenes and all(state == "completed" for state in scenes):
         if reels and all(state == "completed" for state in reels):
             payload["pack_status"] = "completed"
+            delivery = payload.setdefault(
+                "delivery", {"status": "not_ready", "sent_files": [], "completed_at": None}
+            )
+            if delivery.get("status") == "not_ready":
+                delivery["status"] = "ready"
         elif "blocked_music" in reels:
             payload["pack_status"] = "blocked_music"
         else:
@@ -211,16 +224,35 @@ def _set_pack_status(payload: dict[str, Any]) -> None:
         payload["pack_status"] = "queued"
 
 
+def _approved_reference_path(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    candidate = path.expanduser().resolve()
+    if candidate == PROJECT_ROOT or PROJECT_ROOT in candidate.parents:
+        return None
+    if candidate.is_file() and candidate.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}:
+        return candidate
+    if not candidate.is_dir():
+        return None
+    images = [
+        item for item in candidate.iterdir()
+        if item.is_file() and item.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}
+    ]
+    if not images:
+        return None
+    return sorted(
+        images,
+        key=lambda item: (0 if item.stem.casefold() == "naz-primary" else 1, item.name.casefold()),
+    )[0]
+
+
 def _reference_for(scene: Mapping[str, Any], config: WorkerConfig, provider: VideoProvider) -> Path | None:
     if not bool(scene.get("requires_naz_reference")):
         return None
-    if (
-        not provider.supports_reference or config.reference_path is None
-        or not config.reference_path.is_file() or config.reference_path == PROJECT_ROOT
-        or PROJECT_ROOT in config.reference_path.parents
-    ):
+    reference = _approved_reference_path(config.reference_path)
+    if not provider.supports_reference or reference is None:
         raise ProviderError("approved_reference_invalid")
-    return config.reference_path
+    return reference
 
 
 def _mark_failure(job: dict[str, Any], exc: BaseException, config: WorkerConfig) -> None:
@@ -440,6 +472,8 @@ def process_pack(
     payload = story_production.read_manifest(manifest)
     if payload.get("schema") == story_production.LEGACY_STORY_SCHEMA:
         return "legacy_manifest_read_only"
+    if str(payload.get("approval", {}).get("status")) != "approved":
+        return "awaiting_approval"
     if len(payload.get("scene_jobs", [])) > config.max_scene_jobs:
         raise RuntimeError("scene_job_limit_exceeded")
     media = composer or MediaComposer(

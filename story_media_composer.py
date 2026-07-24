@@ -256,6 +256,42 @@ class MediaComposer:
 
 
 def load_music_library(path: Path, *, pack_root: Path | None = None) -> list[LicensedTrack]:
+    if path.is_dir():
+        result: list[LicensedTrack] = []
+        supported = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"}
+        for track_path in sorted(path.iterdir(), key=lambda item: item.name.casefold()):
+            if not track_path.is_file() or track_path.suffix.casefold() not in supported:
+                continue
+            sidecars = [
+                track_path.with_suffix(track_path.suffix + ".json"),
+                track_path.with_suffix(".json"),
+            ]
+            sidecar = next((item for item in sidecars if item.is_file()), None)
+            if sidecar is None:
+                continue
+            try:
+                row = json.loads(sidecar.read_text(encoding="utf-8"))
+                bpm = float(row["bpm"])
+                if not 40 <= bpm <= 240:
+                    continue
+                license_name = str(row["license"]).strip()
+                source = str(row["source"]).strip()
+                if not license_name or not source:
+                    continue
+                raw_grid = row.get("beat_grid")
+                if isinstance(raw_grid, list) and raw_grid:
+                    beat_grid = tuple(float(value) for value in raw_grid)
+                else:
+                    step = 60.0 / bpm
+                    beat_grid = tuple(round(index * step, 6) for index in range(int(600 / step) + 1))
+                result.append(LicensedTrack(
+                    track_id=str(row.get("track_id") or track_path.stem),
+                    path=track_path.resolve(), bpm=bpm, beat_grid=beat_grid,
+                    license=license_name, source=source, checksum=checksum(track_path),
+                ))
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                continue
+        return result
     if not path.is_file():
         return []
     try:

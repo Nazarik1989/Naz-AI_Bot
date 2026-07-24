@@ -5,6 +5,12 @@ is deliberately separate. The bot atomically writes a `naz-story-pack-v2`
 manifest and returns. `naz_story_worker.py` resumes one state transition at a
 time and contains no Telegram or VK publication path.
 
+The administrator opens `Контент → Reels` and sees only the process controls:
+`Подтвердить генерацию`, `Другой вариант`, and `Обновить статус`. Planning and
+variant changes are local and provider-free. Only confirmation makes the pack
+eligible for the separate worker. Finished STORY and Reel files are sent to the
+administrator's private chat automatically; there is no manual download step.
+
 ## Safety defaults
 
 - `NAZ_STORY_RENDER_ENABLED=false` and `NAZ_VIDEO_PROVIDER=disabled` by default.
@@ -13,8 +19,9 @@ time and contains no Telegram or VK publication path.
 - `--check-config` and `--dry-run` make no provider calls.
 - One scene is active per worker invocation. Limits are at most seven scenes,
   two retries, seven paid jobs and 56 generated seconds per UTC day by default.
-- No Story/Reel autopublication exists. VK music last-8 state is not read or
-  consumed.
+- No Story/Reel autopublication exists. Completed media is delivered only to
+  the configured administrator's private bot chat. VK music last-8 state is
+  not read or consumed.
 
 Run static validation:
 
@@ -46,11 +53,22 @@ replacement.
 
 ## Private inputs
 
-`NAZ_VIDEO_REFERENCE_PATH` must point outside Git to the approved Naz avatar.
-A face scene becomes `blocked_reference` if this file is unavailable or the
-provider cannot accept a reference; object-only scenes remain eligible.
+`NAZ_VIDEO_REFERENCE_DIR` must point outside Git to the private folder with
+approved Naz references. Name the canonical avatar `naz-primary.png` (or use
+JPG/JPEG/WebP) so it is selected first; otherwise the first image by filename
+is used. The legacy `NAZ_VIDEO_REFERENCE_PATH` remains supported. A face scene
+becomes `blocked_reference` if no image is available or the provider cannot
+accept a reference; object-only scenes remain eligible.
 
-`NAZ_STORY_MUSIC_LIBRARY` points to a private JSON allowlist:
+`NAZ_STORY_MUSIC_LIBRARY` may point to a private music folder. Each audio file
+must have a same-name JSON sidecar, for example `track.m4a.json`:
+
+```json
+{"bpm": 120, "license": "license-record", "source": "licensed-library"}
+```
+
+An explicit beat grid and `track_id` are optional. The previous single JSON
+allowlist format remains supported:
 
 ```json
 {

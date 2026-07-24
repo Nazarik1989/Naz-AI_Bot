@@ -12,7 +12,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -84,6 +84,8 @@ class ReelEditPlan:
 @dataclass(frozen=True, slots=True)
 class StoryPackPlan:
     plan_id: str
+    base_plan_id: str
+    variant_index: int
     continuity_id: str
     persona: str
     destination: str
@@ -91,6 +93,8 @@ class StoryPackPlan:
     rubric: str
     source_type: str
     source_ref: str
+    safe_facts: tuple[str, ...]
+    editorial_plan: Mapping[str, Any]
     central_thesis: str
     scene_count: int
     scenes: tuple[ScenePlan, ...]
@@ -240,22 +244,53 @@ def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: boo
     )
 
 
-def plan_story_pack(plan: EditorialPlan, safe_facts: tuple[str, ...]) -> StoryPackPlan:
+def _variant_plan_id(base_plan_id: str, variant_index: int) -> str:
+    if variant_index == 0:
+        return base_plan_id
+    return hashlib.sha256(
+        f"{base_plan_id}|story-variant|{variant_index}".encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def plan_story_pack(
+    plan: EditorialPlan,
+    safe_facts: tuple[str, ...],
+    *,
+    variant_index: int = 0,
+) -> StoryPackPlan:
     if plan.production_mode != "story_first" or plan.content_format != "story_pack":
         raise StoryPlanError("EditorialPlan is not Story-first")
     facts = tuple(_safe_fact(item) for item in safe_facts)
     if len(facts) < 4:
         raise StoryPlanError("Story-first requires at least four safe causal facts")
+    if not 0 <= variant_index <= 99:
+        raise StoryPlanError("Story-first variant index must be 0..99")
+    story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
+    variant_plan = replace(plan, plan_id=story_plan_id)
     count = max(4, min(7, len(facts)))
     continuity_id = hashlib.sha256(f"naz|{plan.plan_id}|continuity".encode("utf-8")).hexdigest()[:20]
-    roles = _roles(plan.plan_id, count)
-    scenes = tuple(_scene(plan, continuity_id=continuity_id, role=role, index=i, fact=facts[i]) for i, role in enumerate(roles))
+    roles = _roles(story_plan_id, count)
+    scenes = tuple(
+        _scene(
+            variant_plan,
+            continuity_id=continuity_id,
+            role=role,
+            index=i,
+            fact=facts[i],
+        )
+        for i, role in enumerate(roles)
+    )
     pack = StoryPackPlan(
-        plan_id=plan.plan_id, continuity_id=continuity_id, persona=plan.persona,
+        plan_id=story_plan_id, base_plan_id=plan.plan_id,
+        variant_index=variant_index, continuity_id=continuity_id, persona=plan.persona,
         destination=plan.platform, scheduled_slot=plan.slot, rubric=plan.rubric,
-        source_type=plan.source_type, source_ref=plan.source_ref,
+        source_type=plan.source_type, source_ref=plan.source_ref, safe_facts=facts,
+        editorial_plan=plan.to_dict(),
         central_thesis=plan.thesis_direction, scene_count=count, scenes=scenes,
-        reel_edits=(_reel_edit(plan, scenes, short=False), _reel_edit(plan, scenes, short=True)),
+        reel_edits=(
+            _reel_edit(variant_plan, scenes, short=False),
+            _reel_edit(variant_plan, scenes, short=True),
+        ),
         caption_plan={"main": f"{plan.hook} — {plan.thesis_direction}", "short": f"{plan.ending}: {plan.topic}"},
         music_plan={"tags": list(plan.track_tags), "allowlist_required": True,
                     "consume_publication_rotation": False, "selected_track": None},
@@ -452,14 +487,19 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     payload = pack.to_dict()
     payload.update({
-        "created_at": now, "updated_at": now, "pack_status": "queued",
-        "renderer": {"status": "queued", "name": "ffmpeg"},
+        "created_at": now, "updated_at": now, "pack_status": "awaiting_approval",
+        "approval": {
+            "status": "awaiting_approval", "requested_at": now,
+            "approved_at": None, "superseded_at": None,
+        },
+        "delivery": {"status": "not_ready", "sent_files": [], "completed_at": None},
+        "renderer": {"status": "awaiting_approval", "name": "ffmpeg"},
         "composer": {"status": "planned", "name": "ffmpeg"},
         "provider": {"name": None, "model": None},
         "visual_identity_qa": {"status": "not_run", "blocking": False},
     })
     payload["scene_jobs"] = [{
-        "scene_id": scene.scene_id, "state": "queued", "external_job_id": None,
+        "scene_id": scene.scene_id, "state": "planned", "external_job_id": None,
         "attempts": 0, "submitted_at": None, "provider_status": None,
         "planned_duration_seconds": scene.duration_seconds, "actual_duration_seconds": None,
         "clean_path": f"stories/{scene.scene_id}_clean.mp4",
@@ -476,7 +516,7 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
         "checksum": None, "failure_code": None,
     } for edit in pack.reel_edits]
     payload["expected_outputs"] = {
-        "stories": [{"clean": job["clean_path"], "story": job["story_path"], "status": "queued"} for job in payload["scene_jobs"]],
+        "stories": [{"clean": job["clean_path"], "story": job["story_path"], "status": "planned"} for job in payload["scene_jobs"]],
         "reels": [job["path"] for job in payload["reel_jobs"]],
     }
     payload["overlay_policy"] = "local overlay on matching CLEAN master; no scene regeneration"

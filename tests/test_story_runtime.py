@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import naz_story_worker as worker
+import story_pack_control as control
 import story_production as story
-from story_media_composer import LicensedTrack, MediaComposer, MediaError, MediaProbe, checksum
+from story_media_composer import LicensedTrack, MediaComposer, MediaError, MediaProbe, checksum, load_music_library
 from story_video_provider import (
     FakeVideoProvider,
     ProviderError,
@@ -58,9 +59,11 @@ def config(root, **changes):
     return dataclasses.replace(value, **changes)
 
 
-def make_pack(root):
+def make_pack(root, *, approved=True):
     pack = story.plan_story_pack(planned(), SAFE_FACTS)
     pack_dir = story.persist_story_queue(pack, Path(root))
+    if approved:
+        control.approve_pack(Path(root), pack.plan_id)
     return pack, pack_dir, pack_dir / "story_manifest.json"
 
 
@@ -111,6 +114,17 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(cfg.provider_name, "disabled")
         result = worker.check_config(cfg, {})
         self.assertFalse(result["live_api_called"])
+
+    def test_worker_waits_for_explicit_approval_without_provider_call(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, approved=False)
+            provider = FakeVideoProvider()
+            status = worker.process_pack(
+                pack.plan_id, config=config(root), provider=provider, composer=DummyComposer()
+            )
+            self.assertEqual(status, "awaiting_approval")
+            self.assertEqual(provider.submit_count, 0)
+            self.assertEqual(json.loads(manifest.read_text())["pack_status"], "awaiting_approval")
 
     def test_reference_inside_repository_is_not_approved(self):
         local_reference = Path("tests/fixtures/image-1.png").resolve()
@@ -256,7 +270,57 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(json.loads(manifest.read_text()), original)
 
 
+class ControlTests(unittest.TestCase):
+    def test_approval_is_idempotent_and_never_calls_provider(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, approved=False)
+            self.assertEqual(control.approve_pack(Path(root), pack.plan_id), "approved")
+            self.assertEqual(control.approve_pack(Path(root), pack.plan_id), "already_approved")
+            payload = json.loads(manifest.read_text())
+            self.assertEqual(payload["approval"]["status"], "approved")
+            self.assertTrue(all(not job["external_job_id"] for job in payload["scene_jobs"]))
+
+    def test_other_variant_is_free_and_supersedes_previous_plan(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, approved=False)
+            new_dir = control.create_next_variant(Path(root), pack.plan_id)
+            old = json.loads(manifest.read_text())
+            new = json.loads((new_dir / "story_manifest.json").read_text())
+            self.assertEqual(old["pack_status"], "superseded")
+            self.assertNotEqual(old["plan_id"], new["plan_id"])
+            self.assertEqual(new["approval"]["status"], "awaiting_approval")
+            self.assertNotEqual(old["scenes"], new["scenes"])
+
+    def test_variant_is_forbidden_after_approval(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, _ = make_pack(root)
+            with self.assertRaises(story.StoryPlanError):
+                control.create_next_variant(Path(root), pack.plan_id)
+
+    def test_safe_summary_does_not_expose_facts_or_prompts(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, manifest = make_pack(root, approved=False)
+            payload = json.loads(manifest.read_text())
+            summary = control.safe_summary(payload)
+            self.assertNotIn(SAFE_FACTS[0], summary)
+            self.assertNotIn(payload["scenes"][0]["provider_prompt"], summary)
+
+
 class MediaTests(unittest.TestCase):
+    def test_private_music_folder_requires_license_sidecar(self):
+        with tempfile.TemporaryDirectory() as root:
+            music = Path(root) / "licensed.m4a"
+            music.write_bytes(b"licensed-audio")
+            self.assertEqual(load_music_library(Path(root)), [])
+            music.with_suffix(".m4a.json").write_text(
+                json.dumps({"bpm": 120, "license": "owned", "source": "private-library"}),
+                encoding="utf-8",
+            )
+            tracks = load_music_library(Path(root))
+            self.assertEqual(len(tracks), 1)
+            self.assertEqual(tracks[0].path, music.resolve())
+            self.assertGreater(len(tracks[0].beat_grid), 10)
+
     def test_probe_rejects_resolution_duration_and_codec(self):
         cases = [
             ({"codec_name": "vp9", "pix_fmt": "yuv420p", "width": 1080, "height": 1920, "avg_frame_rate": "30/1"}, 4.0, "codec"),
@@ -335,10 +399,10 @@ class MediaTests(unittest.TestCase):
 class ManifestTests(unittest.TestCase):
     def test_manifest_contains_observability_and_one_master_relation(self):
         with tempfile.TemporaryDirectory() as root:
-            pack, _, manifest = make_pack(root)
+            pack, _, manifest = make_pack(root, approved=False)
             payload = json.loads(manifest.read_text())
             self.assertEqual(payload["schema"], story.STORY_SCHEMA)
-            self.assertEqual(payload["pack_status"], "queued")
+            self.assertEqual(payload["pack_status"], "awaiting_approval")
             self.assertIn("created_at", payload)
             self.assertIn("updated_at", payload)
             self.assertEqual(payload["persona"], "naz")

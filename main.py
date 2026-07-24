@@ -74,6 +74,7 @@ import naz_vk_music
 import scheduled_work
 import semantic_autopost
 import story_production
+import story_pack_control
 import visual_archive
 import vk_publish_queue
 from prompts import (
@@ -211,6 +212,10 @@ AGENT_CONTENT_REUSE_SEEN = env_bool("AGENT_CONTENT_REUSE_SEEN", True)
 AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_content_seen.json").strip())
 NAZ_STORY_PACK_ROOT = Path(
     os.getenv("NAZ_STORY_PACK_ROOT", "/var/lib/naz-ai-bot/story-packs").strip()
+)
+NAZ_STORY_PRIVATE_DELIVERY_ENABLED = env_bool("NAZ_STORY_PRIVATE_DELIVERY_ENABLED", True)
+NAZ_STORY_DELIVERY_INTERVAL_SECONDS = max(
+    30, env_int("NAZ_STORY_DELIVERY_INTERVAL_SECONDS", 60)
 )
 NAZ_SCHEDULED_WORK_DIR = Path(
     os.getenv(
@@ -367,6 +372,9 @@ BTN_GOAL_SALES = "💰 Продажи"
 BTN_POST = "✍️ Написать пост"
 BTN_VIRAL = "🔥 Вирусный пост"
 BTN_REELS = "📱 Reels"
+BTN_REELS_CONFIRM = "✅ Подтвердить генерацию"
+BTN_REELS_VARIANT = "🔀 Другой вариант"
+BTN_REELS_STATUS = "🔄 Обновить статус"
 BTN_PLAN = "📅 Контент-план"
 BTN_HOOKS = "🎯 Заголовки"
 BTN_IMAGE = "🖼 Картинка"
@@ -436,7 +444,6 @@ ANGLE_BUTTON_TO_INDEX = {
 CONTENT_BUTTON_TO_ACTION = {
     BTN_POST: "post",
     BTN_VIRAL: "viral",
-    BTN_REELS: "script",
     BTN_PLAN: "plan",
     BTN_HOOKS: "hooks",
     BTN_IMAGE: "image_only",
@@ -485,6 +492,9 @@ GOAL_KEYBOARD = make_keyboard([
     [BTN_BACK],
 ])
 CONTENT_KEYBOARD = make_keyboard([[BTN_POST, BTN_VIRAL], [BTN_REELS, BTN_PLAN], [BTN_HOOKS, BTN_IMAGE], [BTN_BACK]])
+REELS_KEYBOARD = make_keyboard(
+    [[BTN_REELS_CONFIRM, BTN_REELS_VARIANT], [BTN_REELS_STATUS], [BTN_BACK]]
+)
 CONTROL_KEYBOARD = make_keyboard([[BTN_STATS, BTN_MEMORY], [BTN_AUTOPOST, BTN_SETTINGS], [BTN_BACK]])
 CROSSPOST_KEYBOARD = make_keyboard([[BTN_CROSSPOST_STATUS], [BTN_VOID_DRAFT, BTN_VOID_PUBLISH], [BTN_BACK]])
 ANGLE_KEYBOARD = make_keyboard([
@@ -4082,13 +4092,22 @@ async def process_agent_content_date(
             plan,
             tuple(source_row.get("safe_facts", ())),
         )
-        await notify_admin(
-            bot,
-            f"📦 Agent Content {resolved_date}: Story-first pack атомарно поставлен в очередь для plan_id {plan.plan_id}. Долгая генерация выполняется отдельным worker; публичная публикация отключена.",
+        payload = await asyncio.to_thread(
+            story_production.read_manifest, pack_dir / "story_manifest.json"
         )
+        if ADMIN_ID:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=story_pack_control.safe_summary(payload)
+                    + "\n\nПлан подготовлен без расхода кредитов. Подтверди его или выбери другой вариант.",
+                    reply_markup=REELS_KEYBOARD,
+                )
+            except TelegramError as exc:
+                logger.warning("Story-first approval notification failed: %s", exc)
         mark_agent_content_seen(resolved_date, manifest_hash)
-        logger.info("STORY_FIRST queued | plan_id=%s | path=%s", plan.plan_id, pack_dir)
-        return f"✅ Agent Content {resolved_date}: Story-first pack queued."
+        logger.info("STORY_FIRST awaiting approval | plan_id=%s | path=%s", plan.plan_id, pack_dir)
+        return f"✅ Agent Content {resolved_date}: Story-first plan awaits approval."
 
     try:
         package = await generate_scheduled_package(
@@ -5005,6 +5024,64 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if text == BTN_CONTENT:
         await update.message.reply_text("🚀 Выбери, что собрать:", reply_markup=CONTENT_KEYBOARD)
+        return True
+
+    if text == BTN_REELS:
+        if not is_admin(user_id):
+            USER_PENDING_ACTIONS[user_id] = "script"
+            await update.message.reply_text(
+                "Ок. Напиши тему, и я соберу сценарий Reels.",
+                reply_markup=CONTENT_KEYBOARD,
+            )
+            return True
+        manifest = await asyncio.to_thread(story_pack_control.latest_manifest, NAZ_STORY_PACK_ROOT)
+        if manifest is None:
+            await update.message.reply_text(
+                "🎬 Reels Maker\n\nНового плана пока нет. Он появится автоматически после отбора подходящего материала Agent Content.",
+                reply_markup=REELS_KEYBOARD,
+            )
+            return True
+        payload = await asyncio.to_thread(story_production.read_manifest, manifest)
+        await update.message.reply_text(
+            story_pack_control.safe_summary(payload), reply_markup=REELS_KEYBOARD,
+        )
+        return True
+
+    if text in {BTN_REELS_CONFIRM, BTN_REELS_VARIANT, BTN_REELS_STATUS}:
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 Reels Maker доступен только администратору.", reply_markup=CONTENT_KEYBOARD)
+            return True
+        manifest = await asyncio.to_thread(story_pack_control.latest_manifest, NAZ_STORY_PACK_ROOT)
+        if manifest is None:
+            await update.message.reply_text("Нового плана Reels пока нет.", reply_markup=REELS_KEYBOARD)
+            return True
+        try:
+            if text == BTN_REELS_CONFIRM:
+                result = await asyncio.to_thread(
+                    story_pack_control.approve_pack, NAZ_STORY_PACK_ROOT, manifest.parent.name,
+                )
+                note = "\n\n✅ Генерация подтверждена." if result == "approved" else "\n\nℹ️ Генерация уже подтверждена."
+            elif text == BTN_REELS_VARIANT:
+                new_dir = await asyncio.to_thread(
+                    story_pack_control.create_next_variant,
+                    NAZ_STORY_PACK_ROOT,
+                    manifest.parent.name,
+                )
+                manifest = new_dir / "story_manifest.json"
+                note = "\n\n🔀 Подготовлен другой вариант. Генерация ещё не запущена."
+            else:
+                note = ""
+            payload = await asyncio.to_thread(story_production.read_manifest, manifest)
+            await update.message.reply_text(
+                story_pack_control.safe_summary(payload) + note,
+                reply_markup=REELS_KEYBOARD,
+            )
+        except (OSError, ValueError, story_production.StoryPlanError):
+            logger.warning("Reels Maker control rejected | action=%s", text)
+            await update.message.reply_text(
+                "Это действие сейчас недоступно. Нажми «Обновить статус».",
+                reply_markup=REELS_KEYBOARD,
+            )
         return True
 
     if text == BTN_LINKS:
@@ -6777,6 +6854,62 @@ async def agent_content_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await notify_admin(context.bot, f"⚠️ AGENT_CONTENT_SYNC failed: {type(exc).__name__}: {exc}")
 
 
+@scheduled_work_marker("story_private_delivery")
+async def story_private_delivery_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deliver completed private packs to the admin; never publish to a channel."""
+    if not ADMIN_ID:
+        return
+    manifests = await asyncio.to_thread(story_pack_control.ready_deliveries, NAZ_STORY_PACK_ROOT)
+    if not manifests:
+        return
+    manifest = manifests[0]
+    try:
+        payload = await asyncio.to_thread(story_production.read_manifest, manifest)
+        sent = set(str(item) for item in payload.get("delivery", {}).get("sent_files", []))
+        files = await asyncio.to_thread(story_pack_control.delivery_files, manifest)
+        if not files:
+            logger.warning("Story delivery has no ready files | plan_id=%s", manifest.parent.name)
+            return
+        for media_path in files:
+            filename = media_path.relative_to(manifest.parent).as_posix()
+            if filename in sent:
+                continue
+            with media_path.open("rb") as media:
+                await context.bot.send_video(
+                    chat_id=ADMIN_ID,
+                    video=media,
+                    caption=f"🎬 Reels Maker · {media_path.stem}",
+                )
+            await asyncio.to_thread(
+                story_pack_control.mark_delivery_file_sent, manifest, filename,
+            )
+        await asyncio.to_thread(story_pack_control.mark_delivery_complete, manifest)
+        logger.info("Story pack delivered privately | plan_id=%s", manifest.parent.name)
+    except (OSError, TelegramError, ValueError, story_production.StoryPlanError) as exc:
+        logger.warning(
+            "Story private delivery deferred | plan_id=%s | error=%s",
+            manifest.parent.name,
+            type(exc).__name__,
+        )
+
+
+def setup_story_private_delivery(application: Application) -> None:
+    if not NAZ_STORY_PRIVATE_DELIVERY_ENABLED:
+        logger.info("Story private delivery disabled")
+        return
+    if not application.job_queue:
+        logger.warning("Story private delivery unavailable: JobQueue is missing")
+        return
+    application.job_queue.run_repeating(
+        story_private_delivery_job,
+        interval=NAZ_STORY_DELIVERY_INTERVAL_SECONDS,
+        first=NAZ_STORY_DELIVERY_INTERVAL_SECONDS,
+        name="naz_story_private_delivery",
+        data={"owner": "naz_telegram", "destination": "admin_private"},
+    )
+    logger.info("Story private delivery polling enabled")
+
+
 def setup_autoposting(application: Application) -> None:
     if not AUTOPOST_ENABLED:
         logger.info("Autoposting disabled")
@@ -7301,6 +7434,7 @@ def build_application() -> Application:
     setup_source_monitoring(application)
     setup_agent_content_sync(application)
     setup_crosspost_exchange(application)
+    setup_story_private_delivery(application)
     return application
 
 
