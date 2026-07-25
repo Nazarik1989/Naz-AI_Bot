@@ -496,6 +496,34 @@ CONTENT_KEYBOARD = make_keyboard([[BTN_POST, BTN_VIRAL], [BTN_REELS, BTN_PLAN], 
 REELS_KEYBOARD = make_keyboard(
     [[BTN_REELS_CONFIRM, BTN_REELS_VARIANT], [BTN_REELS_STATUS], [BTN_BACK]]
 )
+
+
+def reels_plan_keyboard(plan_id: str) -> InlineKeyboardMarkup:
+    """Bind every Story control to the exact plan shown in the message."""
+    if not re.fullmatch(r"[a-f0-9]{24}", plan_id):
+        raise ValueError("invalid Reels plan_id")
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    BTN_REELS_CONFIRM,
+                    callback_data=f"reels_confirm:{plan_id}",
+                ),
+                InlineKeyboardButton(
+                    BTN_REELS_VARIANT,
+                    callback_data=f"reels_variant:{plan_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    BTN_REELS_STATUS,
+                    callback_data=f"reels_status:{plan_id}",
+                )
+            ],
+        ]
+    )
+
+
 CONTROL_KEYBOARD = make_keyboard([[BTN_STATS, BTN_MEMORY], [BTN_AUTOPOST, BTN_SETTINGS], [BTN_BACK]])
 CROSSPOST_KEYBOARD = make_keyboard([[BTN_CROSSPOST_STATUS], [BTN_VOID_DRAFT, BTN_VOID_PUBLISH], [BTN_BACK]])
 ANGLE_KEYBOARD = make_keyboard([
@@ -4328,8 +4356,9 @@ async def process_agent_content_date(
                 await bot.send_message(
                     chat_id=ADMIN_ID,
                     text=story_pack_control.safe_summary(payload)
-                    + "\n\nПлан подготовлен без расхода кредитов. Подтверди его или выбери другой вариант.",
-                    reply_markup=REELS_KEYBOARD,
+                    + "\n\nПлан подготовлен без расхода кредитов. Нажми кнопку под карточкой "
+                    "или ответь на неё «подтверждаю».",
+                    reply_markup=reels_plan_keyboard(str(payload.get("plan_id", ""))),
                 )
             except TelegramError as exc:
                 logger.warning("Story-first approval notification failed: %s", exc)
@@ -5240,6 +5269,195 @@ async def crosspost_exchange_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # -----------------------------------------------------------------------------
 
 
+_REELS_CALLBACK_RE = re.compile(r"^reels_(confirm|variant|status):([a-f0-9]{24})$")
+_REELS_SUMMARY_PLAN_RE = re.compile(r"(?m)^План:\s*([a-f0-9]{24})\s*$")
+_REELS_REPLY_ACTIONS = {
+    "подтверждаю": BTN_REELS_CONFIRM,
+    "подтвердить": BTN_REELS_CONFIRM,
+    "подтвердить генерацию": BTN_REELS_CONFIRM,
+    "да, подтверждаю": BTN_REELS_CONFIRM,
+    BTN_REELS_CONFIRM.casefold(): BTN_REELS_CONFIRM,
+    "другой": BTN_REELS_VARIANT,
+    "другой вариант": BTN_REELS_VARIANT,
+    "новый вариант": BTN_REELS_VARIANT,
+    BTN_REELS_VARIANT.casefold(): BTN_REELS_VARIANT,
+    "статус": BTN_REELS_STATUS,
+    "обновить статус": BTN_REELS_STATUS,
+    BTN_REELS_STATUS.casefold(): BTN_REELS_STATUS,
+}
+
+
+def reels_plan_id_from_reply(update: Update) -> Optional[str]:
+    if not update.message or not update.message.reply_to_message:
+        return None
+    replied = update.message.reply_to_message
+    summary = str(getattr(replied, "text", None) or getattr(replied, "caption", None) or "")
+    if not summary.startswith("🎬 Reels Maker"):
+        return None
+    match = _REELS_SUMMARY_PLAN_RE.search(summary)
+    return match.group(1) if match else ""
+
+
+def reels_action_from_reply(text: str) -> Optional[str]:
+    normalized = " ".join(text.casefold().split()).rstrip(".!?")
+    return _REELS_REPLY_ACTIONS.get(normalized)
+
+
+async def reels_control_response(
+    action: str,
+    *,
+    plan_id: Optional[str] = None,
+) -> Tuple[str, Any]:
+    """Apply a free Story control to one explicit plan; never call a provider."""
+    if action not in {BTN_REELS_CONFIRM, BTN_REELS_VARIANT, BTN_REELS_STATUS}:
+        raise ValueError("unsupported Reels control")
+
+    try:
+        manifest = (
+            story_pack_control.manifest_path(NAZ_STORY_PACK_ROOT, plan_id)
+            if plan_id
+            else await asyncio.to_thread(
+                story_pack_control.latest_manifest, NAZ_STORY_PACK_ROOT
+            )
+        )
+        if manifest is None:
+            return "Нового плана Reels пока нет.", REELS_KEYBOARD
+        payload = await asyncio.to_thread(story_production.read_manifest, manifest)
+        current_plan_id = str(payload.get("plan_id", ""))
+        if current_plan_id != manifest.parent.name or (
+            plan_id is not None and current_plan_id != plan_id
+        ):
+            raise story_production.StoryPlanError("story manifest plan_id mismatch")
+        keyboard = reels_plan_keyboard(current_plan_id)
+
+        if plan_id is None and action in {BTN_REELS_CONFIRM, BTN_REELS_VARIANT}:
+            return (
+                story_pack_control.safe_summary(payload)
+                + "\n\nЭта общая кнопка не привязана к плану и ничего не изменила. "
+                "Используй кнопку под этой карточкой.",
+                keyboard,
+            )
+
+        if action == BTN_REELS_CONFIRM and not NAZ_STORY_RENDER_ENABLED:
+            return (
+                story_pack_control.safe_summary(payload)
+                + "\n\nГенерация пока безопасно выключена: подготовка приватной медиабиблиотеки не завершена.",
+                keyboard,
+            )
+
+        if action == BTN_REELS_CONFIRM:
+            result = await asyncio.to_thread(
+                story_pack_control.confirm_generation,
+                NAZ_STORY_PACK_ROOT,
+                current_plan_id,
+            )
+            if result == "approved":
+                note = "\n\n✅ Генерация основной моделью подтверждена."
+            elif result == "secondary_approved":
+                note = "\n\n✅ Повтор проблемной сцены в Gen-4.5 подтверждён."
+            else:
+                note = "\n\nℹ️ Сейчас дополнительного подтверждения не требуется."
+        elif action == BTN_REELS_VARIANT:
+            new_dir = await asyncio.to_thread(
+                story_pack_control.create_next_variant,
+                NAZ_STORY_PACK_ROOT,
+                current_plan_id,
+            )
+            manifest = new_dir / "story_manifest.json"
+            note = "\n\n🔀 Подготовлен другой вариант. Генерация ещё не запущена."
+        else:
+            note = ""
+
+        payload = await asyncio.to_thread(story_production.read_manifest, manifest)
+        resulting_plan_id = str(payload.get("plan_id", ""))
+        if resulting_plan_id != manifest.parent.name:
+            raise story_production.StoryPlanError("story manifest plan_id mismatch")
+        keyboard = reels_plan_keyboard(resulting_plan_id)
+        return story_pack_control.safe_summary(payload) + note, keyboard
+    except (OSError, ValueError, story_production.StoryPlanError):
+        logger.warning(
+            "Reels Maker control rejected | action=%s | plan_id=%s",
+            action,
+            plan_id or "latest",
+        )
+        return (
+            "Это действие сейчас недоступно. Обнови карточку Reels Maker и попробуй снова.",
+            REELS_KEYBOARD,
+        )
+
+
+async def handle_reels_control_message(
+    update: Update,
+    action: str,
+    *,
+    plan_id: Optional[str] = None,
+) -> bool:
+    if action not in {BTN_REELS_CONFIRM, BTN_REELS_VARIANT, BTN_REELS_STATUS}:
+        return False
+    if not update.message or not update.effective_user:
+        return False
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "🔒 Reels Maker доступен только администратору.",
+            reply_markup=CONTENT_KEYBOARD,
+        )
+        return True
+    response, keyboard = await reels_control_response(action, plan_id=plan_id)
+    await update.message.reply_text(response, reply_markup=keyboard)
+    return True
+
+
+async def handle_reels_plan_reply(update: Update, text: str) -> bool:
+    plan_id = reels_plan_id_from_reply(update)
+    if plan_id is None:
+        return False
+    if not update.message or not update.effective_user:
+        return False
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "🔒 Reels Maker доступен только администратору.",
+            reply_markup=CONTENT_KEYBOARD,
+        )
+        return True
+    if not plan_id:
+        await update.message.reply_text(
+            "Не могу определить plan_id этой карточки Reels Maker. Обнови статус и используй новую карточку."
+        )
+        return True
+    action = reels_action_from_reply(text)
+    if action is None:
+        await update.message.reply_text(
+            "Это карточка управления Reels Maker. Ответь «подтверждаю», «другой вариант» "
+            "или используй кнопки под карточкой — обычный чат план не изменяет.",
+            reply_markup=reels_plan_keyboard(plan_id),
+        )
+        return True
+    return await handle_reels_control_message(update, action, plan_id=plan_id)
+
+
+async def reels_control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user or not query.data:
+        return
+    match = _REELS_CALLBACK_RE.fullmatch(query.data)
+    if not match:
+        await query.answer("Недействительная команда Reels Maker.", show_alert=True)
+        return
+    if not is_admin(update.effective_user.id):
+        await query.answer("Reels Maker доступен только администратору.", show_alert=True)
+        return
+    await query.answer()
+    action_key, plan_id = match.groups()
+    action = {
+        "confirm": BTN_REELS_CONFIRM,
+        "variant": BTN_REELS_VARIANT,
+        "status": BTN_REELS_STATUS,
+    }[action_key]
+    response, keyboard = await reels_control_response(action, plan_id=plan_id)
+    if query.message:
+        await query.message.reply_text(response, reply_markup=keyboard)
+
+
 async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     if not update.message or not update.effective_user:
         return False
@@ -5302,59 +5520,13 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return True
         payload = await asyncio.to_thread(story_production.read_manifest, manifest)
         await update.message.reply_text(
-            story_pack_control.safe_summary(payload), reply_markup=REELS_KEYBOARD,
+            story_pack_control.safe_summary(payload),
+            reply_markup=reels_plan_keyboard(str(payload.get("plan_id", ""))),
         )
         return True
 
     if text in {BTN_REELS_CONFIRM, BTN_REELS_VARIANT, BTN_REELS_STATUS}:
-        if not is_admin(user_id):
-            await update.message.reply_text("🔒 Reels Maker доступен только администратору.", reply_markup=CONTENT_KEYBOARD)
-            return True
-        if text == BTN_REELS_CONFIRM and not NAZ_STORY_RENDER_ENABLED:
-            await update.message.reply_text(
-                "Генерация пока безопасно выключена: подготовка приватной медиабиблиотеки не завершена.",
-                reply_markup=REELS_KEYBOARD,
-            )
-            return True
-        manifest = await asyncio.to_thread(story_pack_control.latest_manifest, NAZ_STORY_PACK_ROOT)
-        if manifest is None:
-            await update.message.reply_text("Нового плана Reels пока нет.", reply_markup=REELS_KEYBOARD)
-            return True
-        try:
-            if text == BTN_REELS_CONFIRM:
-                result = await asyncio.to_thread(
-                    story_pack_control.confirm_generation,
-                    NAZ_STORY_PACK_ROOT,
-                    manifest.parent.name,
-                )
-                if result == "approved":
-                    note = "\n\n✅ Генерация основной моделью подтверждена."
-                elif result == "secondary_approved":
-                    note = "\n\n✅ Повтор проблемной сцены в Gen-4.5 подтверждён."
-                else:
-                    note = "\n\nℹ️ Сейчас дополнительного подтверждения не требуется."
-            elif text == BTN_REELS_VARIANT:
-                new_dir = await asyncio.to_thread(
-                    story_pack_control.create_next_variant,
-                    NAZ_STORY_PACK_ROOT,
-                    manifest.parent.name,
-                )
-                manifest = new_dir / "story_manifest.json"
-                note = "\n\n🔀 Подготовлен другой вариант. Генерация ещё не запущена."
-            else:
-                note = ""
-            payload = await asyncio.to_thread(story_production.read_manifest, manifest)
-            await update.message.reply_text(
-                story_pack_control.safe_summary(payload) + note,
-                reply_markup=REELS_KEYBOARD,
-            )
-        except (OSError, ValueError, story_production.StoryPlanError):
-            logger.warning("Reels Maker control rejected | action=%s", text)
-            await update.message.reply_text(
-                "Это действие сейчас недоступно. Нажми «Обновить статус».",
-                reply_markup=REELS_KEYBOARD,
-            )
-        return True
+        return await handle_reels_control_message(update, text)
 
     if text == BTN_LINKS:
         if not is_admin(user_id):
@@ -6361,6 +6533,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text.strip()
 
     if await handle_delegated_reply(update, context, text):
+        return
+
+    if await handle_reels_plan_reply(update, text):
         return
 
     if await handle_generated_artifact_reply(update, text):
@@ -8183,6 +8358,12 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("contact_add", contact_add_command))
     application.add_handler(
         CallbackQueryHandler(contact_message_callback, pattern=r"^contact_(?:send|cancel):\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            reels_control_callback,
+            pattern=r"^reels_(?:confirm|variant|status):[a-f0-9]{24}$",
+        )
     )
     application.add_handler(
         CallbackQueryHandler(generated_revision_callback, pattern=r"^genrev_(?:apply|cancel):[A-Za-z0-9_-]+$")
