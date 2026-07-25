@@ -12,6 +12,8 @@ from story_video_provider import (
     RUNWAY_DATA_URI_BASE64_LIMIT,
     RUNWAY_PROMPT_MAX_UTF16_UNITS,
     ProviderError,
+    ProviderJob,
+    KeyframeRequest,
     RunwayVideoProvider,
     SceneRequest,
     append_prompt_guidance,
@@ -132,6 +134,69 @@ class RunwayModelContractTests(unittest.TestCase):
 
 
 class RunwayReferenceContractTests(unittest.TestCase):
+    def test_downloaded_keyframe_is_normalized_to_video_portrait_size(self):
+        source = io.BytesIO()
+        Image.new("RGB", (960, 720), (2, 3, 9)).save(source, format="PNG")
+        provider = RunwayVideoProvider(
+            api_key="secret-key",
+            model="gen4_turbo",
+            transport=MockTransport([
+                (200, {"Content-Type": "image/png"}, source.getvalue())
+            ]),
+        )
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "keyframe.jpg"
+            provider.download_keyframe(
+                ProviderJob("keyframe-task", "completed", "https://cdn.example/keyframe.png"),
+                destination,
+            )
+            with Image.open(destination) as image:
+                self.assertEqual(image.size, (720, 1280))
+                self.assertEqual(image.format, "JPEG")
+
+    def test_directed_keyframe_uses_identity_reference_not_video_first_frame(self):
+        with tempfile.TemporaryDirectory() as root:
+            reference = create_reference(Path(root) / "naz-primary.jpg")
+            transport = MockTransport([
+                (200, {"Content-Type": "application/json"}, b'{"id":"keyframe-task"}')
+            ])
+            provider = RunwayVideoProvider(
+                api_key="secret-key", model="gen4_turbo", transport=transport
+            )
+            job = provider.submit_keyframe(KeyframeRequest(
+                "01", "@Naz inside the directed Naz AI Lab server room", reference,
+            ))
+            payload = json.loads(transport.calls[0][3].decode("utf-8"))
+            self.assertEqual(job.external_job_id, "keyframe-task")
+            self.assertTrue(transport.calls[0][1].endswith("/text_to_image"))
+            self.assertEqual(payload["model"], "gen4_image_turbo")
+            self.assertEqual(payload["ratio"], "720:960")
+            self.assertEqual(payload["referenceImages"][0]["tag"], "Naz")
+            self.assertTrue(payload["referenceImages"][0]["uri"].startswith("data:image/jpeg;base64,"))
+
+    def test_object_keyframe_uses_standard_image_model_without_identity_reference(self):
+        transport = MockTransport([
+            (200, {"Content-Type": "application/json"}, b'{"id":"object-keyframe"}')
+        ])
+        provider = RunwayVideoProvider(
+            api_key="secret-key", model="gen4_turbo", transport=transport
+        )
+        provider.submit_keyframe(KeyframeRequest("02", "A titanium prototype in the Naz AI Lab"))
+        payload = json.loads(transport.calls[0][3].decode("utf-8"))
+        self.assertEqual(payload["model"], "gen4_image")
+        self.assertNotIn("referenceImages", payload)
+
+    def test_identity_keyframe_requires_explicit_naz_tag_before_transport(self):
+        transport = MockTransport()
+        provider = RunwayVideoProvider(
+            api_key="secret-key", model="gen4_turbo", transport=transport
+        )
+        with self.assertRaisesRegex(ProviderError, "keyframe_identity_tag_missing"):
+            provider.submit_keyframe(KeyframeRequest(
+                "01", "A generic lab scene", Path("not-opened.jpg"),
+            ))
+        self.assertEqual(transport.calls, [])
+
     def test_portrait_reference_is_normalized_in_memory_to_720x1280(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)

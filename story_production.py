@@ -21,7 +21,8 @@ from editorial_orchestrator import EditorialPlan
 from story_pack_lock import ensure_private_group_access
 
 
-STORY_SCHEMA = "naz-story-pack-v2"
+STORY_SCHEMA = "naz-story-pack-v3"
+PREVIOUS_STORY_SCHEMA = "naz-story-pack-v2"
 LEGACY_STORY_SCHEMA = "naz-story-pack-v1"
 RENDERER_UNAVAILABLE = "unavailable"
 DRAMATURGIC_ROLES = (
@@ -32,6 +33,22 @@ REFERENCE_ROLES = ("none", "frontal_identity", "three_quarter_identity")
 REEL_CROPS = ("tight-center", "left-detail", "right-detail", "wide-center")
 CAMERA_MOTIONS = ("slow push", "controlled pan", "handheld follow", "locked with real subject motion")
 SAFE_ZONES = ("upper-middle", "middle-left", "lower-middle above platform controls")
+NAZ_LAB_SETTINGS = (
+    "the cold aisle of the Naz AI Lab server room, black racks, blue status light and visible fibre paths",
+    "the Naz AI Lab prototype bench, optical glass, milled titanium and precise mechanical joints",
+    "the Naz AI Lab systems room, one restrained topology wall and physical control modules",
+    "the dark glass corridor between the Naz AI Lab server room and prototype workshop",
+    "the Naz AI Lab validation bay, a single instrumented prototype under a circular task light",
+)
+ROLE_ACTIONS = {
+    "hook": ("Naz opens the server-room barrier and enters the cold aisle", "the sealed lab becomes an active workspace"),
+    "problem": ("a precise blue fault indicator appears on one physical module", "the failing module is isolated from the system"),
+    "hypothesis": ("Naz compares one titanium prototype with a restrained topology display", "one testable connection is selected"),
+    "test": ("Naz seats a connector and starts one controlled hardware test", "the test rig reaches a stable blue state"),
+    "result": ("the transparent prototype reveals its internal mechanism engaging", "the mechanism runs under load"),
+    "solution": ("Naz locks the validated module into the rack", "the rack returns to a coherent operating state"),
+    "conclusion": ("Naz steps back while the lab settles into a precise working rhythm", "one blue arc remains around the completed system"),
+}
 TERMINAL_SCENE_STATES = {
     "completed", "terminal_failed", "blocked_reference", "submit_ambiguous",
 }
@@ -65,6 +82,8 @@ class ScenePlan:
     duration_seconds: int
     clean_prompt: str
     provider_prompt: str
+    keyframe_prompt: str
+    identity_reference_usage: str
     story_overlay: str
     text_safe_zone: str
     music_cue: str
@@ -159,9 +178,9 @@ def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fa
     # Both configured Runway tiers accept a five-second master.  Keeping the
     # provider master fixed also makes Reel timing and credit accounting exact.
     duration = 5
-    subject = plan.visual_subject_direction
+    requires_reference = _requires_reference(plan.visual_subject_direction)
+    subject = "Naz, the same adult human founder from the approved identity reference" if requires_reference else "one physical Naz AI Lab prototype"
     shot_size = SHOT_SIZES[_rank(plan.plan_id, f"shot:{index}") % len(SHOT_SIZES)]
-    requires_reference = _requires_reference(subject)
     reference_role = (
         "three_quarter_identity"
         if requires_reference and shot_size in {"wide", "medium"}
@@ -169,7 +188,8 @@ def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fa
         if requires_reference
         else "none"
     )
-    setting = f"A real Naz work chronology setting tied to fact {index + 1}"
+    setting = NAZ_LAB_SETTINGS[_rank(plan.plan_id, f"lab-setting:{role}:{index}") % len(NAZ_LAB_SETTINGS)]
+    action, end_state = ROLE_ACTIONS[role]
     standalone = f"{role}: {fact}"[:180]
     overlay = standalone[:72]
     continuity = (
@@ -187,24 +207,42 @@ def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fa
         "Real motion/action is mandatory. No text, captions, logos, platform buttons, stickers, "
         "reactions or watermarks."
     )
+    identity_instruction = (
+        "Use @Naz only for facial identity, age and human build; replace the reference background, pose, "
+        "lighting and framing completely. "
+        if requires_reference else "No person is present. "
+    )
+    keyframe_prompt = (
+        f"Vertical cinematic scene composed for a 9:16 centre crop. {identity_instruction}"
+        f"Location: {setting}. Subject: {subject}. Exact frozen action: {action}. "
+        f"Shot: {shot_size}; leave motion room for a {CAMERA_MOTIONS[_rank(plan.plan_id, f'motion:{index}') % len(CAMERA_MOTIONS)]}. "
+        "Human intelligence / machine precision. Deep Black #020309, Midnight Blue #070B20, "
+        "Electric Blue #185CFF, Ultraviolet #762DFF and Ice Silver #D7E5FF. "
+        "Optical glass, polished titanium, blue anodized aluminium, carbon and technical ceramic. "
+        "Deep black background, cold blue rim light, blue-violet edge, high local contrast, one main subject. "
+        "Photorealistic physical laboratory, materially believable, no text, logos, HUD, code, copper, gold, "
+        "cheap neon cyberpunk, random circuit boards, robots or extra people."
+    )
     provider_prompt = (
-        f"Vertical 9:16 CLEAN video master. {plan.visual_mode}. Role: {role}. "
-        f"Subject: {subject}. Setting: {setting}. Camera: "
+        f"Animate the supplied directed keyframe as a vertical 9:16 CLEAN video master. Role: {role}. "
+        f"Keep the exact subject, Naz identity, laboratory architecture, materials and lighting from the keyframe. "
+        f"Physical action: {action}. Camera: "
         f"{CAMERA_MOTIONS[_rank(plan.plan_id, f'motion:{index}') % len(CAMERA_MOTIONS)]}. "
-        "Begin before the action changes the physical state and end after a clearly visible change. "
-        f"{plan.visual_relation} Canonical Naz continuity: {'; '.join(continuity)}. "
-        "Real motion/action is mandatory. No text, captions, logos, platform UI, stickers, "
-        "reactions or watermarks. Do not depict messages, code, credentials or private records."
+        f"Begin in the supplied pose and end when {end_state}. "
+        "Natural restrained human movement and one clear physical state change are mandatory. "
+        "No scene replacement, morphing, extra people, text, logos, HUD, platform UI, code or watermarks."
     )
     return ScenePlan(
         scene_id=f"{index + 1:02d}_{role}", role=role, standalone_meaning=standalone,
-        concrete_action=f"Perform and reveal the action documented by: {fact}"[:300],
+        concrete_action=action,
         subject=subject, setting=setting,
         start_state="before the documented action changes the situation",
-        end_state="after the documented result is physically visible",
+        end_state=end_state,
         shot_size=shot_size,
         camera_motion=CAMERA_MOTIONS[_rank(plan.plan_id, f"motion:{index}") % len(CAMERA_MOTIONS)],
         duration_seconds=duration, clean_prompt=clean_prompt, provider_prompt=provider_prompt,
+        keyframe_prompt=keyframe_prompt,
+        identity_reference_usage="identity_only" if requires_reference else "none",
         story_overlay=overlay,
         text_safe_zone=SAFE_ZONES[_rank(plan.plan_id, f"safe:{index}") % len(SAFE_ZONES)],
         music_cue=f"cue {index + 1}: follow action change; tags={','.join(plan.track_tags)}",
@@ -343,6 +381,14 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
             raise StoryPlanError("CLEAN master contract is incomplete")
         if not validate_provider_prompt(scene.provider_prompt) or fact_text_in_provider_prompt(scene):
             raise StoryPlanError("provider prompt is not privacy-minimized")
+        if not validate_provider_prompt(scene.keyframe_prompt):
+            raise StoryPlanError("keyframe prompt is unsafe")
+        if scene.requires_naz_reference is not (scene.identity_reference_usage == "identity_only"):
+            raise StoryPlanError("identity reference must be used for identity only")
+        if scene.requires_naz_reference and "@Naz" not in scene.keyframe_prompt:
+            raise StoryPlanError("Naz keyframe prompt must address the identity reference")
+        if "replace the reference background" not in scene.keyframe_prompt and scene.requires_naz_reference:
+            raise StoryPlanError("Naz keyframe must replace the avatar background")
         if not scene.story_overlay or not scene.text_safe_zone:
             raise StoryPlanError("STORY overlay contract is incomplete")
         if pack.continuity_id not in " ".join(scene.continuity_constraints):
@@ -429,7 +475,7 @@ def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 def read_manifest(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema") not in {STORY_SCHEMA, LEGACY_STORY_SCHEMA}:
+    if payload.get("schema") not in {STORY_SCHEMA, PREVIOUS_STORY_SCHEMA, LEGACY_STORY_SCHEMA}:
         raise StoryPlanError("unsupported story manifest schema")
     return payload
 
@@ -464,6 +510,7 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     scene_jobs = payload.get("scene_jobs")
     reel_jobs = payload.get("reel_jobs")
     model_policy = payload.get("model_policy")
+    visual_strategy = payload.get("visual_strategy")
     if not all(isinstance(value, list) for value in (scenes, edits, scene_jobs, reel_jobs)):
         return False
     if not 4 <= len(scenes) <= 7 or payload.get("scene_count") != len(scenes) or not edits:
@@ -472,6 +519,13 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         model_policy.get("primary_tier") != "primary"
         or model_policy.get("secondary_tier") != "secondary"
         or model_policy.get("automatic_fallback") is not False
+    ):
+        return False
+    if not isinstance(visual_strategy, dict) or (
+        visual_strategy.get("planner") != "reels-maker-directed-scenes-v1"
+        or visual_strategy.get("keyframe_required") is not True
+        or visual_strategy.get("avatar_usage") != "identity_reference_only"
+        or visual_strategy.get("direct_avatar_as_video_first_frame") is not False
     ):
         return False
     scene_ids = [str(item.get("scene_id", "")) for item in scenes if isinstance(item, dict)]
@@ -487,6 +541,8 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             or not _duration_in_range(scene.get("duration_seconds"), 5, 5)
             or not isinstance(requires_reference, bool)
             or role not in REFERENCE_ROLES
+            or not str(scene.get("keyframe_prompt", ""))
+            or scene.get("identity_reference_usage") not in {"identity_only", "none"}
         ):
             return False
         if (
@@ -520,6 +576,14 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             or str(job.get("reference_role", "")) != str(scene["reference_role"])
             or str(job.get("clean_path", "")) != f"stories/{scene_id}_clean.mp4"
             or str(job.get("story_path", "")) != f"stories/{scene_id}_story.mp4"
+            or str(job.get("keyframe_path", "")) != f"keyframes/{scene_id}.jpg"
+            or job.get("keyframe_state") not in {
+                "planned", "queued", "submitting", "submitted", "in_progress",
+                "ready", "terminal_failed", "submit_ambiguous",
+            }
+            or "keyframe_submit_intent" not in job
+            or job.get("keyframe_submit_intent") is not None
+            and not isinstance(job.get("keyframe_submit_intent"), dict)
             or "submit_intent" not in job
             or submit_intent is not None and not isinstance(submit_intent, dict)
             or state in {"submitting", "submit_ambiguous"}
@@ -621,6 +685,13 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
             "primary_tier": "primary", "secondary_tier": "secondary",
             "automatic_fallback": False,
         },
+        "visual_strategy": {
+            "planner": "reels-maker-directed-scenes-v1",
+            "keyframe_required": True,
+            "avatar_usage": "identity_reference_only",
+            "direct_avatar_as_video_first_frame": False,
+            "keyframe_provider": "runway",
+        },
         "visual_identity_qa": {"status": "not_run", "blocking": False},
     })
     payload["scene_jobs"] = [{
@@ -635,6 +706,11 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
         "visual_identity_qa": {"status": "not_run", "blocking": False},
         "failure_code": None, "requires_naz_reference": scene.requires_naz_reference,
         "reference_role": scene.reference_role,
+        "keyframe_path": f"keyframes/{scene.scene_id}.jpg",
+        "keyframe_state": "planned", "keyframe_external_job_id": None,
+        "keyframe_attempts": 0, "keyframe_submitted_at": None,
+        "keyframe_provider_status": None, "keyframe_checksum": None,
+        "keyframe_failure_code": None, "keyframe_submit_intent": None,
         "submit_intent": None,
         "model_route": {
             "tier": "primary", "primary_model": None, "secondary_model": None,
@@ -664,11 +740,14 @@ def persist_story_queue(pack: StoryPackPlan, storage_root: Path) -> Path:
     manifest = pack_dir / "story_manifest.json"
     stories_dir = pack_dir / "stories"
     reels_dir = pack_dir / "reels"
+    keyframes_dir = pack_dir / "keyframes"
     stories_dir.mkdir(parents=True, exist_ok=True)
     reels_dir.mkdir(parents=True, exist_ok=True)
+    keyframes_dir.mkdir(parents=True, exist_ok=True)
     ensure_private_group_access(pack_dir, directory=True)
     ensure_private_group_access(stories_dir, directory=True)
     ensure_private_group_access(reels_dir, directory=True)
+    ensure_private_group_access(keyframes_dir, directory=True)
     created = _atomic_create_text(
         manifest,
         json.dumps(_production_payload(pack), ensure_ascii=False, indent=2) + "\n",

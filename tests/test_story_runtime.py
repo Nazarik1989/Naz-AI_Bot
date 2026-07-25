@@ -64,11 +64,18 @@ def config(root, **changes):
     return dataclasses.replace(value, **changes)
 
 
-def make_pack(root, *, approved=True):
-    pack = story.plan_story_pack(planned(), SAFE_FACTS)
+def make_pack(root, *, approved=True, keyframes_ready=True, editorial_plan=None):
+    pack = story.plan_story_pack(editorial_plan or planned(), SAFE_FACTS)
     pack_dir = story.persist_story_queue(pack, Path(root))
     if approved:
         control.approve_pack(Path(root), pack.plan_id)
+    if keyframes_ready:
+        payload = story.read_manifest(pack_dir / "story_manifest.json")
+        for job in payload["scene_jobs"]:
+            keyframe = pack_dir / job["keyframe_path"]
+            keyframe.write_bytes(b"directed-keyframe")
+            job.update({"keyframe_state": "ready", "keyframe_checksum": checksum(keyframe)})
+        story.atomic_json(pack_dir / "story_manifest.json", payload)
     return pack, pack_dir, pack_dir / "story_manifest.json"
 
 
@@ -113,9 +120,72 @@ class ProviderTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_directed_keyframe_completes_before_video_and_is_reused_as_first_frame(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, pack_dir, manifest = make_pack(root, keyframes_ready=False)
+            image = Path(root) / "generated-keyframe.jpg"
+            image.write_bytes(b"generated-directed-keyframe")
+            provider = FakeVideoProvider(media_source=image)
+
+            first = worker.process_pack(
+                pack.plan_id, config=config(root), provider=provider, composer=DummyComposer()
+            )
+            current = json.loads(manifest.read_text(encoding="utf-8"))["scene_jobs"][0]
+            keyframe_job_id = current["keyframe_external_job_id"]
+            self.assertEqual(first, "queued")
+            self.assertEqual(current["keyframe_state"], "submitted")
+            self.assertEqual(provider.submissions, [])
+            self.assertEqual(len(provider.keyframe_submissions), 1)
+
+            provider.complete(keyframe_job_id)
+            worker.process_pack(
+                pack.plan_id, config=config(root), provider=provider, composer=DummyComposer()
+            )
+            current = json.loads(manifest.read_text(encoding="utf-8"))["scene_jobs"][0]
+            self.assertEqual(current["keyframe_state"], "ready")
+            self.assertEqual(provider.submissions, [])
+
+            worker.process_pack(
+                pack.plan_id, config=config(root), provider=provider, composer=DummyComposer()
+            )
+            self.assertEqual(len(provider.submissions), 1)
+            self.assertEqual(
+                provider.submissions[0].reference_path,
+                (pack_dir / current["keyframe_path"]).resolve(),
+            )
+            self.assertNotEqual(
+                provider.submissions[0].reference_path,
+                config(root).reference_path,
+            )
+
+    def test_ready_keyframe_makes_video_independent_from_original_avatar(self):
+        with tempfile.TemporaryDirectory() as root:
+            naz_plan = dataclasses.replace(
+                planned(),
+                visual_subject_direction="the canonical Naz presence because the thesis concerns him",
+            )
+            pack, pack_dir, manifest = make_pack(root, editorial_plan=naz_plan)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertTrue(payload["scenes"][0]["requires_naz_reference"])
+            provider = FakeVideoProvider()
+
+            worker.process_pack(
+                pack.plan_id,
+                config=config(root, reference_path=None),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+
+            self.assertGreaterEqual(len(provider.submissions), 1)
+            first_job = payload["scene_jobs"][0]
+            self.assertEqual(
+                provider.submissions[0].reference_path,
+                (pack_dir / first_job["keyframe_path"]).resolve(),
+            )
+
     def test_budget_counts_only_accepted_or_uncertain_provider_submissions(self):
         with tempfile.TemporaryDirectory() as root:
-            _, _, manifest = make_pack(root)
+            _, _, manifest = make_pack(root, keyframes_ready=False)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             now = datetime.now(timezone.utc).isoformat()
             jobs = payload["scene_jobs"]
@@ -144,14 +214,32 @@ class WorkerTests(unittest.TestCase):
 
     def test_worker_waits_for_explicit_approval_without_provider_call(self):
         with tempfile.TemporaryDirectory() as root:
-            pack, _, manifest = make_pack(root, approved=False)
+            pack, _, manifest = make_pack(root, approved=False, keyframes_ready=False)
             provider = FakeVideoProvider()
             status = worker.process_pack(
                 pack.plan_id, config=config(root), provider=provider, composer=DummyComposer()
             )
             self.assertEqual(status, "awaiting_approval")
             self.assertEqual(provider.submit_count, 0)
+            self.assertEqual(provider.keyframe_submissions, [])
             self.assertEqual(json.loads(manifest.read_text())["pack_status"], "awaiting_approval")
+
+    def test_previous_v2_pack_is_read_only_and_cannot_use_avatar_directly(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["schema"] = story.PREVIOUS_STORY_SCHEMA
+            story.atomic_json(manifest, payload)
+            provider = FakeVideoProvider()
+            self.assertEqual(
+                worker.process_pack(
+                    pack.plan_id, config=config(root), provider=provider,
+                    composer=DummyComposer(),
+                ),
+                "legacy_manifest_read_only",
+            )
+            self.assertEqual(provider.submit_count, 0)
+            self.assertEqual(provider.keyframe_submissions, [])
 
     def test_approved_stale_v2_is_rejected_before_submit(self):
         with tempfile.TemporaryDirectory() as root:
@@ -412,7 +500,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_missing_reference_blocks_only_face_scene(self):
         with tempfile.TemporaryDirectory() as root:
-            _, _, manifest = make_pack(root)
+            _, _, manifest = make_pack(root, keyframes_ready=False)
             payload = json.loads(manifest.read_text())
             payload["scene_jobs"][0]["requires_naz_reference"] = True
             payload["scene_jobs"][0]["reference_role"] = "frontal_identity"
@@ -424,12 +512,16 @@ class WorkerTests(unittest.TestCase):
             worker.process_pack(payload["plan_id"], config=config(root), provider=provider, composer=DummyComposer())
             current = json.loads(manifest.read_text())["scene_jobs"]
             self.assertEqual(current[0]["state"], "blocked_reference")
-            self.assertEqual(current[1]["state"], "submitted")
+            self.assertEqual(current[1]["state"], "queued")
+            self.assertEqual(current[1]["keyframe_state"], "submitted")
+            self.assertEqual(provider.submissions, [])
 
-    def test_turbo_text_only_pack_waits_for_one_secondary_confirmation(self):
+    def test_turbo_text_only_scene_gets_a_directed_keyframe_before_video(self):
         with tempfile.TemporaryDirectory() as root:
-            pack, _, manifest = make_pack(root)
-            transport = MockTransport([])
+            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            transport = MockTransport([
+                (200, {"Content-Type": "application/json"}, b'{"id":"keyframe-task"}')
+            ])
             primary = RunwayVideoProvider(
                 api_key="dedicated-key", model="gen4_turbo", transport=transport
             )
@@ -441,29 +533,14 @@ class WorkerTests(unittest.TestCase):
             status = worker.process_pack(
                 pack.plan_id, config=cfg, provider=primary, composer=DummyComposer()
             )
-            self.assertEqual(status, "awaiting_secondary_approval")
-            self.assertEqual(transport.calls, [])
+            self.assertEqual(status, "queued")
+            self.assertEqual(len(transport.calls), 1)
+            self.assertTrue(transport.calls[0][1].endswith("/text_to_image"))
             pending = json.loads(manifest.read_text(encoding="utf-8"))["scene_jobs"]
-            self.assertTrue(all(job["state"] == "awaiting_secondary_approval" for job in pending))
+            self.assertEqual(pending[0]["keyframe_state"], "submitted")
+            self.assertEqual(pending[0]["keyframe_external_job_id"], "keyframe-task")
+            self.assertTrue(all(job["state"] != "awaiting_secondary_approval" for job in pending))
             self.assertTrue(all(job["attempts"] == 0 for job in pending))
-
-            self.assertEqual(
-                control.confirm_generation(Path(root), pack.plan_id), "secondary_approved"
-            )
-            approved = json.loads(manifest.read_text(encoding="utf-8"))["scene_jobs"]
-            self.assertTrue(all(job["model_route"]["secondary_approved_at"] for job in approved))
-
-            secondary_transport = MockTransport([
-                (200, {"Content-Type": "application/json"}, b'{"id":"secondary-task"}')
-            ])
-            secondary = RunwayVideoProvider(
-                api_key="dedicated-key", model="gen4.5", transport=secondary_transport
-            )
-            status = worker.process_pack(
-                pack.plan_id, config=cfg, provider=secondary, composer=DummyComposer()
-            )
-            self.assertEqual(status, "submitted")
-            self.assertEqual(len(secondary_transport.calls), 1)
 
     def test_secondary_escalation_has_exact_model_failure_allowlist(self):
         self.assertEqual(
@@ -522,7 +599,7 @@ class WorkerTests(unittest.TestCase):
                     "visual_guidance": "Long balanced proportions; fit but not bulky.",
                 },
             }), encoding="utf-8")
-            _, _, manifest = make_pack(root)
+            _, _, manifest = make_pack(root, keyframes_ready=False)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             payload["scenes"][0].update({
                 "requires_naz_reference": True,
@@ -539,10 +616,11 @@ class WorkerTests(unittest.TestCase):
                 config=config(root, reference_path=ref_dir),
                 provider=provider, composer=DummyComposer(),
             )
-            request = provider.submissions[0]
+            request = provider.keyframe_submissions[0]
             self.assertEqual(request.reference_path, (ref_dir / "naz-secondary.jpg").resolve())
             self.assertIn("185 cm", request.prompt)
             self.assertIn("80 kg", request.prompt)
+            self.assertEqual(provider.submissions, [])
             persisted = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertNotIn("185 cm", persisted["scenes"][0]["provider_prompt"])
 
@@ -784,6 +862,10 @@ class ControlTests(unittest.TestCase):
             summary = control.safe_summary(payload)
             self.assertNotIn(SAFE_FACTS[0], summary)
             self.assertNotIn(payload["scenes"][0]["provider_prompt"], summary)
+            self.assertNotIn(payload["scenes"][0]["keyframe_prompt"], summary)
+            self.assertIn("Режиссёрский план", summary)
+            self.assertIn("Оценка Runway", summary)
+            self.assertIn("Аватар используется только для внешности", summary)
 
 
 class MediaTests(unittest.TestCase):

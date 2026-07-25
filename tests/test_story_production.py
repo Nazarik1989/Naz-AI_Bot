@@ -116,6 +116,11 @@ class StoryFirstTests(unittest.TestCase):
                 else "frontal_identity"
             )
             self.assertEqual(scene.reference_role, expected)
+            self.assertEqual(scene.identity_reference_usage, "identity_only")
+            self.assertIn("@Naz", scene.keyframe_prompt)
+            self.assertIn("replace the reference background", scene.keyframe_prompt)
+            self.assertIn("Naz AI Lab", scene.setting)
+            self.assertNotIn("tied to fact", scene.setting)
 
     def test_object_only_scenes_never_receive_naz_reference(self):
         plan = dataclasses.replace(
@@ -124,6 +129,14 @@ class StoryFirstTests(unittest.TestCase):
         pack = story.plan_story_pack(plan, SAFE_FACTS)
         self.assertTrue(all(not scene.requires_naz_reference for scene in pack.scenes))
         self.assertTrue(all(scene.reference_role == "none" for scene in pack.scenes))
+        self.assertTrue(all(scene.identity_reference_usage == "none" for scene in pack.scenes))
+
+    def test_video_prompts_animate_directed_keyframes_within_runway_limit(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        for scene in pack.scenes:
+            self.assertIn("supplied directed keyframe", scene.provider_prompt)
+            self.assertLessEqual(len(scene.provider_prompt.encode("utf-16-le")) // 2, 1000)
+            self.assertLessEqual(len(scene.keyframe_prompt.encode("utf-16-le")) // 2, 1000)
 
     def test_every_reel_fragment_must_be_between_point_four_and_two_seconds(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
