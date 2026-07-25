@@ -21,8 +21,9 @@ from editorial_orchestrator import EditorialPlan
 from story_pack_lock import ensure_private_group_access
 
 
-STORY_SCHEMA = "naz-story-pack-v3"
-PREVIOUS_STORY_SCHEMA = "naz-story-pack-v2"
+STORY_SCHEMA = "naz-story-pack-v4"
+PREVIOUS_STORY_SCHEMA = "naz-story-pack-v3"
+OLDER_STORY_SCHEMA = "naz-story-pack-v2"
 LEGACY_STORY_SCHEMA = "naz-story-pack-v1"
 RENDERER_UNAVAILABLE = "unavailable"
 DRAMATURGIC_ROLES = (
@@ -33,21 +34,64 @@ REFERENCE_ROLES = ("none", "frontal_identity", "three_quarter_identity")
 REEL_CROPS = ("tight-center", "left-detail", "right-detail", "wide-center")
 CAMERA_MOTIONS = ("slow push", "controlled pan", "handheld follow", "locked with real subject motion")
 SAFE_ZONES = ("upper-middle", "middle-left", "lower-middle above platform controls")
-NAZ_LAB_SETTINGS = (
-    "the cold aisle of the Naz AI Lab server room, black racks, blue status light and visible fibre paths",
-    "the Naz AI Lab prototype bench, optical glass, milled titanium and precise mechanical joints",
-    "the Naz AI Lab systems room, one restrained topology wall and physical control modules",
-    "the dark glass corridor between the Naz AI Lab server room and prototype workshop",
-    "the Naz AI Lab validation bay, a single instrumented prototype under a circular task light",
-)
-ROLE_ACTIONS = {
-    "hook": ("Naz opens the server-room barrier and enters the cold aisle", "the sealed lab becomes an active workspace"),
-    "problem": ("a precise blue fault indicator appears on one physical module", "the failing module is isolated from the system"),
-    "hypothesis": ("Naz compares one titanium prototype with a restrained topology display", "one testable connection is selected"),
-    "test": ("Naz seats a connector and starts one controlled hardware test", "the test rig reaches a stable blue state"),
-    "result": ("the transparent prototype reveals its internal mechanism engaging", "the mechanism runs under load"),
-    "solution": ("Naz locks the validated module into the rack", "the rack returns to a coherent operating state"),
-    "conclusion": ("Naz steps back while the lab settles into a precise working rhythm", "one blue arc remains around the completed system"),
+VISUAL_TREATMENTS = {
+    "constraint_recovery": {
+        "label": "constraint recovery through physical rerouting",
+        "beats": {
+            "hook": ("a vast Naz AI Lab server hall during a controlled blackout", "Naz crosses the dark cold aisle carrying one blue task light", "one physical route becomes visible in the darkness"),
+            "problem": ("an isolated power-routing chamber beneath the Naz AI Lab", "Naz finds one disconnected titanium bus coupler among dormant machinery", "the broken physical link is exposed"),
+            "hypothesis": ("a smoked-glass diagnostics bridge overlooking the server hall", "Naz traces one fibre path by hand from the dead rack to a transparent routing core", "one repair path is selected"),
+            "test": ("a narrow maintenance gantry between black server towers", "Naz bridges two blue anodized modules with a precision mechanical connector", "a cold blue pulse crosses the bridge"),
+            "result": ("the central infrastructure chamber of Naz AI Lab", "the transparent routing core engages while Naz watches its internal mechanism turn", "successive server rows wake without any screen interface"),
+            "solution": ("a circular distribution vault with visible fibre paths", "Naz locks the recovered module into the physical network spine", "the lab settles into a stable energy rhythm"),
+            "conclusion": ("the observation platform above the restored Naz AI Lab", "Naz stands above the living infrastructure as one blue arc travels through it", "the system continues working beyond the original limit"),
+        },
+    },
+    "prototype_assembly": {
+        "label": "idea becoming a physical prototype",
+        "beats": {
+            "hook": ("a dark material vault in the Naz AI Lab fabrication wing", "Naz selects one raw titanium blank from negative space", "the unfinished material becomes the single focus"),
+            "problem": ("a precision machining cell behind smoked optical glass", "a milling head stops above an incomplete mechanical cavity", "the missing tolerance is physically visible"),
+            "hypothesis": ("a carbon worktable under a circular cold task light", "Naz aligns a transparent polymer shell over the titanium core", "the intended internal geometry becomes clear"),
+            "test": ("an enclosed prototype assembly bay", "Naz seats the machined core into blue anodized rails", "the exact joints close without force"),
+            "result": ("a cold technical-ceramic validation pedestal", "the assembled object opens and reveals its working internal mechanism", "the prototype performs one measurable motion"),
+            "solution": ("a sparse Naz AI Lab integration bench", "Naz connects the validated object to one restrained power umbilical", "the object operates as part of a larger system"),
+            "conclusion": ("a black exhibition chamber with no audience", "Naz releases the finished prototype and steps into shadow", "the physical object remains active under an ice-silver edge"),
+        },
+    },
+    "network_coordination": {
+        "label": "separate parts becoming one connected system",
+        "beats": {
+            "hook": ("a monumental dark junction hall linking several Naz AI Lab wings", "Naz enters between separated islands of machinery", "the distance between the systems becomes tangible"),
+            "problem": ("a glass corridor with interrupted blue fibre paths", "Naz examines a precise mechanical junction that does not meet", "the conflicting connection is isolated"),
+            "hypothesis": ("an elevated topology chamber built from glass and titanium", "Naz rotates one physical routing ring to align three distant paths", "a coherent route appears without a HUD"),
+            "test": ("a relay bay with three transparent technical modules", "Naz closes the first junction and waits for a physical response downstream", "the far module answers with one cold pulse"),
+            "result": ("the central systems atrium of Naz AI Lab", "multiple mechanisms begin moving in a restrained shared rhythm", "separate machines behave as one system"),
+            "solution": ("a long infrastructure spine beneath the laboratory", "Naz secures the final silver coupling between the connected branches", "the full route becomes mechanically continuous"),
+            "conclusion": ("a high observation bridge above the linked laboratory", "Naz walks beside the single blue path now joining every wing", "coordination remains visible as physical structure"),
+        },
+    },
+    "field_experiment": {
+        "label": "laboratory prototype entering the physical world",
+        "beats": {
+            "hook": ("a rain-dark rooftop relay platform above a restrained future city", "Naz carries a sealed optical-glass prototype into cold wind", "the laboratory object meets an uncontrolled environment"),
+            "problem": ("a concrete service level beneath the rooftop array", "the prototype vibrates against an unstable physical mounting", "the environmental failure is visible"),
+            "hypothesis": ("a transparent mobile Naz AI Lab module parked beside the relay", "Naz compares two mechanical dampers by touch", "one field adjustment is selected"),
+            "test": ("the exposed rooftop mast under blue-violet edge light", "Naz installs the revised carbon brace while the relay moves in wind", "the structure stops oscillating"),
+            "result": ("a wide platform between city darkness and the active relay", "the optical core opens and sends one restrained cobalt beam", "the field prototype holds a stable state"),
+            "solution": ("a narrow maintenance bridge across the rooftop system", "Naz locks the tested brace into the permanent assembly", "the relay becomes a believable working object"),
+            "conclusion": ("the city-facing edge of the completed relay platform", "Naz leaves the functioning device alone against the skyline", "one precise signal continues through the night"),
+        },
+    },
+}
+OBJECT_ONLY_ACTIONS = {
+    "hook": ("one physical mechanism emerges from darkness under a cold task light", "the object becomes the single readable subject"),
+    "problem": ("one joint stops before reaching its exact mechanical seat", "the physical mismatch is exposed"),
+    "hypothesis": ("two material interfaces align around one visible tolerance gap", "one testable geometry becomes clear"),
+    "test": ("the mechanism performs one controlled load cycle", "the critical joint reaches a stable state"),
+    "result": ("the transparent shell reveals the internal assembly engaging", "the mechanism completes its intended motion"),
+    "solution": ("the validated module locks into the surrounding physical system", "the complete assembly operates as one object"),
+    "conclusion": ("the working object remains alone in negative space", "one restrained blue arc marks the finished state"),
 }
 TERMINAL_SCENE_STATES = {
     "completed", "terminal_failed", "blocked_reference", "submit_ambiguous",
@@ -121,6 +165,7 @@ class StoryPackPlan:
     safe_facts: tuple[str, ...]
     editorial_plan: Mapping[str, Any]
     central_thesis: str
+    visual_concept: str
     scene_count: int
     scenes: tuple[ScenePlan, ...]
     reel_edits: tuple[ReelEditPlan, ...]
@@ -174,7 +219,45 @@ def _requires_reference(subject: str) -> bool:
     return any(word in folded for word in ("naz", "наз", "face", "portrait", "лицо", "портрет"))
 
 
-def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fact: str) -> ScenePlan:
+def _visual_treatment(plan: EditorialPlan, facts: tuple[str, ...]) -> str:
+    semantic_input = " ".join((
+        plan.topic, plan.thesis_direction, plan.tension, plan.semantic_theme,
+        plan.semantic_card, plan.facet, plan.imagery, *facts,
+    )).casefold()
+    keyword_groups = {
+        "constraint_recovery": (
+            "credit", "кредит", "limit", "лимит", "законч", "blocked", "блокир",
+            "pause", "пауза", "недоступ", "restriction", "огранич", "exhaust",
+        ),
+        "prototype_assembly": (
+            "prototype", "прототип", "build", "собир", "assembly", "сборк",
+            "material", "материал", "fabricat", "производ", "launch", "запуск",
+        ),
+        "network_coordination": (
+            "team", "команд", "network", "сеть", "relay",
+            "связ", "contact", "контакт", "coordination", "координ",
+        ),
+        "field_experiment": (
+            "city", "город", "street", "улиц", "field", "полев", "outside",
+            "внешн", "travel", "поезд", "weather", "погод",
+        ),
+    }
+    scored = {
+        key: sum(semantic_input.count(word) for word in words)
+        for key, words in keyword_groups.items()
+    }
+    best = max(scored.values())
+    if best:
+        candidates = sorted(key for key, score in scored.items() if score == best)
+    else:
+        candidates = sorted(VISUAL_TREATMENTS)
+    return candidates[_rank(plan.plan_id, "visual-treatment") % len(candidates)]
+
+
+def _scene(
+    plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fact: str,
+    treatment_key: str,
+) -> ScenePlan:
     # Both configured Runway tiers accept a five-second master.  Keeping the
     # provider master fixed also makes Reel timing and credit accounting exact.
     duration = 5
@@ -188,8 +271,10 @@ def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fa
         if requires_reference
         else "none"
     )
-    setting = NAZ_LAB_SETTINGS[_rank(plan.plan_id, f"lab-setting:{role}:{index}") % len(NAZ_LAB_SETTINGS)]
-    action, end_state = ROLE_ACTIONS[role]
+    treatment = VISUAL_TREATMENTS[treatment_key]
+    setting, action, end_state = treatment["beats"][role]
+    if not requires_reference:
+        action, end_state = OBJECT_ONLY_ACTIONS[role]
     standalone = f"{role}: {fact}"[:180]
     overlay = standalone[:72]
     continuity = (
@@ -214,7 +299,7 @@ def _scene(plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fa
     )
     keyframe_prompt = (
         f"Vertical cinematic scene composed for a 9:16 centre crop. {identity_instruction}"
-        f"Location: {setting}. Subject: {subject}. Exact frozen action: {action}. "
+        f"Visual concept: {treatment['label']}. Location: {setting}. Subject: {subject}. Exact frozen action: {action}. "
         f"Shot: {shot_size}; leave motion room for a {CAMERA_MOTIONS[_rank(plan.plan_id, f'motion:{index}') % len(CAMERA_MOTIONS)]}. "
         "Human intelligence / machine precision. Deep Black #020309, Midnight Blue #070B20, "
         "Electric Blue #185CFF, Ultraviolet #762DFF and Ice Silver #D7E5FF. "
@@ -306,10 +391,8 @@ def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: boo
 
 
 def _variant_plan_id(base_plan_id: str, variant_index: int) -> str:
-    if variant_index == 0:
-        return base_plan_id
     return hashlib.sha256(
-        f"{base_plan_id}|story-variant|{variant_index}".encode("utf-8")
+        f"{base_plan_id}|{STORY_SCHEMA}|story-variant|{variant_index}".encode("utf-8")
     ).hexdigest()[:24]
 
 
@@ -329,6 +412,7 @@ def plan_story_pack(
     story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
     variant_plan = replace(plan, plan_id=story_plan_id)
     count = max(4, min(7, len(facts)))
+    treatment_key = _visual_treatment(plan, facts)
     continuity_id = hashlib.sha256(f"naz|{plan.plan_id}|continuity".encode("utf-8")).hexdigest()[:20]
     roles = _roles(story_plan_id, count)
     scenes = tuple(
@@ -338,6 +422,7 @@ def plan_story_pack(
             role=role,
             index=i,
             fact=facts[i],
+            treatment_key=treatment_key,
         )
         for i, role in enumerate(roles)
     )
@@ -347,7 +432,9 @@ def plan_story_pack(
         destination=plan.platform, scheduled_slot=plan.slot, rubric=plan.rubric,
         source_type=plan.source_type, source_ref=plan.source_ref, safe_facts=facts,
         editorial_plan=plan.to_dict(),
-        central_thesis=plan.thesis_direction, scene_count=count, scenes=scenes,
+        central_thesis=plan.thesis_direction,
+        visual_concept=str(VISUAL_TREATMENTS[treatment_key]["label"]),
+        scene_count=count, scenes=scenes,
         reel_edits=(
             _reel_edit(variant_plan, scenes, short=False),
             _reel_edit(variant_plan, scenes, short=True),
@@ -475,7 +562,9 @@ def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 def read_manifest(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema") not in {STORY_SCHEMA, PREVIOUS_STORY_SCHEMA, LEGACY_STORY_SCHEMA}:
+    if payload.get("schema") not in {
+        STORY_SCHEMA, PREVIOUS_STORY_SCHEMA, OLDER_STORY_SCHEMA, LEGACY_STORY_SCHEMA,
+    }:
         raise StoryPlanError("unsupported story manifest schema")
     return payload
 
@@ -512,6 +601,10 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     model_policy = payload.get("model_policy")
     visual_strategy = payload.get("visual_strategy")
     if not all(isinstance(value, list) for value in (scenes, edits, scene_jobs, reel_jobs)):
+        return False
+    if payload.get("visual_concept") not in {
+        str(treatment["label"]) for treatment in VISUAL_TREATMENTS.values()
+    }:
         return False
     if not 4 <= len(scenes) <= 7 or payload.get("scene_count") != len(scenes) or not edits:
         return False
@@ -732,7 +825,7 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
 
 
 def persist_story_queue(pack: StoryPackPlan, storage_root: Path) -> Path:
-    """Atomically create a resumable v2 queue item, or return an existing pack."""
+    """Atomically create a resumable current-schema item, or return that exact pack."""
     root = Path(storage_root).expanduser().resolve()
     pack_dir = (root / pack.plan_id).resolve()
     if root not in pack_dir.parents:
