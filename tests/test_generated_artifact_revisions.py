@@ -118,6 +118,23 @@ class GeneratedArtifactTelegramTests(unittest.TestCase):
         update.message.reply_text.assert_awaited_once()
         self.assertIn("только после подтверждения", update.message.reply_text.await_args.args[0])
 
+    def test_angle_control_message_is_not_registered_as_artifact(self):
+        update = SimpleNamespace(
+            message=SimpleNamespace(reply_text=AsyncMock()),
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=100),
+        )
+        with patch.object(main, "is_angle_engine_message", return_value=True), patch.object(
+            main, "reply_long", new=AsyncMock()
+        ) as service_reply, patch.object(memory, "create_generated_artifact") as create:
+            asyncio.run(
+                main.reply_generated_text(
+                    update, "service control", mode="post", keyboard=main.ANGLE_KEYBOARD
+                )
+            )
+        service_reply.assert_awaited_once()
+        create.assert_not_called()
+
     def test_text_apply_sends_exact_revision_without_publication(self):
         artifact = self.make_artifact()
         pending = memory.create_pending_generated_revision(

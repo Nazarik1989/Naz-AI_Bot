@@ -745,6 +745,9 @@ async def reply_generated_text(
 ) -> List[Any]:
     if not update.message or not update.effective_user or not update.effective_chat:
         return []
+    if is_angle_engine_message(text):
+        await reply_long(update, text, keyboard)
+        return []
     chat_id = getattr(update.effective_chat, "id", None)
     get_bot = getattr(update.message, "get_bot", None)
     if chat_id is None or not callable(get_bot):
