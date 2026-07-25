@@ -223,6 +223,24 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_generated_publications (
+                publication_id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                destination TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reason_code TEXT NOT NULL DEFAULT '',
+                receipt_chat_id TEXT NOT NULL DEFAULT '',
+                receipt_message_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (artifact_id) REFERENCES generated_artifacts(artifact_id)
+            )
+            """
+        )
 
         conn.execute(
             """
@@ -462,6 +480,10 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_pending_generated_revision_owner "
             "ON pending_generated_revisions(owner_user_id, status)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_generated_publication_owner "
+            "ON pending_generated_publications(owner_user_id, status)"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signatures_user_created ON content_signatures(user_id, id)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_semantic_history_user_created "
@@ -623,7 +645,7 @@ def get_pending_generated_revision(revision_id: str, owner_user_id: int) -> Opti
     with db() as conn:
         row = conn.execute(
             """
-            SELECT r.*, a.kind AS artifact_kind, a.mode, a.topic,
+            SELECT r.*, a.kind AS artifact_kind, a.mode, a.topic, a.source_ref,
                    a.current_version, v.telegram_file_id
             FROM pending_generated_revisions r
             JOIN generated_artifacts a ON a.artifact_id=r.artifact_id
@@ -753,6 +775,207 @@ def apply_generated_revision(
         "content": row["proposed_content"],
         "telegram_file_id": telegram_file_id,
     }
+
+
+def create_pending_generated_publication(
+    artifact_id: str,
+    owner_user_id: int,
+    version: int,
+    destination: str = "telegram_channel",
+) -> Dict[str, Any]:
+    publication_id = secrets.token_urlsafe(9)
+    now = utc_now()
+    init_db()
+    with db() as conn:
+        artifact = conn.execute(
+            """
+            SELECT owner_user_id, kind, mode, source_ref, current_version
+            FROM generated_artifacts WHERE artifact_id=?
+            """,
+            (artifact_id,),
+        ).fetchone()
+        if not artifact or int(artifact["owner_user_id"]) != owner_user_id:
+            raise ValueError("Generated artifact is unavailable")
+        if artifact["kind"] != "text" or int(artifact["current_version"]) != int(version):
+            raise ValueError("Generated artifact version is stale")
+        if artifact["mode"] != "agent_content_sync" or not str(artifact["source_ref"] or ""):
+            raise ValueError("Generated artifact is not publishable")
+        existing = conn.execute(
+            """
+            SELECT status FROM pending_generated_publications
+            WHERE artifact_id=? AND version=? AND destination=?
+              AND status IN ('processing', 'published', 'needs_audit')
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (artifact_id, int(version), destination),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"Generated artifact publication is {existing['status']}")
+        conn.execute(
+            """
+            UPDATE pending_generated_publications
+            SET status='superseded', updated_at=?
+            WHERE artifact_id=? AND owner_user_id=? AND status='pending'
+            """,
+            (now, artifact_id, owner_user_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO pending_generated_publications(
+                publication_id, artifact_id, owner_user_id, version,
+                destination, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (publication_id, artifact_id, owner_user_id, int(version), destination, now, now),
+        )
+    return {
+        "publication_id": publication_id,
+        "artifact_id": artifact_id,
+        "owner_user_id": owner_user_id,
+        "version": int(version),
+        "destination": destination,
+        "status": "pending",
+    }
+
+
+def get_pending_generated_publication(
+    publication_id: str,
+    owner_user_id: int,
+) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT p.*, a.kind, a.mode, a.topic, a.source_ref, a.current_version,
+                   v.content
+            FROM pending_generated_publications p
+            JOIN generated_artifacts a ON a.artifact_id=p.artifact_id
+            JOIN generated_artifact_versions v
+              ON v.artifact_id=p.artifact_id AND v.version=p.version
+            WHERE p.publication_id=? AND p.owner_user_id=? AND a.owner_user_id=?
+            """,
+            (publication_id, owner_user_id, owner_user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def cancel_pending_generated_publication(publication_id: str, owner_user_id: int) -> bool:
+    init_db()
+    with db() as conn:
+        result = conn.execute(
+            """
+            UPDATE pending_generated_publications
+            SET status='cancelled', updated_at=?
+            WHERE publication_id=? AND owner_user_id=? AND status='pending'
+            """,
+            (utc_now(), publication_id, owner_user_id),
+        )
+    return result.rowcount == 1
+
+
+def begin_generated_publication(
+    publication_id: str,
+    owner_user_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Claim one approved version before any paid media or external send."""
+    init_db()
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT p.*, a.kind, a.mode, a.topic, a.source_ref, a.current_version,
+                   v.content
+            FROM pending_generated_publications p
+            JOIN generated_artifacts a ON a.artifact_id=p.artifact_id
+            JOIN generated_artifact_versions v
+              ON v.artifact_id=p.artifact_id AND v.version=p.version
+            WHERE p.publication_id=? AND p.owner_user_id=? AND a.owner_user_id=?
+              AND p.status='pending' AND p.version=a.current_version
+            """,
+            (publication_id, owner_user_id, owner_user_id),
+        ).fetchone()
+        if not row:
+            return None
+        updated = conn.execute(
+            """
+            UPDATE pending_generated_publications SET status='processing', updated_at=?
+            WHERE publication_id=? AND owner_user_id=? AND status='pending'
+            """,
+            (utc_now(), publication_id, owner_user_id),
+        )
+        if updated.rowcount != 1:
+            return None
+    return dict(row)
+
+
+def finish_generated_publication(
+    publication_id: str,
+    owner_user_id: int,
+    *,
+    receipt_chat_id: str,
+    receipt_message_id: str,
+) -> bool:
+    init_db()
+    with db() as conn:
+        result = conn.execute(
+            """
+            UPDATE pending_generated_publications
+            SET status='published', reason_code='', receipt_chat_id=?,
+                receipt_message_id=?, updated_at=?
+            WHERE publication_id=? AND owner_user_id=? AND status='processing'
+            """,
+            (
+                str(receipt_chat_id)[:128], str(receipt_message_id)[:128], utc_now(),
+                publication_id, owner_user_id,
+            ),
+        )
+    return result.rowcount == 1
+
+
+def fail_generated_publication(
+    publication_id: str,
+    owner_user_id: int,
+    reason_code: str,
+    *,
+    needs_audit: bool = False,
+) -> bool:
+    init_db()
+    with db() as conn:
+        result = conn.execute(
+            """
+            UPDATE pending_generated_publications
+            SET status=?, reason_code=?, updated_at=?
+            WHERE publication_id=? AND owner_user_id=? AND status='processing'
+            """,
+            (
+                "needs_audit" if needs_audit else "failed",
+                str(reason_code)[:120], utc_now(), publication_id, owner_user_id,
+            ),
+        )
+    return result.rowcount == 1
+
+
+def get_generated_post_by_plan(user_id: int, plan_id: str) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, user_id, task, topic, semantic_theme, semantic_card,
+                   plan_id, editorial_plan_json, published_to_channel
+            FROM generated_posts
+            WHERE user_id=? AND plan_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id, str(plan_id)[:64]),
+        ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["editorial_plan"] = json.loads(str(result.pop("editorial_plan_json") or "{}"))
+    except json.JSONDecodeError:
+        result["editorial_plan"] = {}
+    return result
 
 
 def create_delegation_invite(
