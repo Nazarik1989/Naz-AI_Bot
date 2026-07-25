@@ -119,8 +119,68 @@ class StoryFirstTests(unittest.TestCase):
             self.assertEqual(scene.identity_reference_usage, "identity_only")
             self.assertIn("@Naz", scene.keyframe_prompt)
             self.assertIn("replace the reference background", scene.keyframe_prompt)
-            self.assertIn("Naz AI Lab", scene.setting)
             self.assertNotIn("tied to fact", scene.setting)
+
+    def test_story_plan_id_is_schema_scoped_and_cannot_reuse_an_old_manifest(self):
+        plan = planned()
+        pack = story.plan_story_pack(plan, SAFE_FACTS)
+        self.assertNotEqual(pack.plan_id, plan.plan_id)
+        self.assertEqual(pack.base_plan_id, plan.plan_id)
+        self.assertEqual(len(pack.plan_id), 24)
+
+    def test_current_pack_is_created_beside_old_base_id_without_overwriting_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            plan = planned()
+            old_dir = Path(root) / plan.plan_id
+            old_dir.mkdir()
+            old_manifest = old_dir / "story_manifest.json"
+            old_manifest.write_text(
+                json.dumps({"schema": story.OLDER_STORY_SCHEMA, "plan_id": plan.plan_id}),
+                encoding="utf-8",
+            )
+            before = old_manifest.read_bytes()
+
+            pack = story.plan_story_pack(plan, SAFE_FACTS)
+            current_dir = story.persist_story_queue(pack, Path(root))
+
+            self.assertNotEqual(current_dir, old_dir)
+            self.assertEqual(old_manifest.read_bytes(), before)
+            self.assertEqual(
+                story.read_manifest(current_dir / "story_manifest.json")["schema"],
+                story.STORY_SCHEMA,
+            )
+
+    def test_visual_treatment_comes_from_episode_meaning_not_one_fixed_room(self):
+        constrained = story.plan_story_pack(
+            planned(),
+            (
+                "The generation credits were exhausted during a bounded build.",
+                "The team continued with tools already available.",
+                "One physical system route was selected.",
+                "The route was tested without increasing the limit.",
+            ),
+        )
+        field = story.plan_story_pack(
+            planned(),
+            (
+                "A field prototype left the laboratory for a city rooftop.",
+                "Wind exposed one unstable physical mounting.",
+                "A bounded brace adjustment was selected.",
+                "The outdoor relay remained stable after the test.",
+            ),
+        )
+        self.assertEqual(
+            constrained.visual_concept,
+            story.VISUAL_TREATMENTS["constraint_recovery"]["label"],
+        )
+        self.assertEqual(
+            field.visual_concept,
+            story.VISUAL_TREATMENTS["field_experiment"]["label"],
+        )
+        self.assertNotEqual(constrained.visual_concept, field.visual_concept)
+        self.assertGreaterEqual(len({scene.setting for scene in constrained.scenes}), 4)
+        self.assertTrue(all("tied to fact" not in scene.setting for scene in constrained.scenes))
+        self.assertTrue(all("Perform and reveal" not in scene.concrete_action for scene in constrained.scenes))
 
     def test_object_only_scenes_never_receive_naz_reference(self):
         plan = dataclasses.replace(
@@ -130,6 +190,7 @@ class StoryFirstTests(unittest.TestCase):
         self.assertTrue(all(not scene.requires_naz_reference for scene in pack.scenes))
         self.assertTrue(all(scene.reference_role == "none" for scene in pack.scenes))
         self.assertTrue(all(scene.identity_reference_usage == "none" for scene in pack.scenes))
+        self.assertTrue(all("Naz" not in scene.concrete_action for scene in pack.scenes))
 
     def test_video_prompts_animate_directed_keyframes_within_runway_limit(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)

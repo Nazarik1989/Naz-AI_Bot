@@ -32,6 +32,12 @@ SCENE_STATUS_RU = {
     "terminal_failed": "ошибка", "blocked_reference": "нужен референс Naz",
     "awaiting_secondary_approval": "ожидает подтверждения Gen-4.5",
 }
+VISUAL_CONCEPT_RU = {
+    "constraint recovery through physical rerouting": "Ограничение — ручное восстановление системы",
+    "idea becoming a physical prototype": "Идея становится физическим прототипом",
+    "separate parts becoming one connected system": "Разрозненные части становятся связанной системой",
+    "laboratory prototype entering the physical world": "Прототип выходит из лаборатории в физический мир",
+}
 
 
 def _now() -> str:
@@ -221,6 +227,8 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         for scene in directed if isinstance(scene, Mapping)
     )
     video_credits = int(duration) * 5
+    concept = str(payload.get("visual_concept", ""))
+    concept_label = VISUAL_CONCEPT_RU.get(concept, concept)[:120]
     statuses = "\n".join(
         f"• {SCENE_STATUS_RU.get(state, state)}: {count}"
         for state, count in sorted(counts.items())
@@ -240,6 +248,7 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         f"План: {str(payload.get('plan_id', ''))[:24]}\n"
         f"Вариант: {int(payload.get('variant_index', 0)) + 1}\n"
         f"Рубрика: {str(payload.get('rubric', ''))[:120]}\n"
+        f"Визуальная концепция: {concept_label}\n"
         f"Статус: {PACK_STATUS_RU.get(pack_status, pack_status)}\n"
         f"Сцен: {len(jobs)}, запланировано секунд: {duration:g}\n"
         f"Сцен с Naz: {references}\n\n{statuses}\n\n"

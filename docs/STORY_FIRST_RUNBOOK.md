@@ -1,7 +1,7 @@
 # Naz Story-First production runbook
 
 Story-first planning is part of the normal Agent Content route, but media work
-is deliberately separate. The bot atomically writes a `naz-story-pack-v3`
+is deliberately separate. The bot atomically writes a `naz-story-pack-v4`
 manifest and returns. `naz_story_worker.py` resumes one state transition at a
 time and contains no Telegram or VK publication path.
 
@@ -70,11 +70,14 @@ for close-ups, macro and object-only scenes. Provider images are normalized in
 memory to a valid 720×1280 first frame; private binaries and the profile stay
 outside Git.
 
-The approval card lists every scene's location, physical action and camera plus
-the estimated Runway credits. A v3 pack first creates one asynchronous directed
+The approval card lists a material-driven visual concept plus every scene's
+location, physical action and camera, and the estimated Runway credits. The
+concept is selected from the safe semantic content of the episode; Naz AI Lab
+is a coherent world, not one mandatory room or a fixed action sequence. A v4
+pack first creates one asynchronous directed
 keyframe per scene (`gen4_image_turbo` with `@Naz` for identity scenes,
 `gen4_image` for object-only scenes), then animates that immutable keyframe.
-No keyframe or video task is submitted before explicit approval. v1/v2 packs
+No keyframe or video task is submitted before explicit approval. v1/v2/v3 packs
 remain inspectable but are read-only and cannot silently use the old direct-avatar route.
 
 `NAZ_STORY_MUSIC_LIBRARY` may point to a private music folder. Each audio file

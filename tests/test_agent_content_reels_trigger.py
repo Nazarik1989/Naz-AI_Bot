@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import editorial_orchestrator
 import main
 import memory
+import story_production
 
 
 WORK_CHRONICLE = """
@@ -110,7 +111,7 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
         bot = SimpleNamespace(send_message=AsyncMock())
         pack_dir = Path(self.temp.name) / "story-packs" / ("a" * 24)
         payload = {
-            "schema": "naz-story-pack-v2",
+            "schema": story_production.STORY_SCHEMA,
             "plan_id": "a" * 24,
             "variant_index": 0,
             "rubric": "Рабочая хроника Naz",

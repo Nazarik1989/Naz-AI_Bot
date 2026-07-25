@@ -224,7 +224,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(provider.keyframe_submissions, [])
             self.assertEqual(json.loads(manifest.read_text())["pack_status"], "awaiting_approval")
 
-    def test_previous_v2_pack_is_read_only_and_cannot_use_avatar_directly(self):
+    def test_previous_v3_pack_is_read_only_and_cannot_use_avatar_directly(self):
         with tempfile.TemporaryDirectory() as root:
             pack, _, manifest = make_pack(root)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -240,6 +240,21 @@ class WorkerTests(unittest.TestCase):
             )
             self.assertEqual(provider.submit_count, 0)
             self.assertEqual(provider.keyframe_submissions, [])
+
+    def test_v2_pack_remains_readable_but_read_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["schema"] = story.OLDER_STORY_SCHEMA
+            story.atomic_json(manifest, payload)
+            self.assertEqual(story.read_manifest(manifest)["schema"], story.OLDER_STORY_SCHEMA)
+            self.assertEqual(
+                worker.process_pack(
+                    pack.plan_id, config=config(root), provider=FakeVideoProvider(),
+                    composer=DummyComposer(),
+                ),
+                "legacy_manifest_read_only",
+            )
 
     def test_approved_stale_v2_is_rejected_before_submit(self):
         with tempfile.TemporaryDirectory() as root:
@@ -864,6 +879,9 @@ class ControlTests(unittest.TestCase):
             self.assertNotIn(payload["scenes"][0]["provider_prompt"], summary)
             self.assertNotIn(payload["scenes"][0]["keyframe_prompt"], summary)
             self.assertIn("Режиссёрский план", summary)
+            self.assertIn(
+                control.VISUAL_CONCEPT_RU[payload["visual_concept"]], summary
+            )
             self.assertIn("Оценка Runway", summary)
             self.assertIn("Аватар используется только для внешности", summary)
 
