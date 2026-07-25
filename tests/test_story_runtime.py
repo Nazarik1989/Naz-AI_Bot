@@ -926,6 +926,7 @@ class MediaTests(unittest.TestCase):
             filter_value = next(call[call.index("-filter_complex") + 1] for call in calls if "-filter_complex" in call)
             self.assertIn("scale=ceil(iw*1.18", filter_value)
             self.assertIn("crop=1080:1920", filter_value)
+            self.assertIn("setsar=1,fps=30", filter_value)
             compose_call = next(call for call in calls if "-filter_complex" in call)
             self.assertIn("-ss", compose_call)
             self.assertNotIn("-stream_loop", compose_call)

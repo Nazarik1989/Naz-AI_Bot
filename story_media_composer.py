@@ -240,7 +240,8 @@ class MediaComposer:
             x = "0" if crop == "left-detail" else "iw-1080" if crop == "right-detail" else "(iw-1080)/2"
             filters.append(
                 f"[{index}:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS,"
-                f"scale=ceil(iw*{zoom}/2)*2:ceil(ih*{zoom}/2)*2,crop=1080:1920:{x}:(ih-1920)/2,fps=30[v{index}]"
+                f"scale=ceil(iw*{zoom}/2)*2:ceil(ih*{zoom}/2)*2,"
+                f"crop=1080:1920:{x}:(ih-1920)/2,setsar=1,fps=30[v{index}]"
             )
             total += duration
         beat_tolerance = 0.06
