@@ -1,90 +1,200 @@
-# NAZ AI
+<p align="center">
+  <img src="./docs/assets/avatar.webp" width="230" alt="NAZ AI avatar" />
+</p>
 
-AI content generation and publishing agent built with Python and OpenRouter.
+<h1 align="center">NAZ AI</h1>
 
-Private Story-first media generation is documented in
-[`docs/STORY_FIRST_RUNBOOK.md`](docs/STORY_FIRST_RUNBOOK.md). It is disabled by
-default and has no social autopublishing path.
+<p align="center">
+  <strong>Telegram AI Content OS for evidence-based creation, memory, voice, publishing and approval-gated Story/Reels production.</strong>
+</p>
 
-## Overview
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/Telegram-Bot-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Telegram" />
+  <img src="https://img.shields.io/badge/LLM-OpenRouter-6C5CE7?style=flat-square" alt="OpenRouter" />
+  <img src="https://img.shields.io/badge/Status-Active_Development-00C853?style=flat-square" alt="Status" />
+</p>
 
-NAZ AI is an AI-powered assistant designed to generate content, prompts and ideas for creators and communities.
+## Why this project exists
 
-The project combines Telegram, large language models and automation workflows to streamline content creation and publishing.
+NAZ AI started as a content assistant and evolved into a small operating system for AI-assisted creation.
 
-## Screenshots
+It combines:
 
-### Main Interface
+- persistent conversational memory;
+- expert modes, voice profiles and content goals;
+- text, voice and image workflows;
+- scheduled and manual publishing;
+- safe delegated communication;
+- collaboration with a second editorial persona — **VOID**;
+- an isolated shared VK publishing pipeline.
 
-![Main Interface](Снимок%20экрана%20(861).png)
+The goal is not to generate one more generic post. The goal is to coordinate a repeatable content workflow with a recognizable voice, useful memory and explicit publishing boundaries.
 
-### Content Generation
+---
 
-![Content Generation](Снимок%20экрана%20(865).png)
+## Core capabilities
 
-## Features
+### Creation
 
-- AI content generation
-- Prompt engineering workflows
-- Persistent memory system
-- Automated Telegram publishing
-- Cross-posting integration
-- VPS deployment
-- Custom AI personas
+- posts, hooks, scripts, plans and angle exploration;
+- configurable expert modes and voice profiles;
+- source interpretation and editorial planning;
+- project-first Relay Content Inbox ingestion with provenance and a second privacy scan;
+- deterministic routing between standard posts and Story-first production;
+- image generation and reference-aware visual workflows;
+- voice transcription and optional spoken replies.
+
+### Context and control
+
+- SQLite-backed memory;
+- persistent character and relationship state;
+- admin, saved-contact and unknown-user access boundaries;
+- previews and confirmations before sensitive messaging;
+- diagnostics, statistics and runtime controls.
+
+### Publishing
+
+- Telegram drafts, previews and scheduled releases;
+- VK jobs with media and approved music selection;
+- global duplicate prevention and shared track memory;
+- retry, backoff and publication receipts;
+- coordinated schedules with VOID.
+
+### Story / Reels production
+
+- evidence-gated Story-first selection for verified work chronicles;
+- 4–7 scene Story packs and non-sequential Reel edit plans;
+- Runway video provider integration behind an explicit admin confirmation;
+- bounded Stable Audio library workflow and media composition;
+- resumable production queue with status and alternate controls;
+- completed media delivered only to the private admin chat;
+- no public Story/Reel autopublishing path.
+
+---
 
 ## Architecture
 
+<p align="center">
+  <img src="./docs/assets/architecture.svg" width="100%" alt="NAZ AI architecture" />
+</p>
+
+The application keeps collection, editorial planning, media production, memory, delegated messaging and publishing as distinct responsibilities. The production VK path is deliberately separated from the conversational bot process.
+
+### Relay → Content Inbox → NAZ → ReelsMaker
+
 ```text
-Telegram User
-      ↓
-    NAZ AI
-      ↓
- Memory System
-      ↓
- OpenRouter API
-      ↓
- Content Generation
-      ↓
- Publishing Workflow
+Relay Agent
+  → project/date/topic Markdown
+  → NAZ Content Inbox + privacy scan
+  → immutable EditorialPlan
+  ├─ standard → versioned draft / normal publishing workflow
+  └─ story_first → approval → video/audio providers → Story + Reel edits
+                                           ↓
+                                  private admin delivery
 ```
 
-## Tech Stack
+`scheduled_plan()` is the single creative decision entry point. Story-first is selected only when the source is verified, contains a concrete and visualizable process, provides at least four causal facts and a real result, and contains neither secrets nor private data. Paid provider calls are not made until the administrator confirms the pack.
 
-- Python
-- OpenRouter API
-- Telegram Bot API
-- VPS Deployment
-- GitHub
+---
 
-## Workflow
+## NAZ × VOID
 
-User Request
-↓
-Telegram Bot
-↓
-OpenRouter API
-↓
-AI Processing
-↓
-Generated Content
-↓
-Publishing Workflow
+NAZ and VOID share a relationship model, but retain separate voices and separate content pipelines.
 
-## Roadmap
+<p align="center">
+  <img src="./docs/assets/naz-void.svg" width="100%" alt="NAZ and VOID collaboration" />
+</p>
 
-- Multi-agent collaboration
-- VK integration
-- MAX integration
-- Content analytics
-- Autonomous content workflows
+Their exchange is designed around private thoughts rather than reposting:
+
+1. one agent creates a private thought for the other;
+2. the payload is marked as private and not publication-ready;
+3. the receiver digests it through its own character context;
+4. the receiver creates an original standalone reflection;
+5. similarity checks prevent verbatim reuse.
+
+This lets the two personas influence one another without collapsing into the same editorial voice.
+
+---
+
+## Shared VK publishing model
+
+```text
+NAZ producer ──┐
+               ├──> pending queue ──> isolated VK consumer ──> allowlisted community
+VOID producer ─┘
+```
+
+Security properties:
+
+- bot processes cannot read the authorized browser profile;
+- only the standalone consumer can move jobs through processing states;
+- each job carries a deterministic deduplication key;
+- failed jobs are not recreated silently;
+- a kill switch can disable the publisher without stopping the bots;
+- credentials, cookies and private browser data never enter model prompts.
+
+---
+
+## Repository map
+
+```text
+main.py                    Telegram application and content workflows
+memory.py                  persistent memory layer
+controller.py              orchestration and runtime control
+character_state.py         bounded NAZ character state
+editorial_orchestrator.py  deterministic editorial planning
+story_production.py        Story scenes and non-sequential Reel edit plans
+story_video_provider.py    approval-gated video provider boundary
+story_audio_library.py     bounded audio library and evidence metadata
+story_media_composer.py    media assembly and private delivery artifact
+story_pack_control.py      persistent approval/status/alternate controls
+naz_story_worker.py        resumable Story production worker
+duo_relationship.py        NAZ ↔ VOID relationship and private-thought contract
+delegated_messaging.py     contact safety and contextual delegation
+gaming_vertical.py         gaming rubric and format planning
+vk_publish_queue.py        strict VK producer queue contract
+scheduled_work.py          coordinated schedule and deploy markers
+visual_archive.py          curated visual archive integration
+```
+
+---
+
+## Local setup
+
+> Never commit `.env`, tokens, cookies, browser profiles, databases, logs or private contact material.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+python main.py
+```
+
+Minimum configuration normally includes:
+
+```dotenv
+BOT_TOKEN=...
+ADMIN_ID=...
+OPENAI_API_KEY=...
+```
+
+Voice, image, publishing and cross-agent features are optional and should be enabled only after their corresponding credentials and safety settings are configured.
+
+---
+
+## Public links
+
+- [Open NAZ AI](https://t.me/Naz_ai_1_bot)
+- [Prompt or Die channel](https://t.me/PromptOrDie)
+- [Shared NAZ × VOID VK community](https://vk.com/club237593988)
+
+---
 
 ## Status
 
-Active Development
+Active development. The current main branch includes project-first Relay intake, deterministic Editorial Orchestrator routing, versioned post/image drafts, approval-gated Story/Reels production, memory, voice/image integrations, delegated contacts, NAZ × VOID exchange and the isolated VK queue pipeline. The relevant portfolio audit passed 154 tests with one local multimedia test skipped because FFmpeg was unavailable on the review machine (2026-07-25).
 
-## Author
-
-Nazar Zykov
-
-Telegram:
-https://t.me/Nazar_38rus
+Built by [Nazar Zykov](https://github.com/Nazarik1989).
