@@ -103,7 +103,11 @@ Relay Agent
 NAZ and VOID share a relationship model, but retain separate voices and separate content pipelines.
 
 <p align="center">
-  <img src="./docs/assets/naz-void.svg" width="100%" alt="NAZ and VOID collaboration" />
+  <img src="./docs/assets/naz-void-flow.gif" width="100%" alt="Animated NAZ and VOID editorial flow with distinct voices, relationship state and isolated publishing" />
+</p>
+
+<p align="center">
+  <sub>Animated editorial flow · <a href="./docs/assets/naz-void.svg">Open the static diagram</a></sub>
 </p>
 
 Their exchange is designed around private thoughts rather than reposting:
