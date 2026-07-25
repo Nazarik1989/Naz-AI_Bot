@@ -1,11 +1,14 @@
 import dataclasses
 import json
+import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import naz_story_worker as worker
 import story_pack_control as control
@@ -656,6 +659,48 @@ class WorkerTests(unittest.TestCase):
             story.atomic_json(manifest, payload)
 
             self.assertEqual(worker._queued_plan_ids(Path(root)), [pack.plan_id])
+
+
+class SharedQueuePermissionTests(unittest.TestCase):
+    def test_persist_marks_every_shared_queue_path(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(
+            story, "ensure_private_group_access"
+        ) as shared_access:
+            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack_dir = story.persist_story_queue(pack, Path(root))
+
+        calls = {(call.args[0], call.kwargs["directory"]) for call in shared_access.call_args_list}
+        self.assertTrue({
+            (pack_dir, True),
+            (pack_dir / "stories", True),
+            (pack_dir / "reels", True),
+            (pack_dir / "story_manifest.json", False),
+            (pack_dir / "caption_pack.md", False),
+        }.issubset(calls))
+
+    @unittest.skipIf(os.name == "nt", "Unix group permissions are deployment-specific")
+    def test_manifest_and_lock_remain_private_but_group_writable(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            root_path.chmod(0o2770)
+            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack_dir = story.persist_story_queue(pack, root_path)
+            manifest = pack_dir / "story_manifest.json"
+
+            self.assertEqual(stat.S_IMODE(pack_dir.stat().st_mode), 0o2770)
+            self.assertEqual(stat.S_IMODE((pack_dir / "stories").stat().st_mode), 0o2770)
+            self.assertEqual(stat.S_IMODE((pack_dir / "reels").stat().st_mode), 0o2770)
+            self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o660)
+            self.assertEqual(stat.S_IMODE((pack_dir / "caption_pack.md").stat().st_mode), 0o660)
+
+            payload = story.read_manifest(manifest)
+            story.atomic_json(manifest, payload)
+            self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o660)
+
+            with StoryPackLock(pack_dir):
+                self.assertEqual(
+                    stat.S_IMODE((pack_dir / ".pack.lock").stat().st_mode), 0o660
+                )
 
 
 class ControlTests(unittest.TestCase):
