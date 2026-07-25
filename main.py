@@ -698,6 +698,107 @@ async def send_long_to_chat(bot, chat_id: str | int, text: str) -> List[Any]:
     return sent
 
 
+async def send_generated_text_to_chat(
+    bot,
+    chat_id: str | int,
+    owner_user_id: int,
+    text: str,
+    *,
+    mode: str,
+    topic: str = "",
+    source_ref: str = "",
+    keyboard: ReplyKeyboardMarkup | None = None,
+    artifact_id: str = "",
+    version: int = 1,
+) -> List[Any]:
+    """Send an editable generated text and bind every Telegram chunk to one version."""
+    artifact = None
+    if not artifact_id:
+        artifact = memory.create_generated_artifact(
+            owner_user_id, "text", text, mode=mode, topic=topic, source_ref=source_ref
+        )
+        artifact_id = str(artifact["artifact_id"])
+        version = int(artifact["current_version"])
+    sent: List[Any] = []
+    chunks = split_telegram_text(text)
+    for index, chunk in enumerate(chunks):
+        message = await bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            reply_markup=keyboard if index == len(chunks) - 1 else None,
+            disable_web_page_preview=True,
+        )
+        sent.append(message)
+        memory.bind_generated_artifact_message(
+            artifact_id, version, owner_user_id, int(message.chat_id), int(message.message_id)
+        )
+    return sent
+
+
+async def reply_generated_text(
+    update: Update,
+    text: str,
+    *,
+    mode: str,
+    topic: str = "",
+    keyboard: ReplyKeyboardMarkup | None = None,
+) -> List[Any]:
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return []
+    if is_angle_engine_message(text):
+        await reply_long(update, text, keyboard)
+        return []
+    chat_id = getattr(update.effective_chat, "id", None)
+    get_bot = getattr(update.message, "get_bot", None)
+    if chat_id is None or not callable(get_bot):
+        await reply_long(update, text, keyboard)
+        return []
+    return await send_generated_text_to_chat(
+        get_bot(),
+        chat_id,
+        update.effective_user.id,
+        text,
+        mode=mode,
+        topic=topic,
+        keyboard=keyboard,
+    )
+
+
+def bind_generated_image_message(
+    message,
+    owner_user_id: int,
+    *,
+    instruction: str,
+    mode: str,
+    topic: str = "",
+    artifact_id: str = "",
+    version: int = 1,
+) -> Dict[str, Any]:
+    photos = getattr(message, "photo", None) or []
+    document = getattr(message, "document", None)
+    if photos:
+        file_id = str(photos[-1].file_id)
+    elif document and getattr(document, "file_id", None):
+        file_id = str(document.file_id)
+    else:
+        raise ValueError("Generated image message has no Telegram file")
+    if not artifact_id:
+        artifact = memory.create_generated_artifact(
+            owner_user_id,
+            "image",
+            instruction,
+            mode=mode,
+            topic=topic,
+            telegram_file_id=file_id,
+        )
+        artifact_id = str(artifact["artifact_id"])
+        version = int(artifact["current_version"])
+    memory.bind_generated_artifact_message(
+        artifact_id, version, owner_user_id, int(message.chat_id), int(message.message_id)
+    )
+    return {"artifact_id": artifact_id, "version": version, "telegram_file_id": file_id}
+
+
 def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
     if len(text) <= limit:
         return [text]
@@ -3804,7 +3905,13 @@ async def content_command(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
 
     try:
         result = await generate_content(user_id, topic, task)
-        await reply_long(update, result, ANGLE_KEYBOARD if is_angle_engine_message(result) else CONTENT_KEYBOARD)
+        await reply_generated_text(
+            update,
+            result,
+            mode=task,
+            topic=topic,
+            keyboard=ANGLE_KEYBOARD if is_angle_engine_message(result) else CONTENT_KEYBOARD,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("content_command failed")
         await reply_long(update, f"⚠️ Не смог сгенерировать материал. Причина: {exc}", CONTENT_KEYBOARD)
@@ -3858,7 +3965,9 @@ async def gaming_command(update: Update, context: ContextTypes.DEFAULT_TYPE, *, 
             "post",
             extra_instruction=gaming_vertical.prompt_context("naz", plan),
         )
-        await reply_long(update, result, CONTENT_KEYBOARD)
+        await reply_generated_text(
+            update, result, mode="gaming_commercial" if commercial else "gaming", topic=topic, keyboard=CONTENT_KEYBOARD
+        )
         await update.message.reply_text(
             f"🎮 {plan['intent']} · {plan['format']} · {plan['commercial_angle']}\n"
             "Это черновик: игровая автопубликация пока выключена."
@@ -3893,7 +4002,7 @@ async def insight_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         result = await generate_story_insight(user_id, topic)
-        await reply_long(update, result, CONTENT_KEYBOARD)
+        await reply_generated_text(update, result, mode="insight", topic=topic, keyboard=CONTENT_KEYBOARD)
     except Exception as exc:  # noqa: BLE001
         logger.exception("insight failed")
         await reply_long(update, f"⚠️ Инсайт не собрался. Причина: {exc}", CONTENT_KEYBOARD)
@@ -3989,7 +4098,13 @@ async def scan_sources_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
         item = random.choice(candidates[:8])
         post_text = await generate_source_interpretation(update.effective_user.id, item, save_generated=False)
-        await reply_long(update, f"{post_text}\n\n---\nЧерновик из:\n{format_source_item(item)}", CONTENT_KEYBOARD)
+        await reply_generated_text(
+            update,
+            f"{post_text}\n\n---\nЧерновик из:\n{format_source_item(item)}",
+            mode="scan_sources",
+            topic=str(item.get("title", "")),
+            keyboard=CONTENT_KEYBOARD,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("scan_sources failed")
         await reply_long(update, f"⚠️ Не смог собрать интерпретацию источника. Причина: {exc}", CONTROL_KEYBOARD)
@@ -4064,7 +4179,13 @@ async def agent_content_command(update: Update, context: ContextTypes.DEFAULT_TY
         prefix = f"📥 content-agent: {date_text or 'latest'}"
         if risks:
             prefix += "\n⚠️ Риски найдены: " + ", ".join(risks)
-        await reply_long(update, f"{prefix}\n\n{package}", CONTENT_KEYBOARD)
+        await reply_generated_text(
+            update,
+            f"{prefix}\n\n{package}",
+            mode="agent_content",
+            topic=focus or date_text,
+            keyboard=CONTENT_KEYBOARD,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("agent_content failed")
         await reply_long(update, f"⚠️ Не смог собрать редакторский пакет. Причина: {exc}", CONTROL_KEYBOARD)
@@ -4264,10 +4385,13 @@ async def process_agent_content_date(
             plan_id=plan.plan_id,
             editorial_plan=plan_dict,
         )
-        await notify_admin(
+        await notify_admin_generated(
             bot,
             f"📥 Agent Content {resolved_date}: orchestrated draft готов для plan_id {plan.plan_id}.\n\n"
             f"{package.final_text[:3200]}\n\nДля публикации: /publish_agent_content {resolved_date}",
+            mode="agent_content_sync",
+            topic=plan.topic,
+            source_ref=plan.plan_id,
         )
         mark_agent_content_seen(resolved_date, manifest_hash)
         return f"✅ Agent Content {resolved_date}: orchestrated draft imported."
@@ -4364,7 +4488,24 @@ async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
         images, image_prompt = await generate_two_images_for_post(user_id, topic, post_text)
-        await send_post_with_images(context.bot, update.effective_chat.id, post_text, images)
+        for index, image in enumerate(images, start=1):
+            bio = BytesIO(image)
+            bio.name = f"naz_image_{index}.png"
+            sent = await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=bio,
+                caption=f"Иллюстрация {index}/{len(images)}. Ответь на неё инструкцией, чтобы создать новую версию.",
+            )
+            bind_generated_image_message(
+                sent,
+                user_id,
+                instruction=image_prompt,
+                mode="imagepost_image",
+                topic=topic,
+            )
+        await reply_generated_text(
+            update, post_text, mode="imagepost_text", topic=topic, keyboard=CONTENT_KEYBOARD
+        )
 
         memory.save_generated_post(
             user_id=user_id,
@@ -4396,7 +4537,10 @@ async def image_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if image:
         bio = BytesIO(image)
         bio.name = "naz_image.png"
-        await update.message.reply_photo(photo=bio, caption="🖼 Готово", reply_markup=CONTENT_KEYBOARD)
+        sent = await update.message.reply_photo(photo=bio, caption="🖼 Готово", reply_markup=CONTENT_KEYBOARD)
+        bind_generated_image_message(
+            sent, user_id, instruction=topic, mode="image", topic=topic
+        )
     else:
         await update.message.reply_text("⚠️ Картинка не сгенерировалась. Проверь HF_TOKEN и доступ к модели.", reply_markup=CONTENT_KEYBOARD)
 
@@ -4460,7 +4604,13 @@ async def void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         prefix = "🕳 Мысли после разговора · draft"
         if risks:
             prefix += "\n⚠️ Риски найдены: " + ", ".join(risks)
-        await reply_long(update, f"{prefix}\n\n{post_text}", CONTENT_KEYBOARD)
+        await reply_generated_text(
+            update,
+            f"{prefix}\n\n{post_text}",
+            mode="void",
+            topic="Void Entity crosspost",
+            keyboard=CONTENT_KEYBOARD,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("void crosspost failed")
         await reply_long(update, f"⚠️ Не смог собрать мысль после разговора. Причина: {exc}", MAIN_KEYBOARD)
@@ -5291,7 +5441,9 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await send_typing(update)
         try:
             result = await generate_selected_angle_content(user_id)
-            await reply_long(update, result, ANGLE_KEYBOARD)
+            await reply_generated_text(
+                update, result, mode="angle_post", topic="selected_angle", keyboard=ANGLE_KEYBOARD
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("angle generation failed")
             await update.message.reply_text(f"⚠️ Не получилось написать по углу. Причина: {exc}", reply_markup=ANGLE_KEYBOARD)
@@ -5430,7 +5582,13 @@ async def handle_pending_action(update: Update, context: ContextTypes.DEFAULT_TY
                 prefix = "🕳 Void → Naz draft"
                 if risks:
                     prefix += "\n⚠️ Риски: " + ", ".join(risks)
-                await reply_long(update, f"{prefix}\n\n{post_text}", CROSSPOST_KEYBOARD)
+                await reply_generated_text(
+                    update,
+                    f"{prefix}\n\n{post_text}",
+                    mode="void_draft",
+                    topic="Void Entity crosspost",
+                    keyboard=CROSSPOST_KEYBOARD,
+                )
                 return True
 
             if not CHANNEL_ID:
@@ -5468,13 +5626,22 @@ async def handle_pending_action(update: Update, context: ContextTypes.DEFAULT_TY
             if image:
                 bio = BytesIO(image)
                 bio.name = "naz_image.png"
-                await update.message.reply_photo(photo=bio, caption="🖼 Готово", reply_markup=CONTENT_KEYBOARD)
+                sent = await update.message.reply_photo(photo=bio, caption="🖼 Готово", reply_markup=CONTENT_KEYBOARD)
+                bind_generated_image_message(
+                    sent, user_id, instruction=topic, mode="image", topic=topic
+                )
             else:
                 await update.message.reply_text("⚠️ Картинка не сгенерировалась. Проверь HF_TOKEN.", reply_markup=CONTENT_KEYBOARD)
             return True
 
         result = await generate_content(user_id, topic, action)
-        await reply_long(update, result, ANGLE_KEYBOARD if is_angle_engine_message(result) else CONTENT_KEYBOARD)
+        await reply_generated_text(
+            update,
+            result,
+            mode=action,
+            topic=topic,
+            keyboard=ANGLE_KEYBOARD if is_angle_engine_message(result) else CONTENT_KEYBOARD,
+        )
         return True
     except Exception as exc:  # noqa: BLE001
         logger.exception("pending action failed")
@@ -5720,10 +5887,24 @@ async def send_dialog_image(update: Update, instruction: str, reference_bytes: O
         payload.name = "naz-image.png"
         caption = sanitize_dialog_text(f"Готово. {instruction[:160]}")
         try:
-            await update.message.reply_photo(photo=payload, caption=caption, reply_markup=keyboard)
+            sent = await update.message.reply_photo(photo=payload, caption=caption, reply_markup=keyboard)
+            bind_generated_image_message(
+                sent,
+                update.effective_user.id,
+                instruction=instruction,
+                mode="dialog_image",
+                topic=instruction[:200],
+            )
         except BadRequest:
             payload.seek(0)
-            await update.message.reply_document(document=payload, caption=caption, reply_markup=keyboard)
+            sent = await update.message.reply_document(document=payload, caption=caption, reply_markup=keyboard)
+            bind_generated_image_message(
+                sent,
+                update.effective_user.id,
+                instruction=instruction,
+                mode="dialog_image",
+                topic=instruction[:200],
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Dialog image request failed | reference=%s | error=%s", bool(reference_bytes), type(exc).__name__)
         message = str(exc) if isinstance(exc, (ValueError, ReferenceImageUnsupportedError)) else (
@@ -5752,6 +5933,145 @@ async def handle_photo_instruction(update: Update, context: ContextTypes.DEFAULT
     await send_dialog_image(update, instruction, reference)
 
 
+def generated_revision_keyboard(revision_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Применить", callback_data=f"genrev_apply:{revision_id}"),
+            InlineKeyboardButton("Отмена", callback_data=f"genrev_cancel:{revision_id}"),
+        ]]
+    )
+
+
+async def handle_generated_artifact_reply(update: Update, text: str) -> bool:
+    """Turn a reply to an editable Naz result into a confirmation, never a publication."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return False
+    replied = update.message.reply_to_message
+    if not replied:
+        return False
+    chat_id = getattr(update.effective_chat, "id", None)
+    message_id = getattr(replied, "message_id", None)
+    if chat_id is None or message_id is None:
+        return False
+    artifact = memory.get_generated_artifact_for_reply(
+        chat_id, message_id, update.effective_user.id
+    )
+    if not artifact:
+        return False
+    if int(artifact["bound_version"]) != int(artifact["current_version"]):
+        await update.message.reply_text(
+            "Это уже не последняя версия. Ответь на самое свежее сообщение Naz — старую версию я не перезапишу."
+        )
+        return True
+    revision_kind = "text_replace" if artifact["kind"] == "text" else "image_instruction"
+    try:
+        pending = memory.create_pending_generated_revision(
+            str(artifact["artifact_id"]),
+            update.effective_user.id,
+            int(artifact["current_version"]),
+            revision_kind,
+            text,
+        )
+    except ValueError:
+        await update.message.reply_text("Не смог привязать правку к актуальной версии. Ответь на последнее сообщение Naz.")
+        return True
+    if revision_kind == "text_replace":
+        prompt = (
+            f"Заменить текст целиком и создать версию v{int(artifact['current_version']) + 1}?\n\n"
+            "После подтверждения я покажу новую версию. Ничего не публикую."
+        )
+    else:
+        prompt = (
+            f"Перегенерировать изображение по этой инструкции и создать версию "
+            f"v{int(artifact['current_version']) + 1}?\n\n"
+            "Платный вызов генератора произойдёт только после подтверждения. Ничего не публикую."
+        )
+    await update.message.reply_text(
+        prompt, reply_markup=generated_revision_keyboard(str(pending["revision_id"]))
+    )
+    return True
+
+
+async def generated_revision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user or not query.data:
+        return
+    await query.answer()
+    action, revision_id = query.data.split(":", 1)
+    user_id = update.effective_user.id
+    if action == "genrev_cancel":
+        cancelled = memory.cancel_pending_generated_revision(revision_id, user_id)
+        await query.edit_message_text(
+            "Правка отменена. Исходная версия не изменена." if cancelled else "Эта правка уже обработана или недоступна."
+        )
+        return
+
+    pending = memory.get_pending_generated_revision(revision_id, user_id)
+    if not pending or pending["status"] != "pending" or int(pending["base_version"]) != int(pending["current_version"]):
+        await query.edit_message_text("Эта правка уже обработана или относится к устаревшей версии.")
+        return
+    if pending["kind"] == "text_replace":
+        applied = memory.apply_generated_revision(revision_id, user_id)
+        if not applied:
+            await query.edit_message_text("Версия успела измениться. Правка не применена.")
+            return
+        await query.edit_message_text(f"Принято: версия v{applied['version']}. Ничего не опубликовано.")
+        await send_generated_text_to_chat(
+            context.bot,
+            query.message.chat_id,
+            user_id,
+            str(applied["content"]),
+            mode=str(pending.get("mode") or "revision"),
+            topic=str(pending.get("topic") or ""),
+            artifact_id=str(applied["artifact_id"]),
+            version=int(applied["version"]),
+        )
+        return
+
+    claimed = memory.begin_image_generated_revision(revision_id, user_id)
+    if not claimed:
+        await query.edit_message_text("Эта правка уже запущена, обработана или устарела.")
+        return
+    await query.edit_message_text("Принято. Создаю новую версию изображения; ничего не публикую.")
+    try:
+        telegram_file = await context.bot.get_file(str(claimed["telegram_file_id"]))
+        reference = bytes(await telegram_file.download_as_bytearray())
+        validate_reference_image(reference)
+        image, _ = await process_dialog_image_request(
+            user_id, str(claimed["proposed_content"]), reference_bytes=reference
+        )
+        payload = BytesIO(image)
+        payload.name = "naz-image-revision.png"
+        sent = await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=payload,
+            caption=f"Версия v{int(claimed['base_version']) + 1}. Ничего не опубликовано.",
+        )
+        file_id = str(sent.photo[-1].file_id)
+        applied = memory.apply_generated_revision(
+            revision_id, user_id, telegram_file_id=file_id
+        )
+        if not applied:
+            logger.error("Generated image revision could not be committed | revision_id=%s", revision_id)
+            return
+        bind_generated_image_message(
+            sent,
+            user_id,
+            instruction=str(claimed["proposed_content"]),
+            mode=str(pending.get("mode") or "image_revision"),
+            topic=str(pending.get("topic") or ""),
+            artifact_id=str(applied["artifact_id"]),
+            version=int(applied["version"]),
+        )
+    except Exception as exc:  # noqa: BLE001
+        memory.fail_image_generated_revision(revision_id, user_id)
+        logger.warning("Generated image revision failed | error=%s", type(exc).__name__)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Не удалось создать новую версию изображения. Исходная версия сохранена; публикации не было.",
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user or not update.message.text:
         return
@@ -5760,6 +6080,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text.strip()
 
     if await handle_delegated_reply(update, context, text):
+        return
+
+    if await handle_generated_artifact_reply(update, text):
         return
 
     if is_admin(user_id) and update.message.reply_to_message:
@@ -5829,7 +6152,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_typing(update)
     try:
         answer = sanitize_dialog_text(await generate_answer(user_id, text))
-        await reply_long(update, answer, ANGLE_KEYBOARD if is_angle_engine_message(answer) else main_keyboard_for(user_id))
+        await reply_generated_text(
+            update,
+            answer,
+            mode="dialog",
+            topic=text[:200],
+            keyboard=ANGLE_KEYBOARD if is_angle_engine_message(answer) else main_keyboard_for(user_id),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("handle_message failed")
         await reply_long(update, f"⚠️ Naz споткнулся. Причина: {exc}", main_keyboard_for(user_id))
@@ -6198,6 +6527,19 @@ async def notify_admin(bot, text: str) -> None:
         await send_long_to_chat(bot, ADMIN_ID, text)
     except TelegramError as exc:
         logger.warning("Admin notification failed: %s", exc)
+
+
+async def notify_admin_generated(
+    bot, text: str, *, mode: str, topic: str = "", source_ref: str = ""
+) -> None:
+    if not ADMIN_ID:
+        return
+    try:
+        await send_generated_text_to_chat(
+            bot, ADMIN_ID, ADMIN_ID, text, mode=mode, topic=topic, source_ref=source_ref
+        )
+    except TelegramError as exc:
+        logger.warning("Generated admin notification failed: %s", exc)
 
 
 def unique_recent_reasons(reasons: List[str], limit: int = 5) -> List[str]:
@@ -7530,6 +7872,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("contact_add", contact_add_command))
     application.add_handler(
         CallbackQueryHandler(contact_message_callback, pattern=r"^contact_(?:send|cancel):\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(generated_revision_callback, pattern=r"^genrev_(?:apply|cancel):[A-Za-z0-9_-]+$")
     )
 
     # A shared contact follows /delegate and is used only for this one conversation.

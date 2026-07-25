@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -161,6 +162,67 @@ def init_db() -> None:
         _ensure_column(conn, "generated_posts", "external_job_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "generated_posts", "plan_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "generated_posts", "editorial_plan_json", "TEXT NOT NULL DEFAULT ''")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generated_artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('text', 'image')),
+                mode TEXT NOT NULL DEFAULT '',
+                topic TEXT NOT NULL DEFAULT '',
+                source_ref TEXT NOT NULL DEFAULT '',
+                current_version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(conn, "generated_artifacts", "source_ref", "TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generated_artifact_versions (
+                artifact_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                telegram_file_id TEXT NOT NULL DEFAULT '',
+                revision_kind TEXT NOT NULL DEFAULT 'generated',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (artifact_id, version),
+                FOREIGN KEY (artifact_id) REFERENCES generated_artifacts(artifact_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generated_artifact_bindings (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                artifact_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id),
+                FOREIGN KEY (artifact_id) REFERENCES generated_artifacts(artifact_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_generated_revisions (
+                revision_id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                base_version INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('text_replace', 'image_instruction')),
+                proposed_content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (artifact_id) REFERENCES generated_artifacts(artifact_id)
+            )
+            """
+        )
 
         conn.execute(
             """
@@ -392,6 +454,14 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_user_created ON chat_history(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_user_created ON memory_items(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON generated_posts(created_at)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_generated_artifact_owner "
+            "ON generated_artifacts(owner_user_id, updated_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_generated_revision_owner "
+            "ON pending_generated_revisions(owner_user_id, status)"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signatures_user_created ON content_signatures(user_id, id)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_semantic_history_user_created "
@@ -406,6 +476,283 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pending_contact_owner ON pending_contact_messages(owner_user_id, status)"
         )
+
+
+def create_generated_artifact(
+    owner_user_id: int,
+    kind: str,
+    content: str = "",
+    *,
+    mode: str = "",
+    topic: str = "",
+    source_ref: str = "",
+    telegram_file_id: str = "",
+) -> Dict[str, Any]:
+    """Create the first immutable version of a user-editable generated artifact."""
+    if kind not in {"text", "image"}:
+        raise ValueError("Unsupported generated artifact kind")
+    artifact_id = secrets.token_urlsafe(12)
+    now = utc_now()
+    init_db()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO generated_artifacts(
+                artifact_id, owner_user_id, kind, mode, topic, source_ref,
+                current_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (artifact_id, owner_user_id, kind, mode[:80], topic[:500], source_ref[:200], now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO generated_artifact_versions(
+                artifact_id, version, content, telegram_file_id, revision_kind, created_at
+            ) VALUES (?, 1, ?, ?, 'generated', ?)
+            """,
+            (artifact_id, content, telegram_file_id, now),
+        )
+    return {
+        "artifact_id": artifact_id,
+        "owner_user_id": owner_user_id,
+        "kind": kind,
+        "mode": mode[:80],
+        "topic": topic[:500],
+        "source_ref": source_ref[:200],
+        "current_version": 1,
+        "content": content,
+        "telegram_file_id": telegram_file_id,
+    }
+
+
+def bind_generated_artifact_message(
+    artifact_id: str,
+    version: int,
+    owner_user_id: int,
+    chat_id: int,
+    message_id: int,
+) -> None:
+    init_db()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO generated_artifact_bindings(
+                chat_id, message_id, artifact_id, version, owner_user_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, message_id, artifact_id, version, owner_user_id, utc_now()),
+        )
+
+
+def get_generated_artifact_for_reply(
+    chat_id: int,
+    message_id: int,
+    owner_user_id: int,
+) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT a.*, b.version AS bound_version, v.content, v.telegram_file_id
+            FROM generated_artifact_bindings b
+            JOIN generated_artifacts a ON a.artifact_id=b.artifact_id
+            JOIN generated_artifact_versions v
+              ON v.artifact_id=b.artifact_id AND v.version=a.current_version
+            WHERE b.chat_id=? AND b.message_id=? AND b.owner_user_id=?
+              AND a.owner_user_id=?
+            """,
+            (chat_id, message_id, owner_user_id, owner_user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_pending_generated_revision(
+    artifact_id: str,
+    owner_user_id: int,
+    base_version: int,
+    kind: str,
+    proposed_content: str,
+) -> Dict[str, Any]:
+    if kind not in {"text_replace", "image_instruction"}:
+        raise ValueError("Unsupported generated revision kind")
+    proposed = proposed_content.strip()
+    if not proposed:
+        raise ValueError("Revision must not be empty")
+    revision_id = secrets.token_urlsafe(9)
+    now = utc_now()
+    init_db()
+    with db() as conn:
+        artifact = conn.execute(
+            "SELECT owner_user_id, current_version FROM generated_artifacts WHERE artifact_id=?",
+            (artifact_id,),
+        ).fetchone()
+        if not artifact or int(artifact["owner_user_id"]) != owner_user_id:
+            raise ValueError("Generated artifact is unavailable")
+        if int(artifact["current_version"]) != base_version:
+            raise ValueError("Generated artifact version is stale")
+        conn.execute(
+            """
+            UPDATE pending_generated_revisions
+            SET status='superseded', updated_at=?
+            WHERE artifact_id=? AND owner_user_id=? AND status='pending'
+            """,
+            (now, artifact_id, owner_user_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO pending_generated_revisions(
+                revision_id, artifact_id, owner_user_id, base_version,
+                kind, proposed_content, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (revision_id, artifact_id, owner_user_id, base_version, kind, proposed, now, now),
+        )
+    return {
+        "revision_id": revision_id,
+        "artifact_id": artifact_id,
+        "owner_user_id": owner_user_id,
+        "base_version": base_version,
+        "kind": kind,
+        "proposed_content": proposed,
+        "status": "pending",
+    }
+
+
+def get_pending_generated_revision(revision_id: str, owner_user_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT r.*, a.kind AS artifact_kind, a.mode, a.topic,
+                   a.current_version, v.telegram_file_id
+            FROM pending_generated_revisions r
+            JOIN generated_artifacts a ON a.artifact_id=r.artifact_id
+            JOIN generated_artifact_versions v
+              ON v.artifact_id=a.artifact_id AND v.version=a.current_version
+            WHERE r.revision_id=? AND r.owner_user_id=? AND a.owner_user_id=?
+            """,
+            (revision_id, owner_user_id, owner_user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def cancel_pending_generated_revision(revision_id: str, owner_user_id: int) -> bool:
+    init_db()
+    with db() as conn:
+        result = conn.execute(
+            """
+            UPDATE pending_generated_revisions SET status='cancelled', updated_at=?
+            WHERE revision_id=? AND owner_user_id=? AND status='pending'
+            """,
+            (utc_now(), revision_id, owner_user_id),
+        )
+    return result.rowcount == 1
+
+
+def begin_image_generated_revision(revision_id: str, owner_user_id: int) -> Optional[Dict[str, Any]]:
+    """Atomically claim a current image revision before making the paid provider call."""
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT r.*, a.current_version, v.telegram_file_id
+            FROM pending_generated_revisions r
+            JOIN generated_artifacts a ON a.artifact_id=r.artifact_id
+            JOIN generated_artifact_versions v
+              ON v.artifact_id=a.artifact_id AND v.version=a.current_version
+            WHERE r.revision_id=? AND r.owner_user_id=? AND a.owner_user_id=?
+              AND r.kind='image_instruction' AND r.status='pending'
+              AND r.base_version=a.current_version
+            """,
+            (revision_id, owner_user_id, owner_user_id),
+        ).fetchone()
+        if not row:
+            return None
+        result = conn.execute(
+            """
+            UPDATE pending_generated_revisions SET status='processing', updated_at=?
+            WHERE revision_id=? AND owner_user_id=? AND status='pending'
+            """,
+            (utc_now(), revision_id, owner_user_id),
+        )
+        if result.rowcount != 1:
+            return None
+    return dict(row)
+
+
+def fail_image_generated_revision(revision_id: str, owner_user_id: int) -> None:
+    init_db()
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE pending_generated_revisions SET status='failed', updated_at=?
+            WHERE revision_id=? AND owner_user_id=? AND status='processing'
+            """,
+            (utc_now(), revision_id, owner_user_id),
+        )
+
+
+def apply_generated_revision(
+    revision_id: str,
+    owner_user_id: int,
+    *,
+    telegram_file_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Apply once, only if the pending revision still targets the current version."""
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT r.*, a.kind, a.current_version
+            FROM pending_generated_revisions r
+            JOIN generated_artifacts a ON a.artifact_id=r.artifact_id
+            WHERE r.revision_id=? AND r.owner_user_id=? AND a.owner_user_id=?
+              AND r.status IN ('pending', 'processing')
+            """,
+            (revision_id, owner_user_id, owner_user_id),
+        ).fetchone()
+        if not row or int(row["base_version"]) != int(row["current_version"]):
+            return None
+        if row["kind"] == "image_instruction" and row["status"] != "processing":
+            return None
+        if row["kind"] == "text_replace" and row["status"] != "pending":
+            return None
+        new_version = int(row["current_version"]) + 1
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO generated_artifact_versions(
+                artifact_id, version, content, telegram_file_id, revision_kind, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["artifact_id"], new_version, row["proposed_content"],
+                telegram_file_id, row["kind"], now,
+            ),
+        )
+        updated = conn.execute(
+            """
+            UPDATE generated_artifacts SET current_version=?, updated_at=?
+            WHERE artifact_id=? AND owner_user_id=? AND current_version=?
+            """,
+            (new_version, now, row["artifact_id"], owner_user_id, row["base_version"]),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("Generated artifact changed during revision")
+        conn.execute(
+            """
+            UPDATE pending_generated_revisions SET status='applied', updated_at=?
+            WHERE revision_id=?
+            """,
+            (now, revision_id),
+        )
+    return {
+        "artifact_id": row["artifact_id"],
+        "version": new_version,
+        "kind": row["kind"],
+        "content": row["proposed_content"],
+        "telegram_file_id": telegram_file_id,
+    }
 
 
 def create_delegation_invite(
