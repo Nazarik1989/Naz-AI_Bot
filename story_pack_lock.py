@@ -3,12 +3,36 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import BinaryIO
 
 
 class StoryPackLockError(RuntimeError):
     pass
+
+
+def ensure_private_group_access(path: Path, *, directory: bool) -> None:
+    """Share a private Story path with the parent directory's Unix group.
+
+    Naz main may run as root while the renderer runs as the unprivileged
+    ``naz`` user.  Group inheritance keeps the queue private from everyone
+    else while allowing both processes to update the same manifest and lock.
+    Windows has no equivalent deployment ownership model, so this is a no-op
+    there.
+    """
+    if os.name == "nt":
+        return
+    target = Path(path)
+    if target.is_symlink():
+        raise OSError("unsafe Story pack symlink")
+    parent_gid = target.parent.stat().st_gid
+    current = target.stat()
+    if current.st_gid != parent_gid:
+        os.chown(target, -1, parent_gid, follow_symlinks=False)
+    desired_mode = 0o2770 if directory else 0o660
+    if stat.S_IMODE(current.st_mode) != desired_mode:
+        target.chmod(desired_mode)
 
 
 class AdvisoryFileLock:
@@ -21,7 +45,12 @@ class AdvisoryFileLock:
 
     def __enter__(self) -> "AdvisoryFileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o660)
+        try:
+            ensure_private_group_access(self.path, directory=False)
+        except OSError:
+            os.close(descriptor)
+            raise
         stream = os.fdopen(descriptor, "r+b", buffering=0)
         try:
             if os.name == "nt":

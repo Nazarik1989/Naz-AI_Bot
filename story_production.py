@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from editorial_orchestrator import EditorialPlan
+from story_pack_lock import ensure_private_group_access
 
 
 STORY_SCHEMA = "naz-story-pack-v2"
@@ -396,6 +397,7 @@ def _atomic_text(path: Path, value: str) -> None:
     temporary = Path(raw)
     try:
         temporary.write_text(value, encoding="utf-8")
+        ensure_private_group_access(temporary, directory=False)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -411,6 +413,7 @@ def _atomic_create_text(path: Path, value: str) -> bool:
             stream.write(value)
             stream.flush()
             os.fsync(stream.fileno())
+        ensure_private_group_access(temporary, directory=False)
         try:
             os.link(temporary, path)
             return True
@@ -659,12 +662,18 @@ def persist_story_queue(pack: StoryPackPlan, storage_root: Path) -> Path:
     if root not in pack_dir.parents:
         raise StoryPlanError("unsafe pack path")
     manifest = pack_dir / "story_manifest.json"
-    (pack_dir / "stories").mkdir(parents=True, exist_ok=True)
-    (pack_dir / "reels").mkdir(parents=True, exist_ok=True)
+    stories_dir = pack_dir / "stories"
+    reels_dir = pack_dir / "reels"
+    stories_dir.mkdir(parents=True, exist_ok=True)
+    reels_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_group_access(pack_dir, directory=True)
+    ensure_private_group_access(stories_dir, directory=True)
+    ensure_private_group_access(reels_dir, directory=True)
     created = _atomic_create_text(
         manifest,
         json.dumps(_production_payload(pack), ensure_ascii=False, indent=2) + "\n",
     )
+    ensure_private_group_access(manifest, directory=False)
     existing = read_manifest(manifest)
     if existing.get("plan_id") != pack.plan_id:
         raise StoryPlanError("stored manifest plan_id mismatch")
@@ -676,6 +685,7 @@ def persist_story_queue(pack: StoryPackPlan, storage_root: Path) -> Path:
         _atomic_create_text(pack_dir / "caption_pack.md", caption)
     elif not (pack_dir / "caption_pack.md").exists():
         _atomic_create_text(pack_dir / "caption_pack.md", caption)
+    ensure_private_group_access(pack_dir / "caption_pack.md", directory=False)
     return pack_dir
 
 
@@ -688,21 +698,30 @@ def persist_dry_run(pack: StoryPackPlan, storage_root: Path) -> Path:
     manifest = pack_dir / "story_manifest.json"
     existing: Mapping[str, Any] | None = None
     if manifest.is_file():
+        ensure_private_group_access(pack_dir, directory=True)
+        ensure_private_group_access(manifest, directory=False)
         existing = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(existing, dict) or existing.get("plan_id") != pack.plan_id:
             raise StoryPlanError("stored manifest plan_id mismatch")
         if manifest_has_current_production_contract(existing):
             return pack_dir
-    (pack_dir / "stories").mkdir(parents=True, exist_ok=True)
-    (pack_dir / "reels").mkdir(parents=True, exist_ok=True)
+    stories_dir = pack_dir / "stories"
+    reels_dir = pack_dir / "reels"
+    stories_dir.mkdir(parents=True, exist_ok=True)
+    reels_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_group_access(pack_dir, directory=True)
+    ensure_private_group_access(stories_dir, directory=True)
+    ensure_private_group_access(reels_dir, directory=True)
     payload = _production_payload(pack)
     if existing is not None:
         _preserve_render_statuses(payload, existing)
     atomic_json(manifest, payload)
+    ensure_private_group_access(manifest, directory=False)
     caption = (
         f"# Caption pack\n\nPlan ID: {pack.plan_id}\nContinuity ID: {pack.continuity_id}\n\n"
         f"Main: {pack.caption_plan['main']}\n\nShort: {pack.caption_plan['short']}\n"
     )
     if not (pack_dir / "caption_pack.md").exists():
         _atomic_create_text(pack_dir / "caption_pack.md", caption)
+    ensure_private_group_access(pack_dir / "caption_pack.md", directory=False)
     return pack_dir
