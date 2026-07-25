@@ -7044,10 +7044,32 @@ def chronicle_source_row(
     ]
     facts = tuple(dict.fromkeys(chunks))[:7]
     folded = safe_context.casefold()
-    action_stems = ("сделал", "добавил", "исправил", "запустил", "проверил", "изменил", "собрал", "failed", "fixed", "tested", "built")
-    process_stems = ("шаг", "сначала", "затем", "после", "до ", "лог", "тест", "сбор", "deploy", "build", "retry")
-    result_stems = ("результат", "стало", "получилось", "заработал", "исчез", "нашли", "вывод", "result", "worked", "changed")
-    causal_stems = ("потому", "поэтому", "из-за", "после", "привел", "привёл", "because", "therefore", "then")
+    action_stems = (
+        "дела", "добав", "исправ", "запуст", "провер", "измен", "собра",
+        "переста", "переш", "решил", "попрос", "отключ", "настро", "перенес",
+        "перенёс", "замен", "закрыл", "открыл", "оплат", "разобра", "почин",
+        "убрал", "вернул", "failed", "fixed", "tested", "built", "changed",
+    )
+    process_stems = (
+        "шаг", "сначала", "затем", "после", "до ", "когда", "потом", "вместо",
+        "пришлось", "оказалось", "через", "лог", "тест", "сбор", "deploy", "build",
+        "retry",
+    )
+    result_stems = (
+        "результат", "стало", "получилось", "заработ", "исчез", "нашли", "вывод",
+        "преврат", "продолж", "готов", "работает", "выдерж", "result", "worked",
+        "changed",
+    )
+    causal_stems = (
+        "потому", "поэтому", "из-за", "после", "привел", "привёл", "помог",
+        "чтобы", "теперь", "в итоге", "тогда", "так что", "because", "therefore",
+        "then", "after", "so that",
+    )
+    # A causal work chronicle can express its sequence through explicit
+    # process markers ("сначала", "после", build/log steps) even when each
+    # bounded fact does not repeat "потому/поэтому".  The independent gates
+    # below still require a concrete action, a visual process and a real result.
+    evidence_stems = (*action_stems, *causal_stems, *result_stems, *process_stems)
     risk_values = tuple(str(item).casefold() for item in risks)
     return {
         "source_ref": source_ref,
@@ -7057,7 +7079,14 @@ def chronicle_source_row(
         "source_verified": bool(source_ref and facts),
         "concrete_action": any(stem in folded for stem in action_stems),
         "visualizable_process": any(stem in folded for stem in process_stems),
-        "causal_bits": min(7, sum(1 for item in facts if any(stem in item.casefold() for stem in (*action_stems, *causal_stems)))),
+        "causal_bits": min(
+            7,
+            sum(
+                1
+                for item in facts
+                if any(stem in item.casefold() for stem in evidence_stems)
+            ),
+        ),
         "real_result": any(stem in folded for stem in result_stems),
         "contains_secrets": any("secret" in item or "token" in item or "credential" in item for item in risk_values),
         "contains_private_data": any("private" in item or "personal" in item or "персон" in item for item in risk_values),
