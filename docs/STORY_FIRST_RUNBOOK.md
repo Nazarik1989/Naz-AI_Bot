@@ -1,7 +1,7 @@
 # Naz Story-First production runbook
 
 Story-first planning is part of the normal Agent Content route, but media work
-is deliberately separate. The bot atomically writes a `naz-story-pack-v2`
+is deliberately separate. The bot atomically writes a `naz-story-pack-v3`
 manifest and returns. `naz_story_worker.py` resumes one state transition at a
 time and contains no Telegram or VK publication path.
 
@@ -61,11 +61,21 @@ replacement.
 `NAZ_VIDEO_REFERENCE_DIR` must point outside Git to the private folder with
 `naz-primary.jpg`, `naz-secondary.jpg`, and `naz-reference-profile.json`.
 Primary is the frontal identity reference; secondary is the three-quarter
-identity reference. Exactly one is used per Naz scene. They are never sent as
-Runway first/last keyframes. Height/build guidance from the private profile is
-added only to medium/wide Naz shots and is ignored for close-ups, macro and
-object-only scenes. Inputs are normalized in memory to a valid 720×1280 first
-frame; private binaries and the profile stay outside Git.
+identity reference. Exactly one is used only while generating a directed scene
+keyframe. Reels Maker must replace the avatar background, pose, framing and
+lighting with the approved Naz AI Lab treatment. The resulting keyframe, never
+the avatar itself, becomes the Runway video first frame. Height/build guidance
+from the private profile is added only to medium/wide Naz shots and is ignored
+for close-ups, macro and object-only scenes. Provider images are normalized in
+memory to a valid 720×1280 first frame; private binaries and the profile stay
+outside Git.
+
+The approval card lists every scene's location, physical action and camera plus
+the estimated Runway credits. A v3 pack first creates one asynchronous directed
+keyframe per scene (`gen4_image_turbo` with `@Naz` for identity scenes,
+`gen4_image` for object-only scenes), then animates that immutable keyframe.
+No keyframe or video task is submitted before explicit approval. v1/v2 packs
+remain inspectable but are read-only and cannot silently use the old direct-avatar route.
 
 `NAZ_STORY_MUSIC_LIBRARY` may point to a private music folder. Each audio file
 must have a same-name JSON sidecar, for example `track.m4a.json`:

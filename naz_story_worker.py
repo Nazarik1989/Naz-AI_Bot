@@ -22,8 +22,9 @@ from typing import Any, Mapping
 import story_production
 from story_audio_evidence import eligible_segment_starts
 from story_media_composer import MediaComposer, MediaError, checksum, load_music_library
-from story_pack_lock import AdvisoryFileLock, StoryPackLock, StoryPackLockError
+from story_pack_lock import AdvisoryFileLock, StoryPackLock, StoryPackLockError, ensure_private_group_access
 from story_video_provider import (
+    KeyframeRequest,
     ProviderError,
     SceneRequest,
     VideoProvider,
@@ -43,6 +44,9 @@ SAFE_FAILURE_CODES = {
     "media_pixel_format_invalid", "media_probe_invalid", "media_resolution_invalid",
     "media_tool_failed", "media_tool_unavailable_or_timed_out", "overlay_text_unsafe",
     "provider_download_failed", "provider_download_not_mp4", "provider_job_id_missing",
+    "provider_download_not_image", "keyframe_identity_tag_missing",
+    "keyframe_artifact_invalid", "keyframe_prompt_invalid", "keyframe_prompt_too_long",
+    "daily_keyframe_limit_reached",
     "provider_cancel_uncertain",
     "provider_endpoint_not_found", "provider_input_invalid", "provider_output_url_missing",
     "provider_payment_required", "provider_permission_denied", "provider_request_rejected",
@@ -73,6 +77,9 @@ DEFINITIVE_SUBMIT_FAILURE_CODES = frozenset({
     "provider_input_invalid",
     "provider_payment_required",
     "provider_permission_denied",
+    "keyframe_identity_tag_missing",
+    "keyframe_prompt_invalid",
+    "keyframe_prompt_too_long",
     "provider_prompt_unsafe",
     "provider_request_rejected",
     "video_duration_unsupported",
@@ -123,6 +130,7 @@ class WorkerConfig:
     model_priority: tuple[str, ...] = CANONICAL_MODEL_PRIORITY
     auto_fallback: bool = False
     music_rotation_state_path: Path | None = None
+    daily_keyframe_limit: int = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +189,7 @@ def load_config(env: Mapping[str, str] | None = None) -> WorkerConfig:
         music_rotation_state_path=(
             Path(music_rotation).expanduser().resolve() if music_rotation else None
         ),
+        daily_keyframe_limit=_int(values, "NAZ_KEYFRAME_DAILY_JOB_LIMIT", 7, 1, 7),
     )
 
 
@@ -285,6 +294,29 @@ def _budget_usage(root: Path) -> tuple[int, int]:
     return jobs, seconds
 
 
+def _keyframe_budget_usage(root: Path) -> int:
+    now = datetime.now(timezone.utc).date()
+    jobs = 0
+    for manifest in root.glob("*/story_manifest.json"):
+        try:
+            payload = story_production.read_manifest(manifest)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        for job in payload.get("scene_jobs", []):
+            history = job.get("keyframe_submit_intent_history")
+            intents = list(history) if isinstance(history, list) else []
+            if isinstance(job.get("keyframe_submit_intent"), dict):
+                intents.append(job["keyframe_submit_intent"])
+            for intent in intents:
+                if not isinstance(intent, dict) or intent.get("state") not in {
+                    "accepted", "ambiguous", "submitting",
+                }:
+                    continue
+                created = _utc(intent.get("created_at"))
+                jobs += int(bool(created and created.date() == now))
+    return jobs
+
+
 def _write(manifest: Path, payload: dict[str, Any]) -> None:
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     story_production.atomic_json(manifest, payload)
@@ -296,6 +328,7 @@ def _scene_plan(payload: Mapping[str, Any], scene_id: str) -> Mapping[str, Any]:
 
 def _set_pack_status(payload: dict[str, Any]) -> None:
     scenes = [str(row.get("state")) for row in payload.get("scene_jobs", [])]
+    keyframes = [str(row.get("keyframe_state")) for row in payload.get("scene_jobs", [])]
     reels = [str(row.get("state")) for row in payload.get("reel_jobs", [])]
     if "awaiting_secondary_approval" in scenes:
         payload["pack_status"] = "awaiting_secondary_approval"
@@ -316,6 +349,8 @@ def _set_pack_status(payload: dict[str, Any]) -> None:
         for state in scenes
     ):
         payload["pack_status"] = "partially_blocked"
+    elif any(state in {"submitting", "submitted", "in_progress", "ready"} for state in keyframes):
+        payload["pack_status"] = "in_progress"
     elif any(
         state in {"submitting", "submitted", "in_progress", "downloaded", "composed"}
         for state in scenes
@@ -540,6 +575,197 @@ def _mark_submit_ambiguous(
     _write(manifest, payload)
 
 
+def _keyframe_destination(manifest: Path, job: Mapping[str, Any]) -> Path:
+    root = manifest.parent.resolve()
+    destination = (root / str(job.get("keyframe_path", ""))).resolve()
+    if root not in destination.parents or destination.suffix.casefold() != ".jpg":
+        raise ProviderError("unsafe_media_path")
+    return destination
+
+
+def _mark_keyframe_ambiguous(
+    job: dict[str, Any], payload: dict[str, Any], manifest: Path,
+) -> None:
+    intent = job.get("keyframe_submit_intent")
+    if isinstance(intent, dict):
+        intent.update({"state": "ambiguous", "failure_code": "provider_submit_outcome_ambiguous"})
+    job.update({
+        "keyframe_state": "submit_ambiguous",
+        "keyframe_provider_status": "submit_outcome_ambiguous",
+        "keyframe_failure_code": "provider_submit_outcome_ambiguous",
+        "state": "submit_ambiguous", "failure_code": "provider_submit_outcome_ambiguous",
+    })
+    _set_pack_status(payload)
+    _write(manifest, payload)
+
+
+def _process_keyframe(
+    *, payload: dict[str, Any], job: dict[str, Any], scene: Mapping[str, Any],
+    manifest: Path, config: WorkerConfig, provider: VideoProvider,
+) -> Path | None:
+    state = str(job.get("keyframe_state", "planned"))
+    destination = _keyframe_destination(manifest, job)
+    if state == "ready":
+        if not destination.is_file() or checksum(destination) != job.get("keyframe_checksum"):
+            job.update({
+                "keyframe_state": "terminal_failed",
+                "keyframe_failure_code": "keyframe_artifact_invalid",
+                "state": "terminal_failed", "failure_code": "keyframe_artifact_invalid",
+            })
+            _set_pack_status(payload)
+            _write(manifest, payload)
+            return None
+        return destination
+    if state in {"terminal_failed", "submit_ambiguous"}:
+        return None
+    if state == "submitting":
+        _mark_keyframe_ambiguous(job, payload, manifest)
+        return None
+    if state in {"planned", "queued"}:
+        if _keyframe_budget_usage(config.pack_root) >= config.daily_keyframe_limit:
+            job["keyframe_failure_code"] = "daily_keyframe_limit_reached"
+            _write(manifest, payload)
+            return None
+        original: ReferenceSelection | None = None
+        if bool(scene.get("requires_naz_reference")):
+            role = str(scene.get("reference_role") or "frontal_identity")
+            original = _reference_catalog(config.reference_path).get(role)
+            if not provider.supports_reference or original is None:
+                job.update({
+                    "keyframe_state": "terminal_failed",
+                    "keyframe_failure_code": "approved_reference_invalid",
+                    "state": "blocked_reference", "failure_code": "approved_reference_invalid",
+                })
+                _set_pack_status(payload)
+                _write(manifest, payload)
+                return None
+        prompt = append_prompt_guidance(
+            story_production.validate_provider_prompt(str(scene.get("keyframe_prompt", ""))),
+            original.body_guidance if original else "",
+        )
+        attempt = int(job.get("keyframe_attempts", 0)) + 1
+        created_at = datetime.now(timezone.utc).isoformat()
+        previous = job.get("keyframe_submit_intent")
+        if isinstance(previous, dict):
+            job.setdefault("keyframe_submit_intent_history", []).append(dict(previous))
+        intent_id = hashlib.sha256(
+            f"{payload.get('plan_id')}|{job.get('scene_id')}|keyframe|{attempt}|{created_at}".encode()
+        ).hexdigest()[:24]
+        job.update({
+            "keyframe_state": "submitting", "keyframe_attempts": attempt,
+            "keyframe_external_job_id": None, "keyframe_submitted_at": created_at,
+            "keyframe_provider_status": "submit_intent_persisted",
+            "keyframe_failure_code": None,
+            "keyframe_submit_intent": {
+                "intent_id": intent_id, "model": "gen4_image_turbo" if original else "gen4_image",
+                "created_at": created_at, "state": "submitting", "failure_code": None,
+            },
+        })
+        _write(manifest, payload)
+        try:
+            submitted = provider.submit_keyframe(KeyframeRequest(
+                scene_id=str(job.get("scene_id")), prompt=prompt,
+                reference_path=original.path if original else None,
+            ))
+            if not str(submitted.external_job_id).strip():
+                raise ProviderError("provider_job_id_missing", retryable=True)
+        except ProviderError as exc:
+            code = _failure_code(exc)
+            if code not in DEFINITIVE_SUBMIT_FAILURE_CODES:
+                _mark_keyframe_ambiguous(job, payload, manifest)
+                return None
+            intent = job.get("keyframe_submit_intent")
+            if isinstance(intent, dict):
+                intent.update({"state": "rejected", "failure_code": code})
+            job.update({
+                "keyframe_state": "terminal_failed", "keyframe_failure_code": code,
+                "state": "terminal_failed", "failure_code": code,
+            })
+            _set_pack_status(payload)
+            _write(manifest, payload)
+            return None
+        intent = job.get("keyframe_submit_intent")
+        if isinstance(intent, dict):
+            intent.update({
+                "state": "accepted", "external_job_id": submitted.external_job_id,
+                "failure_code": None,
+            })
+        job.update({
+            "keyframe_state": "submitted", "keyframe_external_job_id": submitted.external_job_id,
+            "keyframe_provider_status": submitted.status,
+            "keyframe_submitted_at": datetime.now(timezone.utc).isoformat(),
+        })
+        _write(manifest, payload)
+        return None
+    external_id = str(job.get("keyframe_external_job_id") or "")
+    if not external_id:
+        job.update({
+            "keyframe_state": "submit_ambiguous", "keyframe_failure_code": "provider_job_id_missing",
+            "state": "submit_ambiguous", "failure_code": "provider_job_id_missing",
+        })
+        _set_pack_status(payload)
+        _write(manifest, payload)
+        return None
+    submitted_at = _utc(job.get("keyframe_submitted_at"))
+    if submitted_at and datetime.now(timezone.utc) - submitted_at > timedelta(
+        seconds=config.poll_timeout_seconds
+    ):
+        try:
+            provider.cancel(external_id)
+        except ProviderError as exc:
+            job["keyframe_state"] = "in_progress"
+            job["keyframe_failure_code"] = _failure_code(exc)
+            _write(manifest, payload)
+            return None
+        job.setdefault("keyframe_provider_job_history", []).append(external_id)
+        job.update({
+            "keyframe_state": "terminal_failed", "keyframe_failure_code": "provider_timeout",
+            "state": "terminal_failed", "failure_code": "provider_timeout",
+        })
+        _set_pack_status(payload)
+        _write(manifest, payload)
+        return None
+    try:
+        current = provider.retrieve(external_id)
+        job["keyframe_provider_status"] = current.status
+        if current.status == "in_progress":
+            job["keyframe_state"] = "in_progress"
+            _write(manifest, payload)
+            return None
+        if current.status == "terminal_failed":
+            code = current.failure_code or "provider_terminal_failure"
+            job.update({
+                "keyframe_state": "terminal_failed", "keyframe_failure_code": code,
+                "state": "terminal_failed", "failure_code": code,
+            })
+            _set_pack_status(payload)
+            _write(manifest, payload)
+            return None
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        raw_fd, raw_name = tempfile.mkstemp(prefix=".keyframe-", suffix=".jpg", dir=destination.parent)
+        os.close(raw_fd)
+        temporary = Path(raw_name)
+        try:
+            provider.download_keyframe(current, temporary)
+            os.replace(temporary, destination)
+            ensure_private_group_access(destination, directory=False)
+        finally:
+            temporary.unlink(missing_ok=True)
+        job.update({
+            "keyframe_state": "ready", "keyframe_checksum": checksum(destination),
+            "keyframe_failure_code": None, "keyframe_provider_status": "completed",
+        })
+        _write(manifest, payload)
+    except ProviderError as exc:
+        job["keyframe_failure_code"] = _failure_code(exc)
+        job["keyframe_state"] = "in_progress" if exc.retryable else "terminal_failed"
+        if not exc.retryable:
+            job.update({"state": "terminal_failed", "failure_code": _failure_code(exc)})
+        _set_pack_status(payload)
+        _write(manifest, payload)
+    return None
+
+
 def _process_scene(
     *, payload: dict[str, Any], job: dict[str, Any], manifest: Path,
     config: WorkerConfig, provider: VideoProvider, composer: MediaComposer,
@@ -556,6 +782,12 @@ def _process_scene(
         # external id there is no safe way to distinguish accepted from lost,
         # so this intent is blocked permanently instead of being submitted twice.
         _mark_submit_ambiguous(job, payload, manifest)
+        return
+    keyframe = _process_keyframe(
+        payload=payload, job=job, scene=scene, manifest=manifest,
+        config=config, provider=provider,
+    )
+    if keyframe is None:
         return
     if state == "composed":
         clean = composer.safe_output(manifest.parent, str(job["clean_path"]))
@@ -575,18 +807,10 @@ def _process_scene(
         _write(manifest, payload)
         return
     if state in {"planned", "queued", "retryable_failed"}:
-        try:
-            reference = _reference_for(scene, config, provider)
-        except ProviderError:
-            job["state"] = "blocked_reference"
-            job["failure_code"] = "approved_reference_invalid"
-            _set_pack_status(payload)
-            _write(manifest, payload)
-            return
-        if provider.model == "gen4_turbo" and reference is None:
-            _request_secondary_for_text_only_scenes(payload, config, provider)
-            _write(manifest, payload)
-            return
+        # Identity was already resolved while producing the immutable keyframe.
+        # Video generation must depend only on that approved scene image, not on
+        # the original avatar remaining available for a second provider call.
+        reference = ReferenceSelection(keyframe, "directed_keyframe", "")
         jobs, seconds = _budget_usage(config.pack_root)
         planned = int(job["planned_duration_seconds"])
         if jobs >= config.daily_job_limit or jobs + 1 > config.daily_job_limit:
@@ -1018,7 +1242,7 @@ def process_pack(
         raise RuntimeError("video_auto_fallback_forbidden")
     with PackLock(pack_dir):
         payload = story_production.read_manifest(manifest)
-        if payload.get("schema") == story_production.LEGACY_STORY_SCHEMA:
+        if payload.get("schema") != story_production.STORY_SCHEMA:
             return "legacy_manifest_read_only"
         if not story_production.manifest_has_current_production_contract(payload):
             raise RuntimeError("story_manifest_contract_stale")

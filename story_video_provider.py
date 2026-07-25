@@ -49,6 +49,13 @@ class SceneRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class KeyframeRequest:
+    scene_id: str
+    prompt: str
+    reference_path: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderJob:
     external_job_id: str
     status: str
@@ -62,8 +69,10 @@ class VideoProvider(Protocol):
     supports_reference: bool
 
     def submit(self, request: SceneRequest) -> ProviderJob: ...
+    def submit_keyframe(self, request: KeyframeRequest) -> ProviderJob: ...
     def retrieve(self, external_job_id: str) -> ProviderJob: ...
     def download(self, job: ProviderJob, destination: Path) -> None: ...
+    def download_keyframe(self, job: ProviderJob, destination: Path) -> None: ...
     def cancel(self, external_job_id: str) -> None: ...
 
 
@@ -271,6 +280,30 @@ class RunwayVideoProvider:
             raise ProviderError("provider_job_id_missing", retryable=True)
         return ProviderJob(job_id, "submitted")
 
+    def submit_keyframe(self, request: KeyframeRequest) -> ProviderJob:
+        prompt = request.prompt.strip()
+        if not prompt:
+            raise ProviderError("keyframe_prompt_invalid")
+        if utf16_code_units(prompt) > RUNWAY_PROMPT_MAX_UTF16_UNITS:
+            raise ProviderError("keyframe_prompt_too_long")
+        payload: dict[str, Any] = {
+            "model": "gen4_image_turbo" if request.reference_path else "gen4_image",
+            "promptText": prompt,
+            "ratio": "720:960",
+        }
+        if request.reference_path:
+            if "@Naz" not in prompt:
+                raise ProviderError("keyframe_identity_tag_missing")
+            payload["referenceImages"] = [{
+                "uri": self._reference_data_uri(request.reference_path),
+                "tag": "Naz",
+            }]
+        result = self._call("POST", "/text_to_image", payload)
+        job_id = str(result.get("id", "")).strip()
+        if not job_id:
+            raise ProviderError("provider_job_id_missing", retryable=True)
+        return ProviderJob(job_id, "submitted")
+
     def retrieve(self, external_job_id: str) -> ProviderJob:
         result = self._call("GET", f"/tasks/{external_job_id}")
         raw_status = str(result.get("status", "")).casefold()
@@ -300,6 +333,31 @@ class RunwayVideoProvider:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(raw)
 
+    def download_keyframe(self, job: ProviderJob, destination: Path) -> None:
+        if not job.output_url:
+            raise ProviderError("provider_output_url_missing")
+        status, headers, raw = self._transport.request(
+            "GET", job.output_url, headers={}, body=None, timeout=self.timeout_seconds,
+        )
+        content_type = str(headers.get("Content-Type", headers.get("content-type", ""))).casefold()
+        if status != 200:
+            raise ProviderError("provider_download_failed", retryable=status == 429 or status >= 500)
+        if not content_type.startswith("image/") or len(raw) < 12:
+            raise ProviderError("provider_download_not_image", retryable=True)
+        try:
+            with Image.open(io.BytesIO(raw)) as opened:
+                opened.load()
+                source = ImageOps.exif_transpose(opened).convert("RGB")
+                portrait = ImageOps.fit(
+                    source, RUNWAY_PORTRAIT_SIZE, method=Image.Resampling.LANCZOS,
+                )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                portrait.save(destination, format="JPEG", quality=92, optimize=True)
+                portrait.close()
+                source.close()
+        except (OSError, UnidentifiedImageError, ValueError):
+            raise ProviderError("provider_download_not_image", retryable=True) from None
+
     def cancel(self, external_job_id: str) -> None:
         status, _, _ = self._transport.request(
             "DELETE", f"{self.base_url}/tasks/{external_job_id}",
@@ -322,6 +380,7 @@ class FakeVideoProvider:
     def __init__(self, media_source: Path | None = None) -> None:
         self.media_source = media_source
         self.submissions: list[SceneRequest] = []
+        self.keyframe_submissions: list[KeyframeRequest] = []
         self.jobs: dict[str, ProviderJob] = {}
         self.submit_count = 0
 
@@ -329,6 +388,13 @@ class FakeVideoProvider:
         self.submit_count += 1
         job = ProviderJob(f"fake-{request.scene_id}-{self.submit_count}", "submitted")
         self.submissions.append(request)
+        self.jobs[job.external_job_id] = ProviderJob(job.external_job_id, "in_progress")
+        return job
+
+    def submit_keyframe(self, request: KeyframeRequest) -> ProviderJob:
+        self.submit_count += 1
+        job = ProviderJob(f"fake-keyframe-{request.scene_id}-{self.submit_count}", "submitted")
+        self.keyframe_submissions.append(request)
         self.jobs[job.external_job_id] = ProviderJob(job.external_job_id, "in_progress")
         return job
 
@@ -342,6 +408,12 @@ class FakeVideoProvider:
         self.jobs[external_job_id] = ProviderJob(external_job_id, "terminal_failed", failure_code="provider_terminal_failure")
 
     def download(self, job: ProviderJob, destination: Path) -> None:
+        if self.media_source is None:
+            raise ProviderError("fake_media_missing")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.media_source, destination)
+
+    def download_keyframe(self, job: ProviderJob, destination: Path) -> None:
         if self.media_source is None:
             raise ProviderError("fake_media_missing")
         destination.parent.mkdir(parents=True, exist_ok=True)

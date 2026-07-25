@@ -111,6 +111,8 @@ def approve_pack(root: Path, plan_id: str) -> str:
         for job in payload.get("scene_jobs", []):
             if job.get("state") == "planned":
                 job["state"] = "queued"
+            if job.get("keyframe_state") == "planned":
+                job["keyframe_state"] = "queued"
         for output in payload.get("expected_outputs", {}).get("stories", []):
             if output.get("status") == "planned":
                 output["status"] = "queued"
@@ -145,6 +147,8 @@ def confirm_generation(root: Path, plan_id: str) -> str:
             for job in payload.get("scene_jobs", []):
                 if job.get("state") == "planned":
                     job["state"] = "queued"
+                if job.get("keyframe_state") == "planned":
+                    job["keyframe_state"] = "queued"
             for output in payload.get("expected_outputs", {}).get("stories", []):
                 if output.get("status") == "planned":
                     output["status"] = "queued"
@@ -204,17 +208,32 @@ def create_next_variant(root: Path, plan_id: str) -> Path:
 
 
 def safe_summary(payload: Mapping[str, Any]) -> str:
-    scenes = payload.get("scene_jobs", []) if isinstance(payload.get("scene_jobs"), list) else []
+    jobs = payload.get("scene_jobs", []) if isinstance(payload.get("scene_jobs"), list) else []
+    directed = payload.get("scenes", []) if isinstance(payload.get("scenes"), list) else []
     counts: dict[str, int] = {}
-    for job in scenes:
+    for job in jobs:
         state = str(job.get("state", "unknown"))
         counts[state] = counts.get(state, 0) + 1
-    status_lines = [
+    duration = sum(float(job.get("planned_duration_seconds", 0)) for job in jobs)
+    references = sum(bool(job.get("requires_naz_reference")) for job in jobs)
+    keyframe_credits = sum(
+        2 if bool(scene.get("requires_naz_reference")) else 5
+        for scene in directed if isinstance(scene, Mapping)
+    )
+    video_credits = int(duration) * 5
+    statuses = "\n".join(
         f"• {SCENE_STATUS_RU.get(state, state)}: {count}"
         for state, count in sorted(counts.items())
-    ]
-    duration = sum(float(job.get("planned_duration_seconds", 0)) for job in scenes)
-    references = sum(bool(job.get("requires_naz_reference")) for job in scenes)
+    ) or "Сцены ещё не созданы"
+    treatment = []
+    for index, scene in enumerate(directed, 1):
+        if isinstance(scene, Mapping):
+            treatment.append(
+                f"{index}. {str(scene.get('role', 'scene')).upper()} · "
+                f"{str(scene.get('setting', ''))[:105]}\n"
+                f"   Действие: {str(scene.get('concrete_action', ''))[:115]} · "
+                f"Камера: {str(scene.get('camera_motion', ''))[:40]}"
+            )
     pack_status = str(payload.get("pack_status", "unknown"))
     return (
         "🎬 Reels Maker\n\n"
@@ -222,9 +241,12 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         f"Вариант: {int(payload.get('variant_index', 0)) + 1}\n"
         f"Рубрика: {str(payload.get('rubric', ''))[:120]}\n"
         f"Статус: {PACK_STATUS_RU.get(pack_status, pack_status)}\n"
-        f"Сцен: {len(scenes)}, запланировано секунд: {duration:g}\n"
-        f"Сцен с Naz: {references}\n\n"
-        + ("\n".join(status_lines) if status_lines else "Сцены ещё не созданы")
+        f"Сцен: {len(jobs)}, запланировано секунд: {duration:g}\n"
+        f"Сцен с Naz: {references}\n\n{statuses}\n\n"
+        "Режиссёрский план:\n" + ("\n".join(treatment) or "—")
+        + f"\n\nОценка Runway: keyframes {keyframe_credits} + video {video_credits} "
+        f"= {keyframe_credits + video_credits} кредитов.\n"
+        "Аватар используется только для внешности; фон, поза и постановка создаются заново."
     )
 
 
