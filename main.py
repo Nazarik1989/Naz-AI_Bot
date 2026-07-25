@@ -2885,8 +2885,10 @@ async def send_post_with_images(
     chat_id: int | str,
     post_text: str,
     images: List[bytes],
+    *,
+    strict_media: bool = False,
 ) -> TelegramPublicationReceipt:
-    """Send post. If images fail, text still goes out."""
+    """Send a post; optional strict mode forbids a text-only media fallback."""
     if not images:
         sent = await send_long_to_chat(bot, chat_id, post_text)
         return _telegram_publication_receipt(sent, chat_id)
@@ -2911,6 +2913,8 @@ async def send_post_with_images(
         return _telegram_publication_receipt(primary_result, chat_id)
     except (TelegramError, BadRequest) as exc:
         logger.exception("Telegram image send failed: %s", exc)
+        if strict_media:
+            raise
         sent = await send_long_to_chat(bot, chat_id, post_text)
         return _telegram_publication_receipt(sent, chat_id)
 
@@ -2923,9 +2927,12 @@ async def send_observed_scheduled_post(
     images: List[bytes],
     user_id: int,
     plan_id: str,
+    strict_media: bool = False,
 ) -> TelegramPublicationReceipt:
     try:
-        return await send_post_with_images(bot, chat_id, post_text, images)
+        return await send_post_with_images(
+            bot, chat_id, post_text, images, strict_media=strict_media
+        )
     except Exception:
         memory.update_editorial_release_event(
             user_id=user_id,
@@ -4388,7 +4395,9 @@ async def process_agent_content_date(
         await notify_admin_generated(
             bot,
             f"📥 Agent Content {resolved_date}: orchestrated draft готов для plan_id {plan.plan_id}.\n\n"
-            f"{package.final_text[:3200]}\n\nДля публикации: /publish_agent_content {resolved_date}",
+            f"{package.final_text[:3200]}\n\n"
+            "Чтобы внести правки — ответь на это сообщение новым текстом. "
+            "Чтобы опубликовать текущую утверждённую версию — ответь на неё командой /publish_revision.",
             mode="agent_content_sync",
             topic=plan.topic,
             source_ref=plan.plan_id,
@@ -5942,6 +5951,49 @@ def generated_revision_keyboard(revision_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def generated_publication_keyboard(publication_id: str, version: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                f"📣 Опубликовать v{version}",
+                callback_data=f"genpub_apply:{publication_id}",
+            ),
+            InlineKeyboardButton(
+                "Оставить черновиком",
+                callback_data=f"genpub_cancel:{publication_id}",
+            ),
+        ]]
+    )
+
+
+async def offer_generated_publication(
+    bot,
+    chat_id: int,
+    owner_user_id: int,
+    artifact_id: str,
+    version: int,
+) -> bool:
+    try:
+        pending = memory.create_pending_generated_publication(
+            artifact_id, owner_user_id, version
+        )
+    except ValueError as exc:
+        logger.info("Generated publication offer unavailable | reason=%s", exc)
+        return False
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Версия v{version} сохранена. Опубликовать именно её в Telegram-канале?\n\n"
+            "Текст заново не генерирую. После подтверждения соберу обязательный визуал "
+            "по действующей политике и отправлю эту версию."
+        ),
+        reply_markup=generated_publication_keyboard(
+            str(pending["publication_id"]), version
+        ),
+    )
+    return True
+
+
 async def handle_generated_artifact_reply(update: Update, text: str) -> bool:
     """Turn a reply to an editable Naz result into a confirmation, never a publication."""
     if not update.message or not update.effective_user or not update.effective_chat:
@@ -6026,6 +6078,14 @@ async def generated_revision_callback(update: Update, context: ContextTypes.DEFA
             artifact_id=str(applied["artifact_id"]),
             version=int(applied["version"]),
         )
+        if pending.get("mode") == "agent_content_sync" and pending.get("source_ref"):
+            await offer_generated_publication(
+                context.bot,
+                query.message.chat_id,
+                user_id,
+                str(applied["artifact_id"]),
+                int(applied["version"]),
+            )
         return
 
     claimed = memory.begin_image_generated_revision(revision_id, user_id)
@@ -6070,6 +6130,227 @@ async def generated_revision_callback(update: Update, context: ContextTypes.DEFA
             chat_id=query.message.chat_id,
             text="Не удалось создать новую версию изображения. Исходная версия сохранена; публикации не было.",
         )
+
+
+async def publish_revision_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Публикация утверждённой версии доступна только администратору.")
+        return
+    replied = update.message.reply_to_message
+    if not replied:
+        await update.message.reply_text("Ответь командой /publish_revision на сохранённую версию текста.")
+        return
+    artifact = memory.get_generated_artifact_for_reply(
+        update.effective_chat.id,
+        replied.message_id,
+        update.effective_user.id,
+    )
+    if not artifact:
+        await update.message.reply_text("Это сообщение не связано с сохранённой версией Naz.")
+        return
+    if int(artifact["bound_version"]) != int(artifact["current_version"]):
+        await update.message.reply_text("Это устаревшая версия. Ответь на последнее сообщение Naz.")
+        return
+    offered = await offer_generated_publication(
+        context.bot,
+        update.effective_chat.id,
+        update.effective_user.id,
+        str(artifact["artifact_id"]),
+        int(artifact["current_version"]),
+    )
+    if not offered:
+        await update.message.reply_text(
+            "Эта версия уже опубликована, обрабатывается или не относится к Agent Content draft."
+        )
+
+
+def approved_revision_package(
+    plan: editorial_orchestrator.EditorialPlan,
+    content: str,
+) -> editorial_orchestrator.GenerationPackage:
+    """Build validation/visual metadata without rewriting the approved text."""
+    return editorial_orchestrator.GenerationPackage(
+        final_text=content,
+        concrete_scene=plan.topic,
+        visual_subject=plan.visual_subject_direction,
+        visual_relation_to_thesis="directly supports the approved thesis",
+        image_prompt_seed=plan.visual_subject_direction,
+        track_tags=plan.track_tags,
+    )
+
+
+async def generated_publication_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.message or not update.effective_user:
+        return
+    await query.answer()
+    action, publication_id = query.data.split(":", 1)
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("Публикация недоступна этому пользователю.")
+        return
+    if action == "genpub_cancel":
+        cancelled = memory.cancel_pending_generated_publication(publication_id, user_id)
+        await query.edit_message_text(
+            "Оставил версию черновиком. Ничего не опубликовано."
+            if cancelled else
+            "Эта публикация уже обработана или недоступна."
+        )
+        return
+    if not CHANNEL_ID:
+        await query.edit_message_text("Telegram-канал не настроен. Ничего не опубликовано.")
+        return
+    claimed = memory.begin_generated_publication(publication_id, user_id)
+    if not claimed:
+        await query.edit_message_text(
+            "Эта версия уже обрабатывается, опубликована или успела устареть."
+        )
+        return
+    content = str(claimed["content"] or "").strip()
+    plan_id = str(claimed["source_ref"] or "")
+    row = memory.get_generated_post_by_plan(user_id, plan_id)
+    try:
+        plan = editorial_orchestrator.EditorialPlan.from_dict(
+            row.get("editorial_plan", {}) if row else {}
+        )
+        editorial_orchestrator.validate_plan(plan)
+    except (TypeError, editorial_orchestrator.EditorialPlanError):
+        memory.fail_generated_publication(publication_id, user_id, "editorial_plan_invalid")
+        await query.edit_message_text("Не нашёл валидный план этого черновика. Ничего не опубликовано.")
+        return
+    if plan.plan_id != plan_id or plan.platform != "telegram":
+        memory.fail_generated_publication(publication_id, user_id, "editorial_plan_mismatch")
+        await query.edit_message_text("План и версия не совпали. Ничего не опубликовано.")
+        return
+    risks = detect_content_risks(content)
+    package = approved_revision_package(plan, content)
+    quality_ok, quality_reason = scheduled_package_quality_check(plan, package)
+    if risks or not quality_ok:
+        reason_code = "approved_text_sensitive" if risks else quality_reason
+        memory.fail_generated_publication(publication_id, user_id, reason_code)
+        await query.edit_message_text(
+            "Утверждённая версия не прошла действующую safety/quality-проверку. Ничего не опубликовано."
+        )
+        return
+    release = memory.get_editorial_release_event(user_id, plan_id, "telegram")
+    if release and release.get("history_commit_status") == "committed":
+        memory.fail_generated_publication(publication_id, user_id, "plan_already_committed")
+        await query.edit_message_text("Этот plan_id уже опубликован. Повторной отправки не будет.")
+        return
+    await query.edit_message_text(
+        f"Подтверждено: публикую точную версию v{claimed['version']}. Текст не перегенерирую."
+    )
+    visual_brief = (
+        f"Plan ID: {plan.plan_id}. Visual mode: {plan.visual_mode}. "
+        f"Subject direction: {plan.visual_subject_direction}. Imagery: {plan.imagery}. "
+        "The visual must directly support the exact administrator-approved text."
+    )
+    try:
+        images, _ = await generate_images_with_retries(
+            user_id,
+            f"{plan.rubric}. {plan.topic}",
+            content,
+            count=CHANNEL_IMAGE_COUNT,
+            editorial_visual_brief=visual_brief,
+        )
+    except Exception as exc:  # noqa: BLE001
+        memory.fail_generated_publication(publication_id, user_id, "image_generation_error")
+        logger.warning("Approved revision image generation failed | error=%s", type(exc).__name__)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Не удалось собрать обязательный визуал. Версия сохранена, публикации не было.",
+        )
+        return
+    if REQUIRE_IMAGES_FOR_CHANNEL_POSTS and not images:
+        memory.fail_generated_publication(publication_id, user_id, "required_image_missing")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Обязательный визуал не прошёл генерацию. Версия сохранена, публикации не было.",
+        )
+        return
+    delivery_claim = memory.claim_editorial_delivery(
+        user_id=user_id, plan_id=plan_id, platform="telegram"
+    )
+    if delivery_claim != "claimed":
+        memory.fail_generated_publication(
+            publication_id,
+            user_id,
+            "delivery_already_committed" if delivery_claim == "committed" else "delivery_requires_audit",
+            needs_audit=delivery_claim == "blocked",
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "Этот выпуск уже опубликован. Повторной отправки не будет."
+                if delivery_claim == "committed" else
+                "Состояние прошлой отправки требует проверки. Повторно ничего не отправляю."
+            ),
+        )
+        return
+    try:
+        receipt = await send_observed_scheduled_post(
+            bot=context.bot,
+            chat_id=CHANNEL_ID,
+            post_text=content,
+            images=images,
+            user_id=user_id,
+            plan_id=plan_id,
+            strict_media=REQUIRE_IMAGES_FOR_CHANNEL_POSTS,
+        )
+        plan_dict = plan.to_dict()
+        memory.save_generated_post(
+            user_id=user_id,
+            expert_mode=get_user_expert_mode(user_id),
+            task="agent_content_approved_revision_publish",
+            topic=plan.topic,
+            content=content,
+            image_count=len(images),
+            published_to_channel=True,
+            semantic_theme=plan.semantic_theme,
+            semantic_card=plan.semantic_card,
+            plan_id=plan.plan_id,
+            editorial_plan=plan_dict,
+        )
+        memory.record_content_signature(user_id, plan_dict, plan.topic)
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            telegram_chat_id=receipt.chat_id,
+            telegram_message_id=receipt.message_id,
+            history_commit_status="committed",
+        )
+        memory.apply_character_event(user_id, "publish")
+        queue_naz_post_for_void(
+            content, source="agent_content_approved_revision_publish", topic=plan.topic
+        )
+        finished = memory.finish_generated_publication(
+            publication_id,
+            user_id,
+            receipt_chat_id=receipt.chat_id,
+            receipt_message_id=receipt.message_id,
+        )
+        if not finished:
+            raise RuntimeError("approved publication receipt state was not committed")
+    except Exception as exc:  # noqa: BLE001
+        memory.fail_generated_publication(
+            publication_id, user_id, "telegram_delivery_ambiguous", needs_audit=True
+        )
+        logger.exception("Approved revision publication requires audit")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Не могу безопасно подтвердить результат отправки. Повторно не отправляю; нужна проверка.",
+        )
+        return
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=f"✅ Опубликована точная версия v{claimed['version']}. Повторной генерации текста не было.",
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7846,6 +8127,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("agent_content", agent_content_command))
     application.add_handler(CommandHandler("sync_agent_content", sync_agent_content_command))
     application.add_handler(CommandHandler("publish_agent_content", publish_agent_content_command))
+    application.add_handler(CommandHandler("publish_revision", publish_revision_command))
 
     # Content commands
     application.add_handler(CommandHandler("post", post_command))
@@ -7875,6 +8157,9 @@ def build_application() -> Application:
     )
     application.add_handler(
         CallbackQueryHandler(generated_revision_callback, pattern=r"^genrev_(?:apply|cancel):[A-Za-z0-9_-]+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(generated_publication_callback, pattern=r"^genpub_(?:apply|cancel):[A-Za-z0-9_-]+$")
     )
 
     # A shared contact follows /delegate and is used only for this one conversation.
