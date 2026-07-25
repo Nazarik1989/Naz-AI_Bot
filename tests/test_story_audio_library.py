@@ -151,7 +151,10 @@ class DurableGenerationTests(unittest.TestCase):
             library._atomic_json(json_path, {"safe": True})
             library._atomic_bytes(audio_path, b"ID3-safe")
             with LibraryLock(directory):
-                self.assertEqual(stat.S_IMODE((directory / GENERATION_LOCK_FILE).stat().st_mode), 0o660)
+                self.assertEqual(
+                    stat.S_IMODE((directory / library.GENERATION_LOCK_FILE).stat().st_mode),
+                    0o660,
+                )
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o2770)
             self.assertEqual(stat.S_IMODE(json_path.stat().st_mode), 0o660)
             self.assertEqual(stat.S_IMODE(audio_path.stat().st_mode), 0o660)
