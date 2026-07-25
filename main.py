@@ -1670,35 +1670,68 @@ def redact_sensitive_text(text: str) -> str:
     return redacted
 
 
-def latest_agent_content_dir(date_hint: str = "") -> Optional[Path]:
-    if date_hint:
-        candidate = AGENT_CONTENT_INBOX / date_hint.strip()
-        if candidate.exists() and candidate.is_dir():
-            return candidate
-        return None
-    if not AGENT_CONTENT_INBOX.exists():
-        return None
-    dirs = [path for path in AGENT_CONTENT_INBOX.iterdir() if path.is_dir()]
-    return random.choice(dirs) if dirs else None
+AGENT_CONTENT_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 
 
 def list_agent_content_dirs() -> List[Path]:
-    if not AGENT_CONTENT_INBOX.exists():
+    """Return legacy and project-first date directories from the inbox."""
+
+    if not AGENT_CONTENT_INBOX.exists() or not AGENT_CONTENT_INBOX.is_dir():
         return []
-    return [path for path in AGENT_CONTENT_INBOX.iterdir() if path.is_dir()]
+    result: List[Path] = []
+    for first_level in AGENT_CONTENT_INBOX.iterdir():
+        if not first_level.is_dir():
+            continue
+        if AGENT_CONTENT_DATE_PATTERN.fullmatch(first_level.name):
+            result.append(first_level)
+            continue
+        for second_level in first_level.iterdir():
+            if (
+                second_level.is_dir()
+                and AGENT_CONTENT_DATE_PATTERN.fullmatch(second_level.name)
+            ):
+                result.append(second_level)
+    return sorted(
+        result,
+        key=lambda path: path.relative_to(AGENT_CONTENT_INBOX).as_posix().casefold(),
+    )
+
+
+def agent_content_dirs_for_date(date_text: str) -> List[Path]:
+    clean_date = date_text.strip()
+    if not AGENT_CONTENT_DATE_PATTERN.fullmatch(clean_date):
+        return []
+    return [path for path in list_agent_content_dirs() if path.name == clean_date]
+
+
+def list_agent_content_dates() -> List[str]:
+    return sorted({path.name for path in list_agent_content_dirs()})
+
+
+def latest_agent_content_dir(date_hint: str = "") -> Optional[Path]:
+    candidates = (
+        agent_content_dirs_for_date(date_hint)
+        if date_hint
+        else list_agent_content_dirs()
+    )
+    return random.choice(candidates) if candidates else None
 
 
 def choose_agent_content_date_for_sync() -> str:
-    dirs = list_agent_content_dirs()
-    if not dirs:
+    dates = list_agent_content_dates()
+    if not dates:
         return current_bot_date()
 
     seen = load_agent_content_seen()
-    changed = [path for path in dirs if seen.get(path.name) != agent_manifest_hash(path)]
-    pool = changed or (dirs if AGENT_CONTENT_REUSE_SEEN else [])
+    changed = [
+        date_text
+        for date_text in dates
+        if seen.get(date_text) != agent_content_hash_for_date(date_text)
+    ]
+    pool = changed or (dates if AGENT_CONTENT_REUSE_SEEN else [])
     if not pool:
         return current_bot_date()
-    return random.choice(pool).name
+    return random.choice(pool)
 
 
 def read_limited_text(path: Path, limit: int = 6000) -> str:
@@ -1723,6 +1756,26 @@ def agent_manifest_hash(day_dir: Path) -> str:
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
+def agent_content_hash_for_date(date_text: str) -> str:
+    digest = hashlib.sha256()
+    day_dirs = agent_content_dirs_for_date(date_text)
+    if not day_dirs:
+        digest.update(date_text.strip().encode("utf-8"))
+    for day_dir in day_dirs:
+        relative_day = day_dir.relative_to(AGENT_CONTENT_INBOX).as_posix()
+        digest.update(relative_day.encode("utf-8"))
+        digest.update(b"\0")
+        for path in sorted(
+            (item for item in day_dir.rglob("*") if item.is_file()),
+            key=lambda item: item.relative_to(day_dir).as_posix().casefold(),
+        ):
+            digest.update(path.relative_to(day_dir).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()[:24]
+
+
 def agent_file(day_dir: Path, names: List[str]) -> Optional[Path]:
     for name in names:
         path = day_dir / name
@@ -1731,10 +1784,57 @@ def agent_file(day_dir: Path, names: List[str]) -> Optional[Path]:
     return None
 
 
+def collect_project_first_agent_materials(
+    date_text: str, focus: str, day_dirs: List[Path],
+) -> Tuple[str, List[str], str]:
+    parts: List[Tuple[str, str]] = []
+    folder_labels: List[str] = []
+    for day_dir in day_dirs:
+        folder_label = day_dir.relative_to(AGENT_CONTENT_INBOX).as_posix()
+        folder_labels.append(folder_label)
+        manifest = load_agent_manifest(day_dir)
+        if manifest:
+            parts.append(
+                (
+                    f"{folder_label}/manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2)[:2500],
+                )
+            )
+        markdown_files = sorted(
+            (path for path in day_dir.rglob("*.md") if path.is_file()),
+            key=lambda path: path.relative_to(day_dir).as_posix().casefold(),
+        )
+        for path in markdown_files[:12]:
+            label = f"{folder_label}/{path.relative_to(day_dir).as_posix()}"
+            parts.append((label, read_limited_text(path, 4000)))
+
+    raw = "\n\n".join(f"### {label}\n{text}" for label, text in parts if text)
+    if not raw:
+        return "", ["agent inbox empty"], date_text
+    risks = detect_content_risks(raw)
+    safe_raw = redact_sensitive_text(raw)
+    context = (
+        f"Date: {date_text}\n"
+        f"Folders: {', '.join(folder_labels)}\n"
+        f"User focus: {focus or 'not specified'}\n\n"
+        f"{safe_raw[:14000]}"
+    )
+    return context, risks, date_text
+
+
 def collect_agent_materials(date_hint: str = "", focus: str = "") -> Tuple[str, List[str], str]:
-    day_dir = latest_agent_content_dir(date_hint)
-    if not day_dir:
+    if date_hint:
+        date_text = date_hint.strip()
+    else:
+        dates = list_agent_content_dates()
+        date_text = random.choice(dates) if dates else ""
+    day_dirs = agent_content_dirs_for_date(date_text)
+    if not day_dirs:
         return "", ["agent inbox missing"], ""
+    if len(day_dirs) > 1 or day_dirs[0].parent != AGENT_CONTENT_INBOX:
+        return collect_project_first_agent_materials(date_text, focus, day_dirs)
+
+    day_dir = day_dirs[0]
 
     manifest = load_agent_manifest(day_dir)
     date_text = str(manifest.get("date") or day_dir.name)
@@ -4038,11 +4138,10 @@ async def process_agent_content_date(
     force: bool = False,
     publish: bool = False,
 ) -> str:
-    day_dir = latest_agent_content_dir(date_text)
-    if not day_dir:
+    if not agent_content_dirs_for_date(date_text):
         return f"⚠️ Agent Content: нет папки за {date_text}."
 
-    manifest_hash = agent_manifest_hash(day_dir)
+    manifest_hash = agent_content_hash_for_date(date_text)
     seen = load_agent_content_seen()
     if not force and seen.get(date_text) == manifest_hash:
         return f"ℹ️ Agent Content {date_text}: manifest не изменился, пропускаю."
