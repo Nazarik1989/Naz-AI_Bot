@@ -113,6 +113,28 @@ class ProviderTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_budget_counts_only_accepted_or_uncertain_provider_submissions(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, manifest = make_pack(root)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            now = datetime.now(timezone.utc).isoformat()
+            jobs = payload["scene_jobs"]
+            jobs[0]["submit_intent"] = {
+                "created_at": now, "state": "rejected", "failure_code": "provider_input_invalid",
+            }
+            jobs[0]["attempts"] = 1
+            jobs[1]["submit_intent"] = {
+                "created_at": now, "state": "accepted", "external_job_id": "accepted-1",
+            }
+            jobs[1]["attempts"] = 1
+            jobs[2]["submit_intent"] = {
+                "created_at": now, "state": "ambiguous", "failure_code": "provider_submit_outcome_ambiguous",
+            }
+            jobs[2]["attempts"] = 1
+            story.atomic_json(manifest, payload)
+
+            self.assertEqual(worker._budget_usage(Path(root)), (2, 10))
+
     def test_feature_flags_default_false_and_check_config_is_offline(self):
         cfg = worker.load_config({})
         self.assertFalse(cfg.render_enabled)
