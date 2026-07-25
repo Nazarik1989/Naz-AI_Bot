@@ -1,7 +1,9 @@
 import io
 import json
 import array
+import os
 import random
+import stat
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -137,6 +139,23 @@ class CatalogTests(unittest.TestCase):
 
 
 class DurableGenerationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Unix permission contract")
+    def test_private_library_outputs_are_group_accessible(self):
+        import story_audio_library as library
+
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            os.chmod(directory, 0o2770)
+            json_path = directory / "track.mp3.json"
+            audio_path = directory / "track.mp3"
+            library._atomic_json(json_path, {"safe": True})
+            library._atomic_bytes(audio_path, b"ID3-safe")
+            with LibraryLock(directory):
+                self.assertEqual(stat.S_IMODE((directory / GENERATION_LOCK_FILE).stat().st_mode), 0o660)
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o2770)
+            self.assertEqual(stat.S_IMODE(json_path.stat().st_mode), 0o660)
+            self.assertEqual(stat.S_IMODE(audio_path.stat().st_mode), 0o660)
+
     def test_parallel_paid_cli_is_locked_out(self):
         with tempfile.TemporaryDirectory() as root:
             with LibraryLock(Path(root)):

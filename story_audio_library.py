@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, Mapping, Protocol, Sequence
 
 from story_audio_evidence import beat_evidence_is_valid
+from story_pack_lock import ensure_private_group_access
 
 
 LIBRARY_SCHEMA = "naz-story-audio-library-v1"
@@ -196,6 +197,7 @@ def beat_grid(spec: AudioTrackSpec) -> tuple[float, ...]:
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_group_access(path.parent, directory=True)
     descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}-", suffix=".tmp", dir=path.parent)
     temporary = Path(raw)
     try:
@@ -205,12 +207,14 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        ensure_private_group_access(path, directory=False)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def _atomic_bytes(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_group_access(path.parent, directory=True)
     descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}-", suffix=".tmp", dir=path.parent)
     temporary = Path(raw)
     try:
@@ -219,6 +223,7 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        ensure_private_group_access(path, directory=False)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -232,8 +237,10 @@ class LibraryLock:
 
     def __enter__(self) -> "LibraryLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_group_access(self.path.parent, directory=True)
         try:
-            self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o660)
+            ensure_private_group_access(self.path, directory=False)
             if os.fstat(self.fd).st_size == 0:
                 os.write(self.fd, b" ")
             os.lseek(self.fd, 0, os.SEEK_SET)
