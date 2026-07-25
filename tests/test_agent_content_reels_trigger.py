@@ -139,6 +139,20 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
 
         self.assertIn("Story-first plan awaits approval", result)
         bot.send_message.assert_awaited_once()
+        keyboard = bot.send_message.await_args.kwargs["reply_markup"]
+        callback_data = {
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        }
+        self.assertEqual(
+            callback_data,
+            {
+                "reels_confirm:" + "a" * 24,
+                "reels_variant:" + "a" * 24,
+                "reels_status:" + "a" * 24,
+            },
+        )
         text_model.assert_not_awaited()
         image_model.assert_not_awaited()
         provider.assert_not_awaited()

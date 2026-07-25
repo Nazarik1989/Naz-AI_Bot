@@ -19,6 +19,29 @@ def fake_update(user_id: int, text: str) -> SimpleNamespace:
     )
 
 
+def fake_reels_reply(user_id: int, text: str, summary: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        message=SimpleNamespace(
+            text=text,
+            reply_to_message=SimpleNamespace(text=summary, caption=None),
+            reply_text=AsyncMock(),
+        ),
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id),
+    )
+
+
+def fake_reels_callback(user_id: int, data: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        callback_query=SimpleNamespace(
+            data=data,
+            answer=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        ),
+        effective_user=SimpleNamespace(id=user_id),
+    )
+
+
 class StoryMenuTests(unittest.TestCase):
     def test_admin_reels_menu_has_only_three_process_actions(self):
         actions = {
@@ -31,7 +54,21 @@ class StoryMenuTests(unittest.TestCase):
             main.BTN_REELS_CONFIRM, main.BTN_REELS_VARIANT, main.BTN_REELS_STATUS,
         })
 
-    def test_confirm_button_approves_without_provider_call(self):
+    def test_plan_keyboard_binds_every_action_to_one_plan(self):
+        plan_id = "a" * 24
+        keyboard = main.reels_plan_keyboard(plan_id)
+        callbacks = {
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        }
+        self.assertEqual(callbacks, {
+            f"reels_confirm:{plan_id}",
+            f"reels_variant:{plan_id}",
+            f"reels_status:{plan_id}",
+        })
+
+    def test_legacy_confirm_button_only_returns_plan_scoped_card(self):
         with tempfile.TemporaryDirectory() as root:
             pack = story.plan_story_pack(planned(), SAFE_FACTS)
             story.persist_story_queue(pack, Path(root))
@@ -46,26 +83,141 @@ class StoryMenuTests(unittest.TestCase):
                 ))
             self.assertTrue(handled)
             payload = story.read_manifest(Path(root) / pack.plan_id / "story_manifest.json")
-            self.assertEqual(payload["approval"]["status"], "approved")
+            self.assertEqual(payload["approval"]["status"], "awaiting_approval")
             self.assertTrue(all(not job["external_job_id"] for job in payload["scene_jobs"]))
+            self.assertIn("общая кнопка", update.message.reply_text.await_args.args[0])
+            keyboard = update.message.reply_text.await_args.kwargs["reply_markup"]
+            self.assertEqual(
+                keyboard.inline_keyboard[0][0].callback_data,
+                f"reels_confirm:{pack.plan_id}",
+            )
 
-    def test_confirm_button_does_not_queue_when_rendering_is_disabled(self):
+    def test_legacy_variant_button_does_not_supersede_latest_plan(self):
         with tempfile.TemporaryDirectory() as root:
             pack = story.plan_story_pack(planned(), SAFE_FACTS)
             story.persist_story_queue(pack, Path(root))
-            update = fake_update(1, main.BTN_REELS_CONFIRM)
+            update = fake_update(1, main.BTN_REELS_VARIANT)
             with patch.object(main, "ADMIN_ID", 1), patch.object(
                 main, "NAZ_STORY_PACK_ROOT", Path(root)
             ), patch.object(
-                main, "NAZ_STORY_RENDER_ENABLED", False
+                main, "NAZ_STORY_RENDER_ENABLED", True
             ):
                 handled = asyncio.run(main.handle_menu_button(
-                    update, SimpleNamespace(), main.BTN_REELS_CONFIRM
+                    update, SimpleNamespace(), main.BTN_REELS_VARIANT
                 ))
             self.assertTrue(handled)
             payload = story.read_manifest(Path(root) / pack.plan_id / "story_manifest.json")
             self.assertEqual(payload["approval"]["status"], "awaiting_approval")
+            self.assertEqual(payload["pack_status"], "awaiting_approval")
+            self.assertEqual(len(control.list_manifests(Path(root))), 1)
+            self.assertIn("общая кнопка", update.message.reply_text.await_args.args[0])
+
+    def test_reply_confirmation_is_not_sent_to_chat_or_provider(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack_dir = story.persist_story_queue(pack, Path(root))
+            summary = control.safe_summary(
+                story.read_manifest(pack_dir / "story_manifest.json")
+            )
+            update = fake_reels_reply(1, "подтверждаю", summary)
+            context = SimpleNamespace()
+            with patch.object(main, "ADMIN_ID", 1), patch.object(
+                main, "NAZ_STORY_PACK_ROOT", Path(root)
+            ), patch.object(
+                main, "NAZ_STORY_RENDER_ENABLED", False
+            ), patch.object(
+                main, "handle_delegated_reply", new=AsyncMock(return_value=False)
+            ), patch.object(
+                main, "generate_answer", new=AsyncMock()
+            ) as chat_model, patch.object(
+                main, "generate_image_bytes", new=AsyncMock()
+            ) as provider:
+                asyncio.run(main.handle_message(update, context))
+
+            payload = story.read_manifest(pack_dir / "story_manifest.json")
+            self.assertEqual(payload["approval"]["status"], "awaiting_approval")
+            self.assertEqual(payload["pack_status"], "awaiting_approval")
             self.assertIn("выключена", update.message.reply_text.await_args.args[0])
+            chat_model.assert_not_awaited()
+            provider.assert_not_awaited()
+
+    def test_callback_confirms_exact_plan_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=0)
+            second = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=1)
+            self.assertNotEqual(first.plan_id, second.plan_id)
+            story.persist_story_queue(first, Path(root))
+            story.persist_story_queue(second, Path(root))
+            update = fake_reels_callback(1, f"reels_confirm:{first.plan_id}")
+            with patch.object(main, "ADMIN_ID", 1), patch.object(
+                main, "NAZ_STORY_PACK_ROOT", Path(root)
+            ), patch.object(
+                main, "NAZ_STORY_RENDER_ENABLED", True
+            ), patch.object(
+                main, "generate_image_bytes", new=AsyncMock()
+            ) as provider:
+                asyncio.run(main.reels_control_callback(update, SimpleNamespace()))
+                asyncio.run(main.reels_control_callback(update, SimpleNamespace()))
+
+            first_payload = story.read_manifest(
+                Path(root) / first.plan_id / "story_manifest.json"
+            )
+            second_payload = story.read_manifest(
+                Path(root) / second.plan_id / "story_manifest.json"
+            )
+            self.assertEqual(first_payload["approval"]["status"], "approved")
+            self.assertEqual(second_payload["approval"]["status"], "awaiting_approval")
+            self.assertTrue(all(
+                not job["external_job_id"] for job in first_payload["scene_jobs"]
+            ))
+            self.assertEqual(update.callback_query.answer.await_count, 2)
+            provider.assert_not_awaited()
+
+    def test_manifest_plan_id_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=0)
+            second = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=1)
+            first_dir = story.persist_story_queue(first, Path(root))
+            second_dir = story.persist_story_queue(second, Path(root))
+            first_manifest = first_dir / "story_manifest.json"
+            first_payload = story.read_manifest(first_manifest)
+            first_payload["plan_id"] = second.plan_id
+            story.atomic_json(first_manifest, first_payload)
+            update = fake_reels_callback(1, f"reels_confirm:{first.plan_id}")
+            with patch.object(main, "ADMIN_ID", 1), patch.object(
+                main, "NAZ_STORY_PACK_ROOT", Path(root)
+            ), patch.object(main, "NAZ_STORY_RENDER_ENABLED", True):
+                asyncio.run(main.reels_control_callback(update, SimpleNamespace()))
+
+            corrupted = story.read_manifest(first_manifest)
+            untouched = story.read_manifest(second_dir / "story_manifest.json")
+            self.assertEqual(corrupted["approval"]["status"], "awaiting_approval")
+            self.assertEqual(untouched["approval"]["status"], "awaiting_approval")
+            self.assertIn(
+                "недоступно",
+                update.callback_query.message.reply_text.await_args.args[0],
+            )
+
+    def test_non_admin_callback_fails_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack_dir = story.persist_story_queue(pack, Path(root))
+            update = fake_reels_callback(2, f"reels_confirm:{pack.plan_id}")
+            with patch.object(main, "ADMIN_ID", 1), patch.object(
+                main, "NAZ_STORY_PACK_ROOT", Path(root)
+            ), patch.object(main, "NAZ_STORY_RENDER_ENABLED", True):
+                asyncio.run(main.reels_control_callback(update, SimpleNamespace()))
+            payload = story.read_manifest(pack_dir / "story_manifest.json")
+            self.assertEqual(payload["approval"]["status"], "awaiting_approval")
+            update.callback_query.message.reply_text.assert_not_awaited()
+            self.assertTrue(update.callback_query.answer.await_args.kwargs["show_alert"])
+
+    def test_malformed_callback_fails_closed(self):
+        update = fake_reels_callback(1, "reels_confirm:../../secrets")
+        with patch.object(main, "ADMIN_ID", 1):
+            asyncio.run(main.reels_control_callback(update, SimpleNamespace()))
+        update.callback_query.message.reply_text.assert_not_awaited()
+        self.assertTrue(update.callback_query.answer.await_args.kwargs["show_alert"])
 
     def test_contact_reels_button_keeps_text_script_flow(self):
         update = fake_update(77, main.BTN_REELS)
