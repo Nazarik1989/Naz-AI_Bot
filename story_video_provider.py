@@ -26,6 +26,7 @@ RUNWAY_MODEL_DURATIONS: Mapping[str, frozenset[int]] = {
 }
 RUNWAY_PORTRAIT_SIZE = (720, 1280)
 RUNWAY_DATA_URI_BASE64_LIMIT = 5 * 1024 * 1024
+RUNWAY_PROMPT_MAX_UTF16_UNITS = 1000
 _REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 _REFERENCE_BACKGROUND = (2, 3, 9)
 
@@ -99,6 +100,44 @@ def _json_object(raw: bytes) -> dict[str, Any]:
     return value
 
 
+def utf16_code_units(value: str) -> int:
+    """Return the length used by Runway's prompt contract."""
+
+    return len(value.encode("utf-16-le")) // 2
+
+
+def append_prompt_guidance(prompt: str, guidance: str) -> str:
+    """Append optional continuity guidance without exceeding Runway's limit."""
+
+    base = prompt.strip()
+    if not base:
+        raise ProviderError("video_prompt_invalid")
+    if utf16_code_units(base) > RUNWAY_PROMPT_MAX_UTF16_UNITS:
+        raise ProviderError("video_prompt_too_long")
+    normalized_guidance = guidance.strip()
+    prefix = " Body continuity: "
+    addition = prefix + normalized_guidance if normalized_guidance else ""
+    if utf16_code_units(base + addition) <= RUNWAY_PROMPT_MAX_UTF16_UNITS:
+        return base + addition
+
+    remaining = RUNWAY_PROMPT_MAX_UTF16_UNITS - utf16_code_units(base)
+    if remaining <= utf16_code_units(prefix):
+        return base
+    fitted: list[str] = []
+    used = 0
+    guidance_budget = remaining - utf16_code_units(prefix)
+    for character in normalized_guidance:
+        width = utf16_code_units(character)
+        if used + width > guidance_budget:
+            break
+        fitted.append(character)
+        used += width
+    compacted = "".join(fitted).rstrip()
+    if " " in compacted:
+        compacted = compacted.rsplit(" ", 1)[0].rstrip()
+    return base + prefix + compacted if compacted else base
+
+
 class RunwayVideoProvider:
     """Runway asynchronous task adapter; all I/O is injectable for tests."""
 
@@ -138,6 +177,16 @@ class RunwayVideoProvider:
         )
         if status == 429 or status >= 500:
             raise ProviderError("provider_temporarily_unavailable", retryable=True)
+        if status in {400, 422}:
+            raise ProviderError("provider_input_invalid")
+        if status == 401:
+            raise ProviderError("video_api_key_invalid")
+        if status == 402:
+            raise ProviderError("provider_payment_required")
+        if status == 403:
+            raise ProviderError("provider_permission_denied")
+        if status == 404:
+            raise ProviderError("provider_endpoint_not_found")
         if not 200 <= status < 300:
             raise ProviderError("provider_request_rejected")
         return _json_object(raw) if raw else {}
@@ -201,9 +250,14 @@ class RunwayVideoProvider:
         duration = self._validate_duration(request.duration_seconds)
         if self.model == "gen4_turbo" and request.reference_path is None:
             raise ProviderError("video_prompt_image_required")
+        prompt = request.prompt.strip()
+        if not prompt:
+            raise ProviderError("video_prompt_invalid")
+        if utf16_code_units(prompt) > RUNWAY_PROMPT_MAX_UTF16_UNITS:
+            raise ProviderError("video_prompt_too_long")
         payload: dict[str, Any] = {
             "model": self.model,
-            "promptText": request.prompt,
+            "promptText": prompt,
             "duration": duration,
             "ratio": "720:1280",
         }

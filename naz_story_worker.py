@@ -23,7 +23,13 @@ import story_production
 from story_audio_evidence import eligible_segment_starts
 from story_media_composer import MediaComposer, MediaError, checksum, load_music_library
 from story_pack_lock import AdvisoryFileLock, StoryPackLock, StoryPackLockError
-from story_video_provider import ProviderError, SceneRequest, VideoProvider, provider_from_environment
+from story_video_provider import (
+    ProviderError,
+    SceneRequest,
+    VideoProvider,
+    append_prompt_guidance,
+    provider_from_environment,
+)
 
 
 LOGGER = logging.getLogger("naz.story.worker")
@@ -38,12 +44,16 @@ SAFE_FAILURE_CODES = {
     "media_tool_failed", "media_tool_unavailable_or_timed_out", "overlay_text_unsafe",
     "provider_download_failed", "provider_download_not_mp4", "provider_job_id_missing",
     "provider_cancel_uncertain",
-    "provider_output_url_missing", "provider_request_rejected", "provider_response_invalid",
+    "provider_endpoint_not_found", "provider_input_invalid", "provider_output_url_missing",
+    "provider_payment_required", "provider_permission_denied", "provider_request_rejected",
+    "provider_response_invalid",
     "provider_prompt_unsafe",
     "provider_status_unknown", "provider_temporarily_unavailable", "provider_terminal_failure",
     "provider_timeout", "provider_transport_error", "reel_crop_missing",
     "reel_cuts_not_on_beat_grid", "reel_fragment_duration_invalid", "reel_fragment_out_of_source",
-    "unsafe_media_path", "video_api_key_missing", "video_provider_disabled", "video_provider_unknown",
+    "unsafe_media_path", "video_api_key_invalid", "video_api_key_missing",
+    "video_provider_disabled", "video_provider_unknown", "video_prompt_invalid",
+    "video_prompt_too_long",
     "provider_reference_required", "video_auto_fallback_forbidden",
     "video_duration_unsupported", "video_model_priority_invalid",
     "video_model_route_mismatch", "video_model_unsupported", "video_prompt_image_required",
@@ -59,11 +69,18 @@ SECONDARY_ESCALATION_CODES = frozenset({
 DEFINITIVE_SUBMIT_FAILURE_CODES = frozenset({
     "approved_reference_invalid",
     "approved_reference_too_large",
+    "provider_endpoint_not_found",
+    "provider_input_invalid",
+    "provider_payment_required",
+    "provider_permission_denied",
     "provider_prompt_unsafe",
     "provider_request_rejected",
     "video_duration_unsupported",
     "video_model_unsupported",
+    "video_api_key_invalid",
+    "video_prompt_invalid",
     "video_prompt_image_required",
+    "video_prompt_too_long",
 })
 
 
@@ -247,10 +264,24 @@ def _budget_usage(root: Path) -> tuple[int, int]:
         if payload.get("schema") != story_production.STORY_SCHEMA:
             continue
         for job in payload.get("scene_jobs", []):
-            submitted = _utc(job.get("submitted_at"))
-            if submitted and submitted.date() == now:
-                jobs += int(job.get("attempts", 0))
-                seconds += int(job.get("planned_duration_seconds", 0)) * int(job.get("attempts", 0))
+            history = job.get("submit_intent_history")
+            intents = list(history) if isinstance(history, list) else []
+            if isinstance(job.get("submit_intent"), dict):
+                intents.append(job["submit_intent"])
+            reserved = 0
+            for intent in intents:
+                if not isinstance(intent, dict) or intent.get("state") not in {
+                    "accepted", "ambiguous", "submitting",
+                }:
+                    continue
+                created = _utc(intent.get("created_at"))
+                if created and created.date() == now:
+                    reserved += 1
+            if not intents and job.get("external_job_id"):
+                submitted = _utc(job.get("submitted_at"))
+                reserved = int(bool(submitted and submitted.date() == now))
+            jobs += reserved
+            seconds += int(job.get("planned_duration_seconds", 0)) * reserved
     return jobs, seconds
 
 
@@ -566,13 +597,11 @@ def _process_scene(
             job["failure_code"] = "daily_seconds_limit_reached"
             _write(manifest, payload)
             return
-        prompt = str(scene["provider_prompt"])
-        if reference and reference.body_guidance:
-            prompt += (
-                " Body continuity for this medium or wide Naz shot: "
-                + reference.body_guidance
-            )
         try:
+            prompt = append_prompt_guidance(
+                str(scene["provider_prompt"]),
+                reference.body_guidance if reference else "",
+            )
             request = SceneRequest(
                 scene_id=str(job["scene_id"]),
                 prompt=story_production.validate_provider_prompt(prompt),

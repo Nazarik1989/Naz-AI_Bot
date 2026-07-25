@@ -10,10 +10,13 @@ from PIL import Image
 
 from story_video_provider import (
     RUNWAY_DATA_URI_BASE64_LIMIT,
+    RUNWAY_PROMPT_MAX_UTF16_UNITS,
     ProviderError,
     RunwayVideoProvider,
     SceneRequest,
+    append_prompt_guidance,
     provider_from_environment,
+    utf16_code_units,
 )
 
 
@@ -100,6 +103,32 @@ class RunwayModelContractTests(unittest.TestCase):
         job = provider.submit(SceneRequest("01", "safe visible motion", 4))
         self.assertEqual(job.external_job_id, "task-1")
         self.assertTrue(transport.calls[0][1].endswith("/text_to_video"))
+
+    def test_prompt_contract_is_enforced_before_transport_in_utf16_units(self):
+        transport = MockTransport()
+        provider = RunwayVideoProvider(
+            api_key="secret-key", model="gen4.5", transport=transport
+        )
+        prompt = "a" * (RUNWAY_PROMPT_MAX_UTF16_UNITS - 1) + "😀"
+        self.assertEqual(utf16_code_units(prompt), RUNWAY_PROMPT_MAX_UTF16_UNITS + 1)
+        with self.assertRaisesRegex(ProviderError, "video_prompt_too_long"):
+            provider.submit(SceneRequest("01", prompt, 5))
+        self.assertEqual(transport.calls, [])
+
+    def test_continuity_guidance_is_compacted_without_changing_base_prompt(self):
+        base = "a" * 940
+        result = append_prompt_guidance(base, "stable body proportions " * 20)
+        self.assertTrue(result.startswith(base))
+        self.assertLessEqual(utf16_code_units(result), RUNWAY_PROMPT_MAX_UTF16_UNITS)
+        self.assertEqual(append_prompt_guidance("a" * 995, "stable body"), "a" * 995)
+
+    def test_invalid_provider_input_has_safe_specific_code(self):
+        transport = MockTransport([(400, {"Content-Type": "application/json"}, b"")])
+        provider = RunwayVideoProvider(
+            api_key="secret-key", model="gen4.5", transport=transport
+        )
+        with self.assertRaisesRegex(ProviderError, "provider_input_invalid"):
+            provider.submit(SceneRequest("01", "safe visible motion", 5))
 
 
 class RunwayReferenceContractTests(unittest.TestCase):
