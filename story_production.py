@@ -242,6 +242,17 @@ def reels_director_prompt(
     count = max(4, min(7, len(facts)))
     story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
     roles = _roles(story_plan_id, count)
+    if _object_only_direction(plan.visual_subject_direction):
+        identity_requirement = "This treatment is object-only: no person and no Naz may appear."
+    elif _requires_reference(plan.visual_subject_direction):
+        identity_requirement = (
+            "Every scene subject must explicitly include Naz as the same real adult human founder."
+        )
+    else:
+        identity_requirement = (
+            "Naz may perform the human actions, while macro/object scenes may omit him. "
+            "Never invent another person; every human subject must explicitly be Naz."
+        )
     brief = {
         "persona": "Naz, a real adult human founder",
         "topic": plan.topic,
@@ -250,6 +261,7 @@ def reels_director_prompt(
         "imagery": plan.imagery,
         "visual_subject_direction": plan.visual_subject_direction,
         "visual_relation": plan.visual_relation,
+        "identity_requirement": identity_requirement,
         "variant_index": variant_index,
         "ordered_roles": roles,
         "verified_facts": list(facts[:count]),
@@ -260,7 +272,7 @@ def reels_director_prompt(
         "paths, headings, metadata, UI, code, dashboards, or the wording 'fact N'. Dramatize "
         "the causal meaning with physically filmable actions; do not merely decorate it with "
         "generic cyberpunk. Naz AI Lab is a flexible world, not one fixed server room. Choose "
-        "locations and props because they express this episode. Naz remains human. Use Deep "
+        "locations and props because they express this episode. Whenever Naz is required, he remains human. Use Deep "
         "Black, Electric Blue, Ultraviolet and Ice Silver with materially believable optical "
         "glass, titanium, anodized aluminium, carbon, technical polymers or ceramic. No gold, "
         "copper branding, random robots, random boards, text, logos or overloaded HUDs.\n\n"
@@ -271,9 +283,55 @@ def reels_director_prompt(
         '"shot_size":"wide|medium|close|macro","camera_motion":'
         '"slow push|controlled pan|handheld follow|locked with real subject motion"}]}. '
         "Return exactly one scene for every ordered role, in the same order. Every setting, "
-        "action and end state must be concrete and distinct. Write scene fields in concise English.\n\n"
+        "action and end state must be concrete and distinct. Obey identity_requirement exactly. "
+        "Write scene fields in concise English.\n\n"
         + json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
     )
+
+
+def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
+    """OpenAI-compatible strict schema for the single director response."""
+    count = max(4, min(7, len(tuple(safe_facts))))
+    scene_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "role", "setting", "subject", "concrete_action", "start_state",
+            "end_state", "shot_size", "camera_motion",
+        ],
+        "properties": {
+            "role": {"type": "string", "enum": list(DRAMATURGIC_ROLES)},
+            "setting": {"type": "string"},
+            "subject": {"type": "string"},
+            "concrete_action": {"type": "string"},
+            "start_state": {"type": "string"},
+            "end_state": {"type": "string"},
+            "shot_size": {"type": "string", "enum": list(SHOT_SIZES)},
+            "camera_motion": {"type": "string", "enum": list(CAMERA_MOTIONS)},
+        },
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "naz_reels_director",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["director_version", "visual_concept", "scenes"],
+                "properties": {
+                    "director_version": {"type": "string", "enum": [DIRECTOR_VERSION]},
+                    "visual_concept": {"type": "string"},
+                    "scenes": {
+                        "type": "array",
+                        "minItems": count,
+                        "maxItems": count,
+                        "items": scene_schema,
+                    },
+                },
+            },
+        },
+    }
 
 
 def _director_field(value: Any, name: str, *, minimum: int = 8, maximum: int = 240) -> str:
@@ -303,14 +361,20 @@ def parse_reels_director_response(
     rows = payload.get("scenes")
     if not isinstance(rows, list) or len(rows) != count:
         raise StoryPlanError("director_scene_count_invalid")
-    requires_reference = _requires_reference(plan.visual_subject_direction)
+    direction_requires_reference = _requires_reference(plan.visual_subject_direction)
+    object_only_direction = _object_only_direction(plan.visual_subject_direction)
     scenes: list[DirectorScene] = []
     for index, (row, expected_role) in enumerate(zip(rows, expected_roles)):
         if not isinstance(row, Mapping) or str(row.get("role", "")).casefold() != expected_role:
             raise StoryPlanError(f"director_role_invalid_{index + 1}")
         subject = _director_field(row.get("subject"), "subject")
-        has_naz = "naz" in subject.casefold()
-        if has_naz is not requires_reference:
+        has_naz_human = _is_naz_human_subject(subject)
+        has_unidentified_human = _mentions_human_subject(subject) and not has_naz_human
+        if (
+            (object_only_direction and has_naz_human)
+            or (direction_requires_reference and not has_naz_human)
+            or has_unidentified_human
+        ):
             raise StoryPlanError(f"director_subject_identity_invalid_{index + 1}")
         shot_size = str(row.get("shot_size", "")).strip().casefold()
         camera_motion = str(row.get("camera_motion", "")).strip().casefold()
@@ -362,7 +426,37 @@ def _roles(plan_id: str, count: int) -> list[str]:
 
 def _requires_reference(subject: str) -> bool:
     folded = subject.casefold()
-    return any(word in folded for word in ("naz", "наз", "face", "portrait", "лицо", "портрет"))
+    return bool(
+        re.search(
+            r"(?:\bnaz\b|\bназ\b|\bface\b|\bportrait\b|\bлицо\b|\bпортрет\b)",
+            folded,
+        )
+    )
+
+
+def _object_only_direction(subject: str) -> bool:
+    return bool(
+        re.search(
+            r"(?i)(?:\bobject[- ]only\b|\bno person\b|\bwithout (?:a )?person\b|"
+            r"\bno invented human\b|\bбез человека\b|\bбез людей\b)",
+            subject,
+        )
+    )
+
+
+def _mentions_human_subject(subject: str) -> bool:
+    return bool(
+        re.search(
+            r"(?i)(?:\bperson\b|\bhuman\b|\bman\b|\bwoman\b|\bfounder\b|"
+            r"\bengineer\b|\btechnician\b|\boperator\b|\bчеловек\b|\bмужчин[аы]\b|"
+            r"\bженщин[аы]\b|\bинженер\b|\bоператор\b)",
+            subject,
+        )
+    )
+
+
+def _is_naz_human_subject(subject: str) -> bool:
+    return bool(re.search(r"(?i)(?:\bnaz\b|\bназ\b)", subject)) and _mentions_human_subject(subject)
 
 
 def _visual_treatment(plan: EditorialPlan, facts: tuple[str, ...]) -> str:
@@ -409,7 +503,11 @@ def _scene(
     # Both configured Runway tiers accept a five-second master.  Keeping the
     # provider master fixed also makes Reel timing and credit accounting exact.
     duration = 5
-    requires_reference = _requires_reference(plan.visual_subject_direction)
+    requires_reference = (
+        _is_naz_human_subject(directed_scene.subject)
+        if directed_scene is not None
+        else _requires_reference(plan.visual_subject_direction)
+    )
     subject = (
         directed_scene.subject
         if directed_scene is not None
