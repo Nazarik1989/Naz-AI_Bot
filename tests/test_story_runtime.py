@@ -885,6 +885,97 @@ class ControlTests(unittest.TestCase):
             self.assertIn("Оценка Runway", summary)
             self.assertIn("Аватар используется только для внешности", summary)
 
+    def test_safe_summary_localizes_director_card_without_changing_render_fields(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, manifest = make_pack(root, approved=False)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["visual_concept"] = "A founder verifies a live service at a workbench"
+            payload["central_thesis"] = "Рабочий результат проверяется реальным действием"
+            payload["admin_concept_ru"] = "Человек проверяет живой сервис реальным действием"
+            first = payload["scenes"][0]
+            first.update({
+                "admin_summary_ru": "Naz проверяет живой сервис на рабочем ноутбуке",
+                "story_overlay": "hook: Naz проверяет живой сервис на рабочем ноутбуке",
+                "requires_naz_reference": True,
+                "shot_size": "medium",
+                "camera_motion": "slow push",
+                "setting": "Naz AI Lab workbench",
+                "concrete_action": "Naz taps the laptop and waits",
+            })
+
+            summary = control.safe_summary(payload)
+
+            self.assertIn("Визуальная концепция: Человек проверяет живой сервис", summary)
+            self.assertIn("1. ЗАЦЕПКА", summary)
+            self.assertIn("Смысл: Naz проверяет живой сервис", summary)
+            self.assertIn("В кадре: Naz · План: средний", summary)
+            self.assertIn("Камера: медленное приближение", summary)
+            self.assertNotIn(payload["visual_concept"], summary)
+            self.assertNotIn(first["setting"], summary)
+            self.assertNotIn(first["concrete_action"], summary)
+
+    def test_safe_summary_falls_back_to_russian_for_english_director_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, manifest = make_pack(root, approved=False)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["visual_concept"] = "An opaque internal director concept"
+            payload["central_thesis"] = "An internal English thesis"
+            payload.pop("admin_concept_ru", None)
+            for scene in payload["scenes"]:
+                scene.pop("admin_summary_ru", None)
+            first = payload["scenes"][0]
+            first.update({
+                "story_overlay": "hook: An internal English scene description",
+                "requires_naz_reference": False,
+                "shot_size": "macro",
+                "camera_motion": "locked with real subject motion",
+            })
+
+            summary = control.safe_summary(payload)
+
+            self.assertIn(
+                "Визуальная концепция: Рабочий эпизод превращается в проверяемый результат",
+                summary,
+            )
+            self.assertIn("Смысл: Показываем исходную ситуацию", summary)
+            self.assertIn("В кадре: объект или механизм · План: макро", summary)
+            self.assertIn("Камера: статичная камера, движение внутри кадра", summary)
+            self.assertNotIn(payload["visual_concept"], summary)
+            self.assertNotIn(first["story_overlay"], summary)
+
+    def test_safe_summary_localizes_existing_live_service_plan_without_regeneration(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, manifest = make_pack(root, approved=False)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["visual_concept"] = "A human founder verifies a live service"
+            payload["central_thesis"] = "Internal English thesis"
+            for scene in payload["scenes"]:
+                scene.pop("admin_summary_ru", None)
+                scene["story_overlay"] = "hook: Internal English scene"
+            first = payload["scenes"][0]
+            first.update({
+                "setting": "Naz AI Lab workbench",
+                "concrete_action": "Naz taps a laptop and pauses above the trackpad",
+                "end_state": "the live service check is ready to begin",
+            })
+            second = payload["scenes"][1]
+            second.update({
+                "setting": "terminal corner",
+                "concrete_action": "Naz types a plain HTTP request and waits",
+                "end_state": "the service returns one response",
+            })
+
+            summary = control.safe_summary(payload)
+
+            self.assertIn(
+                "Визуальная концепция: Naz проверяет живой сервис из лаборатории",
+                summary,
+            )
+            self.assertIn("Naz касается ноутбука и замирает", summary)
+            self.assertIn("отправляет простой запрос из терминала", summary)
+            self.assertNotIn(first["concrete_action"], summary)
+            self.assertNotIn(second["concrete_action"], summary)
+
 
 class MediaTests(unittest.TestCase):
     def test_private_music_folder_requires_license_sidecar(self):

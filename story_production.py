@@ -139,11 +139,13 @@ class DirectorScene:
     end_state: str
     shot_size: str
     camera_motion: str
+    admin_summary_ru: str
 
 
 @dataclass(frozen=True, slots=True)
 class DirectorTreatment:
     visual_concept: str
+    admin_concept_ru: str
     scenes: tuple[DirectorScene, ...]
     version: str = DIRECTOR_VERSION
 
@@ -160,6 +162,7 @@ class ScenePlan:
     end_state: str
     shot_size: str
     camera_motion: str
+    admin_summary_ru: str
     duration_seconds: int
     clean_prompt: str
     provider_prompt: str
@@ -203,6 +206,7 @@ class StoryPackPlan:
     editorial_plan: Mapping[str, Any]
     central_thesis: str
     visual_concept: str
+    admin_concept_ru: str
     director_version: str
     scene_count: int
     scenes: tuple[ScenePlan, ...]
@@ -326,11 +330,13 @@ def reels_director_prompt(
         "copper branding, random robots, random boards, text, logos or overloaded HUDs.\n\n"
         "Return strict JSON only with this shape: "
         '{"director_version":"reels-semantic-director-v2","visual_concept":"...",'
+        '"admin_concept_ru":"...",'
         '"scenes":[{"setting":"...","subject_kind":"naz_human|physical_object",'
         '"subject_detail":"...",'
         '"concrete_action":"...","start_state":"...","end_state":"...",'
         '"shot_size":"wide|medium|close|macro","camera_motion":'
-        '"slow push|controlled pan|handheld follow|locked with real subject motion"}]}. '
+        '"slow push|controlled pan|handheld follow|locked with real subject motion",'
+        '"admin_summary_ru":"..."}]}. '
         "Do not return role names: the application assigns them deterministically. Return exactly "
         "one scene for every ordered role and draft beat, preserving their supplied order. "
         "For naz_human, subject_detail is simply Naz; identity is injected by the application. "
@@ -338,7 +344,11 @@ def reels_director_prompt(
         "action and end state must be physical, content-specific and distinct. Obey "
         "identity_requirement exactly. Concise physical place names such as Naz AI Lab or server "
         "room are valid settings; technical nouns are not transport metadata by themselves. "
-        "Write scene fields in concise English.\n\n"
+        "Write visual_concept, setting, subject_detail, concrete_action, start_state and end_state "
+        "in concise English. Write admin_concept_ru and every admin_summary_ru in concise natural "
+        "Russian for the administrator, each no longer than 240 characters: describe what will "
+        "visibly happen, not service metadata. "
+        "The Russian display fields never enter image or video prompts.\n\n"
         + json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -351,7 +361,7 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
         "additionalProperties": False,
         "required": [
             "setting", "subject_kind", "subject_detail", "concrete_action",
-            "start_state", "end_state", "shot_size", "camera_motion",
+            "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
         ],
         "properties": {
             "setting": {"type": "string"},
@@ -362,6 +372,7 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
             "end_state": {"type": "string"},
             "shot_size": {"type": "string", "enum": list(SHOT_SIZES)},
             "camera_motion": {"type": "string", "enum": list(CAMERA_MOTIONS)},
+            "admin_summary_ru": {"type": "string", "maxLength": 240},
         },
     }
     return {
@@ -372,10 +383,13 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
             "schema": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["director_version", "visual_concept", "scenes"],
+                "required": [
+                    "director_version", "visual_concept", "admin_concept_ru", "scenes"
+                ],
                 "properties": {
                     "director_version": {"type": "string", "enum": [DIRECTOR_VERSION]},
                     "visual_concept": {"type": "string"},
+                    "admin_concept_ru": {"type": "string", "maxLength": 240},
                     "scenes": {
                         "type": "array",
                         "minItems": count,
@@ -421,6 +435,27 @@ def _validated_director_text(value: Any, name: str, *, maximum: int = 1200) -> s
     return text
 
 
+def _director_ru_text(
+    value: Any,
+    code_prefix: str,
+    errors: list[str],
+    *,
+    maximum: int = 240,
+) -> str:
+    text = _director_text(value, code_prefix, errors, maximum=maximum)
+    if text and not re.search(r"[А-Яа-яЁё]", text):
+        errors.append(f"{code_prefix}_not_russian")
+    return text
+
+
+def _validated_director_ru_text(value: Any, name: str, *, maximum: int = 240) -> str:
+    errors: list[str] = []
+    text = _director_ru_text(value, f"director_{name}", errors, maximum=maximum)
+    if errors:
+        raise DirectorValidationError(errors)
+    return text
+
+
 def parse_reels_director_response(
     raw: str,
     plan: EditorialPlan,
@@ -443,13 +478,20 @@ def parse_reels_director_response(
         raise DirectorValidationError(("director_scene_count_invalid",))
 
     errors: list[str] = []
-    if set(payload) != {"director_version", "visual_concept", "scenes"}:
+    if set(payload) != {
+        "director_version", "visual_concept", "admin_concept_ru", "scenes"
+    }:
         errors.append("director_schema_invalid")
     visual_concept = _director_text(
         payload.get("visual_concept"),
         "director_visual_concept",
         errors,
         maximum=1200,
+    )
+    admin_concept_ru = _director_ru_text(
+        payload.get("admin_concept_ru"),
+        "director_admin_concept_ru",
+        errors,
     )
     direction_requires_reference = _requires_reference(plan.visual_subject_direction)
     object_only_direction = _object_only_direction(plan.visual_subject_direction)
@@ -459,7 +501,7 @@ def parse_reels_director_response(
     actions: list[str] = []
     expected_scene_fields = {
         "setting", "subject_kind", "subject_detail", "concrete_action",
-        "start_state", "end_state", "shot_size", "camera_motion",
+        "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
     }
     for index, (row, expected_role) in enumerate(zip(rows, expected_roles)):
         scene_number = index + 1
@@ -483,6 +525,9 @@ def parse_reels_director_response(
         )
         end_state = _director_text(
             row.get("end_state"), f"{scene_prefix}_end_state", errors
+        )
+        admin_summary_ru = _director_ru_text(
+            row.get("admin_summary_ru"), f"{scene_prefix}_admin_summary_ru", errors
         )
 
         subject_kind = str(row.get("subject_kind", "")).strip().casefold()
@@ -526,6 +571,7 @@ def parse_reels_director_response(
                     end_state=end_state,
                     shot_size=shot_size,
                     camera_motion=camera_motion,
+                    admin_summary_ru=admin_summary_ru,
                 )
             )
 
@@ -541,6 +587,7 @@ def parse_reels_director_response(
         raise DirectorValidationError(errors)
     return DirectorTreatment(
         visual_concept=visual_concept,
+        admin_concept_ru=admin_concept_ru,
         scenes=tuple(scenes),
     )
 
@@ -681,6 +728,7 @@ def _scene(
         start_state = directed_scene.start_state
         end_state = directed_scene.end_state
         camera_motion = directed_scene.camera_motion
+        admin_summary_ru = directed_scene.admin_summary_ru
         visual_concept = directed_concept
     else:
         setting, action, end_state = treatment["beats"][role]
@@ -688,6 +736,7 @@ def _scene(
             action, end_state = OBJECT_ONLY_ACTIONS[role]
         start_state = "before the documented action changes the situation"
         camera_motion = CAMERA_MOTIONS[_rank(plan.plan_id, f"motion:{index}") % len(CAMERA_MOTIONS)]
+        admin_summary_ru = ""
         visual_concept = str(treatment["label"])
     standalone = f"{role}: {fact}"[:180]
     overlay = standalone[:72]
@@ -738,6 +787,7 @@ def _scene(
         end_state=end_state,
         shot_size=shot_size,
         camera_motion=camera_motion,
+        admin_summary_ru=admin_summary_ru,
         duration_seconds=duration, clean_prompt=clean_prompt, provider_prompt=provider_prompt,
         keyframe_prompt=keyframe_prompt,
         identity_reference_usage="identity_only" if requires_reference else "none",
@@ -841,9 +891,14 @@ def plan_story_pack(
             director_treatment.visual_concept,
             "visual_concept",
         )
+        admin_concept_ru = _validated_director_ru_text(
+            director_treatment.admin_concept_ru,
+            "admin_concept_ru",
+        )
         director_version = DIRECTOR_VERSION
     else:
         visual_concept = str(VISUAL_TREATMENTS[treatment_key]["label"])
+        admin_concept_ru = ""
         director_version = TEMPLATE_DIRECTOR_VERSION
     continuity_id = hashlib.sha256(f"naz|{plan.plan_id}|continuity".encode("utf-8")).hexdigest()[:20]
     roles = _roles(story_plan_id, count)
@@ -868,6 +923,7 @@ def plan_story_pack(
         editorial_plan=plan.to_dict(),
         central_thesis=plan.thesis_direction,
         visual_concept=visual_concept,
+        admin_concept_ru=admin_concept_ru,
         director_version=director_version,
         scene_count=count, scenes=scenes,
         reel_edits=(
