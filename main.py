@@ -4290,19 +4290,34 @@ def current_bot_date() -> str:
     return datetime.now(ZoneInfo(BOT_TIMEZONE)).date().isoformat()
 
 
+def reels_director_reason_codes(exc: Exception) -> tuple[str, ...]:
+    candidates = getattr(exc, "reason_codes", (str(exc),))
+    safe_codes = tuple(
+        code
+        for item in candidates
+        if re.fullmatch(r"[a-z0-9_]{3,80}", code := str(item).strip().casefold())
+    )
+    if isinstance(exc, story_production.StoryPlanError) and safe_codes:
+        return tuple(dict.fromkeys(safe_codes))
+    return ("director_provider_error",)
+
+
 def reels_director_reason_code(exc: Exception) -> str:
-    if isinstance(exc, story_production.StoryPlanError):
-        code = str(exc).strip().casefold()
-        if re.fullmatch(r"[a-z0-9_]{3,80}", code):
-            return code
-    return "director_provider_error"
+    reason_codes = reels_director_reason_codes(exc)
+    return reason_codes[0] if len(reason_codes) == 1 else "director_contract_invalid"
 
 
 def reels_director_reason_summary(reason_code: str) -> str:
+    if reason_code == "director_contract_invalid":
+        return "несколько полей режиссёрского контракта не прошли проверку"
     if "subject_identity" in reason_code:
         return "предметная и портретная постановка сцены противоречат друг другу"
     if reason_code in {"director_settings_repetitive", "director_actions_repetitive"}:
         return "сцены получились слишком повторяющимися"
+    if reason_code.endswith(("_secret", "_metadata", "_cliche")):
+        return "режиссёрский ответ содержал небезопасную служебную форму или запрещённое визуальное клише"
+    if reason_code.endswith(("_missing", "_too_long", "_invalid", "_unchanged")):
+        return "режиссёрский ответ нарушил типизированный контракт сцены"
     if reason_code.startswith("director_") and reason_code.endswith("_invalid"):
         return "режиссёрский ответ нарушил обязательную структуру или содержал служебные клише"
     if reason_code.startswith("director_role_invalid_") or reason_code.startswith("director_camera_invalid_"):
@@ -4371,6 +4386,7 @@ async def process_agent_content_date(
         try:
             director_treatment = await generate_reels_director_treatment(plan, safe_facts)
         except (RuntimeError, story_production.StoryPlanError) as exc:
+            reason_codes = reels_director_reason_codes(exc)
             reason_code = reels_director_reason_code(exc)
             memory.update_editorial_release_event(
                 user_id=user_id,
@@ -4380,9 +4396,10 @@ async def process_agent_content_date(
                 history_commit_status="not_run",
             )
             logger.warning(
-                "REELS_DIRECTOR rejected | plan_id=%s | reason_code=%s | error=%s",
+                "REELS_DIRECTOR rejected | plan_id=%s | reason_code=%s | reason_codes=%s | error=%s",
                 plan.plan_id,
                 reason_code,
+                ",".join(reason_codes),
                 type(exc).__name__,
             )
             await notify_admin(
@@ -5441,12 +5458,14 @@ async def reels_control_response(
         keyboard = reels_plan_keyboard(resulting_plan_id)
         return story_pack_control.safe_summary(payload) + note, keyboard
     except (OSError, RuntimeError, ValueError, story_production.StoryPlanError) as exc:
+        reason_codes = reels_director_reason_codes(exc)
         reason_code = reels_director_reason_code(exc)
         logger.warning(
-            "Reels Maker control rejected | action=%s | plan_id=%s | reason_code=%s",
+            "Reels Maker control rejected | action=%s | plan_id=%s | reason_code=%s | reason_codes=%s",
             action,
             plan_id or "latest",
             reason_code,
+            ",".join(reason_codes),
         )
         if action == BTN_REELS_VARIANT:
             return (

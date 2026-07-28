@@ -26,7 +26,7 @@ PREVIOUS_STORY_SCHEMA = "naz-story-pack-v4"
 OLDER_STORY_SCHEMA = "naz-story-pack-v3"
 LEGACY_STORY_SCHEMA = "naz-story-pack-v2"
 ANCIENT_STORY_SCHEMA = "naz-story-pack-v1"
-DIRECTOR_VERSION = "reels-semantic-director-v1"
+DIRECTOR_VERSION = "reels-semantic-director-v2"
 TEMPLATE_DIRECTOR_VERSION = "reels-template-director-v1"
 RENDERER_UNAVAILABLE = "unavailable"
 DRAMATURGIC_ROLES = (
@@ -36,6 +36,8 @@ SHOT_SIZES = ("wide", "medium", "close", "macro")
 REFERENCE_ROLES = ("none", "frontal_identity", "three_quarter_identity")
 REEL_CROPS = ("tight-center", "left-detail", "right-detail", "wide-center")
 CAMERA_MOTIONS = ("slow push", "controlled pan", "handheld follow", "locked with real subject motion")
+DIRECTOR_SUBJECT_KINDS = ("naz_human", "physical_object")
+CANONICAL_NAZ_SUBJECT = "Naz, the same real adult human founder"
 SAFE_ZONES = ("upper-middle", "middle-left", "lower-middle above platform controls")
 VISUAL_TREATMENTS = {
     "constraint_recovery": {
@@ -114,10 +116,23 @@ class StoryPlanError(ValueError):
     pass
 
 
+class DirectorValidationError(StoryPlanError):
+    """One fail-closed director rejection containing every safe reason code."""
+
+    def __init__(self, reason_codes: Sequence[str]):
+        unique_codes = tuple(dict.fromkeys(str(code) for code in reason_codes if code))
+        if not unique_codes:
+            unique_codes = ("director_contract_invalid",)
+        self.reason_codes = unique_codes
+        primary = unique_codes[0] if len(unique_codes) == 1 else "director_contract_invalid"
+        super().__init__(primary)
+
+
 @dataclass(frozen=True, slots=True)
 class DirectorScene:
     role: str
     setting: str
+    subject_kind: str
     subject: str
     concrete_action: str
     start_state: str
@@ -220,6 +235,33 @@ def _safe_fact(value: str) -> str:
     return text
 
 
+def draft_story_beats(value: str) -> tuple[str, ...]:
+    """Extract 4–7 ordered, non-secret narrative beats from an approved draft."""
+    text = str(value or "").replace("\r\n", "\n").strip()
+    if not text or _SECRET_RE.search(text):
+        raise StoryPlanError("director_draft_unsafe")
+    paragraphs = [
+        " ".join(item.split())
+        for item in re.split(r"\n\s*\n+", text)
+        if len(" ".join(item.split())) >= 24
+    ]
+    sentences = [
+        " ".join(item.split())
+        for item in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if len(" ".join(item.split())) >= 24
+    ]
+    candidates = list(dict.fromkeys(paragraphs if len(paragraphs) >= 4 else sentences))
+    if len(candidates) < 4:
+        raise StoryPlanError("director_draft_beats_insufficient")
+    if len(candidates) > 7:
+        indexes = {
+            round(position * (len(candidates) - 1) / 6)
+            for position in range(7)
+        }
+        candidates = [candidates[index] for index in sorted(indexes)]
+    return tuple(_safe_fact(item) for item in candidates)
+
+
 _DIRECTOR_TRANSPORT_RE = re.compile(
     r"(?i)(?:\bfact\s*\d+\b|tied to fact|perform and reveal|folders?:|user focus:|"
     r"project:|\.md\b|\.json\b|source_ref|plan_id)"
@@ -246,15 +288,18 @@ def reels_director_prompt(
     story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
     roles = _roles(story_plan_id, count)
     if _object_only_direction(plan.visual_subject_direction):
-        identity_requirement = "This treatment is object-only: no person and no Naz may appear."
+        identity_requirement = "Every scene must use subject_kind=physical_object."
     elif _requires_reference(plan.visual_subject_direction):
+        identity_requirement = "Every scene must use subject_kind=naz_human."
+    elif _human_led_direction(plan.visual_subject_direction):
         identity_requirement = (
-            "Every scene subject must explicitly include Naz as the same real adult human founder."
+            "At least one scene must use subject_kind=naz_human. Object-only macro scenes "
+            "may use subject_kind=physical_object. Never invent another human."
         )
     else:
         identity_requirement = (
-            "Naz may perform the human actions, while macro/object scenes may omit him. "
-            "Never invent another person; every human subject must explicitly be Naz."
+            "Use subject_kind=naz_human for scenes performed by Naz and "
+            "subject_kind=physical_object for true object-only macro scenes."
         )
     brief = {
         "persona": "Naz, a real adult human founder",
@@ -267,7 +312,7 @@ def reels_director_prompt(
         "identity_requirement": identity_requirement,
         "variant_index": variant_index,
         "ordered_roles": roles,
-        "verified_facts": list(facts[:count]),
+        "draft_beats": list(facts[:count]),
     }
     return (
         "Act as Reels Maker, the film director for Naz AI Lab. Convert the supplied verified "
@@ -280,15 +325,19 @@ def reels_director_prompt(
         "glass, titanium, anodized aluminium, carbon, technical polymers or ceramic. No gold, "
         "copper branding, random robots, random boards, text, logos or overloaded HUDs.\n\n"
         "Return strict JSON only with this shape: "
-        '{"director_version":"reels-semantic-director-v1","visual_concept":"...",'
-        '"scenes":[{"role":"...","setting":"...","subject":"...",'
+        '{"director_version":"reels-semantic-director-v2","visual_concept":"...",'
+        '"scenes":[{"setting":"...","subject_kind":"naz_human|physical_object",'
+        '"subject_detail":"...",'
         '"concrete_action":"...","start_state":"...","end_state":"...",'
         '"shot_size":"wide|medium|close|macro","camera_motion":'
         '"slow push|controlled pan|handheld follow|locked with real subject motion"}]}. '
-        "Return exactly one scene for every ordered role, in the same order. Every setting, "
-        "action and end state must be concrete and distinct. Obey identity_requirement exactly. "
-        "Concise physical place names such as Naz AI Lab or server room are valid settings; "
-        "technical nouns are not transport metadata by themselves. "
+        "Do not return role names: the application assigns them deterministically. Return exactly "
+        "one scene for every ordered role and draft beat, preserving their supplied order. "
+        "For naz_human, subject_detail is simply Naz; identity is injected by the application. "
+        "For physical_object, subject_detail names one concrete non-human object. Every setting, "
+        "action and end state must be physical, content-specific and distinct. Obey "
+        "identity_requirement exactly. Concise physical place names such as Naz AI Lab or server "
+        "room are valid settings; technical nouns are not transport metadata by themselves. "
         "Write scene fields in concise English.\n\n"
         + json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
     )
@@ -301,13 +350,13 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "required": [
-            "role", "setting", "subject", "concrete_action", "start_state",
-            "end_state", "shot_size", "camera_motion",
+            "setting", "subject_kind", "subject_detail", "concrete_action",
+            "start_state", "end_state", "shot_size", "camera_motion",
         ],
         "properties": {
-            "role": {"type": "string", "enum": list(DRAMATURGIC_ROLES)},
             "setting": {"type": "string"},
-            "subject": {"type": "string"},
+            "subject_kind": {"type": "string", "enum": list(DIRECTOR_SUBJECT_KINDS)},
+            "subject_detail": {"type": "string"},
             "concrete_action": {"type": "string"},
             "start_state": {"type": "string"},
             "end_state": {"type": "string"},
@@ -339,24 +388,37 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
     }
 
 
-def _director_field(value: Any, name: str, *, minimum: int = 8, maximum: int = 240) -> str:
-    text = " ".join(str(value or "").split())
-    if (
-        not minimum <= len(text) <= maximum
-        or _SECRET_RE.search(text)
-        or _DIRECTOR_TRANSPORT_RE.search(text)
-        or _DIRECTOR_FORBIDDEN_CLICHE_RE.search(text)
-    ):
-        raise StoryPlanError(f"director_{name}_invalid")
+def _director_text(
+    value: Any,
+    code_prefix: str,
+    errors: list[str],
+    *,
+    maximum: int = 600,
+) -> str:
+    """Normalize harmless prose variance and collect safety errors without echoing text."""
+    if not isinstance(value, str):
+        errors.append(f"{code_prefix}_missing")
+        return ""
+    text = " ".join(value.split())
+    if not text:
+        errors.append(f"{code_prefix}_missing")
+    elif len(text) > maximum:
+        errors.append(f"{code_prefix}_too_long")
+    if _SECRET_RE.search(text):
+        errors.append(f"{code_prefix}_secret")
+    if _DIRECTOR_TRANSPORT_RE.search(text):
+        errors.append(f"{code_prefix}_metadata")
+    if _DIRECTOR_FORBIDDEN_CLICHE_RE.search(text):
+        errors.append(f"{code_prefix}_cliche")
     return text
 
 
-def _director_subject(value: Any) -> str:
-    """Expand an unambiguous Naz shorthand before enforcing identity policy."""
-    text = " ".join(str(value or "").split())
-    if re.fullmatch(r"(?i)(?:naz|наз)[.!]?", text):
-        return "Naz, the same real adult human founder"
-    return _director_field(text, "subject")
+def _validated_director_text(value: Any, name: str, *, maximum: int = 1200) -> str:
+    errors: list[str] = []
+    text = _director_text(value, f"director_{name}", errors, maximum=maximum)
+    if errors:
+        raise DirectorValidationError(errors)
+    return text
 
 
 def parse_reels_director_response(
@@ -366,56 +428,119 @@ def parse_reels_director_response(
     *,
     variant_index: int = 0,
 ) -> DirectorTreatment:
-    """Validate a model treatment before it can become an immutable render plan."""
+    """Validate the entire typed treatment before it can become immutable."""
     try:
         payload = json.loads(str(raw).strip())
     except (TypeError, json.JSONDecodeError) as exc:
-        raise StoryPlanError("director_json_invalid") from exc
+        raise DirectorValidationError(("director_json_invalid",)) from exc
     if not isinstance(payload, Mapping) or payload.get("director_version") != DIRECTOR_VERSION:
-        raise StoryPlanError("director_schema_invalid")
+        raise DirectorValidationError(("director_schema_invalid",))
     facts = tuple(_safe_fact(item) for item in safe_facts)
     count = max(4, min(7, len(facts)))
     expected_roles = _roles(_variant_plan_id(plan.plan_id, variant_index), count)
     rows = payload.get("scenes")
     if not isinstance(rows, list) or len(rows) != count:
-        raise StoryPlanError("director_scene_count_invalid")
+        raise DirectorValidationError(("director_scene_count_invalid",))
+
+    errors: list[str] = []
+    if set(payload) != {"director_version", "visual_concept", "scenes"}:
+        errors.append("director_schema_invalid")
+    visual_concept = _director_text(
+        payload.get("visual_concept"),
+        "director_visual_concept",
+        errors,
+        maximum=1200,
+    )
     direction_requires_reference = _requires_reference(plan.visual_subject_direction)
     object_only_direction = _object_only_direction(plan.visual_subject_direction)
+    human_led_direction = _human_led_direction(plan.visual_subject_direction)
     scenes: list[DirectorScene] = []
+    settings: list[str] = []
+    actions: list[str] = []
+    expected_scene_fields = {
+        "setting", "subject_kind", "subject_detail", "concrete_action",
+        "start_state", "end_state", "shot_size", "camera_motion",
+    }
     for index, (row, expected_role) in enumerate(zip(rows, expected_roles)):
-        if not isinstance(row, Mapping) or str(row.get("role", "")).casefold() != expected_role:
-            raise StoryPlanError(f"director_role_invalid_{index + 1}")
-        subject = _director_subject(row.get("subject"))
-        has_naz_human = _is_naz_human_subject(subject)
-        has_unidentified_human = _mentions_human_subject(subject) and not has_naz_human
+        scene_number = index + 1
+        scene_prefix = f"director_scene_{scene_number}"
+        scene_error_start = len(errors)
+        if not isinstance(row, Mapping):
+            errors.append(f"{scene_prefix}_schema_invalid")
+            continue
+        if set(row) != expected_scene_fields:
+            errors.append(f"{scene_prefix}_schema_invalid")
+
+        setting = _director_text(row.get("setting"), f"{scene_prefix}_setting", errors)
+        subject_detail = _director_text(
+            row.get("subject_detail"), f"{scene_prefix}_subject_detail", errors
+        )
+        action = _director_text(
+            row.get("concrete_action"), f"{scene_prefix}_action", errors
+        )
+        start_state = _director_text(
+            row.get("start_state"), f"{scene_prefix}_start_state", errors
+        )
+        end_state = _director_text(
+            row.get("end_state"), f"{scene_prefix}_end_state", errors
+        )
+
+        subject_kind = str(row.get("subject_kind", "")).strip().casefold()
+        if subject_kind not in DIRECTOR_SUBJECT_KINDS:
+            errors.append(f"{scene_prefix}_subject_kind_invalid")
+            subject = ""
+        elif subject_kind == "naz_human":
+            subject = CANONICAL_NAZ_SUBJECT
+        else:
+            subject = subject_detail
+            if _mentions_human_subject(subject_detail):
+                errors.append(f"{scene_prefix}_subject_identity_invalid")
         if (
-            (object_only_direction and has_naz_human)
-            or (direction_requires_reference and not has_naz_human)
-            or has_unidentified_human
+            (object_only_direction and subject_kind == "naz_human")
+            or (direction_requires_reference and subject_kind != "naz_human")
         ):
-            raise StoryPlanError(f"director_subject_identity_invalid_{index + 1}")
+            errors.append(f"{scene_prefix}_subject_identity_invalid")
+
         shot_size = str(row.get("shot_size", "")).strip().casefold()
         camera_motion = str(row.get("camera_motion", "")).strip().casefold()
-        if shot_size not in SHOT_SIZES or camera_motion not in CAMERA_MOTIONS:
-            raise StoryPlanError(f"director_camera_invalid_{index + 1}")
-        scenes.append(
-            DirectorScene(
-                role=expected_role,
-                setting=_director_field(row.get("setting"), "setting", minimum=10),
-                subject=subject,
-                concrete_action=_director_field(row.get("concrete_action"), "action", minimum=12),
-                start_state=_director_field(row.get("start_state"), "start_state"),
-                end_state=_director_field(row.get("end_state"), "end_state"),
-                shot_size=shot_size,
-                camera_motion=camera_motion,
+        if shot_size not in SHOT_SIZES:
+            errors.append(f"{scene_prefix}_shot_size_invalid")
+        if camera_motion not in CAMERA_MOTIONS:
+            errors.append(f"{scene_prefix}_camera_motion_invalid")
+        if start_state and end_state and start_state.casefold() == end_state.casefold():
+            errors.append(f"{scene_prefix}_state_unchanged")
+
+        if setting:
+            settings.append(setting)
+        if action:
+            actions.append(action)
+        if len(errors) == scene_error_start:
+            scenes.append(
+                DirectorScene(
+                    role=expected_role,
+                    setting=setting,
+                    subject_kind=subject_kind,
+                    subject=subject,
+                    concrete_action=action,
+                    start_state=start_state,
+                    end_state=end_state,
+                    shot_size=shot_size,
+                    camera_motion=camera_motion,
+                )
             )
-        )
-    if len({scene.setting.casefold() for scene in scenes}) < min(3, count):
-        raise StoryPlanError("director_settings_repetitive")
-    if len({scene.concrete_action.casefold() for scene in scenes}) != count:
-        raise StoryPlanError("director_actions_repetitive")
+
+    if len(settings) == count and len({item.casefold() for item in settings}) < min(3, count):
+        errors.append("director_settings_repetitive")
+    if len(actions) == count and len({item.casefold() for item in actions}) != count:
+        errors.append("director_actions_repetitive")
+    if human_led_direction and not any(
+        scene.subject_kind == "naz_human" for scene in scenes
+    ):
+        errors.append("director_subject_mix_invalid")
+    if errors:
+        raise DirectorValidationError(errors)
     return DirectorTreatment(
-        visual_concept=_director_field(payload.get("visual_concept"), "visual_concept", minimum=12, maximum=160),
+        visual_concept=visual_concept,
         scenes=tuple(scenes),
     )
 
@@ -460,6 +585,10 @@ def _object_only_direction(subject: str) -> bool:
             subject,
         )
     )
+
+
+def _human_led_direction(subject: str) -> bool:
+    return bool(re.search(r"(?i)(?:\bhuman[- ]led\b|\bhuman[- ]performed\b)", subject))
 
 
 def _mentions_human_subject(subject: str) -> bool:
@@ -522,7 +651,7 @@ def _scene(
     # provider master fixed also makes Reel timing and credit accounting exact.
     duration = 5
     requires_reference = (
-        _is_naz_human_subject(directed_scene.subject)
+        directed_scene.subject_kind == "naz_human"
         if directed_scene is not None
         else _requires_reference(plan.visual_subject_direction)
     )
@@ -676,7 +805,7 @@ def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: boo
 
 def _variant_plan_id(base_plan_id: str, variant_index: int) -> str:
     return hashlib.sha256(
-        f"{base_plan_id}|{STORY_SCHEMA}|story-variant|{variant_index}".encode("utf-8")
+        f"{base_plan_id}|{STORY_SCHEMA}|{DIRECTOR_VERSION}|story-variant|{variant_index}".encode("utf-8")
     ).hexdigest()[:24]
 
 
@@ -701,11 +830,16 @@ def plan_story_pack(
     if director_treatment is not None:
         if director_treatment.version != DIRECTOR_VERSION or len(director_treatment.scenes) != count:
             raise StoryPlanError("director_treatment_invalid")
-        visual_concept = _director_field(
+        if any(
+            scene.subject_kind not in DIRECTOR_SUBJECT_KINDS
+            or (scene.subject_kind == "naz_human" and scene.subject != CANONICAL_NAZ_SUBJECT)
+            or (scene.subject_kind == "physical_object" and _mentions_human_subject(scene.subject))
+            for scene in director_treatment.scenes
+        ):
+            raise StoryPlanError("director_treatment_identity_invalid")
+        visual_concept = _validated_director_text(
             director_treatment.visual_concept,
             "visual_concept",
-            minimum=12,
-            maximum=160,
         )
         director_version = DIRECTOR_VERSION
     else:
@@ -914,7 +1048,7 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         return False
     if director_version == DIRECTOR_VERSION:
         try:
-            _director_field(concept, "visual_concept", minimum=12, maximum=160)
+            _validated_director_text(concept, "visual_concept")
         except StoryPlanError:
             return False
     elif director_version != TEMPLATE_DIRECTOR_VERSION:

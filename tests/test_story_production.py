@@ -48,14 +48,12 @@ def planned(candidate=None):
 
 def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix="Calibrate"):
     count = max(4, min(7, len(facts)))
-    story_plan_id = story._variant_plan_id(plan.plan_id, variant_index)
-    roles = story._roles(story_plan_id, count)
     scenes = []
-    for index, role in enumerate(roles, 1):
+    for index in range(1, count + 1):
         scenes.append({
-            "role": role,
             "setting": f"distinct physical validation chamber number {index}",
-            "subject": "one physical optical-titanium prototype",
+            "subject_kind": "physical_object",
+            "subject_detail": "one physical optical-titanium prototype",
             "concrete_action": f"{action_prefix} mechanical coupling number {index} under controlled load",
             "start_state": f"coupling number {index} is visibly misaligned",
             "end_state": f"coupling number {index} completes one stable motion",
@@ -84,6 +82,12 @@ class StoryFirstTests(unittest.TestCase):
         self.assertEqual(scenes["minItems"], len(SAFE_FACTS))
         self.assertEqual(scenes["maxItems"], len(SAFE_FACTS))
         self.assertFalse(scenes["items"]["additionalProperties"])
+        properties = scenes["items"]["properties"]
+        self.assertNotIn("role", properties)
+        self.assertEqual(
+            properties["subject_kind"]["enum"],
+            list(story.DIRECTOR_SUBJECT_KINDS),
+        )
 
     def test_neutral_work_surface_direction_allows_naz_and_object_scenes(self):
         plan = dataclasses.replace(
@@ -91,7 +95,8 @@ class StoryFirstTests(unittest.TestCase):
             visual_subject_direction="one specific work surface at the moment a result changes",
         )
         payload = json.loads(director_response(plan))
-        payload["scenes"][0]["subject"] = "Naz, the same real adult human founder"
+        payload["scenes"][0]["subject_kind"] = "naz_human"
+        payload["scenes"][0]["subject_detail"] = "Naz"
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
@@ -103,14 +108,15 @@ class StoryFirstTests(unittest.TestCase):
         self.assertFalse(story._is_naz_human_subject("one Naz AI Lab optical prototype"))
         self.assertTrue(story._is_naz_human_subject("Naz, the same real adult human founder"))
 
-    def test_2026_07_08_route_expands_unambiguous_naz_subject_shorthand(self):
+    def test_2026_07_08_route_uses_typed_naz_identity(self):
         plan = dataclasses.replace(
             planned(source(source_ref="agent_content:2026-07-08:fixture")),
             visual_subject_direction="the canonical Naz in the laboratory",
         )
         payload = json.loads(director_response(plan))
         for scene in payload["scenes"]:
-            scene["subject"] = "Naz"
+            scene["subject_kind"] = "naz_human"
+            scene["subject_detail"] = "Naz"
 
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
@@ -127,8 +133,11 @@ class StoryFirstTests(unittest.TestCase):
             planned(), visual_subject_direction="an object-only scene with no person"
         )
         payload = json.loads(director_response(plan))
-        payload["scenes"][0]["subject"] = "Naz, the real adult human founder"
-        with self.assertRaisesRegex(story.StoryPlanError, "director_subject_identity_invalid_1"):
+        payload["scenes"][0]["subject_kind"] = "naz_human"
+        payload["scenes"][0]["subject_detail"] = "Naz"
+        with self.assertRaisesRegex(
+            story.StoryPlanError, "director_scene_1_subject_identity_invalid"
+        ):
             story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
 
     def test_director_roles_follow_causal_order_and_never_start_with_result(self):
@@ -163,7 +172,7 @@ class StoryFirstTests(unittest.TestCase):
         plan = planned()
         payload = json.loads(director_response(plan))
         payload["scenes"][0]["setting"] = "A real setting tied to fact 1"
-        with self.assertRaisesRegex(story.StoryPlanError, "director_setting_invalid"):
+        with self.assertRaisesRegex(story.StoryPlanError, "director_scene_1_setting_metadata"):
             story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
 
     def test_2026_07_08_route_accepts_concrete_technical_locations(self):
@@ -200,7 +209,9 @@ class StoryFirstTests(unittest.TestCase):
             with self.subTest(invalid_setting=invalid_setting):
                 payload = json.loads(director_response(plan))
                 payload["scenes"][0]["setting"] = invalid_setting
-                with self.assertRaisesRegex(story.StoryPlanError, "director_setting_invalid"):
+                with self.assertRaisesRegex(
+                    story.StoryPlanError, "director_scene_1_setting_metadata"
+                ):
                     story.parse_reels_director_response(
                         json.dumps(payload), plan, SAFE_FACTS
                     )
@@ -215,10 +226,75 @@ class StoryFirstTests(unittest.TestCase):
             with self.subTest(invalid_setting=invalid_setting):
                 payload = json.loads(director_response(plan))
                 payload["scenes"][0]["setting"] = invalid_setting
-                with self.assertRaisesRegex(story.StoryPlanError, "director_setting_invalid"):
+                with self.assertRaisesRegex(
+                    story.StoryPlanError, "director_scene_1_setting_cliche"
+                ):
                     story.parse_reels_director_response(
                         json.dumps(payload), plan, SAFE_FACTS
                     )
+
+    def test_2026_07_08_route_accepts_concise_visual_concept(self):
+        plan = planned(source(source_ref="agent_content:2026-07-08:fixture"))
+        payload = json.loads(director_response(plan))
+        payload["visual_concept"] = "Lab"
+
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(
+            plan, SAFE_FACTS, director_treatment=treatment
+        )
+
+        self.assertEqual(treatment.visual_concept, "Lab")
+        self.assertEqual(pack.visual_concept, "Lab")
+
+    def test_2026_07_08_route_accepts_detailed_visual_concept(self):
+        plan = planned(source(source_ref="agent_content:2026-07-08:fixture"))
+        payload = json.loads(director_response(plan))
+        detailed_concept = " ".join(
+            ["physical causality expressed through one evolving laboratory mechanism"] * 8
+        )
+        self.assertGreater(len(detailed_concept), 240)
+        payload["visual_concept"] = detailed_concept
+
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(
+            plan, SAFE_FACTS, director_treatment=treatment
+        )
+
+        self.assertEqual(treatment.visual_concept, detailed_concept)
+        self.assertEqual(pack.visual_concept, detailed_concept)
+
+    def test_director_rejects_unbounded_visual_concept(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["visual_concept"] = "x" * 1201
+
+        with self.assertRaisesRegex(
+            story.StoryPlanError, "director_visual_concept_too_long"
+        ):
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+    def test_director_reports_all_typed_contract_errors_in_one_pass(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["visual_concept"] = "flowing code"
+        payload["scenes"][0]["setting"] = "setting tied to fact 1"
+        payload["scenes"][1]["subject_kind"] = "unknown_person"
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertEqual(str(raised.exception), "director_contract_invalid")
+        self.assertIn("director_visual_concept_cliche", raised.exception.reason_codes)
+        self.assertIn("director_scene_1_setting_metadata", raised.exception.reason_codes)
+        self.assertIn("director_scene_2_subject_kind_invalid", raised.exception.reason_codes)
 
     def test_semantic_director_rejects_malformed_json_without_template_fallback(self):
         with self.assertRaisesRegex(story.StoryPlanError, "director_json_invalid"):
