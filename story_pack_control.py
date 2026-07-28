@@ -361,7 +361,7 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         f"План: {str(payload.get('plan_id', ''))[:24]}\n"
         f"Вариант: {int(payload.get('variant_index', 0)) + 1}\n"
         f"Рубрика: {str(payload.get('rubric', ''))[:120]}\n"
-        f"Визуальная концепция: {concept_label}\n"
+        f"Сюжетная линия: {concept_label}\n"
         f"Статус: {PACK_STATUS_RU.get(pack_status, pack_status)}\n"
         f"Сцен: {len(jobs)}, запланировано секунд: {duration:g}\n"
         f"Сцен с Naz: {references}\n\n{statuses}\n\n"

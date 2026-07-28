@@ -49,21 +49,27 @@ def planned(candidate=None):
 def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix="Calibrate"):
     count = max(4, min(7, len(facts)))
     scenes = []
+    previous_end_state = ""
     for index in range(1, count + 1):
+        start_state = previous_end_state or "the validation mechanism is inactive and unresolved"
+        end_state = f"coupling number {index} completes one stable motion"
         scenes.append({
             "setting": f"distinct physical validation chamber number {index}",
             "subject_kind": "physical_object",
             "subject_detail": "one physical optical-titanium prototype",
             "concrete_action": f"{action_prefix} mechanical coupling number {index} under controlled load",
-            "start_state": f"coupling number {index} is visibly misaligned",
-            "end_state": f"coupling number {index} completes one stable motion",
+            "start_state": start_state,
+            "end_state": end_state,
             "shot_size": story.SHOT_SIZES[(index - 1) % len(story.SHOT_SIZES)],
             "camera_motion": story.CAMERA_MOTIONS[(index - 1) % len(story.CAMERA_MOTIONS)],
             "admin_summary_ru": f"Механическое соединение номер {index} проходит проверку нагрузкой",
         })
+        previous_end_state = end_state
     return json.dumps({
         "director_version": story.DIRECTOR_VERSION,
         "visual_concept": "a failed configuration becoming one testable physical mechanism",
+        "story_spine": "one failed configuration is isolated, corrected and verified under the same load",
+        "continuity_anchor": "the same optical-titanium validation mechanism",
         "admin_concept_ru": "Ошибка конфигурации становится проверяемым механизмом",
         "scenes": scenes,
     })
@@ -88,6 +94,15 @@ class StoryFirstTests(unittest.TestCase):
         self.assertNotIn("role", properties)
         self.assertIn("admin_summary_ru", properties)
         self.assertIn("admin_concept_ru", contract["schema"]["properties"])
+        self.assertIn("story_spine", contract["schema"]["properties"])
+        self.assertIn("continuity_anchor", contract["schema"]["properties"])
+        self.assertEqual(
+            contract["schema"]["properties"]["story_spine"]["maxLength"], 180
+        )
+        self.assertEqual(
+            contract["schema"]["properties"]["continuity_anchor"]["maxLength"],
+            90,
+        )
         self.assertEqual(properties["admin_summary_ru"]["maxLength"], 240)
         self.assertEqual(
             contract["schema"]["properties"]["admin_concept_ru"]["maxLength"],
@@ -170,6 +185,8 @@ class StoryFirstTests(unittest.TestCase):
         )
         self.assertEqual(pack.director_version, story.DIRECTOR_VERSION)
         self.assertEqual(pack.visual_concept, treatment.visual_concept)
+        self.assertEqual(pack.story_spine, treatment.story_spine)
+        self.assertEqual(pack.continuity_anchor, treatment.continuity_anchor)
         self.assertEqual(pack.admin_concept_ru, treatment.admin_concept_ru)
         self.assertEqual(
             [scene.concrete_action for scene in pack.scenes],
@@ -183,8 +200,27 @@ class StoryFirstTests(unittest.TestCase):
             self.assertNotIn(scene.admin_summary_ru, scene.clean_prompt)
             self.assertNotIn(scene.admin_summary_ru, scene.keyframe_prompt)
             self.assertNotIn(scene.admin_summary_ru, scene.provider_prompt)
+            self.assertIn(pack.story_spine, scene.clean_prompt)
+            self.assertIn(pack.story_spine, scene.provider_prompt)
+            self.assertIn(pack.continuity_anchor, scene.clean_prompt)
+            self.assertIn(pack.continuity_anchor, scene.keyframe_prompt)
+            self.assertIn(pack.continuity_anchor, scene.provider_prompt)
+        for previous, current in zip(pack.scenes, pack.scenes[1:]):
+            self.assertEqual(current.start_state, previous.end_state)
         self.assertTrue(all("tied to fact" not in scene.setting for scene in pack.scenes))
         self.assertTrue(all("fact 1" not in scene.concrete_action for scene in pack.scenes))
+
+    def test_director_rejects_independent_scenes_without_state_handoff(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][1]["start_state"] = "an unrelated second episode begins"
+
+        with self.assertRaisesRegex(
+            story.StoryPlanError, "director_scene_2_continuity_broken"
+        ):
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
 
     def test_semantic_director_rejects_metadata_shaped_scene_content(self):
         plan = planned()
@@ -343,6 +379,9 @@ class StoryFirstTests(unittest.TestCase):
         self.assertIn(story.DIRECTOR_VERSION, prompt)
         self.assertIn("admin_summary_ru", prompt)
         self.assertIn("concise natural Russian", prompt)
+        self.assertIn("one concise story_spine", prompt)
+        self.assertIn("copy the preceding scene's end_state verbatim", prompt)
+        self.assertIn("same physical object or system", prompt)
         self.assertNotIn("source_ref", prompt)
         self.assertNotIn("plan_id", prompt)
 
@@ -495,6 +534,20 @@ class StoryFirstTests(unittest.TestCase):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
         for scene in pack.scenes:
             self.assertIn("supplied directed keyframe", scene.provider_prompt)
+            self.assertLessEqual(len(scene.provider_prompt.encode("utf-16-le")) // 2, 1000)
+            self.assertLessEqual(len(scene.keyframe_prompt.encode("utf-16-le")) // 2, 1000)
+
+    def test_maximum_story_spine_and_anchor_still_fit_provider_prompts(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["story_spine"] = "s" * 180
+        payload["continuity_anchor"] = "a" * 90
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(plan, SAFE_FACTS, director_treatment=treatment)
+
+        for scene in pack.scenes:
             self.assertLessEqual(len(scene.provider_prompt.encode("utf-16-le")) // 2, 1000)
             self.assertLessEqual(len(scene.keyframe_prompt.encode("utf-16-le")) // 2, 1000)
 

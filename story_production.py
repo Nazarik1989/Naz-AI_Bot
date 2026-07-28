@@ -145,6 +145,8 @@ class DirectorScene:
 @dataclass(frozen=True, slots=True)
 class DirectorTreatment:
     visual_concept: str
+    story_spine: str
+    continuity_anchor: str
     admin_concept_ru: str
     scenes: tuple[DirectorScene, ...]
     version: str = DIRECTOR_VERSION
@@ -206,6 +208,8 @@ class StoryPackPlan:
     editorial_plan: Mapping[str, Any]
     central_thesis: str
     visual_concept: str
+    story_spine: str
+    continuity_anchor: str
     admin_concept_ru: str
     director_version: str
     scene_count: int
@@ -330,6 +334,7 @@ def reels_director_prompt(
         "copper branding, random robots, random boards, text, logos or overloaded HUDs.\n\n"
         "Return strict JSON only with this shape: "
         '{"director_version":"reels-semantic-director-v2","visual_concept":"...",'
+        '"story_spine":"...","continuity_anchor":"...",'
         '"admin_concept_ru":"...",'
         '"scenes":[{"setting":"...","subject_kind":"naz_human|physical_object",'
         '"subject_detail":"...",'
@@ -339,6 +344,15 @@ def reels_director_prompt(
         '"admin_summary_ru":"..."}]}. '
         "Do not return role names: the application assigns them deterministically. Return exactly "
         "one scene for every ordered role and draft beat, preserving their supplied order. "
+        "First define one concise story_spine (at most 180 characters): a single concrete goal that "
+        "starts unresolved and reaches one observable outcome. Define one continuity_anchor (at "
+        "most 90 characters): the same physical object or system "
+        "whose state carries that goal through the whole Reel. Build one causal chain, not separate "
+        "illustrations. Scene 1 opens the chain. For every later scene, copy the preceding scene's "
+        "end_state verbatim into the new start_state, then advance it with one new action. Keep the "
+        "continuity_anchor present or causally active in every scene. Change location only when the "
+        "previous result motivates that move. Russian admin summaries must also read as consecutive "
+        "steps of this same story. "
         "For naz_human, subject_detail is simply Naz; identity is injected by the application. "
         "For physical_object, subject_detail names one concrete non-human object. Every setting, "
         "action and end state must be physical, content-specific and distinct. Obey "
@@ -384,11 +398,14 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
                 "type": "object",
                 "additionalProperties": False,
                 "required": [
-                    "director_version", "visual_concept", "admin_concept_ru", "scenes"
+                    "director_version", "visual_concept", "story_spine",
+                    "continuity_anchor", "admin_concept_ru", "scenes"
                 ],
                 "properties": {
                     "director_version": {"type": "string", "enum": [DIRECTOR_VERSION]},
                     "visual_concept": {"type": "string"},
+                    "story_spine": {"type": "string", "maxLength": 180},
+                    "continuity_anchor": {"type": "string", "maxLength": 90},
                     "admin_concept_ru": {"type": "string", "maxLength": 240},
                     "scenes": {
                         "type": "array",
@@ -479,7 +496,8 @@ def parse_reels_director_response(
 
     errors: list[str] = []
     if set(payload) != {
-        "director_version", "visual_concept", "admin_concept_ru", "scenes"
+        "director_version", "visual_concept", "story_spine", "continuity_anchor",
+        "admin_concept_ru", "scenes"
     }:
         errors.append("director_schema_invalid")
     visual_concept = _director_text(
@@ -487,6 +505,18 @@ def parse_reels_director_response(
         "director_visual_concept",
         errors,
         maximum=1200,
+    )
+    story_spine = _director_text(
+        payload.get("story_spine"),
+        "director_story_spine",
+        errors,
+        maximum=180,
+    )
+    continuity_anchor = _director_text(
+        payload.get("continuity_anchor"),
+        "director_continuity_anchor",
+        errors,
+        maximum=90,
     )
     admin_concept_ru = _director_ru_text(
         payload.get("admin_concept_ru"),
@@ -499,6 +529,7 @@ def parse_reels_director_response(
     scenes: list[DirectorScene] = []
     settings: list[str] = []
     actions: list[str] = []
+    previous_end_state = ""
     expected_scene_fields = {
         "setting", "subject_kind", "subject_detail", "concrete_action",
         "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
@@ -554,6 +585,10 @@ def parse_reels_director_response(
             errors.append(f"{scene_prefix}_camera_motion_invalid")
         if start_state and end_state and start_state.casefold() == end_state.casefold():
             errors.append(f"{scene_prefix}_state_unchanged")
+        if index and previous_end_state and start_state != previous_end_state:
+            errors.append(f"{scene_prefix}_continuity_broken")
+        if end_state:
+            previous_end_state = end_state
 
         if setting:
             settings.append(setting)
@@ -587,6 +622,8 @@ def parse_reels_director_response(
         raise DirectorValidationError(errors)
     return DirectorTreatment(
         visual_concept=visual_concept,
+        story_spine=story_spine,
+        continuity_anchor=continuity_anchor,
         admin_concept_ru=admin_concept_ru,
         scenes=tuple(scenes),
     )
@@ -693,6 +730,8 @@ def _scene(
     treatment_key: str,
     directed_scene: DirectorScene | None = None,
     directed_concept: str = "",
+    directed_story_spine: str = "",
+    directed_continuity_anchor: str = "",
 ) -> ScenePlan:
     # Both configured Runway tiers accept a five-second master.  Keeping the
     # provider master fixed also makes Reel timing and credit accounting exact.
@@ -730,6 +769,8 @@ def _scene(
         camera_motion = directed_scene.camera_motion
         admin_summary_ru = directed_scene.admin_summary_ru
         visual_concept = directed_concept
+        story_spine = directed_story_spine
+        continuity_anchor = directed_continuity_anchor
     else:
         setting, action, end_state = treatment["beats"][role]
         if not requires_reference:
@@ -738,10 +779,14 @@ def _scene(
         camera_motion = CAMERA_MOTIONS[_rank(plan.plan_id, f"motion:{index}") % len(CAMERA_MOTIONS)]
         admin_summary_ru = ""
         visual_concept = str(treatment["label"])
+        story_spine = visual_concept
+        continuity_anchor = "one evolving physical Naz AI Lab mechanism"
     standalone = f"{role}: {fact}"[:180]
     overlay = standalone[:72]
     continuity = (
         f"continuity_id={continuity_id}",
+        f"story_spine={story_spine}",
+        f"continuity_anchor={continuity_anchor}",
         "same canonical Naz face, age, clothing and human-digital boundary across the pack",
         "Deep Black, Electric Blue, Cobalt, Ultraviolet and Ice Silver only",
         "optical glass, titanium, aluminium, carbon and technical ceramic",
@@ -756,25 +801,26 @@ def _scene(
         "reactions or watermarks."
     )
     identity_instruction = (
-        "Use @Naz only for facial identity, age and human build; replace the reference background, pose, "
-        "lighting and framing completely. "
+        "Use @Naz only for identity, age and build; replace the reference background, pose, light and framing. "
         if requires_reference else "No person is present. "
     )
     keyframe_prompt = (
-        f"Vertical cinematic scene composed for a 9:16 centre crop. {identity_instruction}"
-        f"Visual concept: {visual_concept}. Location: {setting}. Subject: {subject}. Exact frozen action: {action}. "
-        f"Shot: {shot_size}; leave motion room for a {camera_motion}. "
+        f"Cinematic vertical 9:16 keyframe. {identity_instruction}"
+        f"Concept: {visual_concept}. Location: {setting}. Subject: {subject}. Frozen action: {action}. "
+        f"Same story anchor: {continuity_anchor}. "
+        f"Shot: {shot_size}; motion room: {camera_motion}. "
         "Human intelligence / machine precision. Deep Black #020309, Midnight Blue #070B20, "
         "Electric Blue #185CFF, Ultraviolet #762DFF and Ice Silver #D7E5FF. "
         "Optical glass, polished titanium, blue anodized aluminium, carbon and technical ceramic. "
-        "Deep black background, cold blue rim light, blue-violet edge, high local contrast, one main subject. "
-        "Photorealistic physical laboratory, materially believable, no text, logos, HUD, code, copper, gold, "
-        "cheap neon cyberpunk, random circuit boards, robots or extra people."
+        "Black background; cold blue rim; blue-violet edge; high local contrast; one subject. "
+        "Photoreal physical lab; believable materials. No text, logos, HUD, code, copper, gold, "
+        "cheap cyberpunk, random boards, robots or extra people."
     )
     provider_prompt = (
         f"Animate the supplied directed keyframe as a vertical 9:16 CLEAN video master. Role: {role}. "
         f"Keep the exact subject, Naz identity, laboratory architecture, materials and lighting from the keyframe. "
         f"Physical action: {action}. Camera: {camera_motion}. "
+        f"Continue the same story spine ({story_spine}) and continuity anchor ({continuity_anchor}). "
         f"Begin in the supplied pose and end when {end_state}. "
         "Natural restrained human movement and one clear physical state change are mandatory. "
         "No scene replacement, morphing, extra people, text, logos, HUD, platform UI, code or watermarks."
@@ -891,6 +937,16 @@ def plan_story_pack(
             director_treatment.visual_concept,
             "visual_concept",
         )
+        story_spine = _validated_director_text(
+            director_treatment.story_spine,
+            "story_spine",
+            maximum=180,
+        )
+        continuity_anchor = _validated_director_text(
+            director_treatment.continuity_anchor,
+            "continuity_anchor",
+            maximum=90,
+        )
         admin_concept_ru = _validated_director_ru_text(
             director_treatment.admin_concept_ru,
             "admin_concept_ru",
@@ -898,6 +954,8 @@ def plan_story_pack(
         director_version = DIRECTOR_VERSION
     else:
         visual_concept = str(VISUAL_TREATMENTS[treatment_key]["label"])
+        story_spine = visual_concept
+        continuity_anchor = "one evolving physical Naz AI Lab mechanism"
         admin_concept_ru = ""
         director_version = TEMPLATE_DIRECTOR_VERSION
     continuity_id = hashlib.sha256(f"naz|{plan.plan_id}|continuity".encode("utf-8")).hexdigest()[:20]
@@ -912,6 +970,8 @@ def plan_story_pack(
             treatment_key=treatment_key,
             directed_scene=director_treatment.scenes[i] if director_treatment is not None else None,
             directed_concept=visual_concept,
+            directed_story_spine=story_spine,
+            directed_continuity_anchor=continuity_anchor,
         )
         for i, role in enumerate(roles)
     )
@@ -923,6 +983,8 @@ def plan_story_pack(
         editorial_plan=plan.to_dict(),
         central_thesis=plan.thesis_direction,
         visual_concept=visual_concept,
+        story_spine=story_spine,
+        continuity_anchor=continuity_anchor,
         admin_concept_ru=admin_concept_ru,
         director_version=director_version,
         scene_count=count, scenes=scenes,
