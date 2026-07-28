@@ -29,7 +29,7 @@ from functools import wraps
 from html import unescape
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -4343,10 +4343,33 @@ async def process_agent_content_date(
         history_commit_status="pending" if publish else "not_run",
     )
     if plan.production_mode == "story_first":
+        safe_facts = tuple(source_row.get("safe_facts", ()))
+        try:
+            director_treatment = await generate_reels_director_treatment(plan, safe_facts)
+        except (RuntimeError, story_production.StoryPlanError) as exc:
+            memory.update_editorial_release_event(
+                user_id=user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                generation_package_status="invalid",
+                history_commit_status="not_run",
+            )
+            logger.warning(
+                "REELS_DIRECTOR rejected | plan_id=%s | error=%s",
+                plan.plan_id,
+                type(exc).__name__,
+            )
+            await notify_admin(
+                bot,
+                f"⚠️ Reels Maker не собрал безопасный режиссёрский план для {resolved_date}. "
+                "Рендер не запускался, шаблонная замена не использована.",
+            )
+            return f"⚠️ Agent Content {resolved_date}: Reels director rejected."
         pack_dir = await asyncio.to_thread(
             queue_story_first_pack,
             plan,
-            tuple(source_row.get("safe_facts", ())),
+            safe_facts,
+            director_treatment,
         )
         payload = await asyncio.to_thread(
             story_production.read_manifest, pack_dir / "story_manifest.json"
@@ -4356,7 +4379,8 @@ async def process_agent_content_date(
                 await bot.send_message(
                     chat_id=ADMIN_ID,
                     text=story_pack_control.safe_summary(payload)
-                    + "\n\nПлан подготовлен без расхода кредитов. Нажми кнопку под карточкой "
+                    + "\n\nReels Maker сделал режиссёрский план одним текстовым запросом. "
+                    "Изображения и видео ещё не генерировались. Нажми кнопку под карточкой "
                     "или ответь на неё «подтверждаю».",
                     reply_markup=reels_plan_keyboard(str(payload.get("plan_id", ""))),
                 )
@@ -5358,13 +5382,28 @@ async def reels_control_response(
             else:
                 note = "\n\nℹ️ Сейчас дополнительного подтверждения не требуется."
         elif action == BTN_REELS_VARIANT:
+            editorial = payload.get("editorial_plan")
+            facts = payload.get("safe_facts")
+            if not isinstance(editorial, Mapping) or not isinstance(facts, list):
+                raise story_production.StoryPlanError("story variant source contract missing")
+            variant_index = int(payload.get("variant_index", 0)) + 1
+            variant_plan = editorial_orchestrator.EditorialPlan.from_dict(editorial)
+            director_treatment = await generate_reels_director_treatment(
+                variant_plan,
+                tuple(str(item) for item in facts),
+                variant_index=variant_index,
+            )
             new_dir = await asyncio.to_thread(
                 story_pack_control.create_next_variant,
                 NAZ_STORY_PACK_ROOT,
                 current_plan_id,
+                director_treatment=director_treatment,
             )
             manifest = new_dir / "story_manifest.json"
-            note = "\n\n🔀 Подготовлен другой вариант. Генерация ещё не запущена."
+            note = (
+                "\n\n🔀 Reels Maker поставил другой режиссёрский вариант. "
+                "Изображения и видео ещё не генерировались."
+            )
         else:
             note = ""
 
@@ -5374,7 +5413,7 @@ async def reels_control_response(
             raise story_production.StoryPlanError("story manifest plan_id mismatch")
         keyboard = reels_plan_keyboard(resulting_plan_id)
         return story_pack_control.safe_summary(payload) + note, keyboard
-    except (OSError, ValueError, story_production.StoryPlanError):
+    except (OSError, RuntimeError, ValueError, story_production.StoryPlanError):
         logger.warning(
             "Reels Maker control rejected | action=%s | plan_id=%s",
             action,
@@ -7186,11 +7225,51 @@ async def generate_scheduled_package(
     raise ScheduledTechnicalFailure("generation_package_unavailable")
 
 
+async def generate_reels_director_treatment(
+    plan: editorial_orchestrator.EditorialPlan,
+    safe_facts: tuple[str, ...],
+    *,
+    variant_index: int = 0,
+) -> story_production.DirectorTreatment:
+    """Spend one bounded text call on directing; never submit media generation."""
+    prompt = story_production.reels_director_prompt(
+        plan,
+        safe_facts,
+        variant_index=variant_index,
+    )
+    raw = await call_gpt(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are Reels Maker for Naz AI Lab. Return one strict JSON treatment only. "
+                    "Never expose metadata, paths, secrets, private material, or internal planning."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=1800,
+        temperature=0.72,
+        model=CONTENT_MODEL_NAME,
+    )
+    return story_production.parse_reels_director_response(
+        raw,
+        plan,
+        safe_facts,
+        variant_index=variant_index,
+    )
+
+
 def queue_story_first_pack(
     plan: editorial_orchestrator.EditorialPlan,
     safe_facts: tuple[str, ...],
+    director_treatment: story_production.DirectorTreatment | None = None,
 ) -> Path:
-    pack = story_production.plan_story_pack(plan, safe_facts)
+    pack = story_production.plan_story_pack(
+        plan,
+        safe_facts,
+        director_treatment=director_treatment,
+    )
     return story_production.persist_story_queue(pack, NAZ_STORY_PACK_ROOT)
 
 
@@ -7200,6 +7279,26 @@ def story_first_dry_run(
 ) -> Path:
     """Compatibility alias for callers introduced with the v1 planner."""
     return queue_story_first_pack(plan, safe_facts)
+
+
+_CHRONICLE_METADATA_RE = re.compile(
+    r"(?i)^(?:folders?|user focus|project|date|topic(?:-id)?|dialog topic|chat|"
+    r"status|result|autopublish|files?|папк[аи]|фокус|проект|дата|тема(?:-id)?|"
+    r"тема диалога|чат|статус|результат|автопубликация)\s*:"
+)
+
+
+def is_narrative_chronicle_fact(value: str) -> bool:
+    """Exclude transport metadata before Story-first eligibility and directing."""
+    text = " ".join(str(value).split()).strip()
+    folded = text.casefold()
+    if len(text) < 24 or text.startswith("#") or _CHRONICLE_METADATA_RE.match(text):
+        return False
+    if re.search(r"(?i)(?:^|[/\\])\d{4}-\d{2}-\d{2}(?:[/\\]|$)|\.(?:md|json|txt)\b", text):
+        return False
+    if any(marker in folded for marker in ("naz_ai_bot_clean/", "content_inbox/", "manifest.json")):
+        return False
+    return True
 
 
 def chronicle_source_row(
@@ -7213,7 +7312,7 @@ def chronicle_source_row(
     chunks = [
         " ".join(item.split())[:420]
         for item in re.split(r"(?<=[.!?])\s+|\n+", safe_context)
-        if len(" ".join(item.split())) >= 24
+        if is_narrative_chronicle_fact(item)
         and "[REDACTED]" not in item
         and not re.search(r"(?i)(token|api[_ -]?key|password|secret|private message)", item)
     ]

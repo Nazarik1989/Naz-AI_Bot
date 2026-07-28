@@ -1,8 +1,8 @@
-"""Deterministic Story-first planning and atomic queue manifests for Naz.
+"""Validated Story-first treatments and atomic queue manifests for Naz.
 
-Planning is intentionally provider-free and fast.  Paid generation and local
-media composition live in ``naz_story_worker.py`` and never run in a Telegram
-scheduler callback.
+The text director is called by ``main.py`` before this module persists a plan.
+Paid image/video generation and local composition remain isolated in
+``naz_story_worker.py`` and never run in a Telegram scheduler callback.
 """
 
 from __future__ import annotations
@@ -15,16 +15,19 @@ import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from editorial_orchestrator import EditorialPlan
 from story_pack_lock import ensure_private_group_access
 
 
-STORY_SCHEMA = "naz-story-pack-v4"
-PREVIOUS_STORY_SCHEMA = "naz-story-pack-v3"
-OLDER_STORY_SCHEMA = "naz-story-pack-v2"
-LEGACY_STORY_SCHEMA = "naz-story-pack-v1"
+STORY_SCHEMA = "naz-story-pack-v5"
+PREVIOUS_STORY_SCHEMA = "naz-story-pack-v4"
+OLDER_STORY_SCHEMA = "naz-story-pack-v3"
+LEGACY_STORY_SCHEMA = "naz-story-pack-v2"
+ANCIENT_STORY_SCHEMA = "naz-story-pack-v1"
+DIRECTOR_VERSION = "reels-semantic-director-v1"
+TEMPLATE_DIRECTOR_VERSION = "reels-template-director-v1"
 RENDERER_UNAVAILABLE = "unavailable"
 DRAMATURGIC_ROLES = (
     "hook", "problem", "hypothesis", "test", "result", "solution", "conclusion",
@@ -112,6 +115,25 @@ class StoryPlanError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class DirectorScene:
+    role: str
+    setting: str
+    subject: str
+    concrete_action: str
+    start_state: str
+    end_state: str
+    shot_size: str
+    camera_motion: str
+
+
+@dataclass(frozen=True, slots=True)
+class DirectorTreatment:
+    visual_concept: str
+    scenes: tuple[DirectorScene, ...]
+    version: str = DIRECTOR_VERSION
+
+
+@dataclass(frozen=True, slots=True)
 class ScenePlan:
     scene_id: str
     role: str
@@ -166,6 +188,7 @@ class StoryPackPlan:
     editorial_plan: Mapping[str, Any]
     central_thesis: str
     visual_concept: str
+    director_version: str
     scene_count: int
     scenes: tuple[ScenePlan, ...]
     reel_edits: tuple[ReelEditPlan, ...]
@@ -197,6 +220,124 @@ def _safe_fact(value: str) -> str:
     return text
 
 
+_DIRECTOR_CLICHE_RE = re.compile(
+    r"(?i)(?:\bfact\s*\d+\b|tied to fact|perform and reveal|folders?:|user focus:|"
+    r"project:|\.md\b|\.json\b|github|source_ref|plan_id|dashboard|terminal|"
+    r"screen interface|\bhud\b|\bcode\b|random circuit)"
+)
+
+
+def reels_director_prompt(
+    plan: EditorialPlan,
+    safe_facts: Sequence[str],
+    *,
+    variant_index: int = 0,
+) -> str:
+    """Build the bounded prompt for a content-specific, pre-render treatment."""
+    facts = tuple(_safe_fact(item) for item in safe_facts)
+    if len(facts) < 4:
+        raise StoryPlanError("Story-first requires at least four safe causal facts")
+    if not 0 <= variant_index <= 99:
+        raise StoryPlanError("Story-first variant index must be 0..99")
+    count = max(4, min(7, len(facts)))
+    story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
+    roles = _roles(story_plan_id, count)
+    brief = {
+        "persona": "Naz, a real adult human founder",
+        "topic": plan.topic,
+        "thesis": plan.thesis_direction,
+        "tension": plan.tension,
+        "imagery": plan.imagery,
+        "visual_subject_direction": plan.visual_subject_direction,
+        "visual_relation": plan.visual_relation,
+        "variant_index": variant_index,
+        "ordered_roles": roles,
+        "verified_facts": list(facts[:count]),
+    }
+    return (
+        "Act as Reels Maker, the film director for Naz AI Lab. Convert the supplied verified "
+        "episode into one coherent, content-specific 9:16 treatment. Do not reproduce file "
+        "paths, headings, metadata, UI, code, dashboards, or the wording 'fact N'. Dramatize "
+        "the causal meaning with physically filmable actions; do not merely decorate it with "
+        "generic cyberpunk. Naz AI Lab is a flexible world, not one fixed server room. Choose "
+        "locations and props because they express this episode. Naz remains human. Use Deep "
+        "Black, Electric Blue, Ultraviolet and Ice Silver with materially believable optical "
+        "glass, titanium, anodized aluminium, carbon, technical polymers or ceramic. No gold, "
+        "copper branding, random robots, random boards, text, logos or overloaded HUDs.\n\n"
+        "Return strict JSON only with this shape: "
+        '{"director_version":"reels-semantic-director-v1","visual_concept":"...",'
+        '"scenes":[{"role":"...","setting":"...","subject":"...",'
+        '"concrete_action":"...","start_state":"...","end_state":"...",'
+        '"shot_size":"wide|medium|close|macro","camera_motion":'
+        '"slow push|controlled pan|handheld follow|locked with real subject motion"}]}. '
+        "Return exactly one scene for every ordered role, in the same order. Every setting, "
+        "action and end state must be concrete and distinct. Write scene fields in concise English.\n\n"
+        + json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _director_field(value: Any, name: str, *, minimum: int = 8, maximum: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    if not minimum <= len(text) <= maximum or _SECRET_RE.search(text) or _DIRECTOR_CLICHE_RE.search(text):
+        raise StoryPlanError(f"director_{name}_invalid")
+    return text
+
+
+def parse_reels_director_response(
+    raw: str,
+    plan: EditorialPlan,
+    safe_facts: Sequence[str],
+    *,
+    variant_index: int = 0,
+) -> DirectorTreatment:
+    """Validate a model treatment before it can become an immutable render plan."""
+    try:
+        payload = json.loads(str(raw).strip())
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StoryPlanError("director_json_invalid") from exc
+    if not isinstance(payload, Mapping) or payload.get("director_version") != DIRECTOR_VERSION:
+        raise StoryPlanError("director_schema_invalid")
+    facts = tuple(_safe_fact(item) for item in safe_facts)
+    count = max(4, min(7, len(facts)))
+    expected_roles = _roles(_variant_plan_id(plan.plan_id, variant_index), count)
+    rows = payload.get("scenes")
+    if not isinstance(rows, list) or len(rows) != count:
+        raise StoryPlanError("director_scene_count_invalid")
+    requires_reference = _requires_reference(plan.visual_subject_direction)
+    scenes: list[DirectorScene] = []
+    for index, (row, expected_role) in enumerate(zip(rows, expected_roles)):
+        if not isinstance(row, Mapping) or str(row.get("role", "")).casefold() != expected_role:
+            raise StoryPlanError(f"director_role_invalid_{index + 1}")
+        subject = _director_field(row.get("subject"), "subject")
+        has_naz = "naz" in subject.casefold()
+        if has_naz is not requires_reference:
+            raise StoryPlanError(f"director_subject_identity_invalid_{index + 1}")
+        shot_size = str(row.get("shot_size", "")).strip().casefold()
+        camera_motion = str(row.get("camera_motion", "")).strip().casefold()
+        if shot_size not in SHOT_SIZES or camera_motion not in CAMERA_MOTIONS:
+            raise StoryPlanError(f"director_camera_invalid_{index + 1}")
+        scenes.append(
+            DirectorScene(
+                role=expected_role,
+                setting=_director_field(row.get("setting"), "setting", minimum=12),
+                subject=subject,
+                concrete_action=_director_field(row.get("concrete_action"), "action", minimum=12),
+                start_state=_director_field(row.get("start_state"), "start_state"),
+                end_state=_director_field(row.get("end_state"), "end_state"),
+                shot_size=shot_size,
+                camera_motion=camera_motion,
+            )
+        )
+    if len({scene.setting.casefold() for scene in scenes}) < min(3, count):
+        raise StoryPlanError("director_settings_repetitive")
+    if len({scene.concrete_action.casefold() for scene in scenes}) != count:
+        raise StoryPlanError("director_actions_repetitive")
+    return DirectorTreatment(
+        visual_concept=_director_field(payload.get("visual_concept"), "visual_concept", minimum=12, maximum=160),
+        scenes=tuple(scenes),
+    )
+
+
 def validate_provider_prompt(value: str) -> str:
     """Defense-in-depth check immediately before a prompt leaves the host."""
     text = " ".join(str(value).split())
@@ -206,12 +347,17 @@ def validate_provider_prompt(value: str) -> str:
 
 
 def _roles(plan_id: str, count: int) -> list[str]:
-    middle = list(DRAMATURGIC_ROLES[1:-1])
-    middle.sort(key=lambda item: _rank(plan_id, item))
-    start = "hook" if _rank(plan_id, "opening") % 2 == 0 else middle[0]
-    end = "conclusion" if _rank(plan_id, "ending") % 2 == 0 else "result"
-    candidates = [role for role in ("hook", *middle, "result", "conclusion") if role not in {start, end}]
-    return [start, *candidates[: max(0, count - 2)], end]
+    del plan_id  # Scene variation must never scramble the causal story order.
+    sequences = {
+        4: ("hook", "problem", "test", "result"),
+        5: ("hook", "problem", "test", "result", "conclusion"),
+        6: ("hook", "problem", "hypothesis", "test", "result", "conclusion"),
+        7: DRAMATURGIC_ROLES,
+    }
+    try:
+        return list(sequences[count])
+    except KeyError as exc:
+        raise StoryPlanError("scene count must be 4..7") from exc
 
 
 def _requires_reference(subject: str) -> bool:
@@ -257,13 +403,25 @@ def _visual_treatment(plan: EditorialPlan, facts: tuple[str, ...]) -> str:
 def _scene(
     plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fact: str,
     treatment_key: str,
+    directed_scene: DirectorScene | None = None,
+    directed_concept: str = "",
 ) -> ScenePlan:
     # Both configured Runway tiers accept a five-second master.  Keeping the
     # provider master fixed also makes Reel timing and credit accounting exact.
     duration = 5
     requires_reference = _requires_reference(plan.visual_subject_direction)
-    subject = "Naz, the same adult human founder from the approved identity reference" if requires_reference else "one physical Naz AI Lab prototype"
-    shot_size = SHOT_SIZES[_rank(plan.plan_id, f"shot:{index}") % len(SHOT_SIZES)]
+    subject = (
+        directed_scene.subject
+        if directed_scene is not None
+        else "Naz, the same adult human founder from the approved identity reference"
+        if requires_reference
+        else "one physical Naz AI Lab prototype"
+    )
+    shot_size = (
+        directed_scene.shot_size
+        if directed_scene is not None
+        else SHOT_SIZES[_rank(plan.plan_id, f"shot:{index}") % len(SHOT_SIZES)]
+    )
     reference_role = (
         "three_quarter_identity"
         if requires_reference and shot_size in {"wide", "medium"}
@@ -272,9 +430,20 @@ def _scene(
         else "none"
     )
     treatment = VISUAL_TREATMENTS[treatment_key]
-    setting, action, end_state = treatment["beats"][role]
-    if not requires_reference:
-        action, end_state = OBJECT_ONLY_ACTIONS[role]
+    if directed_scene is not None:
+        setting = directed_scene.setting
+        action = directed_scene.concrete_action
+        start_state = directed_scene.start_state
+        end_state = directed_scene.end_state
+        camera_motion = directed_scene.camera_motion
+        visual_concept = directed_concept
+    else:
+        setting, action, end_state = treatment["beats"][role]
+        if not requires_reference:
+            action, end_state = OBJECT_ONLY_ACTIONS[role]
+        start_state = "before the documented action changes the situation"
+        camera_motion = CAMERA_MOTIONS[_rank(plan.plan_id, f"motion:{index}") % len(CAMERA_MOTIONS)]
+        visual_concept = str(treatment["label"])
     standalone = f"{role}: {fact}"[:180]
     overlay = standalone[:72]
     continuity = (
@@ -299,8 +468,8 @@ def _scene(
     )
     keyframe_prompt = (
         f"Vertical cinematic scene composed for a 9:16 centre crop. {identity_instruction}"
-        f"Visual concept: {treatment['label']}. Location: {setting}. Subject: {subject}. Exact frozen action: {action}. "
-        f"Shot: {shot_size}; leave motion room for a {CAMERA_MOTIONS[_rank(plan.plan_id, f'motion:{index}') % len(CAMERA_MOTIONS)]}. "
+        f"Visual concept: {visual_concept}. Location: {setting}. Subject: {subject}. Exact frozen action: {action}. "
+        f"Shot: {shot_size}; leave motion room for a {camera_motion}. "
         "Human intelligence / machine precision. Deep Black #020309, Midnight Blue #070B20, "
         "Electric Blue #185CFF, Ultraviolet #762DFF and Ice Silver #D7E5FF. "
         "Optical glass, polished titanium, blue anodized aluminium, carbon and technical ceramic. "
@@ -311,8 +480,7 @@ def _scene(
     provider_prompt = (
         f"Animate the supplied directed keyframe as a vertical 9:16 CLEAN video master. Role: {role}. "
         f"Keep the exact subject, Naz identity, laboratory architecture, materials and lighting from the keyframe. "
-        f"Physical action: {action}. Camera: "
-        f"{CAMERA_MOTIONS[_rank(plan.plan_id, f'motion:{index}') % len(CAMERA_MOTIONS)]}. "
+        f"Physical action: {action}. Camera: {camera_motion}. "
         f"Begin in the supplied pose and end when {end_state}. "
         "Natural restrained human movement and one clear physical state change are mandatory. "
         "No scene replacement, morphing, extra people, text, logos, HUD, platform UI, code or watermarks."
@@ -321,10 +489,10 @@ def _scene(
         scene_id=f"{index + 1:02d}_{role}", role=role, standalone_meaning=standalone,
         concrete_action=action,
         subject=subject, setting=setting,
-        start_state="before the documented action changes the situation",
+        start_state=start_state,
         end_state=end_state,
         shot_size=shot_size,
-        camera_motion=CAMERA_MOTIONS[_rank(plan.plan_id, f"motion:{index}") % len(CAMERA_MOTIONS)],
+        camera_motion=camera_motion,
         duration_seconds=duration, clean_prompt=clean_prompt, provider_prompt=provider_prompt,
         keyframe_prompt=keyframe_prompt,
         identity_reference_usage="identity_only" if requires_reference else "none",
@@ -401,6 +569,7 @@ def plan_story_pack(
     safe_facts: tuple[str, ...],
     *,
     variant_index: int = 0,
+    director_treatment: DirectorTreatment | None = None,
 ) -> StoryPackPlan:
     if plan.production_mode != "story_first" or plan.content_format != "story_pack":
         raise StoryPlanError("EditorialPlan is not Story-first")
@@ -413,6 +582,19 @@ def plan_story_pack(
     variant_plan = replace(plan, plan_id=story_plan_id)
     count = max(4, min(7, len(facts)))
     treatment_key = _visual_treatment(plan, facts)
+    if director_treatment is not None:
+        if director_treatment.version != DIRECTOR_VERSION or len(director_treatment.scenes) != count:
+            raise StoryPlanError("director_treatment_invalid")
+        visual_concept = _director_field(
+            director_treatment.visual_concept,
+            "visual_concept",
+            minimum=12,
+            maximum=160,
+        )
+        director_version = DIRECTOR_VERSION
+    else:
+        visual_concept = str(VISUAL_TREATMENTS[treatment_key]["label"])
+        director_version = TEMPLATE_DIRECTOR_VERSION
     continuity_id = hashlib.sha256(f"naz|{plan.plan_id}|continuity".encode("utf-8")).hexdigest()[:20]
     roles = _roles(story_plan_id, count)
     scenes = tuple(
@@ -423,6 +605,8 @@ def plan_story_pack(
             index=i,
             fact=facts[i],
             treatment_key=treatment_key,
+            directed_scene=director_treatment.scenes[i] if director_treatment is not None else None,
+            directed_concept=visual_concept,
         )
         for i, role in enumerate(roles)
     )
@@ -433,7 +617,8 @@ def plan_story_pack(
         source_type=plan.source_type, source_ref=plan.source_ref, safe_facts=facts,
         editorial_plan=plan.to_dict(),
         central_thesis=plan.thesis_direction,
-        visual_concept=str(VISUAL_TREATMENTS[treatment_key]["label"]),
+        visual_concept=visual_concept,
+        director_version=director_version,
         scene_count=count, scenes=scenes,
         reel_edits=(
             _reel_edit(variant_plan, scenes, short=False),
@@ -457,6 +642,8 @@ def plan_story_pack(
 def validate_story_pack(pack: StoryPackPlan) -> None:
     if not 4 <= pack.scene_count <= 7 or pack.scene_count != len(pack.scenes):
         raise StoryPlanError("scene count must be 4..7")
+    if pack.director_version not in {DIRECTOR_VERSION, TEMPLATE_DIRECTOR_VERSION}:
+        raise StoryPlanError("unknown director version")
     if pack.renderer not in {"available", RENDERER_UNAVAILABLE}:
         raise StoryPlanError("unknown renderer status")
     for scene in pack.scenes:
@@ -564,6 +751,7 @@ def read_manifest(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema") not in {
         STORY_SCHEMA, PREVIOUS_STORY_SCHEMA, OLDER_STORY_SCHEMA, LEGACY_STORY_SCHEMA,
+        ANCIENT_STORY_SCHEMA,
     }:
         raise StoryPlanError("unsupported story manifest schema")
     return payload
@@ -602,9 +790,18 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     visual_strategy = payload.get("visual_strategy")
     if not all(isinstance(value, list) for value in (scenes, edits, scene_jobs, reel_jobs)):
         return False
-    if payload.get("visual_concept") not in {
+    director_version = str(payload.get("director_version", ""))
+    concept = str(payload.get("visual_concept", ""))
+    if director_version == TEMPLATE_DIRECTOR_VERSION and concept not in {
         str(treatment["label"]) for treatment in VISUAL_TREATMENTS.values()
     }:
+        return False
+    if director_version == DIRECTOR_VERSION:
+        try:
+            _director_field(concept, "visual_concept", minimum=12, maximum=160)
+        except StoryPlanError:
+            return False
+    elif director_version != TEMPLATE_DIRECTOR_VERSION:
         return False
     if not 4 <= len(scenes) <= 7 or payload.get("scene_count") != len(scenes) or not edits:
         return False

@@ -1,13 +1,16 @@
 # Naz Story-First production runbook
 
 Story-first planning is part of the normal Agent Content route, but media work
-is deliberately separate. The bot atomically writes a `naz-story-pack-v4`
+is deliberately separate. Reels Maker uses one bounded text-model request to
+produce a content-specific treatment, validates it, then atomically writes a
+`naz-story-pack-v5`
 manifest and returns. `naz_story_worker.py` resumes one state transition at a
 time and contains no Telegram or VK publication path.
 
 The administrator opens `Контент → Reels` and sees only the process controls:
-`Подтвердить генерацию`, `Другой вариант`, and `Обновить статус`. Planning and
-variant changes are local and provider-free. Only confirmation makes the pack
+`Подтвердить генерацию`, `Другой вариант`, and `Обновить статус`. Initial
+planning and each requested variant use one bounded text-model request; they do
+not call an image or video provider. Only confirmation makes the pack
 eligible for the separate worker. Finished STORY and Reel files are sent to the
 administrator's private chat automatically; there is no manual download step.
 
@@ -70,14 +73,16 @@ for close-ups, macro and object-only scenes. Provider images are normalized in
 memory to a valid 720×1280 first frame; private binaries and the profile stay
 outside Git.
 
-The approval card lists a material-driven visual concept plus every scene's
+The approval card lists a content-directed visual concept plus every scene's
 location, physical action and camera, and the estimated Runway credits. The
-concept is selected from the safe semantic content of the episode; Naz AI Lab
-is a coherent world, not one mandatory room or a fixed action sequence. A v4
+concept and actions are generated from cleaned causal facts and validated before
+the pack exists; transport metadata, paths and generic `fact N` placeholders are
+rejected. Naz AI Lab is a coherent world, not one mandatory room or a fixed
+action sequence. A v5
 pack first creates one asynchronous directed
 keyframe per scene (`gen4_image_turbo` with `@Naz` for identity scenes,
 `gen4_image` for object-only scenes), then animates that immutable keyframe.
-No keyframe or video task is submitted before explicit approval. v1/v2/v3 packs
+No keyframe or video task is submitted before explicit approval. v1/v2/v3/v4 packs
 remain inspectable but are read-only and cannot silently use the old direct-avatar route.
 
 `NAZ_STORY_MUSIC_LIBRARY` may point to a private music folder. Each audio file

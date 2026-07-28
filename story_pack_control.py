@@ -185,8 +185,13 @@ def confirm_generation(root: Path, plan_id: str) -> str:
         return result
 
 
-def create_next_variant(root: Path, plan_id: str) -> Path:
-    """Create a different free plan before any provider task exists."""
+def create_next_variant(
+    root: Path,
+    plan_id: str,
+    *,
+    director_treatment: story_production.DirectorTreatment | None = None,
+) -> Path:
+    """Persist a separately directed variant before any media-provider task exists."""
     path = manifest_path(root, plan_id)
     with _manifest_lock(path):
         payload = story_production.read_manifest(path)
@@ -201,7 +206,10 @@ def create_next_variant(root: Path, plan_id: str) -> Path:
         plan = EditorialPlan.from_dict(editorial)
         next_index = int(payload.get("variant_index", 0)) + 1
         pack = story_production.plan_story_pack(
-            plan, tuple(str(item) for item in facts), variant_index=next_index,
+            plan,
+            tuple(str(item) for item in facts),
+            variant_index=next_index,
+            director_treatment=director_treatment,
         )
         new_dir = story_production.persist_story_queue(pack, root)
         now = _now()
