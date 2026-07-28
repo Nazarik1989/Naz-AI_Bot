@@ -10,6 +10,7 @@ import main
 import memory
 import story_production
 from tests.test_story_production import director_response
+from tools import reels_director_dry_run
 
 
 WORK_CHRONICLE = """
@@ -103,6 +104,25 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
         self.assertEqual(response_format["type"], "json_schema")
         self.assertEqual(treatment.version, story_production.DIRECTOR_VERSION)
 
+    def test_director_validation_logs_all_safe_codes_as_one_contract_reject(self):
+        error = story_production.DirectorValidationError((
+            "director_visual_concept_cliche",
+            "director_scene_2_subject_kind_invalid",
+        ))
+
+        self.assertEqual(
+            main.reels_director_reason_codes(error),
+            error.reason_codes,
+        )
+        self.assertEqual(
+            main.reels_director_reason_code(error),
+            "director_contract_invalid",
+        )
+        self.assertIn(
+            "несколько полей",
+            main.reels_director_reason_summary("director_contract_invalid"),
+        )
+
     def test_call_gpt_forwards_response_format_to_openrouter_sdk(self):
         client = Mock()
         client.chat.completions.create.return_value = SimpleNamespace(
@@ -121,6 +141,40 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
             client.chat.completions.create.call_args.kwargs["response_format"],
             response_format,
         )
+
+    def test_director_dry_run_validates_in_memory_without_queue_or_history_writes(self):
+        async def accepted_treatment(plan, facts):
+            return story_production.parse_reels_director_response(
+                director_response(plan, facts), plan, facts
+            )
+
+        with patch.object(
+            reels_director_dry_run.main,
+            "collect_agent_materials",
+            return_value=(WORK_CHRONICLE, [], "2026-07-08"),
+        ), patch.object(
+            reels_director_dry_run.main,
+            "agent_content_hash_for_date",
+            return_value="fixture-hash",
+        ), patch.object(
+            reels_director_dry_run.main,
+            "generate_reels_director_treatment",
+            new=AsyncMock(side_effect=accepted_treatment),
+        ) as director, patch.object(
+            reels_director_dry_run.main,
+            "queue_story_first_pack",
+        ) as queue, patch.object(
+            reels_director_dry_run.main.memory,
+            "update_editorial_release_event",
+        ) as write_event:
+            result = asyncio.run(reels_director_dry_run.run("2026-07-08"))
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertFalse(result["persisted"])
+        self.assertEqual(result["media_calls"], 0)
+        director.assert_awaited_once()
+        queue.assert_not_called()
+        write_event.assert_not_called()
 
     def test_safety_flags_still_force_standard_mode(self):
         row = self.source_row(("secret credential",))
