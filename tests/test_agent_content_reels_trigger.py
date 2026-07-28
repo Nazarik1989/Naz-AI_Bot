@@ -9,6 +9,7 @@ import editorial_orchestrator
 import main
 import memory
 import story_production
+from tests.test_story_production import director_response
 
 
 WORK_CHRONICLE = """
@@ -75,6 +76,51 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
         )
         self.assertEqual(plan.production_mode, "story_first")
         self.assertEqual(plan.content_format, "story_pack")
+
+    def test_director_call_uses_structured_output_without_retry(self):
+        plan = main.scheduled_plan(
+            user_id=42,
+            platform="telegram",
+            slot="agent_content_sync",
+            seed="agent_content:2026-07-25:fixture",
+            rubric_rows=RUBRICS,
+            source_rows=(self.source_row(),),
+            character=main.naz_character.CharacterState(),
+        )
+        with patch.object(
+            main,
+            "call_gpt",
+            new=AsyncMock(return_value=director_response(plan, self.source_row()["safe_facts"])),
+        ) as call:
+            treatment = asyncio.run(
+                main.generate_reels_director_treatment(
+                    plan,
+                    tuple(self.source_row()["safe_facts"]),
+                )
+            )
+        self.assertEqual(call.await_count, 1)
+        response_format = call.await_args.kwargs["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(treatment.version, story_production.DIRECTOR_VERSION)
+
+    def test_call_gpt_forwards_response_format_to_openrouter_sdk(self):
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))]
+        )
+        response_format = {"type": "json_object"}
+        with patch.object(main, "ensure_openai_client", return_value=client):
+            result = asyncio.run(
+                main.call_gpt(
+                    [{"role": "user", "content": "return json"}],
+                    response_format=response_format,
+                )
+            )
+        self.assertEqual(result, '{"ok":true}')
+        self.assertEqual(
+            client.chat.completions.create.call_args.kwargs["response_format"],
+            response_format,
+        )
 
     def test_safety_flags_still_force_standard_mode(self):
         row = self.source_row(("secret credential",))
@@ -212,7 +258,7 @@ User focus: ежедневный импорт content-agent
                 )
             )
 
-        self.assertIn("Reels director rejected", result)
+        self.assertIn("режиссёрский план отклонён", result)
         queue.assert_not_called()
         mark_seen.assert_not_called()
         self.assertIn("Рендер не запускался", bot.send_message.await_args.kwargs["text"])

@@ -70,6 +70,48 @@ def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix=
 
 
 class StoryFirstTests(unittest.TestCase):
+    def test_reference_detection_uses_words_not_face_substrings(self):
+        self.assertFalse(story._requires_reference("one specific work surface at the result"))
+        self.assertTrue(story._requires_reference("the canonical Naz in the laboratory"))
+        self.assertTrue(story._requires_reference("a close portrait of the founder's face"))
+
+    def test_director_response_format_requires_exact_scene_count_and_strict_json(self):
+        response_format = story.reels_director_response_format(SAFE_FACTS)
+        self.assertEqual(response_format["type"], "json_schema")
+        contract = response_format["json_schema"]
+        self.assertTrue(contract["strict"])
+        scenes = contract["schema"]["properties"]["scenes"]
+        self.assertEqual(scenes["minItems"], len(SAFE_FACTS))
+        self.assertEqual(scenes["maxItems"], len(SAFE_FACTS))
+        self.assertFalse(scenes["items"]["additionalProperties"])
+
+    def test_neutral_work_surface_direction_allows_naz_and_object_scenes(self):
+        plan = dataclasses.replace(
+            planned(),
+            visual_subject_direction="one specific work surface at the moment a result changes",
+        )
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["subject"] = "Naz, the same real adult human founder"
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(plan, SAFE_FACTS, director_treatment=treatment)
+        self.assertTrue(pack.scenes[0].requires_naz_reference)
+        self.assertFalse(pack.scenes[1].requires_naz_reference)
+
+    def test_naz_ai_lab_brand_on_an_object_does_not_trigger_face_reference(self):
+        self.assertFalse(story._is_naz_human_subject("one Naz AI Lab optical prototype"))
+        self.assertTrue(story._is_naz_human_subject("Naz, the same real adult human founder"))
+
+    def test_explicit_object_only_direction_rejects_naz_subject(self):
+        plan = dataclasses.replace(
+            planned(), visual_subject_direction="an object-only scene with no person"
+        )
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["subject"] = "Naz, the real adult human founder"
+        with self.assertRaisesRegex(story.StoryPlanError, "director_subject_identity_invalid_1"):
+            story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
+
     def test_director_roles_follow_causal_order_and_never_start_with_result(self):
         expected = {
             4: ["hook", "problem", "test", "result"],

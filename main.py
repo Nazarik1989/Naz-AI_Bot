@@ -883,17 +883,21 @@ async def call_gpt(
     max_tokens: int = MAX_TOKENS,
     temperature: float = TEMPERATURE,
     model: str | None = None,
+    response_format: Mapping[str, Any] | None = None,
 ) -> str:
     """Call OpenRouter using OpenAI-compatible SDK in a thread."""
 
     def _request() -> str:
         client = ensure_openai_client()
-        response = client.chat.completions.create(
+        request_kwargs: Dict[str, Any] = dict(
             model=model or MODEL_NAME,
             messages=messages,
             max_tokens=max(16, max_tokens),
             temperature=temperature,
         )
+        if response_format is not None:
+            request_kwargs["response_format"] = dict(response_format)
+        response = client.chat.completions.create(**request_kwargs)
         content = response.choices[0].message.content if response.choices else ""
         return (content or "").strip()
 
@@ -4286,6 +4290,26 @@ def current_bot_date() -> str:
     return datetime.now(ZoneInfo(BOT_TIMEZONE)).date().isoformat()
 
 
+def reels_director_reason_code(exc: Exception) -> str:
+    if isinstance(exc, story_production.StoryPlanError):
+        code = str(exc).strip().casefold()
+        if re.fullmatch(r"[a-z0-9_]{3,80}", code):
+            return code
+    return "director_provider_error"
+
+
+def reels_director_reason_summary(reason_code: str) -> str:
+    if "subject_identity" in reason_code:
+        return "предметная и портретная постановка сцены противоречат друг другу"
+    if reason_code in {"director_settings_repetitive", "director_actions_repetitive"}:
+        return "сцены получились слишком повторяющимися"
+    if reason_code.startswith("director_") and reason_code.endswith("_invalid"):
+        return "режиссёрский ответ нарушил обязательную структуру или содержал служебные клише"
+    if reason_code.startswith("director_role_invalid_") or reason_code.startswith("director_camera_invalid_"):
+        return "модель нарушила порядок сцен или контракт камеры"
+    return "провайдер не вернул пригодный структурированный режиссёрский план"
+
+
 async def process_agent_content_date(
     bot,
     user_id: int,
@@ -4347,6 +4371,7 @@ async def process_agent_content_date(
         try:
             director_treatment = await generate_reels_director_treatment(plan, safe_facts)
         except (RuntimeError, story_production.StoryPlanError) as exc:
+            reason_code = reels_director_reason_code(exc)
             memory.update_editorial_release_event(
                 user_id=user_id,
                 plan_id=plan.plan_id,
@@ -4355,16 +4380,18 @@ async def process_agent_content_date(
                 history_commit_status="not_run",
             )
             logger.warning(
-                "REELS_DIRECTOR rejected | plan_id=%s | error=%s",
+                "REELS_DIRECTOR rejected | plan_id=%s | reason_code=%s | error=%s",
                 plan.plan_id,
+                reason_code,
                 type(exc).__name__,
             )
             await notify_admin(
                 bot,
                 f"⚠️ Reels Maker не собрал безопасный режиссёрский план для {resolved_date}. "
+                f"Причина: {reels_director_reason_summary(reason_code)}. "
                 "Рендер не запускался, шаблонная замена не использована.",
             )
-            return f"⚠️ Agent Content {resolved_date}: Reels director rejected."
+            return f"⚠️ Agent Content {resolved_date}: режиссёрский план отклонён."
         pack_dir = await asyncio.to_thread(
             queue_story_first_pack,
             plan,
@@ -5413,12 +5440,21 @@ async def reels_control_response(
             raise story_production.StoryPlanError("story manifest plan_id mismatch")
         keyboard = reels_plan_keyboard(resulting_plan_id)
         return story_pack_control.safe_summary(payload) + note, keyboard
-    except (OSError, RuntimeError, ValueError, story_production.StoryPlanError):
+    except (OSError, RuntimeError, ValueError, story_production.StoryPlanError) as exc:
+        reason_code = reels_director_reason_code(exc)
         logger.warning(
-            "Reels Maker control rejected | action=%s | plan_id=%s",
+            "Reels Maker control rejected | action=%s | plan_id=%s | reason_code=%s",
             action,
             plan_id or "latest",
+            reason_code,
         )
+        if action == BTN_REELS_VARIANT:
+            return (
+                "Reels Maker не смог подготовить другой безопасный вариант. "
+                f"Причина: {reels_director_reason_summary(reason_code)}. "
+                "Текущий план не изменён, рендер не запускался.",
+                REELS_KEYBOARD,
+            )
         return (
             "Это действие сейчас недоступно. Обнови карточку Reels Maker и попробуй снова.",
             REELS_KEYBOARD,
@@ -7251,6 +7287,7 @@ async def generate_reels_director_treatment(
         max_tokens=1800,
         temperature=0.72,
         model=CONTENT_MODEL_NAME,
+        response_format=story_production.reels_director_response_format(safe_facts),
     )
     return story_production.parse_reels_director_response(
         raw,
