@@ -46,7 +46,76 @@ def planned(candidate=None):
     return eo.plan_release(ctx)
 
 
+def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix="Calibrate"):
+    count = max(4, min(7, len(facts)))
+    story_plan_id = story._variant_plan_id(plan.plan_id, variant_index)
+    roles = story._roles(story_plan_id, count)
+    scenes = []
+    for index, role in enumerate(roles, 1):
+        scenes.append({
+            "role": role,
+            "setting": f"distinct physical validation chamber number {index}",
+            "subject": "one physical optical-titanium prototype",
+            "concrete_action": f"{action_prefix} mechanical coupling number {index} under controlled load",
+            "start_state": f"coupling number {index} is visibly misaligned",
+            "end_state": f"coupling number {index} completes one stable motion",
+            "shot_size": story.SHOT_SIZES[(index - 1) % len(story.SHOT_SIZES)],
+            "camera_motion": story.CAMERA_MOTIONS[(index - 1) % len(story.CAMERA_MOTIONS)],
+        })
+    return json.dumps({
+        "director_version": story.DIRECTOR_VERSION,
+        "visual_concept": "a failed configuration becoming one testable physical mechanism",
+        "scenes": scenes,
+    })
+
+
 class StoryFirstTests(unittest.TestCase):
+    def test_director_roles_follow_causal_order_and_never_start_with_result(self):
+        expected = {
+            4: ["hook", "problem", "test", "result"],
+            5: ["hook", "problem", "test", "result", "conclusion"],
+            6: ["hook", "problem", "hypothesis", "test", "result", "conclusion"],
+            7: list(story.DRAMATURGIC_ROLES),
+        }
+        for count, roles in expected.items():
+            with self.subTest(count=count):
+                self.assertEqual(story._roles("any-plan-id", count), roles)
+
+    def test_semantic_director_response_becomes_the_immutable_scene_plan(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(
+            plan, SAFE_FACTS, director_treatment=treatment
+        )
+        self.assertEqual(pack.director_version, story.DIRECTOR_VERSION)
+        self.assertEqual(pack.visual_concept, treatment.visual_concept)
+        self.assertEqual(
+            [scene.concrete_action for scene in pack.scenes],
+            [scene.concrete_action for scene in treatment.scenes],
+        )
+        self.assertTrue(all("tied to fact" not in scene.setting for scene in pack.scenes))
+        self.assertTrue(all("fact 1" not in scene.concrete_action for scene in pack.scenes))
+
+    def test_semantic_director_rejects_metadata_shaped_scene_content(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["setting"] = "A real setting tied to fact 1"
+        with self.assertRaisesRegex(story.StoryPlanError, "director_setting_invalid"):
+            story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
+
+    def test_semantic_director_rejects_malformed_json_without_template_fallback(self):
+        with self.assertRaisesRegex(story.StoryPlanError, "director_json_invalid"):
+            story.parse_reels_director_response("not-json", planned(), SAFE_FACTS)
+
+    def test_director_prompt_is_content_bound_and_contains_no_source_transport_fields(self):
+        prompt = story.reels_director_prompt(planned(), SAFE_FACTS)
+        self.assertIn(SAFE_FACTS[0], prompt)
+        self.assertIn(story.DIRECTOR_VERSION, prompt)
+        self.assertNotIn("source_ref", prompt)
+        self.assertNotIn("plan_id", prompt)
+
     def test_suitable_chronicle_selects_story_first(self):
         plan = planned()
         self.assertEqual((plan.content_format, plan.production_mode), ("story_pack", "story_first"))

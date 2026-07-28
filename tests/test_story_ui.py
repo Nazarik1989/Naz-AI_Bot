@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 import main
 import story_pack_control as control
 import story_production as story
-from tests.test_story_production import SAFE_FACTS, planned
+from tests.test_story_production import SAFE_FACTS, director_response, planned
 
 
 def fake_update(user_id: int, text: str) -> SimpleNamespace:
@@ -172,6 +172,38 @@ class StoryMenuTests(unittest.TestCase):
             ))
             self.assertEqual(update.callback_query.answer.await_count, 2)
             provider.assert_not_awaited()
+
+    def test_scoped_variant_runs_semantic_director_before_superseding(self):
+        with tempfile.TemporaryDirectory() as root:
+            plan = planned()
+            first = story.plan_story_pack(plan, SAFE_FACTS)
+            story.persist_story_queue(first, Path(root))
+            treatment = story.parse_reels_director_response(
+                director_response(plan, variant_index=1),
+                plan,
+                SAFE_FACTS,
+                variant_index=1,
+            )
+            with patch.object(main, "NAZ_STORY_PACK_ROOT", Path(root)), patch.object(
+                main,
+                "generate_reels_director_treatment",
+                new=AsyncMock(return_value=treatment),
+            ) as director:
+                response, _ = asyncio.run(
+                    main.reels_control_response(
+                        main.BTN_REELS_VARIANT,
+                        plan_id=first.plan_id,
+                    )
+                )
+            director.assert_awaited_once()
+            self.assertIn("другой режиссёрский вариант", response)
+            manifests = control.list_manifests(Path(root))
+            new_payload = next(
+                story.read_manifest(path)
+                for path in manifests
+                if path.parent.name != first.plan_id
+            )
+            self.assertEqual(new_payload["director_version"], story.DIRECTOR_VERSION)
 
     def test_manifest_plan_id_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:

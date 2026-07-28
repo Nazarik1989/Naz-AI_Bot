@@ -107,7 +107,35 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
             editorial_orchestrator.EditorialSource(**row)
         ))
 
-    def test_story_first_trigger_creates_plan_without_model_or_provider_calls(self):
+    def test_transport_metadata_and_paths_never_become_director_facts(self):
+        context = """
+Folders: Naz_AI_Bot_clean/2026-07-25
+User focus: ежедневный импорт content-agent
+### Naz_AI_Bot_clean/2026-07-25/2026-07-25--episode.md
+Проект: Naz_AI_Bot_clean
+Тема диалога: лимиты закончились
+Сначала команда воспроизвела ограничение на отдельном тестовом маршруте.
+После проверки один конфликтующий параметр убрали из конфигурации.
+Затем тот же сценарий запустили повторно на неизменном входе.
+В итоге рабочий маршрут завершился и результат подтвердили отдельным тестом.
+""".strip()
+        row = main.chronicle_source_row(
+            source_ref="agent_content:metadata-fixture",
+            safe_context=context,
+            risks=(),
+            topic="Проверенный рабочий эпизод",
+        )
+        joined = "\n".join(row["safe_facts"]).casefold()
+        self.assertNotIn("folders:", joined)
+        self.assertNotIn("user focus:", joined)
+        self.assertNotIn(".md", joined)
+        self.assertNotIn("проект:", joined)
+        self.assertEqual(len(row["safe_facts"]), 4)
+        self.assertTrue(editorial_orchestrator.story_first_eligible(
+            editorial_orchestrator.EditorialSource(**row)
+        ))
+
+    def test_story_first_trigger_uses_one_director_call_without_media_provider_calls(self):
         bot = SimpleNamespace(send_message=AsyncMock())
         pack_dir = Path(self.temp.name) / "story-packs" / ("a" * 24)
         payload = {
@@ -125,7 +153,11 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
             main, "load_agent_content_seen", return_value={}
         ), patch.object(
             main, "collect_agent_materials", return_value=(WORK_CHRONICLE, [], "2026-07-25")
-        ), patch.object(main, "queue_story_first_pack", return_value=pack_dir), patch.object(
+        ), patch.object(
+            main,
+            "generate_reels_director_treatment",
+            new=AsyncMock(return_value=Mock()),
+        ) as director, patch.object(main, "queue_story_first_pack", return_value=pack_dir), patch.object(
             main.story_production, "read_manifest", return_value=payload
         ), patch.object(main, "mark_agent_content_seen"), patch.object(
             main, "generate_scheduled_package", new=AsyncMock()
@@ -154,9 +186,36 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
                 "reels_status:" + "a" * 24,
             },
         )
+        director.assert_awaited_once()
         text_model.assert_not_awaited()
         image_model.assert_not_awaited()
         provider.assert_not_awaited()
+
+    def test_invalid_director_plan_fails_closed_without_template_queue(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(main, "ADMIN_ID", 42), patch.object(
+            main, "agent_content_dirs_for_date", return_value=[Path("fixture")]
+        ), patch.object(main, "agent_content_hash_for_date", return_value="fixture-hash"), patch.object(
+            main, "load_agent_content_seen", return_value={}
+        ), patch.object(
+            main, "collect_agent_materials", return_value=(WORK_CHRONICLE, [], "2026-07-25")
+        ), patch.object(
+            main,
+            "generate_reels_director_treatment",
+            new=AsyncMock(side_effect=story_production.StoryPlanError("director_json_invalid")),
+        ), patch.object(main, "queue_story_first_pack") as queue, patch.object(
+            main, "mark_agent_content_seen"
+        ) as mark_seen:
+            result = asyncio.run(
+                main.process_agent_content_date(
+                    bot, 42, "2026-07-25", force=True, publish=False
+                )
+            )
+
+        self.assertIn("Reels director rejected", result)
+        queue.assert_not_called()
+        mark_seen.assert_not_called()
+        self.assertIn("Рендер не запускался", bot.send_message.await_args.kwargs["text"])
 
 
 if __name__ == "__main__":
