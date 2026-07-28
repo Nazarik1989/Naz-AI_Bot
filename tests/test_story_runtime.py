@@ -905,7 +905,7 @@ class ControlTests(unittest.TestCase):
 
             summary = control.safe_summary(payload)
 
-            self.assertIn("Визуальная концепция: Человек проверяет живой сервис", summary)
+            self.assertIn("Сюжетная линия: Человек проверяет живой сервис", summary)
             self.assertIn("1. ЗАЦЕПКА", summary)
             self.assertIn("Смысл: Naz проверяет живой сервис", summary)
             self.assertIn("В кадре: Naz · План: средний", summary)
@@ -934,7 +934,7 @@ class ControlTests(unittest.TestCase):
             summary = control.safe_summary(payload)
 
             self.assertIn(
-                "Визуальная концепция: Рабочий эпизод превращается в проверяемый результат",
+                "Сюжетная линия: Рабочий эпизод превращается в проверяемый результат",
                 summary,
             )
             self.assertIn("Смысл: Показываем исходную ситуацию", summary)
@@ -968,7 +968,7 @@ class ControlTests(unittest.TestCase):
             summary = control.safe_summary(payload)
 
             self.assertIn(
-                "Визуальная концепция: Naz проверяет живой сервис из лаборатории",
+                "Сюжетная линия: Naz проверяет живой сервис из лаборатории",
                 summary,
             )
             self.assertIn("Naz касается ноутбука и замирает", summary)
