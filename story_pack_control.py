@@ -38,6 +38,36 @@ VISUAL_CONCEPT_RU = {
     "separate parts becoming one connected system": "Разрозненные части становятся связанной системой",
     "laboratory prototype entering the physical world": "Прототип выходит из лаборатории в физический мир",
 }
+SCENE_ROLE_RU = {
+    "hook": "ЗАЦЕПКА",
+    "problem": "ПРОБЛЕМА",
+    "hypothesis": "ГИПОТЕЗА",
+    "test": "ПРОВЕРКА",
+    "result": "РЕЗУЛЬТАТ",
+    "solution": "РЕШЕНИЕ",
+    "conclusion": "ВЫВОД",
+}
+SCENE_FALLBACK_RU = {
+    "hook": "Показываем исходную ситуацию и сразу задаём вопрос.",
+    "problem": "Показываем конкретное препятствие.",
+    "hypothesis": "Показываем идею, которую предстоит проверить.",
+    "test": "Проверяем идею реальным действием.",
+    "result": "Показываем наблюдаемый результат проверки.",
+    "solution": "Закрепляем рабочее решение.",
+    "conclusion": "Оставляем ясный финальный вывод.",
+}
+SHOT_SIZE_RU = {
+    "wide": "общий",
+    "medium": "средний",
+    "close": "крупный",
+    "macro": "макро",
+}
+CAMERA_MOTION_RU = {
+    "slow push": "медленное приближение",
+    "controlled pan": "плавная панорама",
+    "handheld follow": "ручная камера следует за действием",
+    "locked with real subject motion": "статичная камера, движение внутри кадра",
+}
 
 
 def _now() -> str:
@@ -221,6 +251,43 @@ def create_next_variant(
         return new_dir
 
 
+def _legacy_concept_ru(scenes: list[Any]) -> str:
+    text = " ".join(
+        " ".join(
+            str(scene.get(field, ""))
+            for field in ("setting", "concrete_action", "end_state")
+        )
+        for scene in scenes
+        if isinstance(scene, Mapping)
+    ).casefold()
+    if any(marker in text for marker in ("live service", "http request", "public page")):
+        return "Naz проверяет живой сервис из лаборатории и со стороны пользователя"
+    return ""
+
+
+def _legacy_scene_summary_ru(scene: Mapping[str, Any]) -> str:
+    """Explain known pre-localization director actions without exposing raw prompts."""
+    text = " ".join(
+        str(scene.get(field, ""))
+        for field in ("setting", "concrete_action", "start_state", "end_state")
+    ).casefold()
+    if "laptop" in text and any(marker in text for marker in ("closes", "leaves", "walks away")):
+        return "Naz закрывает ноутбук и выходит из кадра после завершённой проверки."
+    if "refused connection" in text and "response" in text:
+        return "На экране отказ соединения сменяется обычным ответом сервиса."
+    if "http request" in text or ("terminal" in text and "request" in text):
+        return "Naz отправляет простой запрос из терминала и ждёт фактический ответ сервиса."
+    if "laptop" in text and any(marker in text for marker in ("public page", "outside", "courtyard")):
+        return "Naz открывает ноутбук снаружи лаборатории и проверяет публичную страницу как пользователь."
+    if "cable" in text and "response" in text:
+        return "Подключение стабилизируется рядом с кабелем, и Naz убирает руку от клавиатуры."
+    if "keyboard" in text and any(marker in text for marker in ("rests flat", "fingers move away")):
+        return "Рядом с клавиатурой показываем деталь, которая остановила работу."
+    if "laptop" in text and any(marker in text for marker in ("trackpad", "taps", "pauses")):
+        return "Naz касается ноутбука и замирает перед началом проверки."
+    return ""
+
+
 def safe_summary(payload: Mapping[str, Any]) -> str:
     jobs = payload.get("scene_jobs", []) if isinstance(payload.get("scene_jobs"), list) else []
     directed = payload.get("scenes", []) if isinstance(payload.get("scenes"), list) else []
@@ -235,8 +302,29 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         for scene in directed if isinstance(scene, Mapping)
     )
     video_credits = int(duration) * 5
-    concept = str(payload.get("visual_concept", ""))
-    concept_label = VISUAL_CONCEPT_RU.get(concept, concept)[:120]
+    concept = str(payload.get("visual_concept", "")).strip()
+    admin_concept = " ".join(str(payload.get("admin_concept_ru", "")).split())
+    concept_label = admin_concept if re.search(r"[А-Яа-яЁё]", admin_concept) else ""
+    if not concept_label:
+        concept_label = VISUAL_CONCEPT_RU.get(concept, "")
+    thesis = " ".join(str(payload.get("central_thesis", "")).split())
+    if not concept_label and re.search(r"[А-Яа-яЁё]", thesis):
+        concept_label = thesis[:120]
+    if not concept_label:
+        for scene in directed:
+            if not isinstance(scene, Mapping):
+                continue
+            overlay = " ".join(str(scene.get("story_overlay", "")).split())
+            prefix, separator, remainder = overlay.partition(":")
+            if separator and prefix.casefold() in SCENE_ROLE_RU:
+                overlay = remainder.strip()
+            if re.search(r"[А-Яа-яЁё]", overlay):
+                concept_label = overlay[:120]
+                break
+    if not concept_label:
+        concept_label = _legacy_concept_ru(directed)
+    if not concept_label:
+        concept_label = "Рабочий эпизод превращается в проверяемый результат"
     statuses = "\n".join(
         f"• {SCENE_STATUS_RU.get(state, state)}: {count}"
         for state, count in sorted(counts.items())
@@ -244,11 +332,28 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
     treatment = []
     for index, scene in enumerate(directed, 1):
         if isinstance(scene, Mapping):
+            role = str(scene.get("role", "scene")).casefold()
+            overlay = " ".join(str(scene.get("admin_summary_ru", "")).split())
+            if not re.search(r"[А-Яа-яЁё]", overlay):
+                overlay = _legacy_scene_summary_ru(scene)
+            if not re.search(r"[А-Яа-яЁё]", overlay):
+                overlay = " ".join(str(scene.get("story_overlay", "")).split())
+            prefix, separator, remainder = overlay.partition(":")
+            if separator and prefix.casefold() in SCENE_ROLE_RU:
+                overlay = remainder.strip()
+            if not re.search(r"[А-Яа-яЁё]", overlay):
+                overlay = SCENE_FALLBACK_RU.get(
+                    role, "Показываем один понятный этап рабочего эпизода."
+                )
+            subject = "Naz" if bool(scene.get("requires_naz_reference")) else "объект или механизм"
+            shot_size = SHOT_SIZE_RU.get(str(scene.get("shot_size", "")).casefold(), "не задан")
+            camera = CAMERA_MOTION_RU.get(
+                str(scene.get("camera_motion", "")).casefold(), "спокойное движение камеры"
+            )
             treatment.append(
-                f"{index}. {str(scene.get('role', 'scene')).upper()} · "
-                f"{str(scene.get('setting', ''))[:105]}\n"
-                f"   Действие: {str(scene.get('concrete_action', ''))[:115]} · "
-                f"Камера: {str(scene.get('camera_motion', ''))[:40]}"
+                f"{index}. {SCENE_ROLE_RU.get(role, 'СЦЕНА')}\n"
+                f"   Смысл: {overlay[:112]}\n"
+                f"   В кадре: {subject} · План: {shot_size} · Камера: {camera}"
             )
     pack_status = str(payload.get("pack_status", "unknown"))
     return (

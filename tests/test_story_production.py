@@ -59,10 +59,12 @@ def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix=
             "end_state": f"coupling number {index} completes one stable motion",
             "shot_size": story.SHOT_SIZES[(index - 1) % len(story.SHOT_SIZES)],
             "camera_motion": story.CAMERA_MOTIONS[(index - 1) % len(story.CAMERA_MOTIONS)],
+            "admin_summary_ru": f"Механическое соединение номер {index} проходит проверку нагрузкой",
         })
     return json.dumps({
         "director_version": story.DIRECTOR_VERSION,
         "visual_concept": "a failed configuration becoming one testable physical mechanism",
+        "admin_concept_ru": "Ошибка конфигурации становится проверяемым механизмом",
         "scenes": scenes,
     })
 
@@ -84,6 +86,13 @@ class StoryFirstTests(unittest.TestCase):
         self.assertFalse(scenes["items"]["additionalProperties"])
         properties = scenes["items"]["properties"]
         self.assertNotIn("role", properties)
+        self.assertIn("admin_summary_ru", properties)
+        self.assertIn("admin_concept_ru", contract["schema"]["properties"])
+        self.assertEqual(properties["admin_summary_ru"]["maxLength"], 240)
+        self.assertEqual(
+            contract["schema"]["properties"]["admin_concept_ru"]["maxLength"],
+            240,
+        )
         self.assertEqual(
             properties["subject_kind"]["enum"],
             list(story.DIRECTOR_SUBJECT_KINDS),
@@ -161,10 +170,19 @@ class StoryFirstTests(unittest.TestCase):
         )
         self.assertEqual(pack.director_version, story.DIRECTOR_VERSION)
         self.assertEqual(pack.visual_concept, treatment.visual_concept)
+        self.assertEqual(pack.admin_concept_ru, treatment.admin_concept_ru)
         self.assertEqual(
             [scene.concrete_action for scene in pack.scenes],
             [scene.concrete_action for scene in treatment.scenes],
         )
+        self.assertEqual(
+            [scene.admin_summary_ru for scene in pack.scenes],
+            [scene.admin_summary_ru for scene in treatment.scenes],
+        )
+        for scene in pack.scenes:
+            self.assertNotIn(scene.admin_summary_ru, scene.clean_prompt)
+            self.assertNotIn(scene.admin_summary_ru, scene.keyframe_prompt)
+            self.assertNotIn(scene.admin_summary_ru, scene.provider_prompt)
         self.assertTrue(all("tied to fact" not in scene.setting for scene in pack.scenes))
         self.assertTrue(all("fact 1" not in scene.concrete_action for scene in pack.scenes))
 
@@ -279,6 +297,25 @@ class StoryFirstTests(unittest.TestCase):
                 json.dumps(payload), plan, SAFE_FACTS
             )
 
+    def test_director_rejects_admin_display_fields_without_russian_text(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["admin_concept_ru"] = "English display concept"
+        payload["scenes"][0]["admin_summary_ru"] = "English display scene"
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_admin_concept_ru_not_russian", raised.exception.reason_codes
+        )
+        self.assertIn(
+            "director_scene_1_admin_summary_ru_not_russian",
+            raised.exception.reason_codes,
+        )
+
     def test_director_reports_all_typed_contract_errors_in_one_pass(self):
         plan = planned()
         payload = json.loads(director_response(plan))
@@ -304,6 +341,8 @@ class StoryFirstTests(unittest.TestCase):
         prompt = story.reels_director_prompt(planned(), SAFE_FACTS)
         self.assertIn(SAFE_FACTS[0], prompt)
         self.assertIn(story.DIRECTOR_VERSION, prompt)
+        self.assertIn("admin_summary_ru", prompt)
+        self.assertIn("concise natural Russian", prompt)
         self.assertNotIn("source_ref", prompt)
         self.assertNotIn("plan_id", prompt)
 
