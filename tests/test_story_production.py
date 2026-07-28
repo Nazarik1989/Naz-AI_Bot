@@ -103,6 +103,25 @@ class StoryFirstTests(unittest.TestCase):
         self.assertFalse(story._is_naz_human_subject("one Naz AI Lab optical prototype"))
         self.assertTrue(story._is_naz_human_subject("Naz, the same real adult human founder"))
 
+    def test_2026_07_08_route_expands_unambiguous_naz_subject_shorthand(self):
+        plan = dataclasses.replace(
+            planned(source(source_ref="agent_content:2026-07-08:fixture")),
+            visual_subject_direction="the canonical Naz in the laboratory",
+        )
+        payload = json.loads(director_response(plan))
+        for scene in payload["scenes"]:
+            scene["subject"] = "Naz"
+
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(
+            plan, SAFE_FACTS, director_treatment=treatment
+        )
+
+        self.assertTrue(all(story._is_naz_human_subject(scene.subject) for scene in treatment.scenes))
+        self.assertTrue(all(scene.requires_naz_reference for scene in pack.scenes))
+
     def test_explicit_object_only_direction_rejects_naz_subject(self):
         plan = dataclasses.replace(
             planned(), visual_subject_direction="an object-only scene with no person"

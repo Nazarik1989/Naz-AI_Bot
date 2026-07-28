@@ -351,6 +351,14 @@ def _director_field(value: Any, name: str, *, minimum: int = 8, maximum: int = 2
     return text
 
 
+def _director_subject(value: Any) -> str:
+    """Expand an unambiguous Naz shorthand before enforcing identity policy."""
+    text = " ".join(str(value or "").split())
+    if re.fullmatch(r"(?i)(?:naz|наз)[.!]?", text):
+        return "Naz, the same real adult human founder"
+    return _director_field(text, "subject")
+
+
 def parse_reels_director_response(
     raw: str,
     plan: EditorialPlan,
@@ -377,7 +385,7 @@ def parse_reels_director_response(
     for index, (row, expected_role) in enumerate(zip(rows, expected_roles)):
         if not isinstance(row, Mapping) or str(row.get("role", "")).casefold() != expected_role:
             raise StoryPlanError(f"director_role_invalid_{index + 1}")
-        subject = _director_field(row.get("subject"), "subject")
+        subject = _director_subject(row.get("subject"))
         has_naz_human = _is_naz_human_subject(subject)
         has_unidentified_human = _mentions_human_subject(subject) and not has_naz_human
         if (
