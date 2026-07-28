@@ -147,6 +147,60 @@ class StoryFirstTests(unittest.TestCase):
         with self.assertRaisesRegex(story.StoryPlanError, "director_setting_invalid"):
             story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
 
+    def test_2026_07_08_route_accepts_concrete_technical_locations(self):
+        plan = planned(source(source_ref="agent_content:2026-07-08:fixture"))
+        payload = json.loads(director_response(plan))
+        locations = (
+            "Naz AI Lab",
+            "server room",
+            "terminal bay",
+            "GitHub build bench",
+            "code test chamber",
+        )
+        for scene, location in zip(payload["scenes"], locations):
+            scene["setting"] = location
+
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, SAFE_FACTS
+        )
+
+        self.assertEqual(
+            [scene.setting for scene in treatment.scenes],
+            list(locations),
+        )
+
+    def test_director_still_rejects_internal_transport_markers(self):
+        plan = planned()
+        for invalid_setting in (
+            "setting tied to fact 2",
+            "Folders: private episode",
+            "project: Naz_AI_Bot_clean",
+            "source_ref inside scene",
+            "plan_id inside scene",
+        ):
+            with self.subTest(invalid_setting=invalid_setting):
+                payload = json.loads(director_response(plan))
+                payload["scenes"][0]["setting"] = invalid_setting
+                with self.assertRaisesRegex(story.StoryPlanError, "director_setting_invalid"):
+                    story.parse_reels_director_response(
+                        json.dumps(payload), plan, SAFE_FACTS
+                    )
+
+    def test_director_still_rejects_cheap_visual_cliches(self):
+        plan = planned()
+        for invalid_setting in (
+            "overloaded HUD control room",
+            "random circuit chamber",
+            "flowing code projection room",
+        ):
+            with self.subTest(invalid_setting=invalid_setting):
+                payload = json.loads(director_response(plan))
+                payload["scenes"][0]["setting"] = invalid_setting
+                with self.assertRaisesRegex(story.StoryPlanError, "director_setting_invalid"):
+                    story.parse_reels_director_response(
+                        json.dumps(payload), plan, SAFE_FACTS
+                    )
+
     def test_semantic_director_rejects_malformed_json_without_template_fallback(self):
         with self.assertRaisesRegex(story.StoryPlanError, "director_json_invalid"):
             story.parse_reels_director_response("not-json", planned(), SAFE_FACTS)

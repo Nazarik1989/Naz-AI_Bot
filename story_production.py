@@ -220,10 +220,13 @@ def _safe_fact(value: str) -> str:
     return text
 
 
-_DIRECTOR_CLICHE_RE = re.compile(
+_DIRECTOR_TRANSPORT_RE = re.compile(
     r"(?i)(?:\bfact\s*\d+\b|tied to fact|perform and reveal|folders?:|user focus:|"
-    r"project:|\.md\b|\.json\b|github|source_ref|plan_id|dashboard|terminal|"
-    r"screen interface|\bhud\b|\bcode\b|random circuit)"
+    r"project:|\.md\b|\.json\b|source_ref|plan_id)"
+)
+_DIRECTOR_FORBIDDEN_CLICHE_RE = re.compile(
+    r"(?i)(?:screen interface|(?:overloaded\s+)?\bhud\b|random circuit|"
+    r"flowing code|code rain)"
 )
 
 
@@ -284,6 +287,8 @@ def reels_director_prompt(
         '"slow push|controlled pan|handheld follow|locked with real subject motion"}]}. '
         "Return exactly one scene for every ordered role, in the same order. Every setting, "
         "action and end state must be concrete and distinct. Obey identity_requirement exactly. "
+        "Concise physical place names such as Naz AI Lab or server room are valid settings; "
+        "technical nouns are not transport metadata by themselves. "
         "Write scene fields in concise English.\n\n"
         + json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
     )
@@ -336,7 +341,12 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
 
 def _director_field(value: Any, name: str, *, minimum: int = 8, maximum: int = 240) -> str:
     text = " ".join(str(value or "").split())
-    if not minimum <= len(text) <= maximum or _SECRET_RE.search(text) or _DIRECTOR_CLICHE_RE.search(text):
+    if (
+        not minimum <= len(text) <= maximum
+        or _SECRET_RE.search(text)
+        or _DIRECTOR_TRANSPORT_RE.search(text)
+        or _DIRECTOR_FORBIDDEN_CLICHE_RE.search(text)
+    ):
         raise StoryPlanError(f"director_{name}_invalid")
     return text
 
@@ -383,7 +393,7 @@ def parse_reels_director_response(
         scenes.append(
             DirectorScene(
                 role=expected_role,
-                setting=_director_field(row.get("setting"), "setting", minimum=12),
+                setting=_director_field(row.get("setting"), "setting", minimum=10),
                 subject=subject,
                 concrete_action=_director_field(row.get("concrete_action"), "action", minimum=12),
                 start_state=_director_field(row.get("start_state"), "start_state"),
