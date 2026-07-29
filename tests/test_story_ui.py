@@ -236,6 +236,33 @@ class StoryMenuTests(unittest.TestCase):
             )
             self.assertEqual(new_payload["director_version"], story.DIRECTOR_VERSION)
 
+    def test_scoped_variant_rejects_stale_manifest_before_director_call(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack_dir = story.persist_story_queue(first, Path(root))
+            manifest = pack_dir / "story_manifest.json"
+            payload = story.read_manifest(manifest)
+            payload["safe_facts"][0] = "tampered source fact"
+            story.atomic_json(manifest, payload)
+
+            with patch.object(
+                main, "NAZ_STORY_PACK_ROOT", Path(root)
+            ), patch.object(
+                main,
+                "generate_reels_director_treatment",
+                new=AsyncMock(),
+            ) as director:
+                response, _ = asyncio.run(
+                    main.reels_control_response(
+                        main.BTN_REELS_VARIANT,
+                        plan_id=first.plan_id,
+                    )
+                )
+
+            director.assert_not_awaited()
+            self.assertIn("Текущий план не изменён", response)
+            self.assertEqual(len(control.list_manifests(Path(root))), 1)
+
     def test_manifest_plan_id_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
             first = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=0)

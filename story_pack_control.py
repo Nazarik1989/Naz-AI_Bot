@@ -436,6 +436,8 @@ def create_next_variant(
     path = manifest_path(root, plan_id)
     with _manifest_lock(path):
         payload = story_production.read_manifest(path)
+        if not story_production.manifest_has_current_production_contract(payload):
+            raise story_production.StoryPlanError("story_manifest_contract_stale")
         if str(payload.get("approval", {}).get("status")) != "awaiting_approval":
             raise story_production.StoryPlanError("another variant is allowed before approval only")
         if any(job.get("external_job_id") for job in payload.get("scene_jobs", [])):

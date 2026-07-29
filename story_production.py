@@ -36,9 +36,9 @@ SUPPORTED_STORY_SCHEMAS = (
     ANCIENT_STORY_SCHEMA,
     FIRST_STORY_SCHEMA,
 )
-DIRECTOR_VERSION = "reels-semantic-director-v4"
+DIRECTOR_VERSION = "reels-semantic-director-v7"
 TEMPLATE_DIRECTOR_VERSION = "reels-template-director-v1"
-MOTION_CONTRACT_VERSION = "single-physical-motion-v1"
+MOTION_CONTRACT_VERSION = "bounded-story-arc-v4"
 VIDEO_MOTION_PROMPT_VERSION = "runway-image-to-video-motion-v2"
 HYBRID_MODEL_ROUTE = "naz-human-gen45-object-turbo-v1"
 RUNWAY_VIDEO_CREDITS_PER_SECOND = {"gen4_turbo": 5, "gen4.5": 12}
@@ -58,11 +58,291 @@ CAMERA_MOTION_PROMPTS = {
 }
 DIRECTOR_SUBJECT_KINDS = ("naz_human", "physical_object")
 DIRECTOR_MOTION_CLASSES = (
-    "adjust", "align", "bend", "calibrate", "carry", "close", "connect", "cut",
+    "align", "bend", "carry", "close", "connect", "cut",
     "disconnect", "fold", "grip", "insert", "lift", "lock", "lower", "open",
     "oscillate", "place", "pour", "press", "pull", "push", "remove", "rotate",
-    "slide", "test", "unlock", "walk",
+    "slide", "unlock",
 )
+DIRECTOR_SELF_MOTION_CLASSES = (
+    "close", "lower", "open", "oscillate", "rotate", "slide",
+)
+DIRECTOR_BRAND_MARKINGS = ("none", "naz_ai_lab")
+
+# Each recipe is a pre-vetted, single-predicate piece of blocking. The text
+# director selects a recipe; it never composes materials, props or grammar.
+# Tuple fields: subject_kind, motion_class, primary prop, optional contact.
+DIRECTOR_ACTION_RECIPES: Mapping[str, tuple[str, str, str, str]] = {
+    "naz_aligns_module_against_guide": (
+        "naz_human", "align", "one titanium module", "against one technical ceramic guide",
+    ),
+    "naz_bends_cable_around_guide": (
+        "naz_human", "bend", "one carbon-sheathed technical cable", "around one titanium guide",
+    ),
+    "naz_carries_module": (
+        "naz_human", "carry", "one blue anodized aluminum module", "",
+    ),
+    "naz_closes_panel_against_frame": (
+        "naz_human", "close", "one smoked-glass panel", "against one titanium frame",
+    ),
+    "naz_connects_plug_into_socket": (
+        "naz_human", "connect", "one titanium plug", "into one technical ceramic socket",
+    ),
+    "naz_cuts_polymer_sheet_along_guide": (
+        "naz_human", "cut", "one transparent technical-polymer sheet", "along one titanium guide",
+    ),
+    "naz_disconnects_plug_from_socket": (
+        "naz_human", "disconnect", "one titanium plug", "from one technical ceramic socket",
+    ),
+    "naz_folds_polymer_sheet_along_guide": (
+        "naz_human", "fold", "one transparent technical-polymer sheet", "along one titanium guide",
+    ),
+    "naz_grips_lever": (
+        "naz_human", "grip", "one milled titanium lever", "",
+    ),
+    "naz_inserts_module_into_slot": (
+        "naz_human", "insert", "one blue anodized aluminum module", "into one technical ceramic slot",
+    ),
+    "naz_lifts_module_from_bench": (
+        "naz_human", "lift", "one titanium module", "from one carbon-fiber workbench",
+    ),
+    "naz_locks_collar_against_stop": (
+        "naz_human", "lock", "one polished titanium collar", "against one technical ceramic stop",
+    ),
+    "naz_lowers_module_onto_mount": (
+        "naz_human", "lower", "one titanium module", "onto one technical ceramic mount",
+    ),
+    "naz_opens_glass_cover": (
+        "naz_human", "open", "one smoked-glass cover", "",
+    ),
+    "naz_places_module_onto_bench": (
+        "naz_human", "place", "one blue anodized aluminum module", "onto one carbon-fiber workbench",
+    ),
+    "naz_presses_mechanical_button": (
+        "naz_human", "press", "one titanium mechanical button", "",
+    ),
+    "naz_pulls_lever": (
+        "naz_human", "pull", "one milled titanium lever", "",
+    ),
+    "naz_pushes_tray_along_rail": (
+        "naz_human", "push", "one blue anodized aluminum tray", "along one titanium rail",
+    ),
+    "naz_removes_module_from_slot": (
+        "naz_human", "remove", "one titanium module", "from one technical ceramic slot",
+    ),
+    "naz_rotates_dial_within_housing": (
+        "naz_human", "rotate", "one titanium dial", "within one smoked-glass housing",
+    ),
+    "naz_slides_tray_along_rail": (
+        "naz_human", "slide", "one blue anodized aluminum tray", "along one titanium rail",
+    ),
+    "naz_unlocks_latch": (
+        "naz_human", "unlock", "one polished titanium latch", "",
+    ),
+    "mechanism_cover_closes_against_frame": (
+        "physical_object", "close", "one smoked-glass cover", "against one titanium frame",
+    ),
+    "mechanism_platform_lowers_onto_mount": (
+        "physical_object", "lower", "one carbon-fiber platform", "onto one technical ceramic mount",
+    ),
+    "mechanism_cover_opens": (
+        "physical_object", "open", "one smoked-glass cover", "",
+    ),
+    "mechanism_rotor_oscillates_within_housing": (
+        "physical_object", "oscillate", "one titanium rotor", "within one smoked-glass housing",
+    ),
+    "mechanism_rotor_rotates_within_housing": (
+        "physical_object", "rotate", "one titanium rotor", "within one technical ceramic housing",
+    ),
+    "mechanism_tray_slides_along_rail": (
+        "physical_object", "slide", "one blue anodized aluminum tray", "along one titanium rail",
+    ),
+    "mechanism_latch_closes_against_stop": (
+        "physical_object", "close", "one polished titanium latch", "against one technical ceramic stop",
+    ),
+    "mechanism_collar_rotates_within_housing": (
+        "physical_object", "rotate", "one blue anodized aluminum collar", "within one titanium housing",
+    ),
+    "mechanism_door_opens_within_frame": (
+        "physical_object", "open", "one titanium door", "within one titanium frame",
+    ),
+    "mechanism_module_slides_along_guide": (
+        "physical_object", "slide", "one transparent technical-polymer module", "along one technical ceramic guide",
+    ),
+    "mechanism_panel_closes_against_frame": (
+        "physical_object", "close", "one carbon-fiber panel", "against one titanium frame",
+    ),
+    "mechanism_platform_lowers_onto_bench": (
+        "physical_object", "lower", "one titanium platform", "onto one carbon-fiber workbench",
+    ),
+}
+DIRECTOR_ACTION_RECIPE_NAMES = tuple(DIRECTOR_ACTION_RECIPES)
+DIRECTOR_PRIMARY_SETTINGS: Mapping[str, str] = {
+    "integration_workbench": "one dark Naz AI Lab integration workbench",
+    "validation_bay": "one enclosed Naz AI Lab validation bay",
+    "server_aisle": "one cold Naz AI Lab server aisle",
+    "optics_bench": "one smoked-glass Naz AI Lab optics bench",
+    "materials_lab": "one sparse Naz AI Lab materials laboratory",
+    "machining_cell": "one precise Naz AI Lab machining cell",
+    "prototype_bay": "one black-glass Naz AI Lab prototype bay",
+    "relay_platform": "one weathered Naz AI Lab relay platform",
+    "systems_chamber": "one physical Naz AI Lab systems chamber",
+    "fabrication_bench": "one titanium Naz AI Lab fabrication bench",
+}
+DIRECTOR_PRIMARY_SETTING_CODES = tuple(DIRECTOR_PRIMARY_SETTINGS)
+DIRECTOR_STATE_LABELS: Mapping[str, str] = {
+    "inactive": "inactive",
+    "active": "active",
+    "unpowered": "unpowered",
+    "powered": "powered",
+    "dark": "dark",
+    "illuminated": "illuminated by one restrained cobalt indicator",
+    "misaligned": "visibly misaligned",
+    "aligned": "visibly aligned",
+    "blocked": "mechanically blocked",
+    "clear": "mechanically clear",
+    "disconnected": "physically disconnected",
+    "connected": "physically connected",
+    "unseated": "outside its mechanical seat",
+    "seated": "fully seated",
+    "loose": "visibly loose",
+    "secured": "mechanically secured",
+    "unlocked": "unlocked",
+    "locked": "locked against its stop",
+    "open": "open",
+    "closed": "closed",
+    "unstable": "visibly unstable under load",
+    "stable": "stable under the same load",
+    "stationary": "stationary",
+    "moving": "moving under visible mechanical drive",
+    "rotating_smoothly": "rotating smoothly under the same visible mechanical drive",
+    "unverified": "not yet physically verified",
+    "verified": "physically verified",
+    "unloaded": "unloaded",
+    "under_load": "under one visible mechanical load",
+    "incomplete": "visibly incomplete",
+    "complete": "visibly complete",
+    "exposed": "physically exposed for inspection",
+    "covered": "covered by its protective shell",
+    "removed": "removed from its seat",
+    "installed": "installed in its mechanical seat",
+    "raised": "raised above its mount",
+    "lowered": "lowered onto its mount",
+    "empty": "visibly empty",
+    "filled": "visibly filled to its marked limit",
+    "intact": "physically intact",
+    "separated": "cleanly separated along its guide",
+}
+DIRECTOR_STATE_CODES = tuple(DIRECTOR_STATE_LABELS)
+DIRECTOR_STORY_ARCS: Mapping[str, Mapping[str, Any]] = {
+    "module_recovery_mixed": {
+        "subject_mode": "mixed",
+        "setting": "integration_workbench",
+        "continuity_anchor": "the same physical Naz AI Lab prototype module",
+        "initial_state": "covered",
+        "description": "Naz exposes, realigns and reconnects one module; its driven rotor proves the repair.",
+        "description_ru": "Наз открывает, выравнивает и подключает один модуль; вращение механизма подтверждает ремонт.",
+        "steps": (
+            ("naz_opens_glass_cover", "exposed", 4),
+            ("naz_removes_module_from_slot", "removed", 6),
+            ("naz_aligns_module_against_guide", "aligned", 4),
+            ("naz_inserts_module_into_slot", "installed", 5),
+            ("naz_connects_plug_into_socket", "connected", 4),
+            ("naz_presses_mechanical_button", "powered", 7),
+            ("mechanism_rotor_rotates_within_housing", "rotating_smoothly", 4),
+        ),
+    },
+    "module_recovery_human": {
+        "subject_mode": "human",
+        "setting": "integration_workbench",
+        "continuity_anchor": "the same physical Naz AI Lab prototype module",
+        "initial_state": "covered",
+        "description": "Naz alone exposes, realigns, reconnects and mechanically verifies one module.",
+        "description_ru": "Наз сам открывает, выравнивает, подключает и механически проверяет один модуль.",
+        "steps": (
+            ("naz_opens_glass_cover", "exposed", 4),
+            ("naz_removes_module_from_slot", "removed", 6),
+            ("naz_aligns_module_against_guide", "aligned", 4),
+            ("naz_inserts_module_into_slot", "installed", 5),
+            ("naz_connects_plug_into_socket", "connected", 4),
+            ("naz_presses_mechanical_button", "powered", 7),
+            ("naz_rotates_dial_within_housing", "illuminated", 4),
+        ),
+    },
+    "connector_calibration_human": {
+        "subject_mode": "human",
+        "setting": "validation_bay",
+        "continuity_anchor": "the same physical Naz AI Lab connector assembly",
+        "initial_state": "locked",
+        "description": "Naz unlocks, exposes, aligns, reconnects and secures one connector assembly.",
+        "description_ru": "Наз разблокирует, открывает, выравнивает, подключает и фиксирует один узел.",
+        "steps": (
+            ("naz_unlocks_latch", "unlocked", 4),
+            ("naz_opens_glass_cover", "exposed", 5),
+            ("naz_removes_module_from_slot", "removed", 7),
+            ("naz_aligns_module_against_guide", "aligned", 4),
+            ("naz_inserts_module_into_slot", "installed", 6),
+            ("naz_connects_plug_into_socket", "connected", 4),
+            ("naz_locks_collar_against_stop", "secured", 4),
+        ),
+    },
+    "automated_validation_cycle": {
+        "subject_mode": "object",
+        "setting": "systems_chamber",
+        "continuity_anchor": "the same physical Naz AI Lab validation mechanism",
+        "initial_state": "closed",
+        "description": "One visibly driven mechanism exposes, loads, stabilizes and verifies itself.",
+        "description_ru": "Один механизм с видимым приводом открывается, принимает нагрузку и проходит проверочный цикл.",
+        "steps": (
+            ("mechanism_door_opens_within_frame", "open", 4),
+            ("mechanism_cover_opens", "exposed", 5),
+            ("mechanism_module_slides_along_guide", "aligned", 4),
+            ("mechanism_platform_lowers_onto_mount", "under_load", 4),
+            ("mechanism_rotor_oscillates_within_housing", "unstable", 6),
+            ("mechanism_latch_closes_against_stop", "secured", 7),
+            ("mechanism_rotor_rotates_within_housing", "rotating_smoothly", 4),
+        ),
+    },
+    "actuator_proof_cycle": {
+        "subject_mode": "object",
+        "setting": "prototype_bay",
+        "continuity_anchor": "the same physical Naz AI Lab actuator system",
+        "initial_state": "raised",
+        "description": "One visibly driven actuator lowers, aligns, locks, loads and proves its cycle.",
+        "description_ru": "Один механизм с видимым приводом опускается, выравнивается, фиксируется и подтверждает рабочий цикл.",
+        "steps": (
+            ("mechanism_platform_lowers_onto_bench", "lowered", 4),
+            ("mechanism_tray_slides_along_rail", "moving", 5),
+            ("mechanism_collar_rotates_within_housing", "aligned", 4),
+            ("mechanism_cover_closes_against_frame", "closed", 6),
+            ("mechanism_latch_closes_against_stop", "secured", 4),
+            ("mechanism_rotor_oscillates_within_housing", "under_load", 7),
+            ("mechanism_rotor_rotates_within_housing", "rotating_smoothly", 4),
+        ),
+    },
+}
+DIRECTOR_STORY_ARC_NAMES = tuple(DIRECTOR_STORY_ARCS)
+DIRECTOR_RECIPE_SUMMARIES_RU: Mapping[str, str] = {
+    "naz_opens_glass_cover": "Наз открывает дымчатую стеклянную крышку и оставляет узел доступным для проверки.",
+    "naz_removes_module_from_slot": "Наз вынимает титановый модуль из керамического паза.",
+    "naz_aligns_module_against_guide": "Наз выравнивает титановый модуль по керамической направляющей.",
+    "naz_inserts_module_into_slot": "Наз устанавливает синий алюминиевый модуль в керамический паз.",
+    "naz_connects_plug_into_socket": "Наз соединяет титановый штекер с керамическим разъёмом.",
+    "naz_presses_mechanical_button": "Наз нажимает одну механическую кнопку и подаёт питание на узел.",
+    "naz_rotates_dial_within_housing": "Наз поворачивает титановый регулятор до проверочного положения.",
+    "naz_unlocks_latch": "Наз разблокирует титановую защёлку.",
+    "naz_locks_collar_against_stop": "Наз фиксирует титановое кольцо на механическом упоре.",
+    "mechanism_door_opens_within_frame": "Видимый привод открывает титановую дверцу внутри рамы.",
+    "mechanism_cover_opens": "Видимый привод открывает дымчатую стеклянную крышку.",
+    "mechanism_module_slides_along_guide": "Привод перемещает полимерный модуль по керамической направляющей.",
+    "mechanism_platform_lowers_onto_mount": "Привод опускает карбоновую платформу на керамическое крепление.",
+    "mechanism_rotor_oscillates_within_housing": "Титановый ротор под нагрузкой совершает контролируемое колебание.",
+    "mechanism_latch_closes_against_stop": "Привод закрывает титановую защёлку на керамическом упоре.",
+    "mechanism_rotor_rotates_within_housing": "Титановый ротор равномерно вращается внутри корпуса и подтверждает работу узла.",
+    "mechanism_platform_lowers_onto_bench": "Привод опускает титановую платформу на карбоновый стенд.",
+    "mechanism_tray_slides_along_rail": "Привод перемещает синий алюминиевый лоток по титановой направляющей.",
+    "mechanism_collar_rotates_within_housing": "Привод поворачивает синее алюминиевое кольцо внутри корпуса.",
+    "mechanism_cover_closes_against_frame": "Привод закрывает дымчатую стеклянную крышку на титановой раме.",
+}
 CANONICAL_NAZ_SUBJECT = "Naz, the same real adult human founder"
 CANONICAL_NAZ_WARDROBE = (
     "the same fitted matte-black technical overshirt, plain black shirt, "
@@ -177,7 +457,10 @@ class DirectorScene:
 class DirectorTreatment:
     visual_concept: str
     story_spine: str
+    story_arc: str
     continuity_anchor: str
+    initial_state_code: str
+    goal_state_code: str
     primary_setting: str
     admin_concept_ru: str
     scenes: tuple[DirectorScene, ...]
@@ -243,7 +526,10 @@ class StoryPackPlan:
     central_thesis: str
     visual_concept: str
     story_spine: str
+    story_arc: str
     continuity_anchor: str
+    initial_state_code: str
+    goal_state_code: str
     admin_concept_ru: str
     director_version: str
     scene_count: int
@@ -313,14 +599,17 @@ _DIRECTOR_FORBIDDEN_CLICHE_RE = re.compile(
     r"flowing code|code rain)"
 )
 _DIRECTOR_INTERFACE_ACTION_RE = re.compile(
-    r"(?i)(?=.*\b(?:types?|clicks?|taps?|swipes?|scrolls?|refreshes?)\b)"
-    r"(?=.*\b(?:keyboard|trackpad|screen|button|laptop|phone|browser|terminal|interface)\b)"
+    r"(?i)(?=.*\b(?:types?|clicks?|taps?|press(?:es)?|swipes?|scrolls?|refreshes?)\b)"
+    r"(?=.*\b(?:keyboard|trackpad|screen|laptop|phone|browser|terminal|interface)\b)"
 )
 _DIRECTOR_MAGIC_ACTION_RE = re.compile(
     r"(?i)\b(?:teleports?|levitates?|materiali[sz]es?|demateriali[sz]es?|morphs?|"
     r"self[- ]assembles?|magically|instant(?:ly)? transforms?)\b"
 )
-_DIRECTOR_MULTI_ACTION_RE = re.compile(r"(?i)(?:;|\bthen\b|\bafter that\b|\bnext,?\b)")
+_DIRECTOR_MULTI_ACTION_RE = re.compile(
+    r"(?i)(?:[;,]|\bthen\b|\bafter that\b|\bbefore that\b|\bwhile\b|"
+    r"\bfollowed by\b|\bas\b|\buntil\b|\bwhen\b)"
+)
 _DIRECTOR_ABSTRACT_ACTION_RE = re.compile(
     r"(?i)\b(?:decides?|explains?|imagines?|observes?|realizes?|thinks?|understands?|"
     r"verifies?|watches?|waits?)\b"
@@ -329,36 +618,97 @@ _DIRECTOR_PASSIVE_ACTION_RE = re.compile(
     r"(?i)\b(?:lies?|looks?|remain(?:s|ing)?|rest(?:s|ing)?|"
     r"sit(?:s|ting)?|stand(?:s|ing)?|stare(?:s|ing)?)\b"
 )
-_DIRECTOR_MOTION_CLASS_RE = {
-    "adjust": re.compile(r"(?i)\badjust(?:s|ed|ing)?\b"),
-    "align": re.compile(r"(?i)\balign(?:s|ed|ing)?\b"),
-    "bend": re.compile(r"(?i)\bbend(?:s|ing)?\b|\bbent\b"),
-    "calibrate": re.compile(r"(?i)\bcalibrat(?:e|es|ed|ing)\b"),
-    "carry": re.compile(r"(?i)\bcarr(?:y|ies|ied|ying)\b"),
-    "close": re.compile(r"(?i)\bclos(?:e|es|ed|ing)\b"),
-    "connect": re.compile(r"(?i)\bconnect(?:s|ed|ing)?\b|\bplug(?:s|ged|ging)?\b"),
-    "cut": re.compile(r"(?i)\bcut(?:s|ting)?\b"),
-    "disconnect": re.compile(r"(?i)\bdisconnect(?:s|ed|ing)?\b|\bunplug(?:s|ged|ging)?\b"),
-    "fold": re.compile(r"(?i)\bfold(?:s|ed|ing)?\b"),
-    "grip": re.compile(r"(?i)\bgrip(?:s|ped|ping)?\b|\bgrasp(?:s|ed|ing)?\b"),
-    "insert": re.compile(r"(?i)\binsert(?:s|ed|ing)?\b"),
-    "lift": re.compile(r"(?i)\blift(?:s|ed|ing)?\b|\brais(?:e|es|ed|ing)\b"),
-    "lock": re.compile(r"(?i)\block(?:s|ed|ing)?\b|\bsecur(?:e|es|ed|ing)\b"),
-    "lower": re.compile(r"(?i)\blower(?:s|ed|ing)?\b"),
-    "open": re.compile(r"(?i)\bopen(?:s|ed|ing)?\b"),
-    "oscillate": re.compile(r"(?i)\boscillat(?:e|es|ed|ing)\b|\bshudder(?:s|ed|ing)?\b|\bvibrat(?:e|es|ed|ing)\b"),
-    "place": re.compile(r"(?i)\bplac(?:e|es|ed|ing)\b|\bset(?:s|ting)?\b"),
-    "pour": re.compile(r"(?i)\bpour(?:s|ed|ing)?\b"),
-    "press": re.compile(r"(?i)\bpress(?:es|ed|ing)?\b|\bdepress(?:es|ed|ing)?\b"),
-    "pull": re.compile(r"(?i)\bpull(?:s|ed|ing)?\b"),
-    "push": re.compile(r"(?i)\bpush(?:es|ed|ing)?\b"),
-    "remove": re.compile(r"(?i)\bremov(?:e|es|ed|ing)\b|\bextract(?:s|ed|ing)?\b"),
-    "rotate": re.compile(r"(?i)\brotat(?:e|es|ed|ing)\b|\bturn(?:s|ed|ing)?\b|\bpivot(?:s|ed|ing)?\b|\btwist(?:s|ed|ing)?\b"),
-    "slide": re.compile(r"(?i)\bslid(?:e|es|ing)\b"),
-    "test": re.compile(r"(?i)\btest(?:s|ed|ing)?\b|\bmeasur(?:e|es|ed|ing)\b"),
-    "unlock": re.compile(r"(?i)\bunlock(?:s|ed|ing)?\b|\breleas(?:e|es|ed|ing)\b"),
-    "walk": re.compile(r"(?i)\bwalk(?:s|ed|ing)?\b|\bstep(?:s|ped|ping)?\b"),
+_DIRECTOR_MOTION_BASE_VERBS = {
+    "align": "align", "bend": "bend", "carry": "carry", "close": "close",
+    "connect": "connect", "cut": "cut", "disconnect": "disconnect",
+    "fold": "fold", "grip": "grip", "insert": "insert", "lift": "lift",
+    "lock": "lock", "lower": "lower", "open": "open",
+    "oscillate": "oscillate", "place": "place", "pour": "pour",
+    "press": "press", "pull": "pull", "push": "push", "remove": "remove",
+    "rotate": "rotate", "slide": "slide", "unlock": "unlock",
 }
+_DIRECTOR_MOTION_THIRD_PERSON_VERBS = {
+    **{name: f"{verb}s" for name, verb in _DIRECTOR_MOTION_BASE_VERBS.items()},
+    "carry": "carries", "close": "closes", "cut": "cuts", "place": "places",
+    "press": "presses", "push": "pushes", "remove": "removes",
+    "slide": "slides",
+}
+_DIRECTOR_MOTION_GERUNDS = {
+    "aligning", "bending", "carrying", "closing", "connecting", "cutting",
+    "disconnecting", "folding", "gripping", "inserting", "lifting", "locking",
+    "lowering", "opening", "oscillating", "placing", "pouring", "pressing",
+    "pulling", "pushing", "removing", "rotating", "sliding", "unlocking",
+}
+def _normalized_action_tokens(value: str) -> list[str]:
+    return [
+        token for raw in value.casefold().split()
+        if (token := re.sub(r"[^a-z-]", "", raw))
+    ]
+
+
+def _has_secondary_motion_predicate(predicate_words: Sequence[str]) -> bool:
+    """Detect a second clause without treating action-like nouns as verbs."""
+    tokens = _normalized_action_tokens(" ".join(predicate_words))
+    if len(tokens) < 2:
+        return False
+    bases = set(_DIRECTOR_MOTION_BASE_VERBS.values())
+    thirds = set(_DIRECTOR_MOTION_THIRD_PERSON_VERBS.values())
+    determiners = {"a", "an", "the", "one"}
+    for index, token in enumerate(tokens[1:], start=1):
+        previous = tokens[index - 1]
+        following = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if previous == "to" and token in bases:
+            return True
+        if token in thirds:
+            return True
+        if token in _DIRECTOR_MOTION_GERUNDS and following in determiners:
+            return True
+    if "and" in tokens:
+        tail = " ".join(tokens[tokens.index("and") + 1:])
+        if (
+            any(token in thirds for token in _normalized_action_tokens(tail))
+            or _DIRECTOR_ABSTRACT_ACTION_RE.search(tail)
+            or _DIRECTOR_PASSIVE_ACTION_RE.search(tail)
+        ):
+            return True
+    return False
+
+
+def _branded_primary_phrase(primary: str, brand_marking: str) -> str:
+    if brand_marking not in DIRECTOR_BRAND_MARKINGS or not primary.startswith("one "):
+        return ""
+    if brand_marking == "naz_ai_lab":
+        return primary.replace("one ", "one Naz AI Lab-branded ", 1)
+    return primary
+
+
+def _bounded_state_phrase(continuity_anchor: str, state_code: str) -> str:
+    label = DIRECTOR_STATE_LABELS.get(state_code, "")
+    if not continuity_anchor or not label:
+        return ""
+    return f"{continuity_anchor} is {label}"
+
+
+def _build_atomic_action(
+    *,
+    action_recipe: str,
+    brand_marking: str,
+) -> str:
+    recipe = DIRECTOR_ACTION_RECIPES.get(action_recipe)
+    if recipe is None:
+        return ""
+    subject_kind, motion_class, primary, contact = recipe
+    third_person_verb = _DIRECTOR_MOTION_THIRD_PERSON_VERBS.get(motion_class, "")
+    primary = _branded_primary_phrase(primary, brand_marking)
+    if not third_person_verb or not primary:
+        return ""
+    contact_phrase = f" {contact}" if contact else ""
+    if subject_kind == "naz_human":
+        return f"Naz {third_person_verb} {primary}{contact_phrase}"
+    if subject_kind == "physical_object":
+        sentence_subject = primary[0].upper() + primary[1:]
+        return f"{sentence_subject} {third_person_verb}{contact_phrase}"
+    return ""
 
 
 def _motion_contract_reason_codes(
@@ -371,33 +721,58 @@ def _motion_contract_reason_codes(
 ) -> tuple[str, ...]:
     """Validate one observable physical action independently of the LLM parser."""
     errors: list[str] = []
-    motion_pattern = _DIRECTOR_MOTION_CLASS_RE.get(motion_class)
-    if motion_pattern is None:
+    base_verb = _DIRECTOR_MOTION_BASE_VERBS.get(motion_class)
+    third_person_verb = _DIRECTOR_MOTION_THIRD_PERSON_VERBS.get(motion_class)
+    if base_verb is None or third_person_verb is None:
         errors.append("motion_class_invalid")
-    matched_classes = {
-        name for name, pattern in _DIRECTOR_MOTION_CLASS_RE.items()
-        if pattern.search(action)
-    }
-    matched_motion_count = sum(
-        len(tuple(pattern.finditer(action)))
-        for pattern in _DIRECTOR_MOTION_CLASS_RE.values()
-    )
-    known_physical_motion = bool(motion_pattern and motion_pattern.search(action))
-    if motion_pattern and not known_physical_motion:
+
+    normalized_action = " ".join(action.split())
+    action_words = normalized_action.split()
+    predicate_words = action_words
+    if subject_kind == "naz_human":
+        if not normalized_action.casefold().startswith("naz "):
+            errors.append("naz_action_subject_missing")
+        else:
+            predicate_words = action_words[1:]
+        expected_verb = third_person_verb
+        lead_verb = predicate_words[0].strip(".!").casefold() if predicate_words else ""
+        known_physical_motion = bool(expected_verb and lead_verb == expected_verb)
+    else:
+        if normalized_action.casefold().startswith("naz "):
+            errors.append("physical_object_action_subject_invalid")
+        if motion_class not in DIRECTOR_SELF_MOTION_CLASSES:
+            errors.append("motion_subject_incompatible")
+        expected_verb = third_person_verb
+        normalized_words = [word.strip(".!,").casefold() for word in action_words]
+        verb_positions = [
+            index for index, word in enumerate(normalized_words)
+            if expected_verb and word == expected_verb
+        ]
+        known_physical_motion = len(verb_positions) == 1 and verb_positions[0] > 0
+        predicate_words = (
+            action_words[verb_positions[0]:]
+            if known_physical_motion
+            else action_words
+        )
+    if expected_verb and not known_physical_motion:
         errors.append("motion_class_mismatch")
-    if len(matched_classes) > 1 or matched_motion_count > 1:
-        errors.append("multi_action")
+    if (
+        known_physical_motion
+        and subject_kind == "naz_human"
+        and len(predicate_words) < 2
+    ):
+        errors.append("physical_action_missing")
     if _DIRECTOR_INTERFACE_ACTION_RE.search(action):
         errors.append("interface_pantomime")
     if _DIRECTOR_MAGIC_ACTION_RE.search(action):
         errors.append("impossible_action")
     if _DIRECTOR_MULTI_ACTION_RE.search(action):
         errors.append("multi_action")
-    if not known_physical_motion and _DIRECTOR_PASSIVE_ACTION_RE.search(action):
+    if _has_secondary_motion_predicate(predicate_words):
+        errors.append("multi_action")
+    if _DIRECTOR_PASSIVE_ACTION_RE.search(action):
         errors.append("physical_action_missing")
-    if subject_kind == "naz_human" and not action.casefold().startswith("naz "):
-        errors.append("naz_action_subject_missing")
-    if _DIRECTOR_ABSTRACT_ACTION_RE.search(action) and not known_physical_motion:
+    if _DIRECTOR_ABSTRACT_ACTION_RE.search(action):
         errors.append("abstract_action")
     if start_state and end_state and start_state.casefold() == end_state.casefold():
         errors.append("state_unchanged")
@@ -419,20 +794,17 @@ def reels_director_prompt(
     count = max(4, min(7, len(facts)))
     story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
     roles = _roles(story_plan_id, count)
-    if _object_only_direction(plan.visual_subject_direction):
-        identity_requirement = "Every scene must use subject_kind=physical_object."
-    elif _requires_reference(plan.visual_subject_direction):
-        identity_requirement = "Every scene must use subject_kind=naz_human."
-    elif _human_led_direction(plan.visual_subject_direction):
-        identity_requirement = (
-            "At least one scene must use subject_kind=naz_human. Object-only macro scenes "
-            "may use subject_kind=physical_object. Never invent another human."
-        )
-    else:
-        identity_requirement = (
-            "Use subject_kind=naz_human for scenes performed by Naz and "
-            "subject_kind=physical_object for true object-only macro scenes."
-        )
+    available_story_arcs = _story_arc_names_for_plan(plan)
+    story_arc_catalog = {
+        name: {
+            "description": str(DIRECTOR_STORY_ARCS[name]["description"]),
+            "ordered_actions": [
+                _build_atomic_action(action_recipe=recipe, brand_marking="none")
+                for recipe, _ in _story_arc_steps(name, count)
+            ],
+        }
+        for name in available_story_arcs
+    }
     brief = {
         "persona": "Naz, a real adult human founder",
         "topic": plan.topic,
@@ -441,7 +813,7 @@ def reels_director_prompt(
         "imagery": plan.imagery,
         "visual_subject_direction": plan.visual_subject_direction,
         "visual_relation": plan.visual_relation,
-        "identity_requirement": identity_requirement,
+        "available_story_arcs": story_arc_catalog,
         "variant_index": variant_index,
         "ordered_roles": roles,
         "draft_beats": list(facts[:count]),
@@ -463,79 +835,49 @@ def reels_director_prompt(
         "cause the stated visible end state. Do not use symbolic gestures, passive watching, "
         "typing, clicking, trackpads, screen pantomime, magical transformation, floating parts, "
         "self-assembly or multi-step choreography. Props obey gravity and ordinary mechanics.\n\n"
-        "Concrete_action must contain one observable motion verb such as grips, presses, slides, "
-        "rotates, inserts, removes, closes or lifts. Static poses such as rests, remains, stands, "
-        "sits or looks belong only in start_state or end_state, never in concrete_action.\n\n"
+        "Do not write concrete_action, subject prose, materials, props, states, settings or any "
+        "free-form action phrase. Choose exactly one story_arc from available_story_arcs. Each "
+        "arc is a complete pre-vetted physical chain: one location, one mechanism, compatible "
+        "materials, ordered actions, continuous states and observable final proof. The application "
+        "expands it into scenes and identity requirements. Do not combine actions from different "
+        "arcs or invent a second plot. Object-only steps move through a visible mechanical drive.\n\n"
         "Return strict JSON only with this shape: "
         f'{{"director_version":"{DIRECTOR_VERSION}","visual_concept":"...",'
-        '"story_spine":"...","continuity_anchor":"...","primary_setting":"...",'
-        '"admin_concept_ru":"...",'
-        '"scenes":[{"subject_kind":"naz_human|physical_object",'
-        '"subject_detail":"...",'
-        '"motion_class":"adjust|align|bend|calibrate|carry|close|connect|cut|disconnect|fold|grip|insert|lift|lock|lower|open|oscillate|place|pour|press|pull|push|remove|rotate|slide|test|unlock|walk",'
-        '"concrete_action":"...","start_state":"...","end_state":"...",'
-        '"shot_size":"wide|medium|close|macro","camera_motion":'
-        '"slow push|controlled pan|handheld follow|locked with real subject motion",'
-        '"admin_summary_ru":"..."}]}. '
+        '"story_spine":"...","story_arc":"module_recovery_mixed",'
+        '"scenes":[{"shot_size":"wide|medium|close|macro","camera_motion":'
+        '"slow push|controlled pan|handheld follow|locked with real subject motion"}]}. '
         "Do not return role names: the application assigns them deterministically. Return exactly "
         "one scene for every ordered role and draft beat, preserving their supplied order. "
         "First define one concise story_spine (at most 180 characters) in cause-and-effect form: "
-        "Naz attempts one visible goal, meets one visible obstacle, performs one corrective test, "
+        "Naz or the physical system pursues one visible goal, meets one visible obstacle, "
+        "performs one corrective test, "
         "and reaches one observable proof. A viewer with sound off must understand this by scene 2. "
-        "Define one continuity_anchor (at "
-        "most 90 characters): the same physical object or system "
-        "whose state carries that goal through the whole Reel. Build one causal chain, not separate "
-        "Define primary_setting once: the single physical set used for the complete micro-film. "
-        "illustrations. Scene 1 shows the goal and unresolved physical state, never a result. "
-        "For every later scene, copy the preceding scene's "
-        "end_state verbatim into the new start_state, then advance it with one new action. Keep the "
-        "continuity_anchor present or causally active in every scene. The application applies "
-        "primary_setting to every scene; vary shot size inside that set instead of teleporting. "
-        "The final end_state must be visible proof that the opening goal succeeded or failed. "
-        "Russian admin summaries must also read as consecutive "
-        "steps of this same story. "
-        "For naz_human, subject_detail is simply Naz; identity is injected by the application. "
-        "For physical_object, subject_detail names one concrete non-human object. Every action "
-        "and end state must be physical, content-specific and distinct. Choose motion_class first, "
-        "then use that exact motion as the single verb of concrete_action. Put observation or proof "
-        "in end_state, never as a second performer action. Obey "
-        "identity_requirement exactly. Concise physical place names such as Naz AI Lab or server "
-        "room are valid primary_setting values; technical nouns are not transport metadata by themselves. "
-        "Write visual_concept, primary_setting, subject_detail, concrete_action, start_state and end_state "
-        "in concise English. Write admin_concept_ru and every admin_summary_ru in concise natural "
-        "Russian for the administrator, each no longer than 240 characters: describe what will "
-        "visibly happen, not service metadata. "
-        "The Russian display fields never enter image or video prompts.\n\n"
+        "The selected story_arc supplies the unresolved initial state, every distinct state change, "
+        "the final proof, one continuity anchor and one physical set. Vary shot size inside that set "
+        "instead of teleporting. Build one causal chain, not separate illustrations. "
+        "Naz identity, every physical object, action and state are injected by the application from "
+        "story_arc; do not return those fields. The application also creates exact Russian admin "
+        "summaries from that same arc, so the approval card cannot diverge from the render prompts. "
+        "Write visual_concept and story_spine in concise English.\n\n"
         + json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
     )
 
 
-def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
+def reels_director_response_format(
+    safe_facts: Sequence[str],
+    plan: EditorialPlan | None = None,
+) -> dict[str, Any]:
     """OpenAI-compatible strict schema for the single director response."""
     count = max(4, min(7, len(tuple(safe_facts))))
     scene_schema = {
         "type": "object",
         "additionalProperties": False,
         "required": [
-            "subject_kind", "subject_detail", "motion_class", "concrete_action",
-            "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
+            "shot_size", "camera_motion",
         ],
         "properties": {
-            "subject_kind": {"type": "string", "enum": list(DIRECTOR_SUBJECT_KINDS)},
-            "subject_detail": {"type": "string"},
-            "motion_class": {"type": "string", "enum": list(DIRECTOR_MOTION_CLASSES)},
-            "concrete_action": {
-                "type": "string",
-                "description": (
-                    "Exactly one observable physical motion in five seconds. No UI action, "
-                    "passive pose, magic, or multi-step choreography. Naz scenes start with Naz."
-                ),
-            },
-            "start_state": {"type": "string"},
-            "end_state": {"type": "string"},
             "shot_size": {"type": "string", "enum": list(SHOT_SIZES)},
             "camera_motion": {"type": "string", "enum": list(CAMERA_MOTIONS)},
-            "admin_summary_ru": {"type": "string", "maxLength": 240},
         },
     }
     return {
@@ -548,15 +890,16 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
                 "additionalProperties": False,
                 "required": [
                     "director_version", "visual_concept", "story_spine",
-                    "continuity_anchor", "primary_setting", "admin_concept_ru", "scenes"
+                    "story_arc", "scenes"
                 ],
                 "properties": {
                     "director_version": {"type": "string", "enum": [DIRECTOR_VERSION]},
-                    "visual_concept": {"type": "string"},
+                    "visual_concept": {"type": "string", "maxLength": 1200},
                     "story_spine": {"type": "string", "maxLength": 180},
-                    "continuity_anchor": {"type": "string", "maxLength": 90},
-                    "primary_setting": {"type": "string", "maxLength": 180},
-                    "admin_concept_ru": {"type": "string", "maxLength": 240},
+                    "story_arc": {
+                        "type": "string",
+                        "enum": list(_story_arc_names_for_plan(plan)),
+                    },
                     "scenes": {
                         "type": "array",
                         "minItems": count,
@@ -646,8 +989,8 @@ def parse_reels_director_response(
 
     errors: list[str] = []
     if set(payload) != {
-        "director_version", "visual_concept", "story_spine", "continuity_anchor",
-        "primary_setting", "admin_concept_ru", "scenes"
+        "director_version", "visual_concept", "story_spine", "story_arc",
+        "scenes"
     }:
         errors.append("director_schema_invalid")
     visual_concept = _director_text(
@@ -662,34 +1005,48 @@ def parse_reels_director_response(
         errors,
         maximum=180,
     )
-    continuity_anchor = _director_text(
-        payload.get("continuity_anchor"),
-        "director_continuity_anchor",
-        errors,
-        maximum=90,
-    )
-    primary_setting = _director_text(
-        payload.get("primary_setting"),
-        "director_primary_setting",
-        errors,
-        maximum=180,
-    )
+    allowed_story_arcs = _story_arc_names_for_plan(plan)
+    story_arc = str(payload.get("story_arc", "")).strip().casefold()
+    if story_arc not in allowed_story_arcs:
+        errors.append("director_story_arc_invalid")
+        selected_story_arc = allowed_story_arcs[0]
+    else:
+        selected_story_arc = story_arc
+    arc = DIRECTOR_STORY_ARCS[selected_story_arc]
+    try:
+        arc_steps = _story_arc_steps(selected_story_arc, count)
+    except StoryPlanError:
+        errors.append("director_story_arc_invalid")
+        arc_steps = ()
+    primary_setting_code = str(arc.get("setting", ""))
+    primary_setting = DIRECTOR_PRIMARY_SETTINGS.get(primary_setting_code, "")
+    continuity_anchor = str(arc.get("continuity_anchor", ""))
+    initial_state_code = str(arc.get("initial_state", ""))
+    goal_state_code = arc_steps[-1][1] if arc_steps else ""
+    if (
+        not primary_setting
+        or not continuity_anchor
+        or len(continuity_anchor) > 90
+        or initial_state_code not in DIRECTOR_STATE_CODES
+        or goal_state_code not in DIRECTOR_STATE_CODES
+        or initial_state_code == goal_state_code
+    ):
+        errors.append("director_story_arc_invalid")
     admin_concept_ru = _director_ru_text(
-        payload.get("admin_concept_ru"),
+        arc.get("description_ru"),
         "director_admin_concept_ru",
         errors,
     )
-    direction_requires_reference = _requires_reference(plan.visual_subject_direction)
-    object_only_direction = _object_only_direction(plan.visual_subject_direction)
-    human_led_direction = _human_led_direction(plan.visual_subject_direction)
     scenes: list[DirectorScene] = []
     actions: list[str] = []
-    previous_end_state = ""
+    end_state_codes: list[str] = []
+    previous_state_code = initial_state_code
     expected_scene_fields = {
-        "subject_kind", "subject_detail", "motion_class", "concrete_action",
-        "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
+        "shot_size", "camera_motion",
     }
-    for index, (row, expected_role) in enumerate(zip(rows, expected_roles)):
+    for index, (row, expected_role, arc_step) in enumerate(
+        zip(rows, expected_roles, arc_steps)
+    ):
         scene_number = index + 1
         scene_prefix = f"director_scene_{scene_number}"
         scene_error_start = len(errors)
@@ -699,38 +1056,34 @@ def parse_reels_director_response(
         if set(row) != expected_scene_fields:
             errors.append(f"{scene_prefix}_schema_invalid")
 
-        subject_detail = _director_text(
-            row.get("subject_detail"), f"{scene_prefix}_subject_detail", errors
-        )
-        action = _director_text(
-            row.get("concrete_action"), f"{scene_prefix}_action", errors, maximum=180
-        )
-        start_state = _director_text(
-            row.get("start_state"), f"{scene_prefix}_start_state", errors, maximum=180
-        )
-        end_state = _director_text(
-            row.get("end_state"), f"{scene_prefix}_end_state", errors, maximum=180
-        )
+        action_recipe, end_state_code = arc_step
+        start_state = _bounded_state_phrase(continuity_anchor, previous_state_code)
+        end_state = _bounded_state_phrase(continuity_anchor, end_state_code)
         admin_summary_ru = _director_ru_text(
-            row.get("admin_summary_ru"), f"{scene_prefix}_admin_summary_ru", errors
+            DIRECTOR_RECIPE_SUMMARIES_RU.get(action_recipe),
+            f"{scene_prefix}_admin_summary_ru",
+            errors,
         )
 
-        subject_kind = str(row.get("subject_kind", "")).strip().casefold()
-        motion_class = str(row.get("motion_class", "")).strip().casefold()
-        if subject_kind not in DIRECTOR_SUBJECT_KINDS:
-            errors.append(f"{scene_prefix}_subject_kind_invalid")
-            subject = ""
-        elif subject_kind == "naz_human":
-            subject = CANONICAL_NAZ_SUBJECT
+        recipe = DIRECTOR_ACTION_RECIPES.get(action_recipe)
+        if recipe is None:
+            errors.append("director_story_arc_invalid")
+            subject_kind = ""
+            motion_class = ""
+            primary = ""
         else:
-            subject = subject_detail
-            if _mentions_human_subject(subject_detail):
-                errors.append(f"{scene_prefix}_subject_identity_invalid")
-        if (
-            (object_only_direction and subject_kind == "naz_human")
-            or (direction_requires_reference and subject_kind != "naz_human")
-        ):
-            errors.append(f"{scene_prefix}_subject_identity_invalid")
+            subject_kind, motion_class, primary, _contact = recipe
+        primary = _branded_primary_phrase(primary, "none")
+        if subject_kind == "naz_human":
+            subject = CANONICAL_NAZ_SUBJECT
+        elif subject_kind == "physical_object":
+            subject = primary
+        else:
+            subject = ""
+        action = _build_atomic_action(
+            action_recipe=action_recipe,
+            brand_marking="none",
+        )
         if action:
             errors.extend(
                 f"{scene_prefix}_{reason}"
@@ -741,9 +1094,6 @@ def parse_reels_director_response(
                     start_state=start_state,
                     end_state=end_state,
                 )
-                if not (
-                    reason == "naz_action_subject_missing" and object_only_direction
-                )
             )
 
         shot_size = str(row.get("shot_size", "")).strip().casefold()
@@ -752,10 +1102,9 @@ def parse_reels_director_response(
             errors.append(f"{scene_prefix}_shot_size_invalid")
         if camera_motion not in CAMERA_MOTIONS:
             errors.append(f"{scene_prefix}_camera_motion_invalid")
-        if index and previous_end_state and start_state != previous_end_state:
-            errors.append(f"{scene_prefix}_continuity_broken")
-        if end_state:
-            previous_end_state = end_state
+        if end_state_code in DIRECTOR_STATE_CODES:
+            end_state_codes.append(end_state_code)
+            previous_state_code = end_state_code
 
         if action:
             actions.append(action)
@@ -778,16 +1127,23 @@ def parse_reels_director_response(
 
     if len(actions) == count and len({item.casefold() for item in actions}) != count:
         errors.append("director_actions_repetitive")
-    if human_led_direction and not any(
-        scene.subject_kind == "naz_human" for scene in scenes
+    if (
+        len(actions) != count
+        or len(end_state_codes) != count
+        or len(set(end_state_codes)) != count
+        or not end_state_codes
+        or end_state_codes[-1] != goal_state_code
     ):
-        errors.append("director_subject_mix_invalid")
+        errors.append("director_story_arc_invalid")
     if errors:
         raise DirectorValidationError(errors)
     return DirectorTreatment(
+        story_arc=selected_story_arc,
         visual_concept=visual_concept,
         story_spine=story_spine,
         continuity_anchor=continuity_anchor,
+        initial_state_code=initial_state_code,
+        goal_state_code=goal_state_code,
         primary_setting=primary_setting,
         admin_concept_ru=admin_concept_ru,
         scenes=tuple(scenes),
@@ -838,6 +1194,55 @@ def _object_only_direction(subject: str) -> bool:
 
 def _human_led_direction(subject: str) -> bool:
     return bool(re.search(r"(?i)(?:\bhuman[- ]led\b|\bhuman[- ]performed\b)", subject))
+
+
+def _story_arc_names_for_plan(plan: EditorialPlan | None) -> tuple[str, ...]:
+    if plan is None:
+        return DIRECTOR_STORY_ARC_NAMES
+    direction = plan.visual_subject_direction
+    if _object_only_direction(direction):
+        modes = {"object"}
+    elif _requires_reference(direction):
+        modes = {"human"}
+    elif _human_led_direction(direction):
+        modes = {"human", "mixed"}
+    else:
+        modes = {"human", "mixed", "object"}
+    arcs = tuple(
+        name
+        for name, arc in DIRECTOR_STORY_ARCS.items()
+        if arc.get("subject_mode") in modes
+    )
+    if not arcs:
+        raise StoryPlanError("director_story_arc_unavailable")
+    return arcs
+
+
+def _story_arc_steps(
+    story_arc: str,
+    scene_count: int,
+) -> tuple[tuple[str, str], ...]:
+    arc = DIRECTOR_STORY_ARCS.get(story_arc)
+    if arc is None or not 4 <= scene_count <= 7:
+        raise StoryPlanError("director_story_arc_invalid")
+    rows = arc.get("steps")
+    if not isinstance(rows, tuple):
+        raise StoryPlanError("director_story_arc_invalid")
+    selected = tuple(
+        (str(recipe), str(end_state))
+        for recipe, end_state, minimum_count in rows
+        if int(minimum_count) <= scene_count
+    )
+    if (
+        len(selected) != scene_count
+        or len({recipe for recipe, _ in selected}) != scene_count
+        or len({end_state for _, end_state in selected}) != scene_count
+        or any(recipe not in DIRECTOR_ACTION_RECIPES for recipe, _ in selected)
+        or any(recipe not in DIRECTOR_RECIPE_SUMMARIES_RU for recipe, _ in selected)
+        or any(end_state not in DIRECTOR_STATE_CODES for _, end_state in selected)
+    ):
+        raise StoryPlanError("director_story_arc_invalid")
+    return selected
 
 
 def _mentions_human_subject(subject: str) -> bool:
@@ -992,7 +1397,14 @@ def _scene(
         "replace the reference background, pose and light. "
         if requires_reference else "No person is present. "
     )
-    subject_instruction = "" if requires_reference else f"Subject: {prompt_subject}. "
+    subject_instruction = (
+        ""
+        if requires_reference
+        else (
+            f"Subject: {prompt_subject}. Show its visible physical hinge, rail or actuator; "
+            "nothing floats or moves by itself. "
+        )
+    )
     keyframe_prompt = (
         f"Cinematic vertical 9:16. {identity_instruction}"
         f"Location: {prompt_setting}. {subject_instruction}Action: {prompt_action}. "
@@ -1006,7 +1418,10 @@ def _scene(
         "Naz keeps the exact face, build and matte-black wardrobe from the first frame. "
         "His hands contact only the visible prop and move with believable weight. "
         if requires_reference
-        else "The same single physical object remains in frame and moves with believable weight. "
+        else (
+            "The same single physical object remains in frame and moves with believable weight. "
+            "Its visible mechanical actuator, hinge or rail drives the one motion; no self-animation. "
+        )
     )
     provider_prompt = (
         "Continuous seamless five-second shot from the supplied directed keyframe. "
@@ -1144,29 +1559,84 @@ def plan_story_pack(
             "story_spine",
             maximum=180,
         )
+        story_arc = director_treatment.story_arc
+        if story_arc not in _story_arc_names_for_plan(plan):
+            raise StoryPlanError("director_story_arc_invalid")
+        arc = DIRECTOR_STORY_ARCS[story_arc]
+        arc_steps = _story_arc_steps(story_arc, count)
         continuity_anchor = _validated_director_text(
             director_treatment.continuity_anchor,
             "continuity_anchor",
             maximum=90,
         )
+        initial_state_code = director_treatment.initial_state_code
+        goal_state_code = director_treatment.goal_state_code
+        if (
+            initial_state_code not in DIRECTOR_STATE_CODES
+            or goal_state_code not in DIRECTOR_STATE_CODES
+            or initial_state_code == goal_state_code
+        ):
+            raise StoryPlanError("director_state_contract_invalid")
+        expected_setting = DIRECTOR_PRIMARY_SETTINGS.get(str(arc.get("setting", "")), "")
+        expected_anchor = str(arc.get("continuity_anchor", ""))
+        expected_initial = str(arc.get("initial_state", ""))
+        expected_goal = arc_steps[-1][1]
+        if (
+            continuity_anchor != expected_anchor
+            or initial_state_code != expected_initial
+            or goal_state_code != expected_goal
+        ):
+            raise StoryPlanError("director_story_arc_invalid")
         primary_setting = _validated_director_text(
             director_treatment.primary_setting,
             "primary_setting",
             maximum=180,
         )
-        if any(
-            scene.setting != primary_setting for scene in director_treatment.scenes
+        if primary_setting != expected_setting:
+            raise StoryPlanError("director_story_arc_invalid")
+        previous_state_code = initial_state_code
+        for scene, (recipe_name, end_state_code) in zip(
+            director_treatment.scenes, arc_steps
         ):
-            raise StoryPlanError("director_setting_continuity_broken")
+            recipe = DIRECTOR_ACTION_RECIPES[recipe_name]
+            expected_subject_kind, expected_motion, expected_primary, _ = recipe
+            expected_subject = (
+                CANONICAL_NAZ_SUBJECT
+                if expected_subject_kind == "naz_human"
+                else _branded_primary_phrase(expected_primary, "none")
+            )
+            if (
+                scene.setting != expected_setting
+                or scene.subject_kind != expected_subject_kind
+                or scene.subject != expected_subject
+                or scene.motion_class != expected_motion
+                or scene.concrete_action
+                != _build_atomic_action(
+                    action_recipe=recipe_name, brand_marking="none"
+                )
+                or scene.start_state
+                != _bounded_state_phrase(continuity_anchor, previous_state_code)
+                or scene.end_state
+                != _bounded_state_phrase(continuity_anchor, end_state_code)
+                or scene.admin_summary_ru
+                != DIRECTOR_RECIPE_SUMMARIES_RU[recipe_name]
+            ):
+                raise StoryPlanError("director_story_arc_invalid")
+            previous_state_code = end_state_code
         admin_concept_ru = _validated_director_ru_text(
             director_treatment.admin_concept_ru,
             "admin_concept_ru",
         )
+        if admin_concept_ru != str(arc.get("description_ru", "")):
+            raise StoryPlanError("director_story_arc_invalid")
         director_version = DIRECTOR_VERSION
     else:
         visual_concept = str(VISUAL_TREATMENTS[treatment_key]["label"])
         story_spine = visual_concept
+        story_arc = ""
         continuity_anchor = "one evolving physical Naz AI Lab mechanism"
+        initial_state_code = ""
+        goal_state_code = ""
         admin_concept_ru = ""
         director_version = TEMPLATE_DIRECTOR_VERSION
     continuity_id = hashlib.sha256(f"naz|{plan.plan_id}|continuity".encode("utf-8")).hexdigest()[:20]
@@ -1195,7 +1665,10 @@ def plan_story_pack(
         central_thesis=plan.thesis_direction,
         visual_concept=visual_concept,
         story_spine=story_spine,
+        story_arc=story_arc,
         continuity_anchor=continuity_anchor,
+        initial_state_code=initial_state_code,
+        goal_state_code=goal_state_code,
         admin_concept_ru=admin_concept_ru,
         director_version=director_version,
         scene_count=count, scenes=scenes,
@@ -1226,7 +1699,32 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
     if pack.renderer not in {"available", RENDERER_UNAVAILABLE}:
         raise StoryPlanError("unknown renderer status")
     previous_end_state = ""
-    for scene in pack.scenes:
+    bounded_end_state_codes: list[str] = []
+    arc_steps: tuple[tuple[str, str], ...] = ()
+    arc_setting = ""
+    if pack.director_version == DIRECTOR_VERSION:
+        if pack.story_arc not in DIRECTOR_STORY_ARCS:
+            raise StoryPlanError("director story arc is invalid")
+        arc = DIRECTOR_STORY_ARCS[pack.story_arc]
+        arc_steps = _story_arc_steps(pack.story_arc, pack.scene_count)
+        arc_setting = DIRECTOR_PRIMARY_SETTINGS.get(str(arc.get("setting", "")), "")
+        if (
+            pack.initial_state_code not in DIRECTOR_STATE_CODES
+            or pack.goal_state_code not in DIRECTOR_STATE_CODES
+            or pack.initial_state_code == pack.goal_state_code
+            or pack.continuity_anchor != str(arc.get("continuity_anchor", ""))
+            or pack.initial_state_code != str(arc.get("initial_state", ""))
+            or pack.goal_state_code != arc_steps[-1][1]
+            or not arc_setting
+            or pack.admin_concept_ru != str(arc.get("description_ru", ""))
+        ):
+            raise StoryPlanError("director state contract is invalid")
+        previous_end_state = _bounded_state_phrase(
+            pack.continuity_anchor, pack.initial_state_code
+        )
+    elif pack.story_arc or pack.initial_state_code or pack.goal_state_code:
+        raise StoryPlanError("template scene cannot claim semantic state contract")
+    for scene_index, scene in enumerate(pack.scenes):
         if scene.subject_kind not in DIRECTOR_SUBJECT_KINDS:
             raise StoryPlanError("scene subject kind is invalid")
         if (
@@ -1236,6 +1734,46 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
         ):
             raise StoryPlanError("scene subject identity contract is invalid")
         if pack.director_version == DIRECTOR_VERSION:
+            recipe_name, expected_end_state_code = arc_steps[scene_index]
+            recipe = DIRECTOR_ACTION_RECIPES[recipe_name]
+            expected_subject_kind, expected_motion, expected_primary, _ = recipe
+            expected_subject = (
+                CANONICAL_NAZ_SUBJECT
+                if expected_subject_kind == "naz_human"
+                else _branded_primary_phrase(expected_primary, "none")
+            )
+            if (
+                scene.setting != arc_setting
+                or scene.subject_kind != expected_subject_kind
+                or scene.subject != expected_subject
+                or scene.motion_class != expected_motion
+                or scene.concrete_action
+                != _build_atomic_action(
+                    action_recipe=recipe_name, brand_marking="none"
+                )
+                or scene.admin_summary_ru
+                != DIRECTOR_RECIPE_SUMMARIES_RU[recipe_name]
+            ):
+                raise StoryPlanError("scene story arc contract is invalid")
+            end_state_code = next(
+                (
+                    code
+                    for code in DIRECTOR_STATE_CODES
+                    if scene.end_state
+                    == _bounded_state_phrase(pack.continuity_anchor, code)
+                ),
+                "",
+            )
+            if scene.start_state != previous_end_state or not end_state_code:
+                raise StoryPlanError("scene bounded state contract is invalid")
+            if end_state_code != expected_end_state_code:
+                raise StoryPlanError("scene story arc state is invalid")
+            if (
+                end_state_code == pack.goal_state_code
+                and scene_index != len(pack.scenes) - 1
+            ):
+                raise StoryPlanError("scene reaches goal before final proof")
+            bounded_end_state_codes.append(end_state_code)
             if scene.motion_class is None or _motion_contract_reason_codes(
                 subject_kind=scene.subject_kind,
                 motion_class=scene.motion_class,
@@ -1244,8 +1782,6 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
                 end_state=scene.end_state,
             ):
                 raise StoryPlanError("scene motion contract is invalid")
-            if previous_end_state and scene.start_state != previous_end_state:
-                raise StoryPlanError("scene motion continuity is broken")
             previous_end_state = scene.end_state
         elif scene.motion_class is not None:
             raise StoryPlanError("template scene cannot claim semantic motion contract")
@@ -1269,6 +1805,12 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
             raise StoryPlanError("STORY overlay contract is incomplete")
         if pack.continuity_id not in " ".join(scene.continuity_constraints):
             raise StoryPlanError("visual continuity mismatch")
+    if pack.director_version == DIRECTOR_VERSION and (
+        len(set(bounded_end_state_codes)) != len(pack.scenes)
+        or not bounded_end_state_codes
+        or bounded_end_state_codes[-1] != pack.goal_state_code
+    ):
+        raise StoryPlanError("director proof state contract is invalid")
     for edit in pack.reel_edits:
         if not edit.hook or not edit.conclusion or len(edit.shots) < 3:
             raise StoryPlanError("Reel needs its own hook, conclusion and EDL")
@@ -1374,7 +1916,8 @@ _IMMUTABLE_PLAN_FIELDS = (
     "plan_id", "base_plan_id", "variant_index", "continuity_id", "persona",
     "destination", "scheduled_slot", "rubric", "source_type", "source_ref",
     "safe_facts", "editorial_plan", "central_thesis", "visual_concept",
-    "story_spine", "continuity_anchor", "admin_concept_ru", "director_version",
+    "story_spine", "story_arc", "continuity_anchor", "initial_state_code", "goal_state_code",
+    "admin_concept_ru", "director_version",
     "scene_count", "scenes", "reel_edits", "caption_plan",
     "safety_flags", "copyright_flags", "policy_versions", "schema",
 )
@@ -1438,16 +1981,45 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         return False
     director_version = str(payload.get("director_version", ""))
     concept = str(payload.get("visual_concept", ""))
+    story_arc = str(payload.get("story_arc", ""))
+    continuity_anchor = str(payload.get("continuity_anchor", ""))
+    initial_state_code = str(payload.get("initial_state_code", ""))
+    goal_state_code = str(payload.get("goal_state_code", ""))
     if director_version == TEMPLATE_DIRECTOR_VERSION and concept not in {
         str(treatment["label"]) for treatment in VISUAL_TREATMENTS.values()
     }:
         return False
     if director_version == DIRECTOR_VERSION:
+        if story_arc not in DIRECTOR_STORY_ARCS:
+            return False
         try:
-            _validated_director_text(concept, "visual_concept")
+            arc_steps = _story_arc_steps(story_arc, len(scenes))
         except StoryPlanError:
             return False
+        arc = DIRECTOR_STORY_ARCS[story_arc]
+        arc_setting = DIRECTOR_PRIMARY_SETTINGS.get(str(arc.get("setting", "")), "")
+        try:
+            _validated_director_text(concept, "visual_concept")
+            _validated_director_text(
+                continuity_anchor, "continuity_anchor", maximum=90
+            )
+        except StoryPlanError:
+            return False
+        if (
+            initial_state_code not in DIRECTOR_STATE_CODES
+            or goal_state_code not in DIRECTOR_STATE_CODES
+            or initial_state_code == goal_state_code
+            or continuity_anchor != str(arc.get("continuity_anchor", ""))
+            or initial_state_code != str(arc.get("initial_state", ""))
+            or goal_state_code != arc_steps[-1][1]
+            or not arc_setting
+            or str(payload.get("admin_concept_ru", ""))
+            != str(arc.get("description_ru", ""))
+        ):
+            return False
     elif director_version != TEMPLATE_DIRECTOR_VERSION:
+        return False
+    elif story_arc or initial_state_code or goal_state_code:
         return False
     if not 4 <= len(scenes) <= 7 or payload.get("scene_count") != len(scenes) or not edits:
         return False
@@ -1474,8 +2046,13 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     if len(scene_ids) != len(scenes) or not all(scene_ids) or len(set(scene_ids)) != len(scene_ids):
         return False
     scenes_by_id = {str(item["scene_id"]): item for item in scenes}
-    previous_end_state = ""
-    for scene in scenes:
+    previous_end_state = (
+        _bounded_state_phrase(continuity_anchor, initial_state_code)
+        if director_version == DIRECTOR_VERSION
+        else ""
+    )
+    bounded_end_state_codes: list[str] = []
+    for scene_index, scene in enumerate(scenes):
         requires_reference = scene.get("requires_naz_reference")
         role = str(scene.get("reference_role", ""))
         shot_size = str(scene.get("shot_size", ""))
@@ -1502,6 +2079,22 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         ) or (not requires_reference and role != "none"):
             return False
         if director_version == DIRECTOR_VERSION:
+            recipe_name, expected_end_state_code = arc_steps[scene_index]
+            recipe = DIRECTOR_ACTION_RECIPES[recipe_name]
+            expected_subject_kind, expected_motion, expected_primary, _ = recipe
+            expected_subject = (
+                CANONICAL_NAZ_SUBJECT
+                if expected_subject_kind == "naz_human"
+                else _branded_primary_phrase(expected_primary, "none")
+            )
+            end_state_code = next(
+                (
+                    code
+                    for code in DIRECTOR_STATE_CODES
+                    if end_state == _bounded_state_phrase(continuity_anchor, code)
+                ),
+                "",
+            )
             if (
                 (subject_kind == "naz_human") is not requires_reference
                 or (subject_kind == "naz_human" and subject != CANONICAL_NAZ_SUBJECT)
@@ -1509,6 +2102,29 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
                 or (
                     requires_reference
                     is not (scene.get("identity_reference_usage") == "identity_only")
+                )
+            ):
+                return False
+            if (
+                str(scene.get("setting", "")) != arc_setting
+                or subject_kind != expected_subject_kind
+                or subject != expected_subject
+                or scene.get("motion_class") != expected_motion
+                or action
+                != _build_atomic_action(
+                    action_recipe=recipe_name, brand_marking="none"
+                )
+                or end_state_code != expected_end_state_code
+                or str(scene.get("admin_summary_ru", ""))
+                != DIRECTOR_RECIPE_SUMMARIES_RU[recipe_name]
+            ):
+                return False
+            if (
+                start_state != previous_end_state
+                or not end_state_code
+                or (
+                    end_state_code == goal_state_code
+                    and scene_index != len(scenes) - 1
                 )
             ):
                 return False
@@ -1521,11 +2137,16 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
                 end_state=end_state,
             ):
                 return False
-            if previous_end_state and start_state != previous_end_state:
-                return False
+            bounded_end_state_codes.append(end_state_code)
             previous_end_state = end_state
         elif scene.get("motion_class") is not None:
             return False
+    if director_version == DIRECTOR_VERSION and (
+        len(set(bounded_end_state_codes)) != len(scenes)
+        or not bounded_end_state_codes
+        or bounded_end_state_codes[-1] != goal_state_code
+    ):
+        return False
     if len(scene_jobs) != len(scenes):
         return False
     job_ids = [str(item.get("scene_id", "")) for item in scene_jobs if isinstance(item, dict)]

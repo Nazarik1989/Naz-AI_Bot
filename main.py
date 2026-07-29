@@ -181,6 +181,7 @@ NAZ_STORIES_EXTRA_FILES = tuple(
 MONITORED_SOURCES_FILE = Path(os.getenv("MONITORED_SOURCES_FILE", "monitored_sources.json").strip())
 SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip())
 AGENT_CONTENT_INBOX = Path(os.getenv("AGENT_CONTENT_INBOX", "content_inbox/agent_content").strip())
+AGENT_CONTENT_PROJECT = os.getenv("AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean").strip()
 
 AUTOPOST_ENABLED = env_bool("NAZ_TELEGRAM_AUTO_ON", env_bool("AUTOPOST_ENABLED", True))
 AUTOPOST_TIMES = os.getenv("NAZ_TELEGRAM_AUTO_TIMES", os.getenv("AUTOPOST_TIMES", "10:00,14:00,18:00,22:00")).strip()
@@ -1837,15 +1838,41 @@ def agent_content_dirs_for_date(date_text: str) -> List[Path]:
     return [path for path in list_agent_content_dirs() if path.name == clean_date]
 
 
+def agent_content_source_dirs_for_date(date_text: str) -> List[Path]:
+    """Prefer Naz's project-first folder without merging unrelated projects."""
+    matches = agent_content_dirs_for_date(date_text)
+    if not matches or not AGENT_CONTENT_PROJECT:
+        return matches
+    preferred = [
+        path
+        for path in matches
+        if path.parent != AGENT_CONTENT_INBOX
+        and path.parent.name.casefold() == AGENT_CONTENT_PROJECT.casefold()
+    ]
+    return preferred
+
+
 def list_agent_content_dates() -> List[str]:
-    return sorted({path.name for path in list_agent_content_dirs()})
+    paths = list_agent_content_dirs()
+    if AGENT_CONTENT_PROJECT:
+        paths = [
+            path
+            for path in paths
+            if path.parent != AGENT_CONTENT_INBOX
+            and path.parent.name.casefold() == AGENT_CONTENT_PROJECT.casefold()
+        ]
+    return sorted({path.name for path in paths})
 
 
 def latest_agent_content_dir(date_hint: str = "") -> Optional[Path]:
     candidates = (
-        agent_content_dirs_for_date(date_hint)
+        agent_content_source_dirs_for_date(date_hint)
         if date_hint
-        else list_agent_content_dirs()
+        else [
+            path
+            for date_text in list_agent_content_dates()
+            for path in agent_content_source_dirs_for_date(date_text)
+        ]
     )
     return random.choice(candidates) if candidates else None
 
@@ -1856,11 +1883,19 @@ def choose_agent_content_date_for_sync() -> str:
         return current_bot_date()
 
     seen = load_agent_content_seen()
-    changed = [
-        date_text
-        for date_text in dates
-        if seen.get(date_text) != agent_content_hash_for_date(date_text)
-    ]
+    changed: List[str] = []
+    migrated_seen = False
+    for date_text in dates:
+        matched_hash = agent_content_matching_seen_hash(
+            date_text, seen.get(date_text, "")
+        )
+        if not matched_hash:
+            changed.append(date_text)
+        elif seen.get(date_text) != matched_hash:
+            seen[date_text] = matched_hash
+            migrated_seen = True
+    if migrated_seen:
+        write_json_file(AGENT_CONTENT_STATE_FILE, seen)
     pool = changed or (dates if AGENT_CONTENT_REUSE_SEEN else [])
     if not pool:
         return current_bot_date()
@@ -1889,9 +1924,9 @@ def agent_manifest_hash(day_dir: Path) -> str:
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
-def agent_content_hash_for_date(date_text: str) -> str:
+def _agent_content_hash_for_dirs(date_text: str, day_dirs: Iterable[Path]) -> str:
     digest = hashlib.sha256()
-    day_dirs = agent_content_dirs_for_date(date_text)
+    day_dirs = tuple(day_dirs)
     if not day_dirs:
         digest.update(date_text.strip().encode("utf-8"))
     for day_dir in day_dirs:
@@ -1907,6 +1942,34 @@ def agent_content_hash_for_date(date_text: str) -> str:
             digest.update(path.read_bytes())
             digest.update(b"\0")
     return digest.hexdigest()[:24]
+
+
+def agent_content_hash_for_date(date_text: str) -> str:
+    return _agent_content_hash_for_dirs(
+        date_text, agent_content_source_dirs_for_date(date_text)
+    )
+
+
+def legacy_agent_content_hash_for_date(date_text: str) -> str:
+    """Read-only compatibility hash from the former all-project selection."""
+    return _agent_content_hash_for_dirs(
+        date_text, agent_content_dirs_for_date(date_text)
+    )
+
+
+def agent_content_matching_seen_hash(date_text: str, seen_hash: str) -> str:
+    if not seen_hash:
+        return ""
+    current_hash = agent_content_hash_for_date(date_text)
+    if seen_hash == current_hash:
+        return current_hash
+    if seen_hash == legacy_agent_content_hash_for_date(date_text):
+        return current_hash
+    return ""
+
+
+def agent_content_seen_matches(date_text: str, seen_hash: str) -> bool:
+    return bool(agent_content_matching_seen_hash(date_text, seen_hash))
 
 
 def agent_file(day_dir: Path, names: List[str]) -> Optional[Path]:
@@ -1961,7 +2024,7 @@ def collect_agent_materials(date_hint: str = "", focus: str = "") -> Tuple[str, 
     else:
         dates = list_agent_content_dates()
         date_text = random.choice(dates) if dates else ""
-    day_dirs = agent_content_dirs_for_date(date_text)
+    day_dirs = agent_content_source_dirs_for_date(date_text)
     if not day_dirs:
         return "", ["agent inbox missing"], ""
     if len(day_dirs) > 1 or day_dirs[0].parent != AGENT_CONTENT_INBOX:
@@ -4307,6 +4370,8 @@ def reels_director_reason_code(exc: Exception) -> str:
     action_markers = (
         "interface_pantomime", "impossible_action", "multi_action",
         "physical_action_missing", "naz_action_subject_missing", "abstract_action",
+        "action_recipe", "brand_marking",
+        "physical_object_action_subject_invalid", "motion_subject_incompatible",
         "motion_class_mismatch", "motion_class_invalid",
     )
     if reason_codes and all(
@@ -4317,11 +4382,15 @@ def reels_director_reason_code(exc: Exception) -> str:
 
 
 def reels_director_reason_summary(reason_code: str) -> str:
+    if reason_code == "story_manifest_contract_stale":
+        return "сохранённый план не прошёл проверку целостности и не может быть использован"
     if reason_code == "director_action_unfilmable" or any(
         marker in reason_code
         for marker in (
             "interface_pantomime", "impossible_action", "multi_action",
             "physical_action_missing", "naz_action_subject_missing", "abstract_action",
+            "action_recipe", "brand_marking",
+            "physical_object_action_subject_invalid", "motion_subject_incompatible",
             "motion_class_mismatch", "motion_class_invalid",
         )
     ):
@@ -4355,12 +4424,17 @@ async def process_agent_content_date(
     force: bool = False,
     publish: bool = False,
 ) -> str:
-    if not agent_content_dirs_for_date(date_text):
+    if not agent_content_source_dirs_for_date(date_text):
         return f"⚠️ Agent Content: нет папки за {date_text}."
 
     manifest_hash = agent_content_hash_for_date(date_text)
     seen = load_agent_content_seen()
-    if not force and seen.get(date_text) == manifest_hash:
+    matching_seen_hash = agent_content_matching_seen_hash(
+        date_text, seen.get(date_text, "")
+    )
+    if not force and matching_seen_hash:
+        if seen.get(date_text) != matching_seen_hash:
+            mark_agent_content_seen(date_text, matching_seen_hash)
         return f"ℹ️ Agent Content {date_text}: manifest не изменился, пропускаю."
 
     safe_context, risks, resolved_date = collect_agent_materials(
@@ -5418,6 +5492,11 @@ async def reels_control_response(
             plan_id is not None and current_plan_id != plan_id
         ):
             raise story_production.StoryPlanError("story manifest plan_id mismatch")
+        if (
+            action == BTN_REELS_VARIANT
+            and not story_production.manifest_has_current_production_contract(payload)
+        ):
+            raise story_production.StoryPlanError("story_manifest_contract_stale")
         keyboard = reels_plan_keyboard(current_plan_id)
 
         if plan_id is None and action in {BTN_REELS_CONFIRM, BTN_REELS_VARIANT}:
@@ -7338,9 +7417,11 @@ async def generate_reels_director_treatment(
             {"role": "user", "content": prompt},
         ],
         max_tokens=1800,
-        temperature=0.72,
+        temperature=0.45,
         model=CONTENT_MODEL_NAME,
-        response_format=story_production.reels_director_response_format(safe_facts),
+        response_format=story_production.reels_director_response_format(
+            safe_facts, plan
+        ),
     )
     return story_production.parse_reels_director_response(
         raw,
@@ -7373,9 +7454,32 @@ def story_first_dry_run(
 
 _CHRONICLE_METADATA_RE = re.compile(
     r"(?i)^(?:folders?|user focus|project|date|topic(?:-id)?|dialog topic|chat|"
-    r"status|result|autopublish|files?|папк[аи]|фокус|проект|дата|тема(?:-id)?|"
-    r"тема диалога|чат|статус|результат|автопубликация)\s*:"
+    r"status|result|autopublish|files?|git branch|branch|title source|source title|"
+    r"format(?: version)?|source[- ]?(?:hash|checksum|replicas?)|boundary|"
+    r"папк[аи]|фокус|проект|дата|тема(?:-id)?|тема диалога|чат|статус|"
+    r"результат|автопубликация|ветка git|источник заголовка|формат|"
+    r"версия формата|источник[- ]?(?:хеш|хэш)|"
+    r"(?:хеш|хэш|контрольная сумма|реплик) источника|граница)\s*:"
 )
+_CHRONICLE_INTERNAL_ID_RE = re.compile(
+    r"(?i)\b(?=[0-9a-f]{7,64}\b)(?=[0-9a-f]*\d)[0-9a-f]+\b"
+)
+
+
+def sanitize_narrative_chronicle_fact(value: str) -> str:
+    """Remove transport identifiers while preserving the documented event."""
+    text = " ".join(str(value).split()).strip()
+    text = re.sub(
+        r"(?i)\b(?:commits?|коммит(?:ы|а|ов)?)\s+"
+        r"(?=[0-9a-f]{7,64}\b)[0-9a-f]+"
+        r"(?:\s+(?:and|и)\s+(?=[0-9a-f]{7,64}\b)[0-9a-f]+)*",
+        "проверенные изменения",
+        text,
+    )
+    text = re.sub(r"(?i)\bPR\s*#?\d+\b", "проверенное изменение", text)
+    text = _CHRONICLE_INTERNAL_ID_RE.sub("", text)
+    text = re.sub(r"https?://\S+", "", text, flags=re.IGNORECASE)
+    return " ".join(text.split()).strip(" ,;:-")
 
 
 def is_narrative_chronicle_fact(value: str) -> bool:
@@ -7399,30 +7503,42 @@ def chronicle_source_row(
     topic: str,
 ) -> Dict[str, Any]:
     """Extract objective evidence; plan_release owns the suitability decision."""
-    chunks = [
-        " ".join(item.split())[:420]
-        for item in re.split(r"(?<=[.!?])\s+|\n+", safe_context)
-        if is_narrative_chronicle_fact(item)
-        and "[REDACTED]" not in item
-        and not re.search(r"(?i)(token|api[_ -]?key|password|secret|private message)", item)
-    ]
+    chunks: List[str] = []
+    for item in re.split(r"(?<=[.!?])\s+|\n+", safe_context):
+        if (
+            not is_narrative_chronicle_fact(item)
+            or "[REDACTED]" in item
+            or re.search(
+                r"(?i)(token|api[_ -]?key|password|secret|private message)", item
+            )
+        ):
+            continue
+        sanitized = sanitize_narrative_chronicle_fact(item)[:420]
+        if len(sanitized) >= 24:
+            chunks.append(sanitized)
     facts = tuple(dict.fromkeys(chunks))[:7]
-    folded = safe_context.casefold()
+    # Eligibility must describe the exact bounded facts sent to the director.
+    # Using the complete transport envelope here can make metadata appear to be
+    # causal evidence even after it was excluded from ``safe_facts``.
+    folded = "\n".join(facts).casefold()
     action_stems = (
         "дела", "добав", "исправ", "запуст", "провер", "измен", "собра",
         "переста", "переш", "решил", "попрос", "отключ", "настро", "перенес",
         "перенёс", "замен", "закрыл", "открыл", "оплат", "разобра", "почин",
-        "убрал", "вернул", "failed", "fixed", "tested", "built", "changed",
+        "убрал", "вернул", "коммит", "пуш", "перезагруз", "включ", "публик",
+        "отмет", "отправ", "зафиксир", "уточнил", "создан", "failed", "fixed",
+        "tested", "built", "changed",
     )
     process_stems = (
         "шаг", "сначала", "затем", "после", "до ", "когда", "потом", "вместо",
         "пришлось", "оказалось", "через", "лог", "тест", "сбор", "deploy", "build",
-        "retry",
+        "retry", "работа началась", "по ходу работы", "в процессе", "к финалу",
+        "запрос уточни",
     )
     result_stems = (
         "результат", "стало", "получилось", "заработ", "исчез", "нашли", "вывод",
         "преврат", "продолж", "готов", "работает", "выдерж", "result", "worked",
-        "changed",
+        "changed", "опублик", "запуш", "подтвержд", "не повторится",
     )
     causal_stems = (
         "потому", "поэтому", "из-за", "после", "привел", "привёл", "помог",

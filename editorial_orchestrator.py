@@ -263,7 +263,7 @@ def story_first_eligible(source: EditorialSource) -> bool:
         and source.visualizable_process
         and source.causal_bits >= 4
         and source.real_result
-        and source.safe_facts
+        and len(source.safe_facts) >= 4
         and not source.contains_secrets
         and not source.contains_private_data
     )
