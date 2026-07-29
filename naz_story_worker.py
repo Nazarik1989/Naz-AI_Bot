@@ -69,6 +69,7 @@ CANONICAL_SECONDARY_MODEL = "gen4.5"
 CANONICAL_MODEL_PRIORITY = (CANONICAL_PRIMARY_MODEL, CANONICAL_SECONDARY_MODEL)
 REFERENCE_KEYFRAME_RETRY_DAILY_LIMIT = 4
 FRONTAL_REFERENCE_RETRY_DAILY_LIMIT = 4
+CONCISE_IDENTITY_RETRY_DAILY_LIMIT = 4
 SECONDARY_ESCALATION_CODES = frozenset({
     "video_prompt_image_required",
     "provider_terminal_failure",
@@ -352,6 +353,31 @@ def _write(manifest: Path, payload: dict[str, Any]) -> None:
 
 def _scene_plan(payload: Mapping[str, Any], scene_id: str) -> Mapping[str, Any]:
     return next(row for row in payload.get("scenes", []) if row.get("scene_id") == scene_id)
+
+
+def _bounded_direction(value: object, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-")
+
+
+def _concise_identity_keyframe_prompt(scene: Mapping[str, Any]) -> str:
+    """Build a short scene prompt for a separately approved BAD_OUTPUT retry."""
+    setting = _bounded_direction(scene.get("setting"), 150)
+    action = _bounded_direction(scene.get("concrete_action"), 180)
+    end_state = _bounded_direction(scene.get("end_state"), 140)
+    shot = _bounded_direction(scene.get("shot_size"), 40)
+    if not setting or not action or not end_state or not shot:
+        raise ProviderError("keyframe_retry_contract_invalid")
+    return story_production.validate_provider_prompt(
+        f"@Naz is the only person, with the same adult face as the reference. "
+        f"Scene: {setting}. Action: {action}. Final state: {end_state}. "
+        f"{shot} vertical cinematic frame. replace the reference background, "
+        "clothing, pose and lighting with a physical Naz AI Lab environment. "
+        "Deep black, electric blue and cold silver; photoreal materials and "
+        "believable anatomy. No captions, logos, watermarks or interface graphics."
+    )
 
 
 def _set_pack_status(payload: dict[str, Any]) -> None:
@@ -655,6 +681,7 @@ def _process_keyframe(
         attempts_before_submit = int(job.get("keyframe_attempts", 0))
         legacy_retry = reference_retry and retry_phase == "legacy_model"
         frontal_retry = reference_retry and retry_phase == "reference_quality"
+        concise_retry = reference_retry and retry_phase == "concise_identity"
         valid_legacy_retry = legacy_retry and attempts_before_submit == 1
         valid_frontal_retry = (
             frontal_retry
@@ -662,10 +689,16 @@ def _process_keyframe(
             and job.get("keyframe_retry_reference_role") == "frontal_identity"
             and bool(job.get("keyframe_frontal_retry_approved_at"))
         )
+        valid_concise_retry = (
+            concise_retry
+            and attempts_before_submit in {1, 3}
+            and job.get("keyframe_retry_reference_role") == "frontal_identity"
+            and bool(job.get("keyframe_concise_retry_approved_at"))
+        )
         if reference_retry and not (
             bool(scene.get("requires_naz_reference"))
             and job.get("keyframe_retry_model") == "gen4_image"
-            and (valid_legacy_retry or valid_frontal_retry)
+            and (valid_legacy_retry or valid_frontal_retry or valid_concise_retry)
         ):
             job.update({
                 "state": "terminal_failed",
@@ -676,13 +709,15 @@ def _process_keyframe(
             _set_pack_status(payload)
             _write(manifest, payload)
             return None
-        retry_scope = (
-            "frontal_reference_retry" if frontal_retry else "reference_model_retry"
-        )
-        retry_limit = (
-            FRONTAL_REFERENCE_RETRY_DAILY_LIMIT
-            if frontal_retry else REFERENCE_KEYFRAME_RETRY_DAILY_LIMIT
-        )
+        if concise_retry:
+            retry_scope = "concise_identity_retry"
+            retry_limit = CONCISE_IDENTITY_RETRY_DAILY_LIMIT
+        elif frontal_retry:
+            retry_scope = "frontal_reference_retry"
+            retry_limit = FRONTAL_REFERENCE_RETRY_DAILY_LIMIT
+        else:
+            retry_scope = "reference_model_retry"
+            retry_limit = REFERENCE_KEYFRAME_RETRY_DAILY_LIMIT
         if reference_retry and (
             _keyframe_retry_budget_usage(config.pack_root, retry_scope) >= retry_limit
         ):
@@ -700,7 +735,7 @@ def _process_keyframe(
             role = str(scene.get("reference_role") or "frontal_identity")
             selected_role = (
                 str(job.get("keyframe_retry_reference_role"))
-                if frontal_retry else role
+                if frontal_retry or concise_retry else role
             )
             catalog = _reference_catalog(config.reference_path)
             original = catalog.get(selected_role)
@@ -713,8 +748,15 @@ def _process_keyframe(
                 _set_pack_status(payload)
                 _write(manifest, payload)
                 return None
+        prompt_source = (
+            _concise_identity_keyframe_prompt(scene)
+            if concise_retry
+            else story_production.validate_provider_prompt(
+                str(scene.get("keyframe_prompt", ""))
+            )
+        )
         prompt = append_prompt_guidance(
-            story_production.validate_provider_prompt(str(scene.get("keyframe_prompt", ""))),
+            prompt_source,
             original.body_guidance if original else "",
             too_long_code="keyframe_prompt_too_long",
         )

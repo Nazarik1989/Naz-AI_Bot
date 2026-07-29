@@ -29,7 +29,11 @@ administrator's private chat automatically; there is no manual download step.
   review identifies the off-axis input as the likely cause, an operator-only
   control may retarget at most four unfinished jobs to the approved frontal
   identity reference. That quality retry has its own four-per-day ceiling and
-  cannot be triggered by an accidental second Telegram button press.
+  cannot be triggered by an accidental second Telegram button press. If the
+  provider returns the same `INTERNAL.BAD_OUTPUT` for both reviewed references,
+  a final operator-only recovery may replace only the runtime keyframe prompt
+  with a short prompt rebuilt from the immutable setting, action, end state and
+  shot fields. It also has an independent four-per-day ceiling.
 - `NAZ_VIDEO_AUTO_FALLBACK=true` is rejected. Gen-4.5 is never submitted until
   the administrator confirms the pending escalation with the existing
   `Подтвердить генерацию` button.
@@ -95,7 +99,8 @@ of legacy Turbo identity failures stays in the same plan, preserves completed
 scenes and appears in the existing progress card. A separately approved
 reference-quality retry may substitute the frontal private reference at runtime;
 it does not mutate the immutable scene treatment or copy either reference into
-Git.
+Git. The concise identity recovery likewise leaves the manifest treatment
+unchanged and is never an automatic fallback.
 No keyframe or video task is submitted before explicit approval. v1/v2/v3/v4 packs
 remain inspectable but are read-only and cannot silently use the old direct-avatar route.
 
