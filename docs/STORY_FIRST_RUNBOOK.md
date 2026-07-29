@@ -3,7 +3,7 @@
 Story-first planning is part of the normal Agent Content route, but media work
 is deliberately separate. Reels Maker uses one bounded text-model request to
 produce a content-specific treatment, validates it, then atomically writes a
-`naz-story-pack-v5`
+`naz-story-pack-v6`
 manifest and returns. `naz_story_worker.py` resumes one state transition at a
 time and contains no Telegram or VK publication path.
 
@@ -43,6 +43,10 @@ administrator's private chat automatically; there is no manual download step.
 - New hybrid plans assign Gen-4.5 to Naz scenes and Turbo to object scenes
   before approval. The approval card shows that mix and its cost. A hybrid
   scene never changes model after approval.
+- Semantic-director v4 persists the declared `motion_class` for every directed
+  scene and revalidates one physical action, causal state continuity and the
+  immutable-plan fingerprint on queue collisions before a pack can reach the
+  paid worker. Schemas v1-v5 remain readable but are production read-only.
 
 Run static validation:
 

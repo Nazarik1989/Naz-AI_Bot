@@ -22,13 +22,23 @@ from story_pack_lock import ensure_private_group_access
 from story_video_provider import ProviderError, compact_runway_prompt
 
 
-STORY_SCHEMA = "naz-story-pack-v5"
-PREVIOUS_STORY_SCHEMA = "naz-story-pack-v4"
-OLDER_STORY_SCHEMA = "naz-story-pack-v3"
-LEGACY_STORY_SCHEMA = "naz-story-pack-v2"
-ANCIENT_STORY_SCHEMA = "naz-story-pack-v1"
-DIRECTOR_VERSION = "reels-semantic-director-v3"
+STORY_SCHEMA = "naz-story-pack-v6"
+PREVIOUS_STORY_SCHEMA = "naz-story-pack-v5"
+OLDER_STORY_SCHEMA = "naz-story-pack-v4"
+LEGACY_STORY_SCHEMA = "naz-story-pack-v3"
+ANCIENT_STORY_SCHEMA = "naz-story-pack-v2"
+FIRST_STORY_SCHEMA = "naz-story-pack-v1"
+SUPPORTED_STORY_SCHEMAS = (
+    STORY_SCHEMA,
+    PREVIOUS_STORY_SCHEMA,
+    OLDER_STORY_SCHEMA,
+    LEGACY_STORY_SCHEMA,
+    ANCIENT_STORY_SCHEMA,
+    FIRST_STORY_SCHEMA,
+)
+DIRECTOR_VERSION = "reels-semantic-director-v4"
 TEMPLATE_DIRECTOR_VERSION = "reels-template-director-v1"
+MOTION_CONTRACT_VERSION = "single-physical-motion-v1"
 VIDEO_MOTION_PROMPT_VERSION = "runway-image-to-video-motion-v2"
 HYBRID_MODEL_ROUTE = "naz-human-gen45-object-turbo-v1"
 RUNWAY_VIDEO_CREDITS_PER_SECOND = {"gen4_turbo": 5, "gen4.5": 12}
@@ -154,6 +164,7 @@ class DirectorScene:
     setting: str
     subject_kind: str
     subject: str
+    motion_class: str
     concrete_action: str
     start_state: str
     end_state: str
@@ -178,6 +189,8 @@ class ScenePlan:
     scene_id: str
     role: str
     standalone_meaning: str
+    subject_kind: str
+    motion_class: str | None
     concrete_action: str
     subject: str
     setting: str
@@ -348,6 +361,49 @@ _DIRECTOR_MOTION_CLASS_RE = {
 }
 
 
+def _motion_contract_reason_codes(
+    *,
+    subject_kind: str,
+    motion_class: str,
+    action: str,
+    start_state: str,
+    end_state: str,
+) -> tuple[str, ...]:
+    """Validate one observable physical action independently of the LLM parser."""
+    errors: list[str] = []
+    motion_pattern = _DIRECTOR_MOTION_CLASS_RE.get(motion_class)
+    if motion_pattern is None:
+        errors.append("motion_class_invalid")
+    matched_classes = {
+        name for name, pattern in _DIRECTOR_MOTION_CLASS_RE.items()
+        if pattern.search(action)
+    }
+    matched_motion_count = sum(
+        len(tuple(pattern.finditer(action)))
+        for pattern in _DIRECTOR_MOTION_CLASS_RE.values()
+    )
+    known_physical_motion = bool(motion_pattern and motion_pattern.search(action))
+    if motion_pattern and not known_physical_motion:
+        errors.append("motion_class_mismatch")
+    if len(matched_classes) > 1 or matched_motion_count > 1:
+        errors.append("multi_action")
+    if _DIRECTOR_INTERFACE_ACTION_RE.search(action):
+        errors.append("interface_pantomime")
+    if _DIRECTOR_MAGIC_ACTION_RE.search(action):
+        errors.append("impossible_action")
+    if _DIRECTOR_MULTI_ACTION_RE.search(action):
+        errors.append("multi_action")
+    if not known_physical_motion and _DIRECTOR_PASSIVE_ACTION_RE.search(action):
+        errors.append("physical_action_missing")
+    if subject_kind == "naz_human" and not action.casefold().startswith("naz "):
+        errors.append("naz_action_subject_missing")
+    if _DIRECTOR_ABSTRACT_ACTION_RE.search(action) and not known_physical_motion:
+        errors.append("abstract_action")
+    if start_state and end_state and start_state.casefold() == end_state.casefold():
+        errors.append("state_unchanged")
+    return tuple(dict.fromkeys(errors))
+
+
 def reels_director_prompt(
     plan: EditorialPlan,
     safe_facts: Sequence[str],
@@ -411,7 +467,7 @@ def reels_director_prompt(
         "rotates, inserts, removes, closes or lifts. Static poses such as rests, remains, stands, "
         "sits or looks belong only in start_state or end_state, never in concrete_action.\n\n"
         "Return strict JSON only with this shape: "
-        '{"director_version":"reels-semantic-director-v3","visual_concept":"...",'
+        f'{{"director_version":"{DIRECTOR_VERSION}","visual_concept":"...",'
         '"story_spine":"...","continuity_anchor":"...","primary_setting":"...",'
         '"admin_concept_ru":"...",'
         '"scenes":[{"subject_kind":"naz_human|physical_object",'
@@ -661,9 +717,6 @@ def parse_reels_director_response(
 
         subject_kind = str(row.get("subject_kind", "")).strip().casefold()
         motion_class = str(row.get("motion_class", "")).strip().casefold()
-        motion_pattern = _DIRECTOR_MOTION_CLASS_RE.get(motion_class)
-        if motion_pattern is None:
-            errors.append(f"{scene_prefix}_motion_class_invalid")
         if subject_kind not in DIRECTOR_SUBJECT_KINDS:
             errors.append(f"{scene_prefix}_subject_kind_invalid")
             subject = ""
@@ -679,31 +732,19 @@ def parse_reels_director_response(
         ):
             errors.append(f"{scene_prefix}_subject_identity_invalid")
         if action:
-            known_physical_motion = bool(motion_pattern and motion_pattern.search(action))
-            if motion_pattern and not known_physical_motion:
-                errors.append(f"{scene_prefix}_motion_class_mismatch")
-            if _DIRECTOR_INTERFACE_ACTION_RE.search(action):
-                errors.append(f"{scene_prefix}_interface_pantomime")
-            if _DIRECTOR_MAGIC_ACTION_RE.search(action):
-                errors.append(f"{scene_prefix}_impossible_action")
-            if _DIRECTOR_MULTI_ACTION_RE.search(action):
-                errors.append(f"{scene_prefix}_multi_action")
-            if (
-                not known_physical_motion
-                and _DIRECTOR_PASSIVE_ACTION_RE.search(action)
-            ):
-                errors.append(f"{scene_prefix}_physical_action_missing")
-            if (
-                subject_kind == "naz_human"
-                and not object_only_direction
-                and not action.casefold().startswith("naz ")
-            ):
-                errors.append(f"{scene_prefix}_naz_action_subject_missing")
-            if (
-                _DIRECTOR_ABSTRACT_ACTION_RE.search(action)
-                and not known_physical_motion
-            ):
-                errors.append(f"{scene_prefix}_abstract_action")
+            errors.extend(
+                f"{scene_prefix}_{reason}"
+                for reason in _motion_contract_reason_codes(
+                    subject_kind=subject_kind,
+                    motion_class=motion_class,
+                    action=action,
+                    start_state=start_state,
+                    end_state=end_state,
+                )
+                if not (
+                    reason == "naz_action_subject_missing" and object_only_direction
+                )
+            )
 
         shot_size = str(row.get("shot_size", "")).strip().casefold()
         camera_motion = str(row.get("camera_motion", "")).strip().casefold()
@@ -711,8 +752,6 @@ def parse_reels_director_response(
             errors.append(f"{scene_prefix}_shot_size_invalid")
         if camera_motion not in CAMERA_MOTIONS:
             errors.append(f"{scene_prefix}_camera_motion_invalid")
-        if start_state and end_state and start_state.casefold() == end_state.casefold():
-            errors.append(f"{scene_prefix}_state_unchanged")
         if index and previous_end_state and start_state != previous_end_state:
             errors.append(f"{scene_prefix}_continuity_broken")
         if end_state:
@@ -727,6 +766,7 @@ def parse_reels_director_response(
                     setting=primary_setting,
                     subject_kind=subject_kind,
                     subject=subject,
+                    motion_class=motion_class,
                     concrete_action=action,
                     start_state=start_state,
                     end_state=end_state,
@@ -877,10 +917,16 @@ def _scene(
         if directed_scene is not None
         else _requires_reference(plan.visual_subject_direction)
     )
+    subject_kind = (
+        directed_scene.subject_kind
+        if directed_scene is not None
+        else "naz_human" if requires_reference else "physical_object"
+    )
+    motion_class = directed_scene.motion_class if directed_scene is not None else None
     subject = (
         directed_scene.subject
         if directed_scene is not None
-        else "Naz, the same adult human founder from the approved identity reference"
+        else CANONICAL_NAZ_SUBJECT
         if requires_reference
         else "one physical Naz AI Lab prototype"
     )
@@ -980,6 +1026,8 @@ def _scene(
         raise StoryPlanError(exc.code) from exc
     return ScenePlan(
         scene_id=f"{index + 1:02d}_{role}", role=role, standalone_meaning=standalone,
+        subject_kind=subject_kind,
+        motion_class=motion_class,
         concrete_action=action,
         subject=subject, setting=setting,
         start_state=start_state,
@@ -1052,7 +1100,10 @@ def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: boo
 
 def _variant_plan_id(base_plan_id: str, variant_index: int) -> str:
     return hashlib.sha256(
-        f"{base_plan_id}|{STORY_SCHEMA}|{DIRECTOR_VERSION}|story-variant|{variant_index}".encode("utf-8")
+        (
+            f"{base_plan_id}|{STORY_SCHEMA}|{DIRECTOR_VERSION}|"
+            f"{MOTION_CONTRACT_VERSION}|story-variant|{variant_index}"
+        ).encode("utf-8")
     ).hexdigest()[:24]
 
 
@@ -1174,7 +1225,30 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
         raise StoryPlanError("unknown director version")
     if pack.renderer not in {"available", RENDERER_UNAVAILABLE}:
         raise StoryPlanError("unknown renderer status")
+    previous_end_state = ""
     for scene in pack.scenes:
+        if scene.subject_kind not in DIRECTOR_SUBJECT_KINDS:
+            raise StoryPlanError("scene subject kind is invalid")
+        if (
+            (scene.subject_kind == "naz_human") is not scene.requires_naz_reference
+            or (scene.subject_kind == "naz_human" and scene.subject != CANONICAL_NAZ_SUBJECT)
+            or (scene.subject_kind == "physical_object" and _mentions_human_subject(scene.subject))
+        ):
+            raise StoryPlanError("scene subject identity contract is invalid")
+        if pack.director_version == DIRECTOR_VERSION:
+            if scene.motion_class is None or _motion_contract_reason_codes(
+                subject_kind=scene.subject_kind,
+                motion_class=scene.motion_class,
+                action=scene.concrete_action,
+                start_state=scene.start_state,
+                end_state=scene.end_state,
+            ):
+                raise StoryPlanError("scene motion contract is invalid")
+            if previous_end_state and scene.start_state != previous_end_state:
+                raise StoryPlanError("scene motion continuity is broken")
+            previous_end_state = scene.end_state
+        elif scene.motion_class is not None:
+            raise StoryPlanError("template scene cannot claim semantic motion contract")
         if scene.duration_seconds != 5:
             raise StoryPlanError("Story duration must be exactly 5 seconds")
         if scene.secret_warning or _SECRET_RE.search(scene.clean_prompt):
@@ -1227,6 +1301,7 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
         if (
             positions[0] != 0
             or positions[-1] != len(pack.scenes) - 1
+            or set(positions) != set(range(len(pack.scenes)))
             or any(current > following for current, following in zip(positions, positions[1:]))
         ):
             raise StoryPlanError("Reel must preserve causal scene order")
@@ -1282,10 +1357,7 @@ def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 def read_manifest(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema") not in {
-        STORY_SCHEMA, PREVIOUS_STORY_SCHEMA, OLDER_STORY_SCHEMA, LEGACY_STORY_SCHEMA,
-        ANCIENT_STORY_SCHEMA,
-    }:
+    if payload.get("schema") not in SUPPORTED_STORY_SCHEMAS:
         raise StoryPlanError("unsupported story manifest schema")
     return payload
 
@@ -1298,6 +1370,39 @@ def update_manifest(path: Path, mutator: Callable[[dict[str, Any]], None]) -> di
     return payload
 
 
+_IMMUTABLE_PLAN_FIELDS = (
+    "plan_id", "base_plan_id", "variant_index", "continuity_id", "persona",
+    "destination", "scheduled_slot", "rubric", "source_type", "source_ref",
+    "safe_facts", "editorial_plan", "central_thesis", "visual_concept",
+    "story_spine", "continuity_anchor", "admin_concept_ru", "director_version",
+    "scene_count", "scenes", "reel_edits", "caption_plan",
+    "safety_flags", "copyright_flags", "policy_versions", "schema",
+)
+_IMMUTABLE_MUSIC_PLAN_FIELDS = (
+    "tags", "allowlist_required", "consume_publication_rotation",
+)
+
+
+def _immutable_plan_fingerprint(payload: Mapping[str, Any]) -> str:
+    immutable = {field: payload.get(field) for field in _IMMUTABLE_PLAN_FIELDS}
+    music_plan = payload.get("music_plan")
+    immutable["music_plan"] = (
+        {
+            field: music_plan.get(field)
+            for field in _IMMUTABLE_MUSIC_PLAN_FIELDS
+        }
+        if isinstance(music_plan, Mapping)
+        else None
+    )
+    canonical = json.dumps(
+        immutable,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _duration_in_range(value: Any, minimum: float, maximum: float) -> bool:
     try:
         duration = float(value)
@@ -1307,13 +1412,21 @@ def _duration_in_range(value: Any, minimum: float, maximum: float) -> bool:
 
 
 def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool:
-    """Return whether a v2 manifest is safe for the current paid worker.
+    """Return whether a v6 manifest is safe for the current paid worker.
 
     This deliberately checks the persisted production envelope, not just the
-    editorial plan.  Old v2 manifests can still be inspected or repaired by a
+    editorial plan.  Older manifests can still be inspected or repaired by a
     dry-run, but cannot be approved or reach a provider accidentally.
     """
     if payload.get("schema") != STORY_SCHEMA:
+        return False
+    fingerprint = payload.get("immutable_plan_fingerprint")
+    if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        return False
+    try:
+        if fingerprint != _immutable_plan_fingerprint(payload):
+            return False
+    except (TypeError, ValueError):
         return False
     scenes = payload.get("scenes")
     edits = payload.get("reel_edits")
@@ -1345,13 +1458,14 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     ):
         return False
     hybrid_policy = model_policy.get("scene_route_policy") == HYBRID_MODEL_ROUTE
-    if model_policy.get("scene_route_policy") not in {None, HYBRID_MODEL_ROUTE}:
+    if not hybrid_policy:
         return False
     if not isinstance(visual_strategy, dict) or (
         visual_strategy.get("planner") != "reels-maker-directed-scenes-v1"
         or visual_strategy.get("keyframe_required") is not True
         or visual_strategy.get("avatar_usage") != "identity_reference_only"
         or visual_strategy.get("direct_avatar_as_video_first_frame") is not False
+        or visual_strategy.get("motion_contract_version") != MOTION_CONTRACT_VERSION
     ):
         return False
     if hybrid_policy and visual_strategy.get("motion_prompt_version") != VIDEO_MOTION_PROMPT_VERSION:
@@ -1360,15 +1474,25 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     if len(scene_ids) != len(scenes) or not all(scene_ids) or len(set(scene_ids)) != len(scene_ids):
         return False
     scenes_by_id = {str(item["scene_id"]): item for item in scenes}
+    previous_end_state = ""
     for scene in scenes:
         requires_reference = scene.get("requires_naz_reference")
         role = str(scene.get("reference_role", ""))
         shot_size = str(scene.get("shot_size", ""))
+        subject_kind = str(scene.get("subject_kind", ""))
+        subject = str(scene.get("subject", ""))
+        action = str(scene.get("concrete_action", ""))
+        start_state = str(scene.get("start_state", ""))
+        end_state = str(scene.get("end_state", ""))
         if (
             shot_size not in SHOT_SIZES
             or not _duration_in_range(scene.get("duration_seconds"), 5, 5)
             or not isinstance(requires_reference, bool)
             or role not in REFERENCE_ROLES
+            or subject_kind not in DIRECTOR_SUBJECT_KINDS
+            or not action
+            or not start_state
+            or not end_state
             or not str(scene.get("keyframe_prompt", ""))
             or scene.get("identity_reference_usage") not in {"identity_only", "none"}
         ):
@@ -1376,6 +1500,31 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         if (
             requires_reference and role not in {"frontal_identity", "three_quarter_identity"}
         ) or (not requires_reference and role != "none"):
+            return False
+        if director_version == DIRECTOR_VERSION:
+            if (
+                (subject_kind == "naz_human") is not requires_reference
+                or (subject_kind == "naz_human" and subject != CANONICAL_NAZ_SUBJECT)
+                or (subject_kind == "physical_object" and _mentions_human_subject(subject))
+                or (
+                    requires_reference
+                    is not (scene.get("identity_reference_usage") == "identity_only")
+                )
+            ):
+                return False
+            motion_class = scene.get("motion_class")
+            if not isinstance(motion_class, str) or _motion_contract_reason_codes(
+                subject_kind=subject_kind,
+                motion_class=motion_class,
+                action=action,
+                start_state=start_state,
+                end_state=end_state,
+            ):
+                return False
+            if previous_end_state and start_state != previous_end_state:
+                return False
+            previous_end_state = end_state
+        elif scene.get("motion_class") is not None:
             return False
     if len(scene_jobs) != len(scenes):
         return False
@@ -1427,11 +1576,6 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             != ("gen4.5" if scene["requires_naz_reference"] else "gen4_turbo")
         ):
             return False
-        if not hybrid_policy and (
-            route.get("scene_strategy") is not None
-            or route.get("selected_model") is not None
-        ):
-            return False
     edit_ids: list[str] = []
     for edit in edits:
         if not isinstance(edit, dict) or not isinstance(edit.get("shots"), list):
@@ -1465,7 +1609,19 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             return False
         if not any(shot["source_shot_size"] != shot["reel_shot_size"] for shot in shots):
             return False
-        if [str(shot["source_scene_id"]) for shot in shots] == scene_ids[: len(shots)]:
+        positions = [
+            scene_ids.index(str(shot["source_scene_id"]))
+            for shot in shots
+        ]
+        if (
+            positions[0] != 0
+            or positions[-1] != len(scene_ids) - 1
+            or set(positions) != set(range(len(scene_ids)))
+            or any(
+                current > following
+                for current, following in zip(positions, positions[1:])
+            )
+        ):
             return False
     if len(set(edit_ids)) != len(edit_ids) or len(reel_jobs) != len(edits):
         return False
@@ -1510,8 +1666,10 @@ def _preserve_render_statuses(payload: dict[str, Any], existing: Mapping[str, An
 def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     payload = pack.to_dict()
+    immutable_plan_fingerprint = _immutable_plan_fingerprint(payload)
     payload.update({
         "created_at": now, "updated_at": now, "pack_status": "awaiting_approval",
+        "immutable_plan_fingerprint": immutable_plan_fingerprint,
         "approval": {
             "status": "awaiting_approval", "requested_at": now,
             "approved_at": None, "superseded_at": None,
@@ -1531,6 +1689,7 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
             "avatar_usage": "identity_reference_only",
             "direct_avatar_as_video_first_frame": False,
             "keyframe_provider": "runway",
+            "motion_contract_version": MOTION_CONTRACT_VERSION,
             "motion_prompt_version": VIDEO_MOTION_PROMPT_VERSION,
         },
         "visual_identity_qa": {"status": "not_run", "blocking": False},
@@ -1580,6 +1739,12 @@ def persist_story_queue(pack: StoryPackPlan, storage_root: Path) -> Path:
     pack_dir = (root / pack.plan_id).resolve()
     if root not in pack_dir.parents:
         raise StoryPlanError("unsafe pack path")
+    # Validate the exact JSON shape that will be persisted: dataclasses.asdict
+    # keeps tuples in memory, while the manifest contract intentionally accepts
+    # only JSON arrays.
+    payload = json.loads(json.dumps(_production_payload(pack), ensure_ascii=False))
+    if not manifest_has_current_production_contract(payload):
+        raise StoryPlanError("story_manifest_contract_stale")
     manifest = pack_dir / "story_manifest.json"
     stories_dir = pack_dir / "stories"
     reels_dir = pack_dir / "reels"
@@ -1593,12 +1758,23 @@ def persist_story_queue(pack: StoryPackPlan, storage_root: Path) -> Path:
     ensure_private_group_access(keyframes_dir, directory=True)
     created = _atomic_create_text(
         manifest,
-        json.dumps(_production_payload(pack), ensure_ascii=False, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
     )
     ensure_private_group_access(manifest, directory=False)
     existing = read_manifest(manifest)
     if existing.get("plan_id") != pack.plan_id:
         raise StoryPlanError("stored manifest plan_id mismatch")
+    try:
+        existing_fingerprint = _immutable_plan_fingerprint(existing)
+    except (TypeError, ValueError) as exc:
+        raise StoryPlanError("stored_manifest_contract_mismatch") from exc
+    if (
+        existing.get("immutable_plan_fingerprint") != payload["immutable_plan_fingerprint"]
+        or existing.get("immutable_plan_fingerprint") != existing_fingerprint
+    ):
+        raise StoryPlanError("stored_manifest_contract_mismatch")
+    if not manifest_has_current_production_contract(existing):
+        raise StoryPlanError("story_manifest_contract_stale")
     caption = (
         f"# Caption pack\n\nPlan ID: {pack.plan_id}\nContinuity ID: {pack.continuity_id}\n\n"
         f"Main: {pack.caption_plan['main']}\n\nShort: {pack.caption_plan['short']}\n"
