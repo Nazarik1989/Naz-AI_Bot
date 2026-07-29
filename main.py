@@ -4307,6 +4307,7 @@ def reels_director_reason_code(exc: Exception) -> str:
     action_markers = (
         "interface_pantomime", "impossible_action", "multi_action",
         "physical_action_missing", "naz_action_subject_missing", "abstract_action",
+        "motion_class_mismatch", "motion_class_invalid",
     )
     if reason_codes and all(
         any(marker in code for marker in action_markers) for code in reason_codes
@@ -4321,6 +4322,7 @@ def reels_director_reason_summary(reason_code: str) -> str:
         for marker in (
             "interface_pantomime", "impossible_action", "multi_action",
             "physical_action_missing", "naz_action_subject_missing", "abstract_action",
+            "motion_class_mismatch", "motion_class_invalid",
         )
     ):
         return "сцена содержала непригодное для съёмки, перегруженное или физически неправдоподобное действие"

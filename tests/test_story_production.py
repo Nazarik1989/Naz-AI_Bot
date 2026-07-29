@@ -56,6 +56,7 @@ def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix=
         scenes.append({
             "subject_kind": "physical_object",
             "subject_detail": "one physical optical-titanium prototype",
+            "motion_class": "calibrate",
             "concrete_action": f"{action_prefix} mechanical coupling number {index} under controlled load",
             "start_state": start_state,
             "end_state": end_state,
@@ -114,6 +115,10 @@ class StoryFirstTests(unittest.TestCase):
             properties["subject_kind"]["enum"],
             list(story.DIRECTOR_SUBJECT_KINDS),
         )
+        self.assertEqual(
+            properties["motion_class"]["enum"],
+            list(story.DIRECTOR_MOTION_CLASSES),
+        )
 
     def test_neutral_work_surface_direction_allows_naz_and_object_scenes(self):
         plan = dataclasses.replace(
@@ -167,6 +172,7 @@ class StoryFirstTests(unittest.TestCase):
         payload["scenes"][0].update({
             "subject_kind": "naz_human",
             "subject_detail": "Naz",
+            "motion_class": "press",
             "concrete_action": "Naz taps the laptop trackpad and waits",
         })
 
@@ -194,6 +200,7 @@ class StoryFirstTests(unittest.TestCase):
         payload["scenes"][0]["concrete_action"] = (
             "The optical-titanium prototype shudders once under controlled load"
         )
+        payload["scenes"][0]["motion_class"] = "oscillate"
 
         treatment = story.parse_reels_director_response(
             json.dumps(payload), planned(), SAFE_FACTS
@@ -217,6 +224,20 @@ class StoryFirstTests(unittest.TestCase):
 
         self.assertIn(
             "director_scene_1_physical_action_missing",
+            raised.exception.reason_codes,
+        )
+
+    def test_director_rejects_action_that_does_not_match_motion_class(self):
+        payload = json.loads(director_response(planned()))
+        payload["scenes"][0]["motion_class"] = "slide"
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), planned(), SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_motion_class_mismatch",
             raised.exception.reason_codes,
         )
 
