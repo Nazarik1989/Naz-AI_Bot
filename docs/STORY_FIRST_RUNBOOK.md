@@ -76,21 +76,44 @@ replacement.
 `NAZ_VIDEO_REFERENCE_DIR` must point outside Git to the private folder with
 `naz-primary.jpg`, `naz-secondary.jpg`, and `naz-reference-profile.json`.
 Primary is the frontal identity reference; secondary is the three-quarter
-identity reference. Exactly one is used only while generating a directed scene
-keyframe. Reels Maker must replace the avatar background, pose, framing and
-lighting with the approved Naz AI Lab treatment. The resulting keyframe, never
-the avatar itself, becomes the Runway video first frame. Height/build guidance
-from the private profile is added only to medium/wide Naz shots and is ignored
-for close-ups, macro and object-only scenes. Provider images are normalized in
+identity reference. The legacy v1 profile remains supported. A v2 profile may
+name `frontal_identity`, `three_quarter_identity`, and an optional
+`full_body_identity`. For a Naz keyframe the worker sends the preferred view
+first, then the other available character-plate views, de-duplicated and capped
+at Runway Gen-4's three-reference limit. The prompt identifies all views as the
+same adult man and explicitly excludes their clothing and backgrounds. Reels
+Maker replaces the reference background, clothing, pose, framing and lighting
+with the approved Naz AI Lab treatment. The resulting keyframe, never an avatar
+binary, becomes the Runway video first frame. Height/build guidance from the
+private profile is appended at runtime. Provider images are normalized in
 memory to a valid 720×1280 first frame; private binaries and the profile stay
 outside Git.
 
+Example private v2 profile (filenames only; do not commit the images or this
+profile):
+
+```json
+{
+  "schema": "naz-reference-profile.v2",
+  "persona": "naz",
+  "reference_files": {
+    "frontal_identity": "naz-front.jpg",
+    "three_quarter_identity": "naz-three-quarter.jpg",
+    "full_body_identity": "naz-full-body.jpg"
+  }
+}
+```
+
 The approval card lists a content-directed visual concept plus every scene's
 location, physical action and camera, and the estimated Runway credits. The
-concept and actions are generated from cleaned causal facts and validated before
-the pack exists; transport metadata, paths and generic `fact N` placeholders are
-rejected. Naz AI Lab is a coherent world, not one mandatory room or a fixed
-action sequence. A v5
+semantic director must express one silent-readable goal, obstacle, corrective
+test and visible proof. Every scene keeps the same primary setting and hands its
+end state to the next scene. Final Reel edits preserve that causal order and may
+only repeat adjacent reframed fragments when a short treatment needs seven cuts.
+The application injects one restrained matte-black Naz lab wardrobe across all
+human scenes. Transport metadata, paths, generic `fact N` placeholders, costume
+changes and backward timeline jumps are rejected. Naz AI Lab remains a coherent
+world chosen per episode, not one mandatory room for every episode. A v5
 pack first creates one asynchronous directed keyframe per scene with
 `gen4_image`; identity scenes keep the tagged `@Naz` reference while object-only
 scenes use the text-only form. It then animates that immutable keyframe with the

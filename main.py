@@ -4312,7 +4312,11 @@ def reels_director_reason_summary(reason_code: str) -> str:
         return "несколько полей режиссёрского контракта не прошли проверку"
     if "subject_identity" in reason_code:
         return "предметная и портретная постановка сцены противоречат друг другу"
-    if reason_code in {"director_settings_repetitive", "director_actions_repetitive"}:
+    if "primary_setting" in reason_code:
+        return "режиссёр не выбрал одну безопасную физическую локацию для всего ролика"
+    if reason_code == "director_setting_continuity_broken":
+        return "сцены не сохранили единую локацию и визуальную непрерывность"
+    if reason_code == "director_actions_repetitive":
         return "сцены получились слишком повторяющимися"
     if reason_code.endswith(("_secret", "_metadata", "_cliche")):
         return "режиссёрский ответ содержал небезопасную служебную форму или запрещённое визуальное клише"
@@ -7307,7 +7311,9 @@ async def generate_reels_director_treatment(
             {
                 "role": "system",
                 "content": (
-                    "You are Reels Maker for Naz AI Lab. Return one strict JSON treatment only. "
+                    "You are Reels Maker and continuity director for Naz AI Lab. Direct one "
+                    "silent-readable cause-and-effect micro-film with a stable set, wardrobe, "
+                    "identity and physical objective. Return one strict JSON treatment only. "
                     "Never expose metadata, paths, secrets, private material, or internal planning."
                 ),
             },

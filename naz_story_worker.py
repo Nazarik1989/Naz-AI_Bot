@@ -45,6 +45,7 @@ SAFE_FAILURE_CODES = {
     "media_tool_failed", "media_tool_unavailable_or_timed_out", "overlay_text_unsafe",
     "provider_download_failed", "provider_download_not_mp4", "provider_job_id_missing",
     "provider_download_not_image", "keyframe_identity_tag_missing",
+    "keyframe_reference_count_invalid",
     "keyframe_artifact_invalid", "keyframe_prompt_invalid", "keyframe_prompt_too_long",
     "keyframe_retry_contract_invalid",
     "daily_keyframe_limit_reached",
@@ -82,6 +83,7 @@ DEFINITIVE_SUBMIT_FAILURE_CODES = frozenset({
     "provider_payment_required",
     "provider_permission_denied",
     "keyframe_identity_tag_missing",
+    "keyframe_reference_count_invalid",
     "keyframe_prompt_invalid",
     "keyframe_prompt_too_long",
     "provider_prompt_unsafe",
@@ -364,19 +366,18 @@ def _bounded_direction(value: object, limit: int) -> str:
 
 def _concise_identity_keyframe_prompt(scene: Mapping[str, Any]) -> str:
     """Build a short scene prompt for a separately approved BAD_OUTPUT retry."""
-    setting = _bounded_direction(scene.get("setting"), 150)
-    action = _bounded_direction(scene.get("concrete_action"), 180)
-    end_state = _bounded_direction(scene.get("end_state"), 140)
-    shot = _bounded_direction(scene.get("shot_size"), 40)
+    setting = _bounded_direction(scene.get("setting"), 80)
+    action = _bounded_direction(scene.get("concrete_action"), 100)
+    end_state = _bounded_direction(scene.get("end_state"), 80)
+    shot = _bounded_direction(scene.get("shot_size"), 20)
     if not setting or not action or not end_state or not shot:
         raise ProviderError("keyframe_retry_contract_invalid")
     return story_production.validate_provider_prompt(
-        f"@Naz is the only person, with the same adult face as the reference. "
+        f"@Naz is the only person and keeps the reference face and build. "
         f"Scene: {setting}. Action: {action}. Final state: {end_state}. "
-        f"{shot} vertical cinematic frame. replace the reference background, "
-        "clothing, pose and lighting with a physical Naz AI Lab environment. "
-        "Deep black, electric blue and cold silver; photoreal materials and "
-        "believable anatomy. No captions, logos, watermarks or interface graphics."
+        f"{shot} vertical frame. Replace reference clothing, background, pose and light "
+        "with a matte-black Naz AI Lab wardrobe and physical lab. Deep black, electric "
+        "blue, cold silver; photoreal anatomy. No text, logos, HUD or extra people."
     )
 
 
@@ -452,15 +453,27 @@ def _reference_catalog(path: Path | None) -> dict[str, ReferenceSelection]:
             profile = json.loads(profile_path.read_text(encoding="utf-8"))
             if not isinstance(profile, dict):
                 return {}
-            if profile.get("schema") != "naz-reference-profile.v1" or profile.get("persona") != "naz":
+            schema = profile.get("schema")
+            if (
+                schema not in {"naz-reference-profile.v1", "naz-reference-profile.v2"}
+                or profile.get("persona") != "naz"
+            ):
                 return {}
             rows = profile.get("reference_files", {})
             body = profile.get("body_profile", {})
             if not isinstance(rows, dict) or not isinstance(body, dict):
                 return {}
-            if any(
-                not isinstance(rows.get(name), str)
-                for name in ("primary", "secondary")
+            required_names = (
+                ("primary", "secondary")
+                if schema == "naz-reference-profile.v1"
+                else ("frontal_identity", "three_quarter_identity")
+            )
+            if any(not isinstance(rows.get(name), str) for name in required_names):
+                return {}
+            if (
+                schema == "naz-reference-profile.v2"
+                and rows.get("full_body_identity") is not None
+                and not isinstance(rows.get("full_body_identity"), str)
             ):
                 return {}
             if body and (
@@ -488,9 +501,19 @@ def _reference_catalog(path: Path | None) -> dict[str, ReferenceSelection]:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return {}
     else:
+        schema = "naz-reference-profile.v1"
         rows = {"primary": "naz-primary.jpg", "secondary": "naz-secondary.jpg"}
-    primary = _safe_reference_file(candidate, str(rows.get("primary", "")))
-    secondary = _safe_reference_file(candidate, str(rows.get("secondary", "")))
+    if schema == "naz-reference-profile.v2":
+        primary_name = str(rows.get("frontal_identity", ""))
+        secondary_name = str(rows.get("three_quarter_identity", ""))
+        full_body_name = str(rows.get("full_body_identity", ""))
+    else:
+        primary_name = str(rows.get("primary", ""))
+        secondary_name = str(rows.get("secondary", ""))
+        full_body_name = ""
+    primary = _safe_reference_file(candidate, primary_name)
+    secondary = _safe_reference_file(candidate, secondary_name)
+    full_body = _safe_reference_file(candidate, full_body_name)
     result: dict[str, ReferenceSelection] = {}
     if primary:
         result["frontal_identity"] = ReferenceSelection(primary, "frontal_identity")
@@ -498,7 +521,41 @@ def _reference_catalog(path: Path | None) -> dict[str, ReferenceSelection]:
         result["three_quarter_identity"] = ReferenceSelection(
             secondary, "three_quarter_identity", body_guidance
         )
+    if full_body:
+        result["full_body_identity"] = ReferenceSelection(
+            full_body, "full_body_identity", body_guidance
+        )
     return result
+
+
+def _identity_reference_set(
+    catalog: Mapping[str, ReferenceSelection], preferred_role: str,
+) -> tuple[ReferenceSelection, ...]:
+    """Return one ordered, de-duplicated Naz character plate with at most three views."""
+    roles = (
+        preferred_role,
+        "frontal_identity",
+        "three_quarter_identity",
+        "full_body_identity",
+    )
+    selected: list[ReferenceSelection] = []
+    seen: set[Path] = set()
+    for role in roles:
+        reference = catalog.get(role)
+        if reference is None or reference.path in seen:
+            continue
+        selected.append(reference)
+        seen.add(reference.path)
+        if len(selected) == 3:
+            break
+    return tuple(selected)
+
+
+def _identity_reference_guidance(references: tuple[ReferenceSelection, ...]) -> str:
+    tags = ("@Naz", "@NazView2", "@NazView3")[: len(references)]
+    if len(tags) <= 1:
+        return ""
+    return f"{' '.join(tags)} are the same man; preserve face and build, not clothes or background."
 
 
 def _reference_for(
@@ -731,6 +788,7 @@ def _process_keyframe(
             _write(manifest, payload)
             return None
         original: ReferenceSelection | None = None
+        identity_references: tuple[ReferenceSelection, ...] = ()
         if bool(scene.get("requires_naz_reference")):
             role = str(scene.get("reference_role") or "frontal_identity")
             selected_role = (
@@ -748,6 +806,16 @@ def _process_keyframe(
                 _set_pack_status(payload)
                 _write(manifest, payload)
                 return None
+            identity_references = _identity_reference_set(catalog, selected_role)
+            if not identity_references:
+                job.update({
+                    "keyframe_state": "terminal_failed",
+                    "keyframe_failure_code": "approved_reference_invalid",
+                    "state": "blocked_reference", "failure_code": "approved_reference_invalid",
+                })
+                _set_pack_status(payload)
+                _write(manifest, payload)
+                return None
         prompt_source = (
             _concise_identity_keyframe_prompt(scene)
             if concise_retry
@@ -755,9 +823,22 @@ def _process_keyframe(
                 str(scene.get("keyframe_prompt", ""))
             )
         )
+        identity_guidance = _identity_reference_guidance(identity_references)
+        if identity_guidance:
+            prompt_source = f"{identity_guidance} {prompt_source}"
+        body_guidance = next(
+            (
+                reference.body_guidance
+                for reference in identity_references
+                if reference.body_guidance
+            ),
+            original.body_guidance if original else "",
+        )
+        if body_guidance:
+            prompt_source = f"Body continuity: {body_guidance} {prompt_source}"
         prompt = append_prompt_guidance(
             prompt_source,
-            original.body_guidance if original else "",
+            "",
             too_long_code="keyframe_prompt_too_long",
         )
         attempt = int(job.get("keyframe_attempts", 0)) + 1
@@ -786,6 +867,7 @@ def _process_keyframe(
             submitted = provider.submit_keyframe(KeyframeRequest(
                 scene_id=str(job.get("scene_id")), prompt=prompt,
                 reference_path=original.path if original else None,
+                reference_paths=tuple(reference.path for reference in identity_references),
             ))
             if not str(submitted.external_job_id).strip():
                 raise ProviderError("provider_job_id_missing", retryable=True)

@@ -40,7 +40,7 @@ Naz remains human while working at the boundary between a physical prototype and
 
 - Silhouette: lean, mobile, slightly forward; ready to stand up and test something.
 - Face: preserve the approved avatar's proportions, gaze and recognisable identity. Natural skin warmth is allowed only in portraits.
-- Hair and clothing: follow the approved reference when visible; practical dark builder layers remain the default wardrobe family.
+- Hair: preserve the approved identity references. Clothing is not copied from reference photos: Story-first uses one restrained matte-black technical overshirt, plain black shirt, tailored black trousers and minimal black boots throughout an episode; no armour, robes, glossy sci-fi costumes or unexplained wardrobe changes.
 - Props: a material sample, tool, precise assembly, unfinished prototype or test rig. A laptop is optional, never the automatic subject.
 - Body language: points, leans forward, tests, assembles and reacts; becomes still when doubt finally reaches him.
 

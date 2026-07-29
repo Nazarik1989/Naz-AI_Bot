@@ -215,6 +215,46 @@ class RunwayReferenceContractTests(unittest.TestCase):
         self.assertEqual(payload["model"], "gen4_image")
         self.assertNotIn("referenceImages", payload)
 
+    def test_identity_keyframe_accepts_three_character_plate_references(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            references = tuple(
+                create_reference(directory / filename)
+                for filename in ("naz-front.jpg", "naz-angle.jpg", "naz-body.jpg")
+            )
+            transport = MockTransport([
+                (200, {"Content-Type": "application/json"}, b'{"id":"multi-ref-task"}')
+            ])
+            provider = RunwayVideoProvider(
+                api_key="secret-key", model="gen4_turbo", transport=transport
+            )
+
+            provider.submit_keyframe(KeyframeRequest(
+                "01",
+                "@Naz, @NazView2 and @NazView3 show the same adult man in Naz AI Lab",
+                reference_path=references[0],
+                reference_paths=references,
+            ))
+
+            payload = json.loads(transport.calls[0][3].decode("utf-8"))
+            self.assertEqual(
+                [item["tag"] for item in payload["referenceImages"]],
+                ["Naz", "NazView2", "NazView3"],
+            )
+            self.assertEqual(len(payload["referenceImages"]), 3)
+
+    def test_identity_keyframe_rejects_more_than_three_references_before_transport(self):
+        transport = MockTransport()
+        provider = RunwayVideoProvider(
+            api_key="secret-key", model="gen4_turbo", transport=transport
+        )
+        references = tuple(Path(f"naz-{index}.jpg") for index in range(4))
+        with self.assertRaisesRegex(ProviderError, "keyframe_reference_count_invalid"):
+            provider.submit_keyframe(KeyframeRequest(
+                "01", "@Naz in Naz AI Lab", reference_paths=references,
+            ))
+        self.assertEqual(transport.calls, [])
+
     def test_identity_keyframe_requires_explicit_naz_tag_before_transport(self):
         transport = MockTransport()
         provider = RunwayVideoProvider(
