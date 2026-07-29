@@ -43,10 +43,15 @@ administrator's private chat automatically; there is no manual download step.
 - New hybrid plans assign Gen-4.5 to Naz scenes and Turbo to object scenes
   before approval. The approval card shows that mix and its cost. A hybrid
   scene never changes model after approval.
-- Semantic-director v4 persists the declared `motion_class` for every directed
-  scene and revalidates one physical action, causal state continuity and the
-  immutable-plan fingerprint on queue collisions before a pack can reach the
-  paid worker. Schemas v1-v5 remain readable but are production read-only.
+- Semantic-director v7 filters transport metadata before eligibility and lets
+  the director choose only one pre-vetted physical `story_arc`. The application
+  expands that arc into material-compatible actions, subject identity, one
+  location and mechanism, continuous states, Russian approval summaries and
+  observable final proof; none of those fields is free-form model output.
+  It revalidates that bounded scene contract and the immutable-plan fingerprint
+  on queue collisions before a pack can reach the paid worker. Schemas v1-v5
+  remain readable but are production read-only; older v6 director contracts
+  also fail the current provider preflight.
 
 Run static validation:
 

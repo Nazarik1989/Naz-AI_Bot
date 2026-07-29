@@ -47,32 +47,25 @@ def planned(candidate=None):
     return eo.plan_release(ctx)
 
 
-def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix="Calibrate"):
+def director_response(plan, facts=SAFE_FACTS, *, variant_index=0):
     count = max(4, min(7, len(facts)))
+    arc_names = story._story_arc_names_for_plan(plan)
+    story_arc = (
+        "automated_validation_cycle"
+        if "automated_validation_cycle" in arc_names
+        else arc_names[0]
+    )
     scenes = []
-    previous_end_state = ""
     for index in range(1, count + 1):
-        start_state = previous_end_state or "the validation mechanism is inactive and unresolved"
-        end_state = f"coupling number {index} completes one stable motion"
         scenes.append({
-            "subject_kind": "physical_object",
-            "subject_detail": "one physical optical-titanium prototype",
-            "motion_class": "calibrate",
-            "concrete_action": f"{action_prefix} mechanical coupling number {index} under controlled load",
-            "start_state": start_state,
-            "end_state": end_state,
             "shot_size": story.SHOT_SIZES[(index - 1) % len(story.SHOT_SIZES)],
             "camera_motion": story.CAMERA_MOTIONS[(index - 1) % len(story.CAMERA_MOTIONS)],
-            "admin_summary_ru": f"Механическое соединение номер {index} проходит проверку нагрузкой",
         })
-        previous_end_state = end_state
     return json.dumps({
         "director_version": story.DIRECTOR_VERSION,
         "visual_concept": "a failed configuration becoming one testable physical mechanism",
         "story_spine": "one failed configuration is isolated, corrected and verified under the same load",
-        "continuity_anchor": "the same optical-titanium validation mechanism",
-        "primary_setting": "one physical Naz AI Lab validation chamber",
-        "admin_concept_ru": "Ошибка конфигурации становится проверяемым механизмом",
+        "story_arc": story_arc,
         "scenes": scenes,
     })
 
@@ -84,194 +77,191 @@ class StoryFirstTests(unittest.TestCase):
         self.assertTrue(story._requires_reference("a close portrait of the founder's face"))
 
     def test_director_response_format_requires_exact_scene_count_and_strict_json(self):
-        response_format = story.reels_director_response_format(SAFE_FACTS)
+        response_format = story.reels_director_response_format(SAFE_FACTS, planned())
         self.assertEqual(response_format["type"], "json_schema")
         contract = response_format["json_schema"]
         self.assertTrue(contract["strict"])
-        scenes = contract["schema"]["properties"]["scenes"]
+        root_schema = contract["schema"]
+        self.assertFalse(root_schema["additionalProperties"])
+        self.assertEqual(set(root_schema["required"]), set(root_schema["properties"]))
+        scenes = root_schema["properties"]["scenes"]
         self.assertEqual(scenes["minItems"], len(SAFE_FACTS))
         self.assertEqual(scenes["maxItems"], len(SAFE_FACTS))
         self.assertFalse(scenes["items"]["additionalProperties"])
         properties = scenes["items"]["properties"]
+        self.assertEqual(set(scenes["items"]["required"]), set(properties))
         self.assertNotIn("role", properties)
-        self.assertIn("admin_summary_ru", properties)
-        self.assertIn("admin_concept_ru", contract["schema"]["properties"])
+        self.assertNotIn("admin_summary_ru", properties)
+        self.assertNotIn("admin_concept_ru", contract["schema"]["properties"])
         self.assertIn("story_spine", contract["schema"]["properties"])
-        self.assertIn("continuity_anchor", contract["schema"]["properties"])
-        self.assertIn("primary_setting", contract["schema"]["properties"])
+        self.assertNotIn("continuity_anchor", contract["schema"]["properties"])
+        self.assertIn("story_arc", contract["schema"]["properties"])
+        self.assertNotIn("primary_setting", contract["schema"]["properties"])
+        self.assertNotIn("initial_state", contract["schema"]["properties"])
+        self.assertNotIn("goal_state", contract["schema"]["properties"])
         self.assertNotIn("setting", properties)
         self.assertEqual(
             contract["schema"]["properties"]["story_spine"]["maxLength"], 180
         )
+        self.assertNotIn("concrete_action", properties)
+        self.assertNotIn("subject_detail", properties)
+        self.assertNotIn("action_object", properties)
+        self.assertNotIn("subject_kind", properties)
+        self.assertNotIn("motion_class", properties)
+        self.assertNotIn("action_recipe", properties)
+        self.assertNotIn("brand_marking", properties)
+        self.assertNotIn("start_state", properties)
+        self.assertNotIn("end_state", properties)
         self.assertEqual(
-            contract["schema"]["properties"]["continuity_anchor"]["maxLength"],
-            90,
+            contract["schema"]["properties"]["story_arc"]["enum"],
+            list(story._story_arc_names_for_plan(planned())),
         )
-        self.assertEqual(properties["admin_summary_ru"]["maxLength"], 240)
         self.assertEqual(
-            contract["schema"]["properties"]["admin_concept_ru"]["maxLength"],
-            240,
-        )
-        self.assertEqual(
-            properties["subject_kind"]["enum"],
-            list(story.DIRECTOR_SUBJECT_KINDS),
-        )
-        self.assertEqual(
-            properties["motion_class"]["enum"],
-            list(story.DIRECTOR_MOTION_CLASSES),
+            contract["schema"]["properties"]["visual_concept"]["maxLength"],
+            1200,
         )
 
-    def test_neutral_work_surface_direction_allows_naz_and_object_scenes(self):
-        plan = dataclasses.replace(
-            planned(),
-            visual_subject_direction="one specific work surface at the moment a result changes",
-        )
+    def test_story_arc_selection_controls_identity_without_free_form_subjects(self):
+        plan = planned()
         payload = json.loads(director_response(plan))
-        payload["scenes"][0]["subject_kind"] = "naz_human"
-        payload["scenes"][0]["subject_detail"] = "Naz"
-        payload["scenes"][0]["concrete_action"] = (
-            "Naz calibrates mechanical coupling number 1 under controlled load"
-        )
+        payload["story_arc"] = "module_recovery_mixed"
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
         pack = story.plan_story_pack(plan, SAFE_FACTS, director_treatment=treatment)
-        self.assertTrue(pack.scenes[0].requires_naz_reference)
-        self.assertFalse(pack.scenes[1].requires_naz_reference)
 
-    def test_naz_ai_lab_brand_on_an_object_does_not_trigger_face_reference(self):
-        self.assertFalse(story._is_naz_human_subject("one Naz AI Lab optical prototype"))
-        self.assertTrue(story._is_naz_human_subject("Naz, the same real adult human founder"))
+        self.assertTrue(any(scene.requires_naz_reference for scene in pack.scenes))
+        self.assertTrue(any(not scene.requires_naz_reference for scene in pack.scenes))
+        self.assertTrue(all(
+            story._is_naz_human_subject(scene.subject)
+            for scene in pack.scenes
+            if scene.requires_naz_reference
+        ))
 
-    def test_2026_07_08_route_uses_typed_naz_identity(self):
-        plan = dataclasses.replace(
-            planned(source(source_ref="agent_content:2026-07-08:fixture")),
-            visual_subject_direction="the canonical Naz in the laboratory",
+    def test_explicit_identity_directions_bound_the_story_arc_enum(self):
+        human_plan = dataclasses.replace(
+            planned(), visual_subject_direction="the canonical Naz in the laboratory"
         )
-        payload = json.loads(director_response(plan))
-        for scene in payload["scenes"]:
-            scene["subject_kind"] = "naz_human"
-            scene["subject_detail"] = "Naz"
-            scene["concrete_action"] = "Naz " + scene["concrete_action"].lower()
-
-        treatment = story.parse_reels_director_response(
-            json.dumps(payload), plan, SAFE_FACTS
+        object_plan = dataclasses.replace(
+            planned(), visual_subject_direction="an object-only scene with no person"
         )
-        pack = story.plan_story_pack(
-            plan, SAFE_FACTS, director_treatment=treatment
+        human_arcs = story._story_arc_names_for_plan(human_plan)
+        object_arcs = story._story_arc_names_for_plan(object_plan)
+
+        self.assertTrue(all(
+            story.DIRECTOR_STORY_ARCS[name]["subject_mode"] == "human"
+            for name in human_arcs
+        ))
+        self.assertTrue(all(
+            story.DIRECTOR_STORY_ARCS[name]["subject_mode"] == "object"
+            for name in object_arcs
+        ))
+        schema = story.reels_director_response_format(SAFE_FACTS, object_plan)
+        self.assertEqual(
+            schema["json_schema"]["schema"]["properties"]["story_arc"]["enum"],
+            list(object_arcs),
         )
 
-        self.assertTrue(all(story._is_naz_human_subject(scene.subject) for scene in treatment.scenes))
-        self.assertTrue(all(scene.requires_naz_reference for scene in pack.scenes))
-
-    def test_director_rejects_interface_pantomime_before_media_generation(self):
-        plan = dataclasses.replace(
-            planned(),
-            visual_subject_direction="one specific work surface at the moment a result changes",
-        )
-        payload = json.loads(director_response(plan))
-        payload["scenes"][0].update({
-            "subject_kind": "naz_human",
-            "subject_detail": "Naz",
-            "motion_class": "press",
-            "concrete_action": "Naz taps the laptop trackpad and waits",
-        })
-
+        payload = json.loads(director_response(object_plan))
+        payload["story_arc"] = "module_recovery_human"
         with self.assertRaises(story.DirectorValidationError) as raised:
-            story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
+            story.parse_reels_director_response(
+                json.dumps(payload), object_plan, SAFE_FACTS
+            )
+        self.assertIn("director_story_arc_invalid", raised.exception.reason_codes)
 
-        self.assertIn("director_scene_1_interface_pantomime", raised.exception.reason_codes)
-
-    def test_director_rejects_magic_and_multi_step_choreography(self):
-        for action, reason in (
-            ("The prototype magically self-assembles", "director_scene_1_impossible_action"),
-            ("Calibrate the coupling then rotate the housing", "director_scene_1_multi_action"),
-            ("Calibrate the coupling and rotate the housing", "director_scene_1_multi_action"),
-            ("Calibrate the coupling while the housing rotates", "director_scene_1_multi_action"),
+    def test_model_cannot_supply_actions_props_settings_or_states(self):
+        for field, value in (
+            ("action_recipe", "naz_presses_mechanical_button"),
+            ("concrete_action", "Naz presses a laptop button"),
+            ("end_state", "powered"),
+            ("start_state", "inactive"),
+            ("brand_marking", "naz_ai_lab"),
+            ("primary_setting", "server_aisle"),
         ):
-            with self.subTest(action=action):
+            with self.subTest(field=field):
                 payload = json.loads(director_response(planned()))
-                payload["scenes"][0]["concrete_action"] = action
+                if field == "primary_setting":
+                    payload[field] = value
+                    expected = "director_schema_invalid"
+                else:
+                    payload["scenes"][0][field] = value
+                    expected = "director_scene_1_schema_invalid"
                 with self.assertRaises(story.DirectorValidationError) as raised:
                     story.parse_reels_director_response(
                         json.dumps(payload), planned(), SAFE_FACTS
                     )
-                self.assertIn(reason, raised.exception.reason_codes)
+                self.assertIn(expected, raised.exception.reason_codes)
 
-    def test_director_accepts_unlisted_but_observable_object_motion(self):
-        payload = json.loads(director_response(planned()))
-        payload["scenes"][0]["concrete_action"] = (
-            "The optical-titanium prototype shudders once under controlled load"
-        )
-        payload["scenes"][0]["motion_class"] = "oscillate"
+    def test_every_arc_expands_to_distinct_pre_vetted_actions_and_states(self):
+        for arc_name in story.DIRECTOR_STORY_ARC_NAMES:
+            for count in range(4, 8):
+                with self.subTest(arc=arc_name, count=count):
+                    steps = story._story_arc_steps(arc_name, count)
+                    self.assertEqual(len(steps), count)
+                    self.assertEqual(len({item[0] for item in steps}), count)
+                    self.assertEqual(len({item[1] for item in steps}), count)
+                    for recipe_name, end_state in steps:
+                        recipe = story.DIRECTOR_ACTION_RECIPES[recipe_name]
+                        action = story._build_atomic_action(
+                            action_recipe=recipe_name, brand_marking="none"
+                        )
+                        self.assertTrue(action)
+                        self.assertIn(end_state, story.DIRECTOR_STATE_CODES)
+                        self.assertFalse(story._motion_contract_reason_codes(
+                            subject_kind=recipe[0],
+                            motion_class=recipe[1],
+                            action=action,
+                            start_state="before",
+                            end_state="after",
+                        ))
 
+    def test_story_arc_supplies_one_location_anchor_and_causal_state_chain(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["story_arc"] = "module_recovery_mixed"
         treatment = story.parse_reels_director_response(
-            json.dumps(payload), planned(), SAFE_FACTS
+            json.dumps(payload), plan, SAFE_FACTS
         )
+        arc = story.DIRECTOR_STORY_ARCS[treatment.story_arc]
+        expected_steps = story._story_arc_steps(treatment.story_arc, len(SAFE_FACTS))
 
         self.assertEqual(
-            treatment.scenes[0].concrete_action,
-            payload["scenes"][0]["concrete_action"],
+            {scene.setting for scene in treatment.scenes},
+            {story.DIRECTOR_PRIMARY_SETTINGS[arc["setting"]]},
         )
-
-    def test_director_rejects_passive_pose_as_concrete_action(self):
-        payload = json.loads(director_response(planned()))
-        payload["scenes"][0]["concrete_action"] = (
-            "The optical-titanium prototype rests beside the inactive coupling"
+        self.assertEqual(treatment.continuity_anchor, arc["continuity_anchor"])
+        self.assertEqual(treatment.initial_state_code, arc["initial_state"])
+        self.assertEqual(treatment.goal_state_code, expected_steps[-1][1])
+        self.assertEqual(treatment.admin_concept_ru, arc["description_ru"])
+        self.assertEqual(
+            [scene.admin_summary_ru for scene in treatment.scenes],
+            [
+                story.DIRECTOR_RECIPE_SUMMARIES_RU[recipe]
+                for recipe, _ in expected_steps
+            ],
         )
+        for previous, current in zip(treatment.scenes, treatment.scenes[1:]):
+            self.assertEqual(current.start_state, previous.end_state)
 
-        with self.assertRaises(story.DirectorValidationError) as raised:
-            story.parse_reels_director_response(
-                json.dumps(payload), planned(), SAFE_FACTS
-            )
-
-        self.assertIn(
-            "director_scene_1_physical_action_missing",
-            raised.exception.reason_codes,
+    def test_object_arc_injects_visible_mechanical_drive_into_provider_prompts(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
         )
+        pack = story.plan_story_pack(plan, SAFE_FACTS, director_treatment=treatment)
 
-    def test_director_rejects_action_that_does_not_match_motion_class(self):
-        payload = json.loads(director_response(planned()))
-        payload["scenes"][0]["motion_class"] = "slide"
+        self.assertTrue(all(not scene.requires_naz_reference for scene in pack.scenes))
+        self.assertTrue(all(
+            "visible mechanical actuator" in scene.provider_prompt
+            and "no self-animation" in scene.provider_prompt
+            for scene in pack.scenes
+        ))
 
-        with self.assertRaises(story.DirectorValidationError) as raised:
-            story.parse_reels_director_response(
-                json.dumps(payload), planned(), SAFE_FACTS
-            )
-
-        self.assertIn(
-            "director_scene_1_motion_class_mismatch",
-            raised.exception.reason_codes,
-        )
-
-    def test_director_rejects_two_actions_from_the_same_motion_class(self):
-        payload = json.loads(director_response(planned()))
-        payload["scenes"][0].update({
-            "motion_class": "rotate",
-            "concrete_action": "Rotate the routing ring and turn the locking collar",
-        })
-
-        with self.assertRaises(story.DirectorValidationError) as raised:
-            story.parse_reels_director_response(
-                json.dumps(payload), planned(), SAFE_FACTS
-            )
-
-        self.assertIn(
-            "director_scene_1_multi_action",
-            raised.exception.reason_codes,
-        )
-
-    def test_new_manifest_routes_naz_to_gen45_and_objects_to_turbo(self):
-        plan = dataclasses.replace(
-            planned(),
-            visual_subject_direction="one specific work surface at the moment a result changes",
-        )
+    def test_new_manifest_routes_mixed_arc_naz_to_gen45_and_objects_to_turbo(self):
+        plan = planned()
         payload = json.loads(director_response(plan))
-        payload["scenes"][0].update({
-            "subject_kind": "naz_human",
-            "subject_detail": "Naz",
-            "concrete_action": "Naz calibrates mechanical coupling number 1 under controlled load",
-        })
+        payload["story_arc"] = "module_recovery_mixed"
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
@@ -280,29 +270,15 @@ class StoryFirstTests(unittest.TestCase):
             manifest = story.persist_story_queue(pack, Path(root)) / "story_manifest.json"
             persisted = story.read_manifest(manifest)
 
-        routes = {
-            scene["scene_id"]: job["model_route"]["selected_model"]
-            for scene, job in zip(persisted["scenes"], persisted["scene_jobs"])
-        }
-        self.assertEqual(routes[persisted["scenes"][0]["scene_id"]], "gen4.5")
-        self.assertTrue(
-            all(
-                routes[scene["scene_id"]] == "gen4_turbo"
-                for scene in persisted["scenes"][1:]
+        for scene, job in zip(persisted["scenes"], persisted["scene_jobs"]):
+            self.assertEqual(
+                job["model_route"]["selected_model"],
+                "gen4.5" if scene["requires_naz_reference"] else "gen4_turbo",
             )
-        )
 
-    def test_explicit_object_only_direction_rejects_naz_subject(self):
-        plan = dataclasses.replace(
-            planned(), visual_subject_direction="an object-only scene with no person"
-        )
-        payload = json.loads(director_response(plan))
-        payload["scenes"][0]["subject_kind"] = "naz_human"
-        payload["scenes"][0]["subject_detail"] = "Naz"
-        with self.assertRaisesRegex(
-            story.StoryPlanError, "director_scene_1_subject_identity_invalid"
-        ):
-            story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
+    def test_abstract_director_motion_classes_are_not_available(self):
+        for motion_class in ("adjust", "calibrate", "test", "walk"):
+            self.assertNotIn(motion_class, story.DIRECTOR_MOTION_CLASSES)
 
     def test_director_roles_follow_causal_order_and_never_start_with_result(self):
         expected = {
@@ -326,7 +302,10 @@ class StoryFirstTests(unittest.TestCase):
         self.assertEqual(pack.director_version, story.DIRECTOR_VERSION)
         self.assertEqual(pack.visual_concept, treatment.visual_concept)
         self.assertEqual(pack.story_spine, treatment.story_spine)
+        self.assertEqual(pack.story_arc, treatment.story_arc)
         self.assertEqual(pack.continuity_anchor, treatment.continuity_anchor)
+        self.assertEqual(pack.initial_state_code, treatment.initial_state_code)
+        self.assertEqual(pack.goal_state_code, treatment.goal_state_code)
         self.assertEqual(pack.admin_concept_ru, treatment.admin_concept_ru)
         self.assertEqual(
             [scene.concrete_action for scene in pack.scenes],
@@ -348,101 +327,49 @@ class StoryFirstTests(unittest.TestCase):
             self.assertNotIn(pack.story_spine, scene.provider_prompt)
             self.assertIn(pack.continuity_anchor, scene.clean_prompt)
             self.assertIn(pack.continuity_anchor, scene.keyframe_prompt)
-            self.assertNotIn(pack.continuity_anchor, scene.provider_prompt)
+            self.assertIn(pack.continuity_anchor, scene.provider_prompt)
             self.assertTrue(scene.provider_prompt.startswith("Continuous seamless five-second shot"))
         for previous, current in zip(pack.scenes, pack.scenes[1:]):
             self.assertEqual(current.start_state, previous.end_state)
         self.assertTrue(all("tied to fact" not in scene.setting for scene in pack.scenes))
         self.assertTrue(all("fact 1" not in scene.concrete_action for scene in pack.scenes))
 
-    def test_director_rejects_independent_scenes_without_state_handoff(self):
-        plan = planned()
-        payload = json.loads(director_response(plan))
-        payload["scenes"][1]["start_state"] = "an unrelated second episode begins"
-
-        with self.assertRaisesRegex(
-            story.StoryPlanError, "director_scene_2_continuity_broken"
-        ):
-            story.parse_reels_director_response(
-                json.dumps(payload), plan, SAFE_FACTS
-            )
-
-    def test_director_applies_one_primary_setting_to_every_scene(self):
-        plan = planned()
-        payload = json.loads(director_response(plan))
-        payload["primary_setting"] = "one restrained Naz AI Lab server aisle"
-        treatment = story.parse_reels_director_response(
-            json.dumps(payload), plan, SAFE_FACTS
-        )
-        self.assertEqual(
-            {scene.setting for scene in treatment.scenes},
-            {payload["primary_setting"]},
-        )
-
-    def test_semantic_director_rejects_metadata_shaped_scene_content(self):
-        plan = planned()
-        payload = json.loads(director_response(plan))
-        payload["primary_setting"] = "A real setting tied to fact 1"
-        with self.assertRaisesRegex(story.StoryPlanError, "director_primary_setting_metadata"):
-            story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
-
-    def test_2026_07_08_route_accepts_concrete_technical_locations(self):
-        plan = planned(source(source_ref="agent_content:2026-07-08:fixture"))
-        payload = json.loads(director_response(plan))
-        locations = (
-            "Naz AI Lab",
-            "server room",
-            "terminal bay",
-            "GitHub build bench",
-            "code test chamber",
-        )
-        for location in locations:
-            with self.subTest(location=location):
-                candidate = json.loads(json.dumps(payload))
-                candidate["primary_setting"] = location
-                treatment = story.parse_reels_director_response(
-                    json.dumps(candidate), plan, SAFE_FACTS
-                )
-                self.assertEqual(
-                    {scene.setting for scene in treatment.scenes},
-                    {location},
-                )
-
-    def test_director_still_rejects_internal_transport_markers(self):
-        plan = planned()
-        for invalid_setting in (
+    def test_unknown_or_free_form_story_arc_is_rejected(self):
+        for value in (
+            "cover_closes_then_system_fills",
             "setting tied to fact 2",
-            "Folders: private episode",
-            "project: Naz_AI_Bot_clean",
-            "source_ref inside scene",
-            "plan_id inside scene",
+            "random cyberpunk server room",
         ):
-            with self.subTest(invalid_setting=invalid_setting):
-                payload = json.loads(director_response(plan))
-                payload["primary_setting"] = invalid_setting
-                with self.assertRaisesRegex(
-                    story.StoryPlanError, "director_primary_setting_metadata"
-                ):
+            with self.subTest(value=value):
+                payload = json.loads(director_response(planned()))
+                payload["story_arc"] = value
+                with self.assertRaises(story.DirectorValidationError) as raised:
                     story.parse_reels_director_response(
-                        json.dumps(payload), plan, SAFE_FACTS
+                        json.dumps(payload), planned(), SAFE_FACTS
                     )
+                self.assertIn(
+                    "director_story_arc_invalid", raised.exception.reason_codes
+                )
 
-    def test_director_still_rejects_cheap_visual_cliches(self):
-        plan = planned()
-        for invalid_setting in (
-            "overloaded HUD control room",
-            "random circuit chamber",
-            "flowing code projection room",
-        ):
-            with self.subTest(invalid_setting=invalid_setting):
-                payload = json.loads(director_response(plan))
-                payload["primary_setting"] = invalid_setting
-                with self.assertRaisesRegex(
-                    story.StoryPlanError, "director_primary_setting_cliche"
-                ):
-                    story.parse_reels_director_response(
-                        json.dumps(payload), plan, SAFE_FACTS
-                    )
+    def test_arc_contract_makes_absurd_action_state_pair_unrepresentable(self):
+        schema = story.reels_director_response_format(SAFE_FACTS, planned())
+        scene_properties = schema["json_schema"]["schema"]["properties"][
+            "scenes"
+        ]["items"]["properties"]
+        self.assertNotIn("action_recipe", scene_properties)
+        self.assertNotIn("end_state", scene_properties)
+        self.assertNotIn("setting", scene_properties)
+        self.assertNotIn("subject", scene_properties)
+
+        payload = json.loads(director_response(planned()))
+        payload["scenes"][0]["end_state"] = "filled"
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), planned(), SAFE_FACTS
+            )
+        self.assertIn(
+            "director_scene_1_schema_invalid", raised.exception.reason_codes
+        )
 
     def test_2026_07_08_route_accepts_concise_visual_concept(self):
         plan = planned(source(source_ref="agent_content:2026-07-08:fixture"))
@@ -490,7 +417,7 @@ class StoryFirstTests(unittest.TestCase):
                 json.dumps(payload), plan, SAFE_FACTS
             )
 
-    def test_director_rejects_admin_display_fields_without_russian_text(self):
+    def test_admin_display_fields_are_derived_and_cannot_be_model_supplied(self):
         plan = planned()
         payload = json.loads(director_response(plan))
         payload["admin_concept_ru"] = "English display concept"
@@ -501,20 +428,17 @@ class StoryFirstTests(unittest.TestCase):
                 json.dumps(payload), plan, SAFE_FACTS
             )
 
+        self.assertIn("director_schema_invalid", raised.exception.reason_codes)
         self.assertIn(
-            "director_admin_concept_ru_not_russian", raised.exception.reason_codes
-        )
-        self.assertIn(
-            "director_scene_1_admin_summary_ru_not_russian",
-            raised.exception.reason_codes,
+            "director_scene_1_schema_invalid", raised.exception.reason_codes
         )
 
     def test_director_reports_all_typed_contract_errors_in_one_pass(self):
         plan = planned()
         payload = json.loads(director_response(plan))
         payload["visual_concept"] = "flowing code"
-        payload["primary_setting"] = "setting tied to fact 1"
-        payload["scenes"][1]["subject_kind"] = "unknown_person"
+        payload["story_arc"] = "unknown_person_watches_screen"
+        payload["scenes"][1]["concrete_action"] = "click a dashboard"
 
         with self.assertRaises(story.DirectorValidationError) as raised:
             story.parse_reels_director_response(
@@ -523,8 +447,8 @@ class StoryFirstTests(unittest.TestCase):
 
         self.assertEqual(str(raised.exception), "director_contract_invalid")
         self.assertIn("director_visual_concept_cliche", raised.exception.reason_codes)
-        self.assertIn("director_primary_setting_metadata", raised.exception.reason_codes)
-        self.assertIn("director_scene_2_subject_kind_invalid", raised.exception.reason_codes)
+        self.assertIn("director_story_arc_invalid", raised.exception.reason_codes)
+        self.assertIn("director_scene_2_schema_invalid", raised.exception.reason_codes)
 
     def test_semantic_director_rejects_malformed_json_without_template_fallback(self):
         with self.assertRaisesRegex(story.StoryPlanError, "director_json_invalid"):
@@ -534,13 +458,19 @@ class StoryFirstTests(unittest.TestCase):
         prompt = story.reels_director_prompt(planned(), SAFE_FACTS)
         self.assertIn(SAFE_FACTS[0], prompt)
         self.assertIn(story.DIRECTOR_VERSION, prompt)
-        self.assertIn("admin_summary_ru", prompt)
-        self.assertIn("concise natural Russian", prompt)
+        self.assertIn("exact Russian admin summaries", prompt)
         self.assertIn("one concise story_spine", prompt)
-        self.assertIn("copy the preceding scene's end_state verbatim", prompt)
-        self.assertIn("same physical object or system", prompt)
+        self.assertIn("supplies the unresolved initial state", prompt)
+        self.assertIn("one continuity anchor", prompt)
         self.assertIn("viewer with sound off", prompt)
-        self.assertIn("Define primary_setting once", prompt)
+        self.assertIn("Choose exactly one story_arc", prompt)
+        self.assertIn("Build one causal chain, not separate illustrations.", prompt)
+        self.assertIn("Do not write concrete_action", prompt)
+        self.assertIn("available_story_arcs", prompt)
+        self.assertNotIn("brand_marking=naz_ai_lab", prompt)
+        self.assertIn("visible mechanical drive", prompt)
+        self.assertNotIn("not separate Define primary_setting", prompt)
+        self.assertNotIn("complete micro-film. illustrations", prompt)
         self.assertIn("Never invent armour", prompt)
         self.assertNotIn("source_ref", prompt)
         self.assertNotIn("plan_id", prompt)
@@ -559,6 +489,10 @@ class StoryFirstTests(unittest.TestCase):
 
     def test_insufficient_facts_stays_a_standard_post(self):
         plan = planned(source(causal_bits=3, safe_facts=SAFE_FACTS[:3]))
+        self.assertEqual(plan.production_mode, "standard")
+
+    def test_claimed_causality_cannot_override_too_few_director_facts(self):
+        plan = planned(source(causal_bits=7, safe_facts=SAFE_FACTS[:3]))
         self.assertEqual(plan.production_mode, "standard")
 
     def test_secret_or_private_material_never_selects_story_first(self):
@@ -722,11 +656,10 @@ class StoryFirstTests(unittest.TestCase):
             self.assertLessEqual(len(scene.provider_prompt.encode("utf-16-le")) // 2, 1000)
             self.assertLessEqual(len(scene.keyframe_prompt.encode("utf-16-le")) // 2, 1000)
 
-    def test_maximum_story_spine_and_anchor_still_fit_provider_prompts(self):
+    def test_maximum_story_spine_and_derived_anchor_fit_provider_prompts(self):
         plan = planned()
         payload = json.loads(director_response(plan))
         payload["story_spine"] = "s" * 180
-        payload["continuity_anchor"] = "a" * 90
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
@@ -864,6 +797,23 @@ class StoryFirstTests(unittest.TestCase):
             job["model_route"]["selected_model"] = None
         self.assertFalse(story.manifest_has_current_production_contract(legacy_route))
 
+        stale_director = json.loads(json.dumps(current))
+        stale_director["director_version"] = "reels-semantic-director-v4"
+        stale_director["immutable_plan_fingerprint"] = (
+            story._immutable_plan_fingerprint(stale_director)
+        )
+        self.assertFalse(
+            story.manifest_has_current_production_contract(stale_director)
+        )
+
+        stale_motion_contract = json.loads(json.dumps(current))
+        stale_motion_contract["visual_strategy"]["motion_contract_version"] = (
+            "single-physical-motion-v1"
+        )
+        self.assertFalse(
+            story.manifest_has_current_production_contract(stale_motion_contract)
+        )
+
     def test_seven_scene_directed_pack_has_current_production_contract(self):
         seven_facts = SAFE_FACTS + (
             "A sixth physical check preserved the corrected state.",
@@ -889,7 +839,10 @@ class StoryFirstTests(unittest.TestCase):
             payload = story.read_manifest(manifest)
 
         self.assertEqual(len(payload["scenes"]), 7)
-        self.assertTrue(all(scene["motion_class"] == "calibrate" for scene in payload["scenes"]))
+        self.assertTrue(all(
+            scene["motion_class"] in story.DIRECTOR_SELF_MOTION_CLASSES
+            for scene in payload["scenes"]
+        ))
         self.assertEqual(
             [scene["motion_class"] for scene in payload["scenes"]],
             [scene.motion_class for scene in treatment.scenes],
@@ -933,6 +886,44 @@ class StoryFirstTests(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.assertFalse(story.manifest_has_current_production_contract(tampered))
 
+    def test_persisted_director_state_contract_rejects_tampering(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(plan, SAFE_FACTS, director_treatment=treatment)
+        with tempfile.TemporaryDirectory() as root:
+            manifest = story.persist_story_queue(pack, Path(root)) / "story_manifest.json"
+            current = story.read_manifest(manifest)
+
+        mutations = {
+            "free_form_state": lambda payload: payload["scenes"][0].__setitem__(
+                "end_state", "the browser refreshes and a robot explodes"
+            ),
+            "broken_handoff": lambda payload: payload["scenes"][1].__setitem__(
+                "start_state", payload["scenes"][0]["start_state"]
+            ),
+            "early_goal": lambda payload: payload["scenes"][1].__setitem__(
+                "end_state",
+                story._bounded_state_phrase(
+                    payload["continuity_anchor"], payload["goal_state_code"]
+                ),
+            ),
+            "unknown_goal": lambda payload: payload.__setitem__(
+                "goal_state_code", "browser_refreshed"
+            ),
+        }
+        for name, mutate in mutations.items():
+            tampered = json.loads(json.dumps(current))
+            mutate(tampered)
+            tampered["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(
+                tampered
+            )
+            with self.subTest(name=name):
+                self.assertFalse(
+                    story.manifest_has_current_production_contract(tampered)
+                )
+
     def test_hand_built_director_treatment_cannot_bypass_motion_contract(self):
         plan = planned()
         treatment = story.parse_reels_director_response(
@@ -946,7 +937,7 @@ class StoryFirstTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             story.StoryPlanError,
-            "scene motion contract is invalid",
+            "director_story_arc_invalid",
         ):
             story.plan_story_pack(plan, SAFE_FACTS, director_treatment=broken)
 

@@ -159,6 +159,47 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(provider.submit_count, 0)
                 self.assertEqual(provider.keyframe_submissions, [])
 
+    def test_stale_v6_director_contract_never_reaches_provider(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+        for mutation in ("director_v4", "motion_v1"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as root:
+                pack = story.plan_story_pack(
+                    plan, SAFE_FACTS, director_treatment=treatment
+                )
+                manifest = (
+                    story.persist_story_queue(pack, Path(root))
+                    / "story_manifest.json"
+                )
+                control.approve_pack(Path(root), pack.plan_id)
+                payload = story.read_manifest(manifest)
+                if mutation == "director_v4":
+                    payload["director_version"] = "reels-semantic-director-v4"
+                    payload["immutable_plan_fingerprint"] = (
+                        story._immutable_plan_fingerprint(payload)
+                    )
+                else:
+                    payload["visual_strategy"]["motion_contract_version"] = (
+                        "single-physical-motion-v1"
+                    )
+                story.atomic_json(manifest, payload)
+                provider = FakeVideoProvider()
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "story_manifest_contract_stale"
+                ):
+                    worker.process_pack(
+                        pack.plan_id,
+                        config=config(root),
+                        provider=provider,
+                        composer=DummyComposer(),
+                    )
+
+                self.assertEqual(provider.submit_count, 0)
+                self.assertEqual(provider.keyframe_submissions, [])
+
     def test_existing_approved_pack_compacts_keyframe_before_provider_submit(self):
         with tempfile.TemporaryDirectory() as root:
             pack, _, manifest = make_pack(root, keyframes_ready=False)
@@ -1485,6 +1526,22 @@ class ControlTests(unittest.TestCase):
             self.assertNotEqual(old["plan_id"], new["plan_id"])
             self.assertEqual(new["approval"]["status"], "awaiting_approval")
             self.assertNotEqual(old["scenes"], new["scenes"])
+
+    def test_other_variant_rejects_tampered_immutable_source_before_replanning(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, approved=False)
+            payload = story.read_manifest(manifest)
+            payload["safe_facts"][0] = "tampered source fact"
+            story.atomic_json(manifest, payload)
+            before = manifest.read_bytes()
+
+            with self.assertRaisesRegex(
+                story.StoryPlanError, "story_manifest_contract_stale"
+            ):
+                control.create_next_variant(Path(root), pack.plan_id)
+
+            self.assertEqual(manifest.read_bytes(), before)
+            self.assertEqual(len(control.list_manifests(Path(root))), 1)
 
     def test_variant_is_forbidden_after_approval(self):
         with tempfile.TemporaryDirectory() as root:
