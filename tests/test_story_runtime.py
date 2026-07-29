@@ -885,6 +885,32 @@ class ControlTests(unittest.TestCase):
             self.assertIn("Оценка Runway", summary)
             self.assertIn("Аватар используется только для внешности", summary)
 
+    def test_safe_progress_summary_reports_real_manifest_stages(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, manifest = make_pack(root, approved=False, keyframes_ready=False)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["approval"]["status"] = "approved"
+            payload["pack_status"] = "in_progress"
+            payload["scene_jobs"][0].update({
+                "keyframe_state": "ready",
+                "state": "completed",
+            })
+            payload["scene_jobs"][1].update({
+                "keyframe_state": "ready",
+                "state": "in_progress",
+            })
+            scene_count = len(payload["scene_jobs"])
+
+            summary = control.safe_progress_summary(payload)
+
+            self.assertIn("Reels Maker · прогресс", summary)
+            self.assertIn(f"Ключевые кадры: 2/{scene_count}", summary)
+            self.assertIn(f"Видео сцен: 1/{scene_count}", summary)
+            self.assertIn("Готовые Reels: 0/2", summary)
+            self.assertIn(f"Сейчас: сцена 2/{scene_count} — создаётся видео.", summary)
+            self.assertNotIn(SAFE_FACTS[0], summary)
+            self.assertNotIn(payload["scenes"][0]["provider_prompt"], summary)
+
     def test_safe_summary_localizes_director_card_without_changing_render_fields(self):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root, approved=False)

@@ -288,6 +288,124 @@ def _legacy_scene_summary_ru(scene: Mapping[str, Any]) -> str:
     return ""
 
 
+def _story_progress(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return truthful manifest-backed progress without estimating elapsed time."""
+    scene_jobs = (
+        payload.get("scene_jobs", [])
+        if isinstance(payload.get("scene_jobs"), list)
+        else []
+    )
+    reel_jobs = (
+        payload.get("reel_jobs", [])
+        if isinstance(payload.get("reel_jobs"), list)
+        else []
+    )
+    video_started_states = {
+        "submitting", "submitted", "in_progress", "downloaded", "composed", "completed",
+    }
+    keyframes_ready = sum(
+        str(job.get("keyframe_state", "")) == "ready"
+        or str(job.get("state", "")) in video_started_states
+        for job in scene_jobs
+        if isinstance(job, Mapping)
+    )
+    videos_ready = sum(
+        str(job.get("state", "")) == "completed"
+        for job in scene_jobs
+        if isinstance(job, Mapping)
+    )
+    reels_ready = sum(
+        str(job.get("state", "")) == "completed"
+        for job in reel_jobs
+        if isinstance(job, Mapping)
+    )
+    completed_units = keyframes_ready + videos_ready + reels_ready
+    total_units = len(scene_jobs) * 2 + len(reel_jobs)
+    percent = int(completed_units * 100 / total_units) if total_units else 0
+    filled = min(10, int(completed_units * 10 / total_units)) if total_units else 0
+    return {
+        "scene_jobs": scene_jobs,
+        "reel_jobs": reel_jobs,
+        "keyframes_ready": keyframes_ready,
+        "videos_ready": videos_ready,
+        "reels_ready": reels_ready,
+        "completed_units": completed_units,
+        "total_units": total_units,
+        "percent": percent,
+        "bar": "█" * filled + "░" * (10 - filled),
+    }
+
+
+def _current_story_stage(payload: Mapping[str, Any], progress: Mapping[str, Any]) -> str:
+    approval = payload.get("approval", {})
+    if isinstance(approval, Mapping) and approval.get("status") == "awaiting_approval":
+        return "ожидается подтверждение генерации"
+
+    pack_status = str(payload.get("pack_status", "unknown"))
+    terminal_pack_labels = {
+        "completed": "всё готово",
+        "blocked_music": "Stories готовы, подбор музыки заблокирован",
+        "partially_blocked": "одна или несколько сцен требуют внимания",
+        "awaiting_secondary_approval": "нужно подтверждение повтора проблемной сцены",
+        "superseded": "этот вариант заменён новым",
+    }
+    if pack_status in terminal_pack_labels:
+        return terminal_pack_labels[pack_status]
+
+    scene_jobs = progress.get("scene_jobs", [])
+    scene_total = len(scene_jobs)
+    for index, job in enumerate(scene_jobs, 1):
+        if not isinstance(job, Mapping):
+            continue
+        scene_state = str(job.get("state", "planned"))
+        if scene_state == "completed":
+            continue
+        keyframe_state = str(job.get("keyframe_state", "planned"))
+        if keyframe_state in {"terminal_failed", "submit_ambiguous"}:
+            return f"сцена {index}/{scene_total} — проблема с ключевым кадром"
+        if keyframe_state in {"planned", "queued", "retryable_failed"}:
+            return f"сцена {index}/{scene_total} — ключевой кадр ждёт очереди"
+        if keyframe_state in {"submitting", "submitted", "in_progress"}:
+            return f"сцена {index}/{scene_total} — создаётся ключевой кадр"
+        if scene_state in {"planned", "queued"}:
+            return f"сцена {index}/{scene_total} — видео ждёт очереди"
+        if scene_state in {"submitting", "submitted", "in_progress"}:
+            return f"сцена {index}/{scene_total} — создаётся видео"
+        if scene_state in {"downloaded", "composed"}:
+            return f"сцена {index}/{scene_total} — локальная сборка и проверка"
+        if scene_state == "retryable_failed":
+            return f"сцена {index}/{scene_total} — ожидается повтор после временной ошибки"
+        if scene_state in {"terminal_failed", "blocked_reference", "submit_ambiguous"}:
+            return f"сцена {index}/{scene_total} — требуется внимание"
+        return f"сцена {index}/{scene_total} — {SCENE_STATUS_RU.get(scene_state, scene_state)}"
+
+    reel_jobs = progress.get("reel_jobs", [])
+    if reel_jobs and any(
+        isinstance(job, Mapping) and str(job.get("state", "")) != "completed"
+        for job in reel_jobs
+    ):
+        return "собираются итоговые Reels"
+    return PACK_STATUS_RU.get(pack_status, pack_status)
+
+
+def safe_progress_summary(payload: Mapping[str, Any]) -> str:
+    """Compact progress card backed only by safe manifest state fields."""
+    progress = _story_progress(payload)
+    scene_total = len(progress["scene_jobs"])
+    reel_total = len(progress["reel_jobs"])
+    pack_status = str(payload.get("pack_status", "unknown"))
+    return (
+        "🎬 Reels Maker · прогресс\n\n"
+        f"План: {str(payload.get('plan_id', ''))[:24]}\n"
+        f"Статус: {PACK_STATUS_RU.get(pack_status, pack_status)}\n"
+        f"[{progress['bar']}] {progress['percent']}% этапов\n\n"
+        f"Ключевые кадры: {progress['keyframes_ready']}/{scene_total}\n"
+        f"Видео сцен: {progress['videos_ready']}/{scene_total}\n"
+        f"Готовые Reels: {progress['reels_ready']}/{reel_total}\n\n"
+        f"Сейчас: {_current_story_stage(payload, progress)}."
+    )
+
+
 def safe_summary(payload: Mapping[str, Any]) -> str:
     jobs = payload.get("scene_jobs", []) if isinstance(payload.get("scene_jobs"), list) else []
     directed = payload.get("scenes", []) if isinstance(payload.get("scenes"), list) else []
