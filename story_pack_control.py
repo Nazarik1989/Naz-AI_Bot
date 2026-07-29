@@ -157,11 +157,34 @@ def approve_pack(root: Path, plan_id: str) -> str:
         return "approved"
 
 
+def _reference_keyframe_retry_candidates(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Find legacy Turbo reference failures eligible for one explicit retry."""
+    candidates: list[dict[str, Any]] = []
+    for job in payload.get("scene_jobs", []):
+        if not isinstance(job, dict):
+            continue
+        intent = job.get("keyframe_submit_intent")
+        if not isinstance(intent, Mapping):
+            continue
+        if (
+            bool(job.get("requires_naz_reference"))
+            and job.get("state") == "terminal_failed"
+            and job.get("keyframe_state") == "terminal_failed"
+            and job.get("keyframe_failure_code") == "provider_terminal_failure"
+            and int(job.get("keyframe_attempts", 0)) == 1
+            and intent.get("model") == "gen4_image_turbo"
+            and not job.get("keyframe_retry_approved_at")
+        ):
+            candidates.append(job)
+    return candidates
+
+
 def confirm_generation(root: Path, plan_id: str) -> str:
     """Context-aware confirmation with no provider/API call.
 
-    The first press approves the pack.  A later press approves only secondary
-    retries that are already waiting; it never pre-approves future failures.
+    The first press approves the pack.  A later press approves only a secondary
+    video retry or the bounded legacy reference-keyframe retry already waiting;
+    it never pre-approves future failures.
     """
     path = manifest_path(root, plan_id)
     with _manifest_lock(path):
@@ -194,20 +217,46 @@ def confirm_generation(root: Path, plan_id: str) -> str:
                 job for job in payload.get("scene_jobs", [])
                 if job.get("state") == "awaiting_secondary_approval"
             ]
-            if not pending:
-                return "already_approved"
             confirmed_at = _now()
-            for job in pending:
-                route = job.get("model_route")
-                if not isinstance(route, dict) or not route.get("secondary_requested_at"):
-                    raise story_production.StoryPlanError("secondary model route missing")
-                route.update({"tier": "secondary", "secondary_approved_at": confirmed_at})
-                job.update({
-                    "state": "queued", "external_job_id": None,
-                    "provider_status": None, "failure_code": None,
-                })
-            payload["pack_status"] = "queued"
-            result = "secondary_approved"
+            if pending:
+                for job in pending:
+                    route = job.get("model_route")
+                    if not isinstance(route, dict) or not route.get("secondary_requested_at"):
+                        raise story_production.StoryPlanError("secondary model route missing")
+                    route.update({"tier": "secondary", "secondary_approved_at": confirmed_at})
+                    job.update({
+                        "state": "queued", "external_job_id": None,
+                        "provider_status": None, "failure_code": None,
+                    })
+                payload["pack_status"] = "queued"
+                result = "secondary_approved"
+            else:
+                keyframe_retries = _reference_keyframe_retry_candidates(payload)
+                if not keyframe_retries:
+                    return "already_approved"
+                if len(keyframe_retries) > 4:
+                    raise story_production.StoryPlanError(
+                        "reference keyframe retry limit exceeded"
+                    )
+                for job in keyframe_retries:
+                    external_id = str(job.get("keyframe_external_job_id") or "")
+                    history = job.setdefault("keyframe_provider_job_history", [])
+                    if external_id and external_id not in history:
+                        history.append(external_id)
+                    job.update({
+                        "state": "queued",
+                        "failure_code": None,
+                        "keyframe_state": "queued",
+                        "keyframe_external_job_id": None,
+                        "keyframe_submitted_at": None,
+                        "keyframe_provider_status": None,
+                        "keyframe_failure_code": None,
+                        "keyframe_retry_model": "gen4_image",
+                        "keyframe_retry_reason_code": "provider_terminal_failure",
+                        "keyframe_retry_approved_at": confirmed_at,
+                    })
+                payload["pack_status"] = "queued"
+                result = "reference_keyframes_retry_approved"
         else:
             raise story_production.StoryPlanError("story pack cannot be approved in current state")
         payload["updated_at"] = _now()
@@ -416,8 +465,7 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
     duration = sum(float(job.get("planned_duration_seconds", 0)) for job in jobs)
     references = sum(bool(job.get("requires_naz_reference")) for job in jobs)
     keyframe_credits = sum(
-        2 if bool(scene.get("requires_naz_reference")) else 5
-        for scene in directed if isinstance(scene, Mapping)
+        5 for scene in directed if isinstance(scene, Mapping)
     )
     video_credits = int(duration) * 5
     concept = str(payload.get("visual_concept", "")).strip()

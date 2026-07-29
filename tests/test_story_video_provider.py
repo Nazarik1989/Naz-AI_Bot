@@ -198,7 +198,7 @@ class RunwayReferenceContractTests(unittest.TestCase):
             payload = json.loads(transport.calls[0][3].decode("utf-8"))
             self.assertEqual(job.external_job_id, "keyframe-task")
             self.assertTrue(transport.calls[0][1].endswith("/text_to_image"))
-            self.assertEqual(payload["model"], "gen4_image_turbo")
+            self.assertEqual(payload["model"], "gen4_image")
             self.assertEqual(payload["ratio"], "720:960")
             self.assertEqual(payload["referenceImages"][0]["tag"], "Naz")
             self.assertTrue(payload["referenceImages"][0]["uri"].startswith("data:image/jpeg;base64,"))

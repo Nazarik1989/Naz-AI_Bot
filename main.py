@@ -5423,6 +5423,11 @@ async def reels_control_response(
                 note = "\n\n✅ Генерация основной моделью подтверждена."
             elif result == "secondary_approved":
                 note = "\n\n✅ Повтор проблемной сцены в Gen-4.5 подтверждён."
+            elif result == "reference_keyframes_retry_approved":
+                note = (
+                    "\n\n✅ Точечный повтор заблокированных кадров Naz через "
+                    "gen4_image подтверждён. Готовые сцены не изменены."
+                )
             else:
                 note = "\n\nℹ️ Сейчас дополнительного подтверждения не требуется."
         elif action == BTN_REELS_VARIANT:

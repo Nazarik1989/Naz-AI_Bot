@@ -672,6 +672,102 @@ class WorkerTests(unittest.TestCase):
             persisted = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertNotIn("185 cm", persisted["scenes"][0]["provider_prompt"])
 
+    def test_approved_reference_retry_bypasses_spent_primary_budget_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            reference = Path(root) / "naz-approved.jpg"
+            reference.write_bytes(b"private-reference")
+            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            payload = story.read_manifest(manifest)
+            failed_index = 0
+            payload["scenes"][failed_index].update({
+                "requires_naz_reference": True,
+                "reference_role": "three_quarter_identity",
+                "identity_reference_usage": "identity_only",
+                "keyframe_prompt": payload["scenes"][failed_index]["keyframe_prompt"].replace(
+                    "No person is present.",
+                    "@Naz is present; replace the reference background.",
+                ),
+            })
+            failed = payload["scene_jobs"][failed_index]
+            failed.update({
+                "requires_naz_reference": True,
+                "reference_role": "three_quarter_identity",
+            })
+            failed.update({
+                "state": "terminal_failed",
+                "failure_code": "provider_terminal_failure",
+                "keyframe_state": "terminal_failed",
+                "keyframe_external_job_id": "legacy-turbo-job",
+                "keyframe_attempts": 1,
+                "keyframe_provider_status": "terminal_failed",
+                "keyframe_failure_code": "provider_terminal_failure",
+                "keyframe_submit_intent": {
+                    "intent_id": "legacy-turbo-intent",
+                    "model": "gen4_image_turbo",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "state": "accepted",
+                    "external_job_id": "legacy-turbo-job",
+                    "failure_code": None,
+                },
+            })
+            payload["pack_status"] = "partially_blocked"
+            story.atomic_json(manifest, payload)
+            self.assertEqual(
+                control.confirm_generation(Path(root), pack.plan_id),
+                "reference_keyframes_retry_approved",
+            )
+            provider = FakeVideoProvider()
+
+            status = worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=reference, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+
+            self.assertEqual(status, "queued")
+            self.assertEqual(len(provider.keyframe_submissions), 1)
+            current = story.read_manifest(manifest)["scene_jobs"][failed_index]
+            self.assertEqual(current["keyframe_state"], "submitted")
+            self.assertEqual(current["keyframe_attempts"], 2)
+            self.assertEqual(current["keyframe_submit_intent"]["model"], "gen4_image")
+            self.assertEqual(
+                current["keyframe_submit_intent"]["approval_scope"],
+                "reference_model_retry",
+            )
+            self.assertEqual(
+                current["keyframe_submit_intent_history"][0]["model"],
+                "gen4_image_turbo",
+            )
+
+            worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=reference, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+            self.assertEqual(len(provider.keyframe_submissions), 1)
+
+            provider.fail(current["keyframe_external_job_id"])
+            worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=reference, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+            failed_again = story.read_manifest(manifest)["scene_jobs"][failed_index]
+            self.assertEqual(failed_again["keyframe_state"], "terminal_failed")
+            self.assertEqual(
+                control.confirm_generation(Path(root), pack.plan_id),
+                "already_approved",
+            )
+
     def test_reference_profile_rejects_filename_traversal(self):
         with tempfile.TemporaryDirectory() as root:
             ref_dir = Path(root) / "references"
@@ -870,6 +966,107 @@ class ControlTests(unittest.TestCase):
             payload = json.loads(manifest.read_text())
             self.assertEqual(payload["approval"]["status"], "approved")
             self.assertTrue(all(not job["external_job_id"] for job in payload["scene_jobs"]))
+
+    def test_confirmation_requeues_only_legacy_turbo_reference_failures_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            payload = story.read_manifest(manifest)
+            failed_index = 0
+            untouched_index = 1
+            payload["scenes"][failed_index].update({
+                "requires_naz_reference": True,
+                "reference_role": "three_quarter_identity",
+                "identity_reference_usage": "identity_only",
+                "keyframe_prompt": payload["scenes"][failed_index]["keyframe_prompt"].replace(
+                    "No person is present.",
+                    "@Naz is present; replace the reference background.",
+                ),
+            })
+            failed = payload["scene_jobs"][failed_index]
+            untouched = payload["scene_jobs"][untouched_index]
+            failed.update({
+                "requires_naz_reference": True,
+                "reference_role": "three_quarter_identity",
+                "state": "terminal_failed",
+                "failure_code": "provider_terminal_failure",
+                "keyframe_state": "terminal_failed",
+                "keyframe_external_job_id": "legacy-turbo-job",
+                "keyframe_attempts": 1,
+                "keyframe_provider_status": "terminal_failed",
+                "keyframe_failure_code": "provider_terminal_failure",
+                "keyframe_submit_intent": {
+                    "intent_id": "legacy-intent",
+                    "model": "gen4_image_turbo",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "state": "accepted",
+                    "external_job_id": "legacy-turbo-job",
+                    "failure_code": None,
+                },
+            })
+            untouched_before = dict(untouched)
+            payload["pack_status"] = "partially_blocked"
+            story.atomic_json(manifest, payload)
+
+            self.assertEqual(
+                control.confirm_generation(Path(root), pack.plan_id),
+                "reference_keyframes_retry_approved",
+            )
+            current = story.read_manifest(manifest)
+            retried = current["scene_jobs"][failed_index]
+            self.assertEqual(retried["state"], "queued")
+            self.assertEqual(retried["keyframe_state"], "queued")
+            self.assertIsNone(retried["keyframe_external_job_id"])
+            self.assertEqual(retried["keyframe_attempts"], 1)
+            self.assertEqual(retried["keyframe_retry_model"], "gen4_image")
+            self.assertEqual(
+                retried["keyframe_retry_reason_code"], "provider_terminal_failure"
+            )
+            self.assertIn(
+                "legacy-turbo-job", retried["keyframe_provider_job_history"]
+            )
+            self.assertEqual(current["scene_jobs"][untouched_index], untouched_before)
+            self.assertEqual(
+                control.confirm_generation(Path(root), pack.plan_id),
+                "already_approved",
+            )
+
+    def test_confirmation_fails_closed_above_reference_retry_cap(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            payload = story.read_manifest(manifest)
+            for index in range(5):
+                scene = payload["scenes"][index]
+                job = payload["scene_jobs"][index]
+                scene.update({
+                    "requires_naz_reference": True,
+                    "reference_role": "three_quarter_identity",
+                    "identity_reference_usage": "identity_only",
+                })
+                job.update({
+                    "requires_naz_reference": True,
+                    "reference_role": "three_quarter_identity",
+                    "state": "terminal_failed",
+                    "failure_code": "provider_terminal_failure",
+                    "keyframe_state": "terminal_failed",
+                    "keyframe_attempts": 1,
+                    "keyframe_failure_code": "provider_terminal_failure",
+                    "keyframe_submit_intent": {
+                        "intent_id": f"legacy-{index}",
+                        "model": "gen4_image_turbo",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "state": "accepted",
+                        "failure_code": None,
+                    },
+                })
+            payload["pack_status"] = "partially_blocked"
+            story.atomic_json(manifest, payload)
+            before = manifest.read_bytes()
+
+            with self.assertRaisesRegex(
+                story.StoryPlanError, "reference keyframe retry limit exceeded"
+            ):
+                control.confirm_generation(Path(root), pack.plan_id)
+            self.assertEqual(manifest.read_bytes(), before)
 
     def test_approval_controls_reject_stale_v2_before_mutation(self):
         for action in (control.approve_pack, control.confirm_generation):
