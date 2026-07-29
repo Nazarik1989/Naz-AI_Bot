@@ -5408,7 +5408,7 @@ async def reels_control_response(
 
         if action == BTN_REELS_CONFIRM and not NAZ_STORY_RENDER_ENABLED:
             return (
-                story_pack_control.safe_summary(payload)
+                story_pack_control.safe_progress_summary(payload)
                 + "\n\nГенерация пока безопасно выключена: подготовка приватной медиабиблиотеки не завершена.",
                 keyboard,
             )
@@ -5456,7 +5456,12 @@ async def reels_control_response(
         if resulting_plan_id != manifest.parent.name:
             raise story_production.StoryPlanError("story manifest plan_id mismatch")
         keyboard = reels_plan_keyboard(resulting_plan_id)
-        return story_pack_control.safe_summary(payload) + note, keyboard
+        summary = (
+            story_pack_control.safe_summary(payload)
+            if action == BTN_REELS_VARIANT
+            else story_pack_control.safe_progress_summary(payload)
+        )
+        return summary + note, keyboard
     except (OSError, RuntimeError, ValueError, story_production.StoryPlanError) as exc:
         reason_codes = reels_director_reason_codes(exc)
         reason_code = reels_director_reason_code(exc)

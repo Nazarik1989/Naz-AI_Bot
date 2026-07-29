@@ -173,6 +173,37 @@ class StoryMenuTests(unittest.TestCase):
             self.assertEqual(update.callback_query.answer.await_count, 2)
             provider.assert_not_awaited()
 
+    def test_scoped_status_returns_compact_manifest_progress(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack_dir = story.persist_story_queue(pack, Path(root))
+            control.approve_pack(Path(root), pack.plan_id)
+            payload = story.read_manifest(pack_dir / "story_manifest.json")
+            payload["scene_jobs"][0].update({
+                "keyframe_state": "ready",
+                "state": "in_progress",
+            })
+            payload["pack_status"] = "in_progress"
+            scene_count = len(payload["scene_jobs"])
+            story.atomic_json(pack_dir / "story_manifest.json", payload)
+
+            with patch.object(main, "NAZ_STORY_PACK_ROOT", Path(root)):
+                response, keyboard = asyncio.run(
+                    main.reels_control_response(
+                        main.BTN_REELS_STATUS,
+                        plan_id=pack.plan_id,
+                    )
+                )
+
+            self.assertIn("Reels Maker · прогресс", response)
+            self.assertIn(f"Ключевые кадры: 1/{scene_count}", response)
+            self.assertIn(f"Видео сцен: 0/{scene_count}", response)
+            self.assertNotIn("Режиссёрский план", response)
+            self.assertEqual(
+                keyboard.inline_keyboard[-1][0].callback_data,
+                f"reels_status:{pack.plan_id}",
+            )
+
     def test_scoped_variant_runs_semantic_director_before_superseding(self):
         with tempfile.TemporaryDirectory() as root:
             plan = planned()
