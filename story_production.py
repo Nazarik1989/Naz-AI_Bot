@@ -316,6 +316,10 @@ _DIRECTOR_ABSTRACT_ACTION_RE = re.compile(
     r"(?i)\b(?:decides?|explains?|imagines?|observes?|realizes?|thinks?|understands?|"
     r"verifies?|watches?|waits?)\b"
 )
+_DIRECTOR_PASSIVE_ACTION_RE = re.compile(
+    r"(?i)\b(?:lies?|looks?|remain(?:s|ing)?|rest(?:s|ing)?|"
+    r"sit(?:s|ting)?|stand(?:s|ing)?|stare(?:s|ing)?)\b"
+)
 
 
 def reels_director_prompt(
@@ -377,6 +381,9 @@ def reels_director_prompt(
         "cause the stated visible end state. Do not use symbolic gestures, passive watching, "
         "typing, clicking, trackpads, screen pantomime, magical transformation, floating parts, "
         "self-assembly or multi-step choreography. Props obey gravity and ordinary mechanics.\n\n"
+        "Concrete_action must contain one observable motion verb such as grips, presses, slides, "
+        "rotates, inserts, removes, closes or lifts. Static poses such as rests, remains, stands, "
+        "sits or looks belong only in start_state or end_state, never in concrete_action.\n\n"
         "Return strict JSON only with this shape: "
         '{"director_version":"reels-semantic-director-v3","visual_concept":"...",'
         '"story_spine":"...","continuity_anchor":"...","primary_setting":"...",'
@@ -432,7 +439,13 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
         "properties": {
             "subject_kind": {"type": "string", "enum": list(DIRECTOR_SUBJECT_KINDS)},
             "subject_detail": {"type": "string"},
-            "concrete_action": {"type": "string"},
+            "concrete_action": {
+                "type": "string",
+                "description": (
+                    "Exactly one observable physical motion in five seconds. No UI action, "
+                    "passive pose, magic, or multi-step choreography. Naz scenes start with Naz."
+                ),
+            },
             "start_state": {"type": "string"},
             "end_state": {"type": "string"},
             "shot_size": {"type": "string", "enum": list(SHOT_SIZES)},
@@ -633,13 +646,17 @@ def parse_reels_director_response(
         ):
             errors.append(f"{scene_prefix}_subject_identity_invalid")
         if action:
+            known_physical_motion = bool(_DIRECTOR_PHYSICAL_ACTION_RE.search(action))
             if _DIRECTOR_INTERFACE_ACTION_RE.search(action):
                 errors.append(f"{scene_prefix}_interface_pantomime")
             if _DIRECTOR_MAGIC_ACTION_RE.search(action):
                 errors.append(f"{scene_prefix}_impossible_action")
             if _DIRECTOR_MULTI_ACTION_RE.search(action):
                 errors.append(f"{scene_prefix}_multi_action")
-            if not _DIRECTOR_PHYSICAL_ACTION_RE.search(action):
+            if (
+                not known_physical_motion
+                and _DIRECTOR_PASSIVE_ACTION_RE.search(action)
+            ):
                 errors.append(f"{scene_prefix}_physical_action_missing")
             if (
                 subject_kind == "naz_human"
@@ -649,7 +666,7 @@ def parse_reels_director_response(
                 errors.append(f"{scene_prefix}_naz_action_subject_missing")
             if (
                 _DIRECTOR_ABSTRACT_ACTION_RE.search(action)
-                and not _DIRECTOR_PHYSICAL_ACTION_RE.search(action)
+                and not known_physical_motion
             ):
                 errors.append(f"{scene_prefix}_abstract_action")
 

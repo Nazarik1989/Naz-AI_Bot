@@ -189,6 +189,37 @@ class StoryFirstTests(unittest.TestCase):
                     )
                 self.assertIn(reason, raised.exception.reason_codes)
 
+    def test_director_accepts_unlisted_but_observable_object_motion(self):
+        payload = json.loads(director_response(planned()))
+        payload["scenes"][0]["concrete_action"] = (
+            "The optical-titanium prototype shudders once under controlled load"
+        )
+
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), planned(), SAFE_FACTS
+        )
+
+        self.assertEqual(
+            treatment.scenes[0].concrete_action,
+            payload["scenes"][0]["concrete_action"],
+        )
+
+    def test_director_rejects_passive_pose_as_concrete_action(self):
+        payload = json.loads(director_response(planned()))
+        payload["scenes"][0]["concrete_action"] = (
+            "The optical-titanium prototype rests beside the inactive coupling"
+        )
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), planned(), SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_physical_action_missing",
+            raised.exception.reason_codes,
+        )
+
     def test_new_manifest_routes_naz_to_gen45_and_objects_to_turbo(self):
         plan = dataclasses.replace(
             planned(),
