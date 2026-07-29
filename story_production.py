@@ -47,6 +47,12 @@ CAMERA_MOTION_PROMPTS = {
     "locked with real subject motion": "The locked-off camera remains still",
 }
 DIRECTOR_SUBJECT_KINDS = ("naz_human", "physical_object")
+DIRECTOR_MOTION_CLASSES = (
+    "adjust", "align", "bend", "calibrate", "carry", "close", "connect", "cut",
+    "disconnect", "fold", "grip", "insert", "lift", "lock", "lower", "open",
+    "oscillate", "place", "pour", "press", "pull", "push", "remove", "rotate",
+    "slide", "test", "unlock", "walk",
+)
 CANONICAL_NAZ_SUBJECT = "Naz, the same real adult human founder"
 CANONICAL_NAZ_WARDROBE = (
     "the same fitted matte-black technical overshirt, plain black shirt, "
@@ -302,16 +308,6 @@ _DIRECTOR_MAGIC_ACTION_RE = re.compile(
     r"self[- ]assembles?|magically|instant(?:ly)? transforms?)\b"
 )
 _DIRECTOR_MULTI_ACTION_RE = re.compile(r"(?i)(?:;|\bthen\b|\bafter that\b|\bnext,?\b)")
-_DIRECTOR_PHYSICAL_ACTION_RE = re.compile(
-    r"(?i)\b(?:adjusts?|aligns?|assembles?|attaches?|calibrates?|carries?|closes?|"
-    r"bends?|clamps?|clips?|compresses?|connects?|crosses?|cuts?|emits?|engages?|"
-    r"extends?|fastens?|fits?|folds?|holds?|inserts?|installs?|lifts?|locks?|lowers?|"
-    r"measures?|moves?|opens?|oscillates?|picks?|pivots?|places?|plugs?|pours?|"
-    r"presses?|pulls?|pushes?|raises?|releases?|removes?|retracts?|rolls?|rotates?|"
-    r"routes?|screws?|seats?|secures?|sets?|slides?|snaps?|switches?|tests?|tilts?|"
-    r"tightens?|travels?|turns?|twists?|unfastens?|unlocks?|unplugs?|unscrews?|"
-    r"vibrates?|walks?)\b"
-)
 _DIRECTOR_ABSTRACT_ACTION_RE = re.compile(
     r"(?i)\b(?:decides?|explains?|imagines?|observes?|realizes?|thinks?|understands?|"
     r"verifies?|watches?|waits?)\b"
@@ -320,6 +316,36 @@ _DIRECTOR_PASSIVE_ACTION_RE = re.compile(
     r"(?i)\b(?:lies?|looks?|remain(?:s|ing)?|rest(?:s|ing)?|"
     r"sit(?:s|ting)?|stand(?:s|ing)?|stare(?:s|ing)?)\b"
 )
+_DIRECTOR_MOTION_CLASS_RE = {
+    "adjust": re.compile(r"(?i)\badjust(?:s|ed|ing)?\b"),
+    "align": re.compile(r"(?i)\balign(?:s|ed|ing)?\b"),
+    "bend": re.compile(r"(?i)\bbend(?:s|ing)?\b|\bbent\b"),
+    "calibrate": re.compile(r"(?i)\bcalibrat(?:e|es|ed|ing)\b"),
+    "carry": re.compile(r"(?i)\bcarr(?:y|ies|ied|ying)\b"),
+    "close": re.compile(r"(?i)\bclos(?:e|es|ed|ing)\b"),
+    "connect": re.compile(r"(?i)\bconnect(?:s|ed|ing)?\b|\bplug(?:s|ged|ging)?\b"),
+    "cut": re.compile(r"(?i)\bcut(?:s|ting)?\b"),
+    "disconnect": re.compile(r"(?i)\bdisconnect(?:s|ed|ing)?\b|\bunplug(?:s|ged|ging)?\b"),
+    "fold": re.compile(r"(?i)\bfold(?:s|ed|ing)?\b"),
+    "grip": re.compile(r"(?i)\bgrip(?:s|ped|ping)?\b|\bgrasp(?:s|ed|ing)?\b"),
+    "insert": re.compile(r"(?i)\binsert(?:s|ed|ing)?\b"),
+    "lift": re.compile(r"(?i)\blift(?:s|ed|ing)?\b|\brais(?:e|es|ed|ing)\b"),
+    "lock": re.compile(r"(?i)\block(?:s|ed|ing)?\b|\bsecur(?:e|es|ed|ing)\b"),
+    "lower": re.compile(r"(?i)\blower(?:s|ed|ing)?\b"),
+    "open": re.compile(r"(?i)\bopen(?:s|ed|ing)?\b"),
+    "oscillate": re.compile(r"(?i)\boscillat(?:e|es|ed|ing)\b|\bshudder(?:s|ed|ing)?\b|\bvibrat(?:e|es|ed|ing)\b"),
+    "place": re.compile(r"(?i)\bplac(?:e|es|ed|ing)\b|\bset(?:s|ting)?\b"),
+    "pour": re.compile(r"(?i)\bpour(?:s|ed|ing)?\b"),
+    "press": re.compile(r"(?i)\bpress(?:es|ed|ing)?\b|\bdepress(?:es|ed|ing)?\b"),
+    "pull": re.compile(r"(?i)\bpull(?:s|ed|ing)?\b"),
+    "push": re.compile(r"(?i)\bpush(?:es|ed|ing)?\b"),
+    "remove": re.compile(r"(?i)\bremov(?:e|es|ed|ing)\b|\bextract(?:s|ed|ing)?\b"),
+    "rotate": re.compile(r"(?i)\brotat(?:e|es|ed|ing)\b|\bturn(?:s|ed|ing)?\b|\bpivot(?:s|ed|ing)?\b|\btwist(?:s|ed|ing)?\b"),
+    "slide": re.compile(r"(?i)\bslid(?:e|es|ing)\b"),
+    "test": re.compile(r"(?i)\btest(?:s|ed|ing)?\b|\bmeasur(?:e|es|ed|ing)\b"),
+    "unlock": re.compile(r"(?i)\bunlock(?:s|ed|ing)?\b|\breleas(?:e|es|ed|ing)\b"),
+    "walk": re.compile(r"(?i)\bwalk(?:s|ed|ing)?\b|\bstep(?:s|ped|ping)?\b"),
+}
 
 
 def reels_director_prompt(
@@ -390,6 +416,7 @@ def reels_director_prompt(
         '"admin_concept_ru":"...",'
         '"scenes":[{"subject_kind":"naz_human|physical_object",'
         '"subject_detail":"...",'
+        '"motion_class":"adjust|align|bend|calibrate|carry|close|connect|cut|disconnect|fold|grip|insert|lift|lock|lower|open|oscillate|place|pour|press|pull|push|remove|rotate|slide|test|unlock|walk",'
         '"concrete_action":"...","start_state":"...","end_state":"...",'
         '"shot_size":"wide|medium|close|macro","camera_motion":'
         '"slow push|controlled pan|handheld follow|locked with real subject motion",'
@@ -413,7 +440,8 @@ def reels_director_prompt(
         "steps of this same story. "
         "For naz_human, subject_detail is simply Naz; identity is injected by the application. "
         "For physical_object, subject_detail names one concrete non-human object. Every action "
-        "and end state must be physical, content-specific and distinct. Put observation or proof "
+        "and end state must be physical, content-specific and distinct. Choose motion_class first, "
+        "then use that exact motion as the single verb of concrete_action. Put observation or proof "
         "in end_state, never as a second performer action. Obey "
         "identity_requirement exactly. Concise physical place names such as Naz AI Lab or server "
         "room are valid primary_setting values; technical nouns are not transport metadata by themselves. "
@@ -433,12 +461,13 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "required": [
-            "subject_kind", "subject_detail", "concrete_action",
+            "subject_kind", "subject_detail", "motion_class", "concrete_action",
             "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
         ],
         "properties": {
             "subject_kind": {"type": "string", "enum": list(DIRECTOR_SUBJECT_KINDS)},
             "subject_detail": {"type": "string"},
+            "motion_class": {"type": "string", "enum": list(DIRECTOR_MOTION_CLASSES)},
             "concrete_action": {
                 "type": "string",
                 "description": (
@@ -601,7 +630,7 @@ def parse_reels_director_response(
     actions: list[str] = []
     previous_end_state = ""
     expected_scene_fields = {
-        "subject_kind", "subject_detail", "concrete_action",
+        "subject_kind", "subject_detail", "motion_class", "concrete_action",
         "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
     }
     for index, (row, expected_role) in enumerate(zip(rows, expected_roles)):
@@ -631,6 +660,10 @@ def parse_reels_director_response(
         )
 
         subject_kind = str(row.get("subject_kind", "")).strip().casefold()
+        motion_class = str(row.get("motion_class", "")).strip().casefold()
+        motion_pattern = _DIRECTOR_MOTION_CLASS_RE.get(motion_class)
+        if motion_pattern is None:
+            errors.append(f"{scene_prefix}_motion_class_invalid")
         if subject_kind not in DIRECTOR_SUBJECT_KINDS:
             errors.append(f"{scene_prefix}_subject_kind_invalid")
             subject = ""
@@ -646,7 +679,9 @@ def parse_reels_director_response(
         ):
             errors.append(f"{scene_prefix}_subject_identity_invalid")
         if action:
-            known_physical_motion = bool(_DIRECTOR_PHYSICAL_ACTION_RE.search(action))
+            known_physical_motion = bool(motion_pattern and motion_pattern.search(action))
+            if motion_pattern and not known_physical_motion:
+                errors.append(f"{scene_prefix}_motion_class_mismatch")
             if _DIRECTOR_INTERFACE_ACTION_RE.search(action):
                 errors.append(f"{scene_prefix}_interface_pantomime")
             if _DIRECTOR_MAGIC_ACTION_RE.search(action):
