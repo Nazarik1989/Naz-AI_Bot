@@ -21,7 +21,11 @@ administrator's private chat automatically; there is no manual download step.
   `OPENAI_API_KEY`, voice, Voice Hub, or realtime credentials.
 - `--check-config` and `--dry-run` make no provider calls.
 - One scene is active per worker invocation. Limits are at most seven scenes,
-  two retries, seven paid jobs and 56 generated seconds per UTC day by default.
+  two video retries, seven initial keyframes, seven paid video jobs and 56
+  generated seconds per UTC day by default. A legacy identity keyframe that
+  failed on the old Turbo route may be retried once through `gen4_image` only
+  after explicit confirmation; these migrations have a separate four-per-day
+  ceiling.
 - `NAZ_VIDEO_AUTO_FALLBACK=true` is rejected. Gen-4.5 is never submitted until
   the administrator confirms the pending escalation with the existing
   `Подтвердить генерацию` button.
@@ -79,9 +83,12 @@ concept and actions are generated from cleaned causal facts and validated before
 the pack exists; transport metadata, paths and generic `fact N` placeholders are
 rejected. Naz AI Lab is a coherent world, not one mandatory room or a fixed
 action sequence. A v5
-pack first creates one asynchronous directed
-keyframe per scene (`gen4_image_turbo` with `@Naz` for identity scenes,
-`gen4_image` for object-only scenes), then animates that immutable keyframe.
+pack first creates one asynchronous directed keyframe per scene with
+`gen4_image`; identity scenes keep the tagged `@Naz` reference while object-only
+scenes use the text-only form. It then animates that immutable keyframe with the
+video route. `gen4_image_turbo` is not used for new keyframes. A bounded retry
+of legacy Turbo identity failures stays in the same plan, preserves completed
+scenes and appears in the existing progress card.
 No keyframe or video task is submitted before explicit approval. v1/v2/v3/v4 packs
 remain inspectable but are read-only and cannot silently use the old direct-avatar route.
 
