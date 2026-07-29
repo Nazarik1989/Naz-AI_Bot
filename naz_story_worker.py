@@ -46,6 +46,7 @@ SAFE_FAILURE_CODES = {
     "provider_download_failed", "provider_download_not_mp4", "provider_job_id_missing",
     "provider_download_not_image", "keyframe_identity_tag_missing",
     "keyframe_artifact_invalid", "keyframe_prompt_invalid", "keyframe_prompt_too_long",
+    "keyframe_retry_contract_invalid",
     "daily_keyframe_limit_reached",
     "provider_cancel_uncertain",
     "provider_endpoint_not_found", "provider_input_invalid", "provider_output_url_missing",
@@ -66,6 +67,7 @@ SAFE_FAILURE_CODES = {
 CANONICAL_PRIMARY_MODEL = "gen4_turbo"
 CANONICAL_SECONDARY_MODEL = "gen4.5"
 CANONICAL_MODEL_PRIORITY = (CANONICAL_PRIMARY_MODEL, CANONICAL_SECONDARY_MODEL)
+REFERENCE_KEYFRAME_RETRY_DAILY_LIMIT = 4
 SECONDARY_ESCALATION_CODES = frozenset({
     "video_prompt_image_required",
     "provider_terminal_failure",
@@ -311,6 +313,31 @@ def _keyframe_budget_usage(root: Path) -> int:
                 if not isinstance(intent, dict) or intent.get("state") not in {
                     "accepted", "ambiguous", "submitting",
                 }:
+                    continue
+                created = _utc(intent.get("created_at"))
+                jobs += int(bool(created and created.date() == now))
+    return jobs
+
+
+def _reference_keyframe_retry_budget_usage(root: Path) -> int:
+    now = datetime.now(timezone.utc).date()
+    jobs = 0
+    for manifest in root.glob("*/story_manifest.json"):
+        try:
+            payload = story_production.read_manifest(manifest)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        for job in payload.get("scene_jobs", []):
+            history = job.get("keyframe_submit_intent_history")
+            intents = list(history) if isinstance(history, list) else []
+            if isinstance(job.get("keyframe_submit_intent"), dict):
+                intents.append(job["keyframe_submit_intent"])
+            for intent in intents:
+                if not isinstance(intent, dict):
+                    continue
+                if intent.get("approval_scope") != "reference_model_retry":
+                    continue
+                if intent.get("state") not in {"accepted", "ambiguous", "submitting"}:
                     continue
                 created = _utc(intent.get("created_at"))
                 jobs += int(bool(created and created.date() == now))
@@ -622,7 +649,31 @@ def _process_keyframe(
         _mark_keyframe_ambiguous(job, payload, manifest)
         return None
     if state in {"planned", "queued"}:
-        if _keyframe_budget_usage(config.pack_root) >= config.daily_keyframe_limit:
+        reference_retry = bool(job.get("keyframe_retry_approved_at"))
+        if reference_retry and not (
+            bool(scene.get("requires_naz_reference"))
+            and job.get("keyframe_retry_model") == "gen4_image"
+            and int(job.get("keyframe_attempts", 0)) == 1
+        ):
+            job.update({
+                "state": "terminal_failed",
+                "failure_code": "keyframe_retry_contract_invalid",
+                "keyframe_state": "terminal_failed",
+                "keyframe_failure_code": "keyframe_retry_contract_invalid",
+            })
+            _set_pack_status(payload)
+            _write(manifest, payload)
+            return None
+        if reference_retry and (
+            _reference_keyframe_retry_budget_usage(config.pack_root)
+            >= REFERENCE_KEYFRAME_RETRY_DAILY_LIMIT
+        ):
+            job["keyframe_failure_code"] = "daily_keyframe_limit_reached"
+            _write(manifest, payload)
+            return None
+        if not reference_retry and (
+            _keyframe_budget_usage(config.pack_root) >= config.daily_keyframe_limit
+        ):
             job["keyframe_failure_code"] = "daily_keyframe_limit_reached"
             _write(manifest, payload)
             return None
@@ -652,15 +703,18 @@ def _process_keyframe(
         intent_id = hashlib.sha256(
             f"{payload.get('plan_id')}|{job.get('scene_id')}|keyframe|{attempt}|{created_at}".encode()
         ).hexdigest()[:24]
+        submit_intent = {
+            "intent_id": intent_id, "model": "gen4_image",
+            "created_at": created_at, "state": "submitting", "failure_code": None,
+        }
+        if reference_retry:
+            submit_intent["approval_scope"] = "reference_model_retry"
         job.update({
             "keyframe_state": "submitting", "keyframe_attempts": attempt,
             "keyframe_external_job_id": None, "keyframe_submitted_at": created_at,
             "keyframe_provider_status": "submit_intent_persisted",
             "keyframe_failure_code": None,
-            "keyframe_submit_intent": {
-                "intent_id": intent_id, "model": "gen4_image_turbo" if original else "gen4_image",
-                "created_at": created_at, "state": "submitting", "failure_code": None,
-            },
+            "keyframe_submit_intent": submit_intent,
         })
         _write(manifest, payload)
         try:

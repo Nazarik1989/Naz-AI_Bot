@@ -336,7 +336,10 @@ class RunwayVideoProvider:
         if utf16_code_units(prompt) > RUNWAY_PROMPT_MAX_UTF16_UNITS:
             raise ProviderError("keyframe_prompt_too_long")
         payload: dict[str, Any] = {
-            "model": "gen4_image_turbo" if request.reference_path else "gen4_image",
+            # gen4_image is the supported route for both text-only keyframes
+            # and identity references.  Turbo is Text+Image-only and proved
+            # unreliable for the canonical Naz reference in production.
+            "model": "gen4_image",
             "promptText": prompt,
             "ratio": "720:960",
         }
