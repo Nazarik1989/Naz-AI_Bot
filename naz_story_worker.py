@@ -642,6 +642,7 @@ def _process_keyframe(
         prompt = append_prompt_guidance(
             story_production.validate_provider_prompt(str(scene.get("keyframe_prompt", ""))),
             original.body_guidance if original else "",
+            too_long_code="keyframe_prompt_too_long",
         )
         attempt = int(job.get("keyframe_attempts", 0)) + 1
         created_at = datetime.now(timezone.utc).isoformat()

@@ -17,6 +17,7 @@ from story_video_provider import (
     RunwayVideoProvider,
     SceneRequest,
     append_prompt_guidance,
+    compact_runway_prompt,
     provider_from_environment,
     utf16_code_units,
 )
@@ -123,6 +124,34 @@ class RunwayModelContractTests(unittest.TestCase):
         self.assertTrue(result.startswith(base))
         self.assertLessEqual(utf16_code_units(result), RUNWAY_PROMPT_MAX_UTF16_UNITS)
         self.assertEqual(append_prompt_guidance("a" * 995, "stable body"), "a" * 995)
+
+    def test_bounded_legacy_prompt_keeps_visual_core_and_safety_tail(self):
+        prompt = (
+            "Vertical keyframe. Physical action: Naz closes one titanium connector. "
+            + "Material continuity and cold laboratory light. " * 24
+            + "No text, logos, HUD, code, copper, gold, robots or extra people."
+        )
+
+        compacted = compact_runway_prompt(
+            prompt,
+            too_long_code="keyframe_prompt_too_long",
+        )
+
+        self.assertLessEqual(
+            utf16_code_units(compacted),
+            RUNWAY_PROMPT_MAX_UTF16_UNITS,
+        )
+        self.assertIn("Physical action: Naz closes one titanium connector", compacted)
+        self.assertTrue(compacted.endswith(
+            "No text, logos, HUD, code, copper, gold, robots or extra people."
+        ))
+
+    def test_unbounded_or_tail_less_prompt_still_fails_closed(self):
+        with self.assertRaisesRegex(ProviderError, "keyframe_prompt_too_long"):
+            compact_runway_prompt(
+                "unsafe filler " * 120,
+                too_long_code="keyframe_prompt_too_long",
+            )
 
     def test_invalid_provider_input_has_safe_specific_code(self):
         transport = MockTransport([(400, {"Content-Type": "application/json"}, b"")])

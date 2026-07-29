@@ -20,8 +20,10 @@ from story_video_provider import (
     FakeVideoProvider,
     ProviderError,
     ProviderJob,
+    RUNWAY_PROMPT_MAX_UTF16_UNITS,
     RunwayVideoProvider,
     SceneRequest,
+    utf16_code_units,
 )
 from tests.test_story_production import SAFE_FACTS, planned
 
@@ -120,6 +122,37 @@ class ProviderTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_existing_approved_pack_compacts_keyframe_before_provider_submit(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            scene = payload["scenes"][0]
+            scene["keyframe_prompt"] = (
+                "Vertical keyframe. Physical action remains visible. "
+                + "Cold laboratory continuity and precise materials. " * 22
+                + "No text, logos, HUD, code, copper, gold, robots or extra people."
+            )
+            story.atomic_json(manifest, payload)
+            provider = FakeVideoProvider()
+
+            status = worker.process_pack(
+                pack.plan_id,
+                config=config(root),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+
+            self.assertEqual(status, "queued")
+            self.assertEqual(len(provider.keyframe_submissions), 1)
+            submitted_prompt = provider.keyframe_submissions[0].prompt
+            self.assertLessEqual(
+                utf16_code_units(submitted_prompt),
+                RUNWAY_PROMPT_MAX_UTF16_UNITS,
+            )
+            self.assertTrue(submitted_prompt.endswith(
+                "No text, logos, HUD, code, copper, gold, robots or extra people."
+            ))
+
     def test_directed_keyframe_completes_before_video_and_is_reused_as_first_frame(self):
         with tempfile.TemporaryDirectory() as root:
             pack, pack_dir, manifest = make_pack(root, keyframes_ready=False)

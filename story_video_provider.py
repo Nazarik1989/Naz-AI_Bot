@@ -27,6 +27,7 @@ RUNWAY_MODEL_DURATIONS: Mapping[str, frozenset[int]] = {
 RUNWAY_PORTRAIT_SIZE = (720, 1280)
 RUNWAY_DATA_URI_BASE64_LIMIT = 5 * 1024 * 1024
 RUNWAY_PROMPT_MAX_UTF16_UNITS = 1000
+RUNWAY_PROMPT_COMPACT_MAX_UTF16_UNITS = 1400
 _REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 _REFERENCE_BACKGROUND = (2, 3, 9)
 
@@ -115,14 +116,72 @@ def utf16_code_units(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
 
-def append_prompt_guidance(prompt: str, guidance: str) -> str:
+def _truncate_utf16_at_word(value: str, budget: int) -> str:
+    fitted: list[str] = []
+    used = 0
+    for character in value:
+        width = utf16_code_units(character)
+        if used + width > budget:
+            break
+        fitted.append(character)
+        used += width
+    compacted = "".join(fitted).rstrip()
+    if len(compacted) < len(value) and " " in compacted:
+        compacted = compacted.rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return compacted
+
+
+def compact_runway_prompt(
+    prompt: str,
+    *,
+    too_long_code: str = "video_prompt_too_long",
+) -> str:
+    """Fit a bounded legacy prompt while preserving its safety prohibition tail."""
+    base = " ".join(str(prompt).split())
+    units = utf16_code_units(base)
+    if units <= RUNWAY_PROMPT_MAX_UTF16_UNITS:
+        return base
+    if units > RUNWAY_PROMPT_COMPACT_MAX_UTF16_UNITS:
+        raise ProviderError(too_long_code)
+
+    safety_markers = (
+        " No scene replacement,",
+        " No text, captions,",
+        " No text, logos,",
+        " No text/logos/",
+    )
+    marker_index = max(base.rfind(marker) for marker in safety_markers)
+    if marker_index <= 0:
+        raise ProviderError(too_long_code)
+    prefix = base[:marker_index].rstrip(" ,;:-")
+    safety_tail = base[marker_index:].strip()
+    prefix_budget = (
+        RUNWAY_PROMPT_MAX_UTF16_UNITS
+        - utf16_code_units(safety_tail)
+        - utf16_code_units(". ")
+    )
+    if prefix_budget <= 0:
+        raise ProviderError(too_long_code)
+    fitted_prefix = _truncate_utf16_at_word(prefix, prefix_budget)
+    if not fitted_prefix:
+        raise ProviderError(too_long_code)
+    result = f"{fitted_prefix}. {safety_tail}"
+    if utf16_code_units(result) > RUNWAY_PROMPT_MAX_UTF16_UNITS:
+        raise ProviderError(too_long_code)
+    return result
+
+
+def append_prompt_guidance(
+    prompt: str,
+    guidance: str,
+    *,
+    too_long_code: str = "video_prompt_too_long",
+) -> str:
     """Append optional continuity guidance without exceeding Runway's limit."""
 
-    base = prompt.strip()
+    base = compact_runway_prompt(prompt, too_long_code=too_long_code)
     if not base:
         raise ProviderError("video_prompt_invalid")
-    if utf16_code_units(base) > RUNWAY_PROMPT_MAX_UTF16_UNITS:
-        raise ProviderError("video_prompt_too_long")
     normalized_guidance = guidance.strip()
     prefix = " Body continuity: "
     addition = prefix + normalized_guidance if normalized_guidance else ""
@@ -132,18 +191,8 @@ def append_prompt_guidance(prompt: str, guidance: str) -> str:
     remaining = RUNWAY_PROMPT_MAX_UTF16_UNITS - utf16_code_units(base)
     if remaining <= utf16_code_units(prefix):
         return base
-    fitted: list[str] = []
-    used = 0
     guidance_budget = remaining - utf16_code_units(prefix)
-    for character in normalized_guidance:
-        width = utf16_code_units(character)
-        if used + width > guidance_budget:
-            break
-        fitted.append(character)
-        used += width
-    compacted = "".join(fitted).rstrip()
-    if " " in compacted:
-        compacted = compacted.rsplit(" ", 1)[0].rstrip()
+    compacted = _truncate_utf16_at_word(normalized_guidance, guidance_budget)
     return base + prefix + compacted if compacted else base
 
 
