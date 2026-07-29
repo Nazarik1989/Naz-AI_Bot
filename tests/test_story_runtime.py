@@ -830,7 +830,50 @@ class WorkerTests(unittest.TestCase):
                 composer=DummyComposer(),
             )
             self.assertEqual(
-                control.approve_frontal_reference_retry(Path(root), pack.plan_id),
+                control.approve_concise_identity_retry(Path(root), pack.plan_id),
+                "concise_identity_keyframes_retry_approved",
+            )
+
+            worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+            self.assertEqual(len(provider.keyframe_submissions), 3)
+            concise_request = provider.keyframe_submissions[2]
+            self.assertEqual(concise_request.reference_path, primary.resolve())
+            self.assertIn("@Naz", concise_request.prompt)
+            self.assertLess(utf16_code_units(concise_request.prompt), 700)
+            concise = story.read_manifest(manifest)["scene_jobs"][failed_index]
+            self.assertEqual(concise["keyframe_attempts"], 4)
+            self.assertEqual(
+                concise["keyframe_submit_intent"]["approval_scope"],
+                "concise_identity_retry",
+            )
+
+            worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+            self.assertEqual(len(provider.keyframe_submissions), 3)
+            provider.fail(concise["keyframe_external_job_id"])
+            worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+            self.assertEqual(
+                control.approve_concise_identity_retry(Path(root), pack.plan_id),
                 "already_approved",
             )
 
@@ -1215,6 +1258,47 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(current["scene_jobs"][4], untouched_before)
             self.assertEqual(
                 control.approve_frontal_reference_retry(Path(root), pack.plan_id),
+                "already_approved",
+            )
+
+            first = current["scene_jobs"][0]
+            first.update({
+                "state": "terminal_failed",
+                "failure_code": "provider_terminal_failure",
+                "keyframe_state": "terminal_failed",
+                "keyframe_external_job_id": "frontal-reference-job",
+                "keyframe_attempts": 3,
+                "keyframe_failure_code": "provider_terminal_failure",
+                "keyframe_submit_intent": {
+                    "intent_id": "frontal-reference-intent",
+                    "model": "gen4_image",
+                    "created_at": approved_at,
+                    "state": "accepted",
+                    "approval_scope": "frontal_reference_retry",
+                    "external_job_id": "frontal-reference-job",
+                    "failure_code": None,
+                },
+            })
+            current["pack_status"] = "partially_blocked"
+            story.atomic_json(manifest, current)
+
+            self.assertEqual(
+                control.approve_concise_identity_retry(Path(root), pack.plan_id),
+                "concise_identity_keyframes_retry_approved",
+            )
+            concise = story.read_manifest(manifest)
+            self.assertEqual(
+                [job["keyframe_attempts"] for job in concise["scene_jobs"][:4]],
+                [3, 1, 1, 1],
+            )
+            for job in concise["scene_jobs"][:4]:
+                self.assertEqual(job["keyframe_retry_phase"], "concise_identity")
+                self.assertEqual(
+                    job["keyframe_retry_prompt_mode"], "concise_structured"
+                )
+                self.assertTrue(job["keyframe_concise_retry_approved_at"])
+            self.assertEqual(
+                control.approve_concise_identity_retry(Path(root), pack.plan_id),
                 "already_approved",
             )
 
