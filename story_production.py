@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from editorial_orchestrator import EditorialPlan
 from story_pack_lock import ensure_private_group_access
+from story_video_provider import ProviderError, compact_runway_prompt
 
 
 STORY_SCHEMA = "naz-story-pack-v5"
@@ -725,6 +726,17 @@ def _visual_treatment(plan: EditorialPlan, facts: tuple[str, ...]) -> str:
     return candidates[_rank(plan.plan_id, "visual-treatment") % len(candidates)]
 
 
+def _provider_excerpt(value: str, maximum: int) -> str:
+    """Keep the immutable director field intact while bounding provider prose."""
+    text = " ".join(str(value).split())
+    if len(text) <= maximum:
+        return text
+    compacted = text[:maximum].rstrip()
+    if " " in compacted:
+        compacted = compacted.rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return compacted
+
+
 def _scene(
     plan: EditorialPlan, *, continuity_id: str, role: str, index: int, fact: str,
     treatment_key: str,
@@ -781,6 +793,12 @@ def _scene(
         visual_concept = str(treatment["label"])
         story_spine = visual_concept
         continuity_anchor = "one evolving physical Naz AI Lab mechanism"
+    prompt_visual_concept = _provider_excerpt(visual_concept, 180)
+    prompt_setting = _provider_excerpt(setting, 120)
+    prompt_subject = _provider_excerpt(subject, 120)
+    prompt_action = _provider_excerpt(action, 180)
+    prompt_continuity_anchor = _provider_excerpt(continuity_anchor, 90)
+    prompt_end_state = _provider_excerpt(end_state, 180)
     standalone = f"{role}: {fact}"[:180]
     overlay = standalone[:72]
     continuity = (
@@ -806,8 +824,9 @@ def _scene(
     )
     keyframe_prompt = (
         f"Cinematic vertical 9:16 keyframe. {identity_instruction}"
-        f"Concept: {visual_concept}. Location: {setting}. Subject: {subject}. Frozen action: {action}. "
-        f"Same story anchor: {continuity_anchor}. "
+        f"Concept: {prompt_visual_concept}. Location: {prompt_setting}. "
+        f"Subject: {prompt_subject}. Frozen action: {prompt_action}. "
+        f"Same story anchor: {prompt_continuity_anchor}. "
         f"Shot: {shot_size}; motion room: {camera_motion}. "
         "Human intelligence / machine precision. Deep Black #020309, Midnight Blue #070B20, "
         "Electric Blue #185CFF, Ultraviolet #762DFF and Ice Silver #D7E5FF. "
@@ -819,12 +838,20 @@ def _scene(
     provider_prompt = (
         f"Animate the supplied directed keyframe as a vertical 9:16 CLEAN video master. Role: {role}. "
         f"Keep the exact subject, Naz identity, laboratory architecture, materials and lighting from the keyframe. "
-        f"Physical action: {action}. Camera: {camera_motion}. "
-        f"Continue the same story spine ({story_spine}) and continuity anchor ({continuity_anchor}). "
-        f"Begin in the supplied pose and end when {end_state}. "
+        f"Physical action: {prompt_action}. Camera: {camera_motion}. "
+        f"Continue the same story spine ({story_spine}) and continuity anchor ({prompt_continuity_anchor}). "
+        f"Begin in the supplied pose and end when {prompt_end_state}. "
         "Natural restrained human movement and one clear physical state change are mandatory. "
         "No scene replacement, morphing, extra people, text, logos, HUD, platform UI, code or watermarks."
     )
+    try:
+        keyframe_prompt = compact_runway_prompt(
+            keyframe_prompt,
+            too_long_code="keyframe_prompt_too_long",
+        )
+        provider_prompt = compact_runway_prompt(provider_prompt)
+    except ProviderError as exc:
+        raise StoryPlanError(exc.code) from exc
     return ScenePlan(
         scene_id=f"{index + 1:02d}_{role}", role=role, standalone_meaning=standalone,
         concrete_action=action,
