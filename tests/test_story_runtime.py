@@ -459,6 +459,40 @@ class WorkerTests(unittest.TestCase):
         result = worker.check_config(config(Path.cwd(), reference_path=local_reference), {})
         self.assertIn("approved_reference_inside_repository", result["issues"])
 
+    def test_hybrid_route_selects_models_and_never_requests_secondary(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = config(root)
+            base_route = {
+                "tier": "primary",
+                "primary_model": None,
+                "secondary_model": None,
+                "primary_failure_code": None,
+                "secondary_requested_at": None,
+                "secondary_approved_at": None,
+                "scene_strategy": story.HYBRID_MODEL_ROUTE,
+            }
+            naz_job = {
+                "state": "queued",
+                "requires_naz_reference": True,
+                "model_route": {**base_route, "selected_model": "gen4.5"},
+            }
+            object_job = {
+                "state": "queued",
+                "requires_naz_reference": False,
+                "model_route": {**base_route, "selected_model": "gen4_turbo"},
+            }
+
+            self.assertEqual(worker._selected_model(naz_job, cfg), "gen4.5")
+            self.assertEqual(worker._selected_model(object_job, cfg), "gen4_turbo")
+
+            provider = RunwayVideoProvider(
+                api_key="dedicated-key", model="gen4_turbo", transport=MockTransport([])
+            )
+            self.assertFalse(worker._request_secondary(
+                object_job, {}, "provider_terminal_failure", cfg, provider
+            ))
+            self.assertIsNone(object_job["model_route"]["secondary_requested_at"])
+
     def test_repeat_run_reuses_external_job(self):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root)
@@ -552,6 +586,7 @@ class WorkerTests(unittest.TestCase):
             payload = json.loads(manifest.read_text())
             payload["scene_jobs"][0]["requires_naz_reference"] = True
             payload["scene_jobs"][0]["reference_role"] = "frontal_identity"
+            payload["scene_jobs"][0]["model_route"]["selected_model"] = "gen4.5"
             payload["scenes"][0]["requires_naz_reference"] = True
             payload["scenes"][0]["reference_role"] = "frontal_identity"
             story.atomic_json(manifest, payload)
@@ -657,6 +692,7 @@ class WorkerTests(unittest.TestCase):
                 "requires_naz_reference": True,
                 "reference_role": "three_quarter_identity",
             })
+            payload["scene_jobs"][0]["model_route"]["selected_model"] = "gen4.5"
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
             worker.process_pack(
@@ -783,6 +819,7 @@ class WorkerTests(unittest.TestCase):
                 "requires_naz_reference": True,
                 "reference_role": "three_quarter_identity",
             })
+            failed["model_route"]["selected_model"] = "gen4.5"
             failed.update({
                 "state": "terminal_failed",
                 "failure_code": "provider_terminal_failure",
@@ -1184,6 +1221,7 @@ class ControlTests(unittest.TestCase):
                     "failure_code": None,
                 },
             })
+            failed["model_route"]["selected_model"] = "gen4.5"
             untouched_before = dict(untouched)
             payload["pack_status"] = "partially_blocked"
             story.atomic_json(manifest, payload)
@@ -1239,6 +1277,7 @@ class ControlTests(unittest.TestCase):
                         "failure_code": None,
                     },
                 })
+                job["model_route"]["selected_model"] = "gen4.5"
             payload["pack_status"] = "partially_blocked"
             story.atomic_json(manifest, payload)
             before = manifest.read_bytes()
@@ -1268,6 +1307,7 @@ class ControlTests(unittest.TestCase):
                     "keyframe_retry_model": "gen4_image",
                     "keyframe_retry_approved_at": approved_at,
                 })
+                job["model_route"]["selected_model"] = "gen4.5"
                 if index == 0:
                     job.update({
                         "state": "terminal_failed",
@@ -1446,6 +1486,22 @@ class ControlTests(unittest.TestCase):
             self.assertIn(f"Сейчас: сцена 2/{scene_count} — создаётся видео.", summary)
             self.assertNotIn(SAFE_FACTS[0], summary)
             self.assertNotIn(payload["scenes"][0]["provider_prompt"], summary)
+
+    def test_safe_summary_prices_the_approved_hybrid_model_mix(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, manifest = make_pack(root, approved=False)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["scene_jobs"][0]["model_route"]["selected_model"] = "gen4.5"
+            summary = control.safe_summary(payload)
+            seconds = int(payload["scene_jobs"][0]["planned_duration_seconds"])
+            turbo_seconds = sum(
+                int(job["planned_duration_seconds"])
+                for job in payload["scene_jobs"][1:]
+            )
+            expected_video = seconds * 12 + turbo_seconds * 5
+
+            self.assertIn(f"Gen-4.5 {seconds}s + Turbo {turbo_seconds}s", summary)
+            self.assertIn(f"video {expected_video}", summary)
 
     def test_safe_summary_localizes_director_card_without_changing_render_fields(self):
         with tempfile.TemporaryDirectory() as root:

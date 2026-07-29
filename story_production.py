@@ -29,6 +29,9 @@ LEGACY_STORY_SCHEMA = "naz-story-pack-v2"
 ANCIENT_STORY_SCHEMA = "naz-story-pack-v1"
 DIRECTOR_VERSION = "reels-semantic-director-v3"
 TEMPLATE_DIRECTOR_VERSION = "reels-template-director-v1"
+VIDEO_MOTION_PROMPT_VERSION = "runway-image-to-video-motion-v2"
+HYBRID_MODEL_ROUTE = "naz-human-gen45-object-turbo-v1"
+RUNWAY_VIDEO_CREDITS_PER_SECOND = {"gen4_turbo": 5, "gen4.5": 12}
 RENDERER_UNAVAILABLE = "unavailable"
 DRAMATURGIC_ROLES = (
     "hook", "problem", "hypothesis", "test", "result", "solution", "conclusion",
@@ -37,6 +40,12 @@ SHOT_SIZES = ("wide", "medium", "close", "macro")
 REFERENCE_ROLES = ("none", "frontal_identity", "three_quarter_identity")
 REEL_CROPS = ("tight-center", "left-detail", "right-detail", "wide-center")
 CAMERA_MOTIONS = ("slow push", "controlled pan", "handheld follow", "locked with real subject motion")
+CAMERA_MOTION_PROMPTS = {
+    "slow push": "The camera slowly pushes in",
+    "controlled pan": "The camera makes one controlled pan",
+    "handheld follow": "A restrained handheld camera follows the action",
+    "locked with real subject motion": "The locked-off camera remains still",
+}
 DIRECTOR_SUBJECT_KINDS = ("naz_human", "physical_object")
 CANONICAL_NAZ_SUBJECT = "Naz, the same real adult human founder"
 CANONICAL_NAZ_WARDROBE = (
@@ -284,6 +293,29 @@ _DIRECTOR_FORBIDDEN_CLICHE_RE = re.compile(
     r"(?i)(?:screen interface|(?:overloaded\s+)?\bhud\b|random circuit|"
     r"flowing code|code rain)"
 )
+_DIRECTOR_INTERFACE_ACTION_RE = re.compile(
+    r"(?i)(?=.*\b(?:types?|clicks?|taps?|swipes?|scrolls?|refreshes?)\b)"
+    r"(?=.*\b(?:keyboard|trackpad|screen|button|laptop|phone|browser|terminal|interface)\b)"
+)
+_DIRECTOR_MAGIC_ACTION_RE = re.compile(
+    r"(?i)\b(?:teleports?|levitates?|materiali[sz]es?|demateriali[sz]es?|morphs?|"
+    r"self[- ]assembles?|magically|instant(?:ly)? transforms?)\b"
+)
+_DIRECTOR_MULTI_ACTION_RE = re.compile(r"(?i)(?:;|\bthen\b|\bafter that\b|\bnext,?\b)")
+_DIRECTOR_PHYSICAL_ACTION_RE = re.compile(
+    r"(?i)\b(?:adjusts?|aligns?|assembles?|attaches?|calibrates?|carries?|closes?|"
+    r"bends?|clamps?|clips?|compresses?|connects?|crosses?|cuts?|emits?|engages?|"
+    r"extends?|fastens?|fits?|folds?|holds?|inserts?|installs?|lifts?|locks?|lowers?|"
+    r"measures?|moves?|opens?|oscillates?|picks?|pivots?|places?|plugs?|pours?|"
+    r"presses?|pulls?|pushes?|raises?|releases?|removes?|retracts?|rolls?|rotates?|"
+    r"routes?|screws?|seats?|secures?|sets?|slides?|snaps?|switches?|tests?|tilts?|"
+    r"tightens?|travels?|turns?|twists?|unfastens?|unlocks?|unplugs?|unscrews?|"
+    r"vibrates?|walks?)\b"
+)
+_DIRECTOR_ABSTRACT_ACTION_RE = re.compile(
+    r"(?i)\b(?:decides?|explains?|imagines?|observes?|realizes?|thinks?|understands?|"
+    r"verifies?|watches?|waits?)\b"
+)
 
 
 def reels_director_prompt(
@@ -340,6 +372,11 @@ def reels_director_prompt(
         "copper branding, random robots, random boards, text, logos or overloaded HUDs. "
         f"Canonical wardrobe throughout: {CANONICAL_NAZ_WARDROBE}. Never invent "
         "armour, robes, glossy sci-fi costumes, ornamental uniforms or wardrobe changes.\n\n"
+        "Stage one simple action that can be performed continuously in five seconds per scene. "
+        "Every Naz action must begin with Naz, make direct contact with one visible prop, and "
+        "cause the stated visible end state. Do not use symbolic gestures, passive watching, "
+        "typing, clicking, trackpads, screen pantomime, magical transformation, floating parts, "
+        "self-assembly or multi-step choreography. Props obey gravity and ordinary mechanics.\n\n"
         "Return strict JSON only with this shape: "
         '{"director_version":"reels-semantic-director-v3","visual_concept":"...",'
         '"story_spine":"...","continuity_anchor":"...","primary_setting":"...",'
@@ -369,7 +406,8 @@ def reels_director_prompt(
         "steps of this same story. "
         "For naz_human, subject_detail is simply Naz; identity is injected by the application. "
         "For physical_object, subject_detail names one concrete non-human object. Every action "
-        "and end state must be physical, content-specific and distinct. Obey "
+        "and end state must be physical, content-specific and distinct. Put observation or proof "
+        "in end_state, never as a second performer action. Obey "
         "identity_requirement exactly. Concise physical place names such as Naz AI Lab or server "
         "room are valid primary_setting values; technical nouns are not transport metadata by themselves. "
         "Write visual_concept, primary_setting, subject_detail, concrete_action, start_state and end_state "
@@ -567,13 +605,13 @@ def parse_reels_director_response(
             row.get("subject_detail"), f"{scene_prefix}_subject_detail", errors
         )
         action = _director_text(
-            row.get("concrete_action"), f"{scene_prefix}_action", errors
+            row.get("concrete_action"), f"{scene_prefix}_action", errors, maximum=180
         )
         start_state = _director_text(
-            row.get("start_state"), f"{scene_prefix}_start_state", errors
+            row.get("start_state"), f"{scene_prefix}_start_state", errors, maximum=180
         )
         end_state = _director_text(
-            row.get("end_state"), f"{scene_prefix}_end_state", errors
+            row.get("end_state"), f"{scene_prefix}_end_state", errors, maximum=180
         )
         admin_summary_ru = _director_ru_text(
             row.get("admin_summary_ru"), f"{scene_prefix}_admin_summary_ru", errors
@@ -594,6 +632,26 @@ def parse_reels_director_response(
             or (direction_requires_reference and subject_kind != "naz_human")
         ):
             errors.append(f"{scene_prefix}_subject_identity_invalid")
+        if action:
+            if _DIRECTOR_INTERFACE_ACTION_RE.search(action):
+                errors.append(f"{scene_prefix}_interface_pantomime")
+            if _DIRECTOR_MAGIC_ACTION_RE.search(action):
+                errors.append(f"{scene_prefix}_impossible_action")
+            if _DIRECTOR_MULTI_ACTION_RE.search(action):
+                errors.append(f"{scene_prefix}_multi_action")
+            if not _DIRECTOR_PHYSICAL_ACTION_RE.search(action):
+                errors.append(f"{scene_prefix}_physical_action_missing")
+            if (
+                subject_kind == "naz_human"
+                and not object_only_direction
+                and not action.casefold().startswith("naz ")
+            ):
+                errors.append(f"{scene_prefix}_naz_action_subject_missing")
+            if (
+                _DIRECTOR_ABSTRACT_ACTION_RE.search(action)
+                and not _DIRECTOR_PHYSICAL_ACTION_RE.search(action)
+            ):
+                errors.append(f"{scene_prefix}_abstract_action")
 
         shot_size = str(row.get("shot_size", "")).strip().casefold()
         camera_motion = str(row.get("camera_motion", "")).strip().casefold()
@@ -846,14 +904,19 @@ def _scene(
         "Real optical glass, titanium, blue aluminium, carbon, ceramic; cold rim light. "
         "No text, logos, HUD, code, copper, gold, neon cliche, robots or extra people."
     )
+    motion_continuity = (
+        "Naz keeps the exact face, build and matte-black wardrobe from the first frame. "
+        "His hands contact only the visible prop and move with believable weight. "
+        if requires_reference
+        else "The same single physical object remains in frame and moves with believable weight. "
+    )
     provider_prompt = (
-        f"Animate the supplied directed keyframe as a vertical 9:16 CLEAN video master. Role: {role}. "
-        f"Keep the exact subject, Naz identity, wardrobe, laboratory architecture, materials and lighting from the keyframe. "
-        f"Physical action: {prompt_action}. Camera: {camera_motion}. "
-        f"Continue the same story spine ({story_spine}) and continuity anchor ({prompt_continuity_anchor}). "
-        f"Begin in the supplied pose and end when {prompt_end_state}. "
-        "Natural restrained human movement and one clear physical state change are mandatory. "
-        "No scene replacement, morphing, extra people, text, logos, HUD, platform UI, code or watermarks."
+        "Continuous seamless five-second shot from the supplied directed keyframe. "
+        f"{CAMERA_MOTION_PROMPTS[camera_motion]}. "
+        f"One physical action: {prompt_action}. "
+        f"The action finishes with this visible state: {prompt_end_state}. "
+        f"{motion_continuity}"
+        "The first-frame architecture, materials and lighting remain stable for the entire take."
     )
     try:
         keyframe_prompt = compact_runway_prompt(
@@ -1229,12 +1292,17 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         or model_policy.get("automatic_fallback") is not False
     ):
         return False
+    hybrid_policy = model_policy.get("scene_route_policy") == HYBRID_MODEL_ROUTE
+    if model_policy.get("scene_route_policy") not in {None, HYBRID_MODEL_ROUTE}:
+        return False
     if not isinstance(visual_strategy, dict) or (
         visual_strategy.get("planner") != "reels-maker-directed-scenes-v1"
         or visual_strategy.get("keyframe_required") is not True
         or visual_strategy.get("avatar_usage") != "identity_reference_only"
         or visual_strategy.get("direct_avatar_as_video_first_frame") is not False
     ):
+        return False
+    if hybrid_policy and visual_strategy.get("motion_prompt_version") != VIDEO_MOTION_PROMPT_VERSION:
         return False
     scene_ids = [str(item.get("scene_id", "")) for item in scenes if isinstance(item, dict)]
     if len(scene_ids) != len(scenes) or not all(scene_ids) or len(set(scene_ids)) != len(scene_ids):
@@ -1299,6 +1367,17 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             or not isinstance(route, dict)
             or not route_fields.issubset(route)
             or route.get("tier") not in {"primary", "secondary"}
+        ):
+            return False
+        if hybrid_policy and (
+            route.get("scene_strategy") != HYBRID_MODEL_ROUTE
+            or route.get("selected_model")
+            != ("gen4.5" if scene["requires_naz_reference"] else "gen4_turbo")
+        ):
+            return False
+        if not hybrid_policy and (
+            route.get("scene_strategy") is not None
+            or route.get("selected_model") is not None
         ):
             return False
     edit_ids: list[str] = []
@@ -1392,6 +1471,7 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
         "model_policy": {
             "primary_tier": "primary", "secondary_tier": "secondary",
             "automatic_fallback": False,
+            "scene_route_policy": HYBRID_MODEL_ROUTE,
         },
         "visual_strategy": {
             "planner": "reels-maker-directed-scenes-v1",
@@ -1399,6 +1479,7 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
             "avatar_usage": "identity_reference_only",
             "direct_avatar_as_video_first_frame": False,
             "keyframe_provider": "runway",
+            "motion_prompt_version": VIDEO_MOTION_PROMPT_VERSION,
         },
         "visual_identity_qa": {"status": "not_run", "blocking": False},
     })
@@ -1424,6 +1505,8 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
             "tier": "primary", "primary_model": None, "secondary_model": None,
             "primary_failure_code": None, "secondary_requested_at": None,
             "secondary_approved_at": None,
+            "scene_strategy": HYBRID_MODEL_ROUTE,
+            "selected_model": "gen4.5" if scene.requires_naz_reference else "gen4_turbo",
         },
     } for scene in pack.scenes]
     payload["reel_jobs"] = [{

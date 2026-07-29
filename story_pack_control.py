@@ -629,7 +629,20 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
     keyframe_credits = sum(
         5 for scene in directed if isinstance(scene, Mapping)
     )
-    video_credits = int(duration) * 5
+    model_seconds = {"gen4_turbo": 0, "gen4.5": 0}
+    for job in jobs:
+        route = job.get("model_route", {}) if isinstance(job, Mapping) else {}
+        model = str(route.get("selected_model") or "gen4_turbo")
+        if model not in model_seconds:
+            model = "gen4_turbo"
+        model_seconds[model] += int(job.get("planned_duration_seconds", 0))
+    video_credits = sum(
+        seconds * story_production.RUNWAY_VIDEO_CREDITS_PER_SECOND[model]
+        for model, seconds in model_seconds.items()
+    )
+    model_mix = (
+        f"Gen-4.5 {model_seconds['gen4.5']}s + Turbo {model_seconds['gen4_turbo']}s"
+    )
     concept = str(payload.get("visual_concept", "")).strip()
     admin_concept = " ".join(str(payload.get("admin_concept_ru", "")).split())
     concept_label = admin_concept if re.search(r"[А-Яа-яЁё]", admin_concept) else ""
@@ -696,6 +709,7 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         "Режиссёрский план:\n" + ("\n".join(treatment) or "—")
         + f"\n\nОценка Runway: keyframes {keyframe_credits} + video {video_credits} "
         f"= {keyframe_credits + video_credits} кредитов.\n"
+        f"Модели: {model_mix}.\n"
         "Аватар используется только для внешности; фон, поза и постановка создаются заново."
     )
 

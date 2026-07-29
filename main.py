@@ -4304,10 +4304,26 @@ def reels_director_reason_codes(exc: Exception) -> tuple[str, ...]:
 
 def reels_director_reason_code(exc: Exception) -> str:
     reason_codes = reels_director_reason_codes(exc)
+    action_markers = (
+        "interface_pantomime", "impossible_action", "multi_action",
+        "physical_action_missing", "naz_action_subject_missing", "abstract_action",
+    )
+    if reason_codes and all(
+        any(marker in code for marker in action_markers) for code in reason_codes
+    ):
+        return "director_action_unfilmable"
     return reason_codes[0] if len(reason_codes) == 1 else "director_contract_invalid"
 
 
 def reels_director_reason_summary(reason_code: str) -> str:
+    if reason_code == "director_action_unfilmable" or any(
+        marker in reason_code
+        for marker in (
+            "interface_pantomime", "impossible_action", "multi_action",
+            "physical_action_missing", "naz_action_subject_missing", "abstract_action",
+        )
+    ):
+        return "сцена содержала непригодное для съёмки, перегруженное или физически неправдоподобное действие"
     if reason_code == "director_contract_invalid":
         return "несколько полей режиссёрского контракта не прошли проверку"
     if "subject_identity" in reason_code:
