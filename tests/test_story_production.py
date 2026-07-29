@@ -14,8 +14,16 @@ SAFE_FACTS = (
     "A failing build exposed one reproducible configuration mismatch.",
     "The configuration was compared with the known working release.",
     "One bounded setting was corrected and the build was repeated.",
-    "The repeated check completed and changed the observable result.",
+    "The repeated software check completed and changed the observable result.",
     "A regression check confirmed the result on the same input.",
+)
+
+JULY_11_PUBLICATION_FACTS = (
+    "The approved draft entered the publication review queue.",
+    "A duplicate-publication check found the same release identifier.",
+    "The scheduled publish action was held before delivery.",
+    "The operator kept the existing schedule unchanged.",
+    "No publication was created from the rejected duplicate.",
 )
 
 
@@ -48,26 +56,125 @@ def planned(candidate=None):
 
 
 def director_response(plan, facts=SAFE_FACTS, *, variant_index=0):
+    plan = plan or planned()
     count = max(4, min(7, len(facts)))
+    roles = story._roles(
+        story._variant_plan_id(plan.plan_id, variant_index),
+        count,
+    )
     arc_names = story._story_arc_names_for_plan(plan)
     story_arc = (
         "automated_validation_cycle"
         if "automated_validation_cycle" in arc_names
         else arc_names[0]
     )
+    arc_steps = story._story_arc_steps(story_arc, count)
+    semantic_goals = (
+        "Reveal failing build and reproducible configuration mismatch.",
+        "Compare configuration with known working release.",
+        "Correct bounded setting, then repeat build.",
+        "Reveal changed observable result after repeated check.",
+        "Confirm regression result on input.",
+        "Reveal corrected state with physical check.",
+        "Reveal seventh software result completed in causal chain.",
+    )
+    relations = (
+        "opening",
+        "Configuration comparison follows reproducible mismatch.",
+        "Bounded setting correction follows working release comparison.",
+        "Repeated check follows bounded setting correction.",
+        "Regression check follows changed observable result.",
+        "Physical check follows regression input and corrected state.",
+        "Seventh software result follows corrected physical check.",
+    )
+    understandings = (
+        "Viewer understands failing build and reproducible configuration mismatch.",
+        "Viewer understands known release and configuration comparison.",
+        "Viewer understands bounded setting correction and repeated build.",
+        "Viewer understands repeated check and changed observable result.",
+        "Viewer understands confirmed regression result on input.",
+        "Viewer understands corrected state and physical check.",
+        "Viewer understands seventh software result completed in causal chain.",
+    )
+    visual_relations = (
+        "Physical mechanism maps failing build to reproducible configuration mismatch.",
+        "Physical mechanism maps working release to configuration comparison.",
+        "Physical mechanism maps bounded setting correction to repeated build.",
+        "Physical mechanism maps repeated check to changed observable result.",
+        "Physical mechanism maps regression check to confirmed result on input.",
+        "Physical mechanism maps corrected state to physical check.",
+        "Physical mechanism maps seventh software result to completed causal chain.",
+    )
     scenes = []
-    for index in range(1, count + 1):
+    for index, role in enumerate(roles, start=1):
+        motion_class = story.DIRECTOR_ACTION_RECIPES[arc_steps[index - 1][0]][1]
         scenes.append({
+            "beat_id": f"beat-{index:02d}-{role}",
+            "semantic_goal": semantic_goals[index - 1],
+            "source_fact_refs": [f"fact-{index}"],
+            "relation_to_previous": relations[index - 1],
+            "expected_viewer_understanding": understandings[index - 1],
+            "visualization_kind": "physical_metaphor",
+            "visual_relation_to_beat": (
+                f"The physical {motion_class} action maps this beat: "
+                f"{visual_relations[index - 1]}"
+            ),
             "shot_size": story.SHOT_SIZES[(index - 1) % len(story.SHOT_SIZES)],
             "camera_motion": story.CAMERA_MOTIONS[(index - 1) % len(story.CAMERA_MOTIONS)],
         })
     return json.dumps({
         "director_version": story.DIRECTOR_VERSION,
-        "visual_concept": "a failed configuration becoming one testable physical mechanism",
-        "story_spine": "one failed configuration is isolated, corrected and verified under the same load",
+        "core_thesis": (
+            "Configuration mismatch: bounded correction, repeated build, "
+            "regression confirmation."
+        ),
+        "thesis_source_fact_refs": ["fact-1", "fact-3", "fact-5"],
+        "viewer_problem": "The reproducible mismatch is exposed by a failing build.",
+        "hook": "Reveal failing build and reproducible mismatch.",
+        "hook_thesis_ref": "core_thesis",
+        "payoff": "Show regression confirmation after bounded correction.",
+        "payoff_thesis_ref": "core_thesis",
+        "visual_concept": (
+            "Physical mechanism maps configuration mismatch to regression confirmation."
+        ),
+        "story_spine": "Failing build, bounded correction, repeated regression check.",
         "story_arc": story_arc,
         "scenes": scenes,
     })
+
+
+def select_story_arc(payload, story_arc):
+    payload["story_arc"] = story_arc
+    arc_steps = story._story_arc_steps(story_arc, len(payload["scenes"]))
+    for scene, (recipe_name, _) in zip(payload["scenes"], arc_steps):
+        relation_prefix, separator, relation_body = scene[
+            "visual_relation_to_beat"
+        ].partition(": ")
+        if not separator:
+            raise AssertionError(
+                f"director fixture relation has no marker prefix: {relation_prefix}"
+            )
+        motion_class = story.DIRECTOR_ACTION_RECIPES[recipe_name][1]
+        scene["visual_relation_to_beat"] = (
+            f"The physical {motion_class} action maps this beat: {relation_body}"
+        )
+    return payload
+
+
+def directed_pack(plan=None, facts=SAFE_FACTS, *, variant_index=0):
+    plan = plan or planned()
+    treatment = story.parse_reels_director_response(
+        director_response(plan, facts, variant_index=variant_index),
+        plan,
+        facts,
+        variant_index=variant_index,
+    )
+    return story.plan_story_pack(
+        plan,
+        tuple(facts),
+        variant_index=variant_index,
+        director_treatment=treatment,
+    )
 
 
 class StoryFirstTests(unittest.TestCase):
@@ -91,8 +198,38 @@ class StoryFirstTests(unittest.TestCase):
         properties = scenes["items"]["properties"]
         self.assertEqual(set(scenes["items"]["required"]), set(properties))
         self.assertNotIn("role", properties)
+        self.assertTrue({
+            "beat_id",
+            "semantic_goal",
+            "source_fact_refs",
+            "relation_to_previous",
+            "expected_viewer_understanding",
+            "visualization_kind",
+            "visual_relation_to_beat",
+        }.issubset(properties))
+        self.assertEqual(
+            properties["visualization_kind"]["enum"],
+            ["literal", "physical_metaphor"],
+        )
         self.assertNotIn("admin_summary_ru", properties)
         self.assertNotIn("admin_concept_ru", contract["schema"]["properties"])
+        self.assertTrue({
+            "core_thesis",
+            "thesis_source_fact_refs",
+            "viewer_problem",
+            "hook",
+            "hook_thesis_ref",
+            "payoff",
+            "payoff_thesis_ref",
+        }.issubset(contract["schema"]["properties"]))
+        self.assertEqual(
+            contract["schema"]["properties"]["hook_thesis_ref"]["enum"],
+            ["core_thesis"],
+        )
+        self.assertEqual(
+            contract["schema"]["properties"]["payoff_thesis_ref"]["enum"],
+            ["core_thesis"],
+        )
         self.assertIn("story_spine", contract["schema"]["properties"])
         self.assertNotIn("continuity_anchor", contract["schema"]["properties"])
         self.assertIn("story_arc", contract["schema"]["properties"])
@@ -124,7 +261,7 @@ class StoryFirstTests(unittest.TestCase):
     def test_story_arc_selection_controls_identity_without_free_form_subjects(self):
         plan = planned()
         payload = json.loads(director_response(plan))
-        payload["story_arc"] = "module_recovery_mixed"
+        select_story_arc(payload, "module_recovery_mixed")
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
@@ -216,10 +353,17 @@ class StoryFirstTests(unittest.TestCase):
                             end_state="after",
                         ))
 
+    def test_every_story_arc_has_semantic_axis_metadata(self):
+        self.assertEqual(
+            set(story.DIRECTOR_ARC_SEMANTIC_AXES),
+            set(story.DIRECTOR_STORY_ARCS),
+        )
+        self.assertTrue(all(story.DIRECTOR_ARC_SEMANTIC_AXES.values()))
+
     def test_story_arc_supplies_one_location_anchor_and_causal_state_chain(self):
         plan = planned()
         payload = json.loads(director_response(plan))
-        payload["story_arc"] = "module_recovery_mixed"
+        select_story_arc(payload, "module_recovery_mixed")
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
@@ -261,7 +405,7 @@ class StoryFirstTests(unittest.TestCase):
     def test_new_manifest_routes_mixed_arc_naz_to_gen45_and_objects_to_turbo(self):
         plan = planned()
         payload = json.loads(director_response(plan))
-        payload["story_arc"] = "module_recovery_mixed"
+        select_story_arc(payload, "module_recovery_mixed")
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
@@ -300,6 +444,14 @@ class StoryFirstTests(unittest.TestCase):
             plan, SAFE_FACTS, director_treatment=treatment
         )
         self.assertEqual(pack.director_version, story.DIRECTOR_VERSION)
+        self.assertEqual(pack.central_thesis, treatment.core_thesis)
+        self.assertEqual(
+            pack.thesis_source_fact_refs,
+            treatment.thesis_source_fact_refs,
+        )
+        self.assertEqual(pack.viewer_problem, treatment.viewer_problem)
+        self.assertEqual(pack.hook, treatment.hook)
+        self.assertEqual(pack.payoff, treatment.payoff)
         self.assertEqual(pack.visual_concept, treatment.visual_concept)
         self.assertEqual(pack.story_spine, treatment.story_spine)
         self.assertEqual(pack.story_arc, treatment.story_arc)
@@ -319,20 +471,517 @@ class StoryFirstTests(unittest.TestCase):
             [scene.admin_summary_ru for scene in pack.scenes],
             [scene.admin_summary_ru for scene in treatment.scenes],
         )
-        for scene in pack.scenes:
+        for scene_index, scene in enumerate(pack.scenes):
+            directed = treatment.scenes[scene_index]
+            self.assertEqual(scene.beat_id, directed.beat_id)
+            self.assertEqual(scene.semantic_goal, directed.semantic_goal)
+            self.assertEqual(scene.source_fact_refs, directed.source_fact_refs)
+            self.assertEqual(
+                scene.relation_to_previous,
+                directed.relation_to_previous,
+            )
             self.assertNotIn(scene.admin_summary_ru, scene.clean_prompt)
             self.assertNotIn(scene.admin_summary_ru, scene.keyframe_prompt)
             self.assertNotIn(scene.admin_summary_ru, scene.provider_prompt)
-            self.assertIn(pack.story_spine, scene.clean_prompt)
+            self.assertIn(scene.semantic_goal, scene.clean_prompt)
             self.assertNotIn(pack.story_spine, scene.provider_prompt)
             self.assertIn(pack.continuity_anchor, scene.clean_prompt)
             self.assertIn(pack.continuity_anchor, scene.keyframe_prompt)
             self.assertIn(pack.continuity_anchor, scene.provider_prompt)
+            self.assertIn(scene.semantic_goal, scene.clean_prompt)
+            self.assertIn(scene.semantic_goal, scene.keyframe_prompt)
+            self.assertIn(scene.semantic_goal, scene.provider_prompt)
+            self.assertNotIn(scene.visual_relation_to_beat, scene.clean_prompt)
+            self.assertNotIn(scene.visual_relation_to_beat, scene.keyframe_prompt)
+            self.assertNotIn(scene.visual_relation_to_beat, scene.provider_prompt)
+            for source_fact in SAFE_FACTS:
+                self.assertNotIn(source_fact, scene.clean_prompt)
+                self.assertNotIn(source_fact, scene.keyframe_prompt)
+                self.assertNotIn(source_fact, scene.provider_prompt)
             self.assertTrue(scene.provider_prompt.startswith("Continuous seamless five-second shot"))
         for previous, current in zip(pack.scenes, pack.scenes[1:]):
             self.assertEqual(current.start_state, previous.end_state)
         self.assertTrue(all("tied to fact" not in scene.setting for scene in pack.scenes))
         self.assertTrue(all("fact 1" not in scene.concrete_action for scene in pack.scenes))
+
+        tampered_scene = dataclasses.replace(
+            pack.scenes[0],
+            provider_prompt=pack.scenes[0].provider_prompt + " unrelated addition",
+        )
+        tampered = dataclasses.replace(
+            pack,
+            scenes=(tampered_scene, *pack.scenes[1:]),
+        )
+        with self.assertRaises(story.StoryPlanError):
+            story.validate_story_pack(tampered)
+
+    def test_grounded_core_thesis_replaces_editorial_axis_in_story_pack(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(
+            plan, SAFE_FACTS, director_treatment=treatment
+        )
+
+        self.assertNotEqual(treatment.core_thesis, plan.thesis_direction)
+        self.assertEqual(pack.central_thesis, treatment.core_thesis)
+        self.assertEqual(
+            pack.thesis_source_fact_refs,
+            treatment.thesis_source_fact_refs,
+        )
+        self.assertEqual(pack.viewer_problem, treatment.viewer_problem)
+        self.assertEqual(pack.hook, treatment.hook)
+        self.assertEqual(pack.payoff, treatment.payoff)
+
+    def test_core_thesis_must_be_grounded_in_existing_source_refs(self):
+        plan = planned()
+        cases = {
+            "missing_refs": (
+                lambda payload: payload.__setitem__("thesis_source_fact_refs", []),
+                "director_thesis_source_fact_refs_invalid",
+            ),
+            "unknown_ref": (
+                lambda payload: payload.__setitem__(
+                    "thesis_source_fact_refs", ["fact-99"]
+                ),
+                "director_thesis_source_fact_refs_invalid",
+            ),
+            "unsupported_claim": (
+                lambda payload: payload.__setitem__(
+                    "core_thesis",
+                    "A spacecraft launch proved orbital tourism.",
+                ),
+                "director_core_thesis_unsupported",
+            ),
+        }
+        for name, (mutate, reason_code) in cases.items():
+            payload = json.loads(director_response(plan))
+            mutate(payload)
+            with self.subTest(name=name), self.assertRaises(
+                story.DirectorValidationError
+            ) as raised:
+                story.parse_reels_director_response(
+                    json.dumps(payload), plan, SAFE_FACTS
+                )
+            self.assertIn(reason_code, raised.exception.reason_codes)
+
+    def test_hook_and_payoff_must_reference_the_same_core_thesis(self):
+        plan = planned()
+        for field in ("hook_thesis_ref", "payoff_thesis_ref"):
+            payload = json.loads(director_response(plan))
+            payload[field] = "another_thesis"
+            with self.subTest(field=field), self.assertRaises(
+                story.DirectorValidationError
+            ) as raised:
+                story.parse_reels_director_response(
+                    json.dumps(payload), plan, SAFE_FACTS
+                )
+            self.assertIn(
+                "director_hook_payoff_mismatch",
+                raised.exception.reason_codes,
+            )
+
+    def test_every_scene_has_the_expected_beat_and_grounded_semantic_fields(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+        expected_roles = story._roles(
+            story._variant_plan_id(plan.plan_id, 0), len(SAFE_FACTS)
+        )
+
+        self.assertEqual(
+            [scene.beat_id for scene in treatment.scenes],
+            [
+                f"beat-{index:02d}-{role}"
+                for index, role in enumerate(expected_roles, start=1)
+            ],
+        )
+        self.assertTrue(all(scene.semantic_goal for scene in treatment.scenes))
+        self.assertTrue(all(scene.source_fact_refs for scene in treatment.scenes))
+        self.assertEqual(treatment.scenes[0].relation_to_previous, "opening")
+        self.assertTrue(all(
+            scene.relation_to_previous
+            for scene in treatment.scenes[1:]
+        ))
+
+    def test_scene_semantic_contract_fails_closed_field_by_field(self):
+        plan = planned()
+        cases = {
+            "wrong_beat": (
+                lambda scene: scene.__setitem__("beat_id", "beat-99-result"),
+                "director_scene_1_beat_id_invalid",
+            ),
+            "unknown_fact": (
+                lambda scene: scene.__setitem__("source_fact_refs", ["fact-99"]),
+                "director_scene_1_source_fact_refs_invalid",
+            ),
+            "unsupported_goal": (
+                lambda scene: scene.__setitem__(
+                    "semantic_goal", "Celebrate an unrelated victory."
+                ),
+                "director_scene_1_semantic_goal_unsupported",
+            ),
+            "missing_transition": (
+                lambda scene: scene.__setitem__("relation_to_previous", ""),
+                "director_scene_2_relation_to_previous_missing",
+            ),
+            "dubious_visual_relation": (
+                lambda scene: scene.__setitem__(
+                    "visual_relation_to_beat", "A beautiful futuristic mechanism."
+                ),
+                "director_scene_1_visual_relation_unsupported",
+            ),
+        }
+        for name, (mutate, reason_code) in cases.items():
+            payload = json.loads(director_response(plan))
+            scene_index = 1 if name == "missing_transition" else 0
+            mutate(payload["scenes"][scene_index])
+            with self.subTest(name=name), self.assertRaises(
+                story.DirectorValidationError
+            ) as raised:
+                story.parse_reels_director_response(
+                    json.dumps(payload), plan, SAFE_FACTS
+                )
+            self.assertIn(reason_code, raised.exception.reason_codes)
+
+    def test_duplicate_semantic_goals_are_rejected(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][1]["semantic_goal"] = payload["scenes"][0][
+            "semantic_goal"
+        ]
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_semantic_goal_duplicate",
+            raised.exception.reason_codes,
+        )
+
+    def test_unknown_numeric_claim_is_rejected(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][2]["semantic_goal"] += " It increased throughput by 99 percent."
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_unknown_numeric_claim",
+            raised.exception.reason_codes,
+        )
+
+    def test_number_cannot_migrate_from_an_unrelated_fact(self):
+        facts = (
+            "A failing build exposed 99 reproducible configuration mismatches.",
+            *SAFE_FACTS[1:],
+        )
+        plan = planned(source(safe_facts=facts))
+        payload = json.loads(director_response(plan, facts))
+        payload["scenes"][1]["semantic_goal"] = (
+            "Compare 99 configuration with known working release."
+        )
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, facts
+            )
+
+        self.assertIn(
+            "director_unknown_numeric_claim",
+            raised.exception.reason_codes,
+        )
+
+    def test_hook_and_payoff_must_share_thesis_content_not_connectors(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["core_thesis"] = "Build configuration causal chain."
+        payload["hook"] = "Configuration mismatch causal hook."
+        payload["payoff"] = "Regression check causal payoff."
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_hook_payoff_mismatch",
+            raised.exception.reason_codes,
+        )
+
+    def test_transition_must_name_previous_and_current_content(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][1]["relation_to_previous"] = (
+            "Known working release follows semantic transition."
+        )
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_2_relation_to_previous_missing",
+            raised.exception.reason_codes,
+        )
+
+    def test_unknown_claim_cannot_hide_behind_source_token_overlap(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["semantic_goal"] = (
+            "Reveal configuration mismatch deleted customer database."
+        )
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_semantic_goal_unsupported",
+            raised.exception.reason_codes,
+        )
+
+    def test_partial_and_short_raw_source_copy_is_rejected(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["semantic_goal"] = (
+            "A failing build exposed one reproducible"
+        )
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn("director_raw_source_copy", raised.exception.reason_codes)
+        self.assertTrue(
+            story._raw_source_fragment_in_text("Build failed.", ("Build failed.",))
+        )
+
+    def test_scene_relation_cannot_add_a_second_physical_action(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        motion = story.DIRECTOR_ACTION_RECIPES[
+            story._story_arc_steps(payload["story_arc"], len(SAFE_FACTS))[0][0]
+        ][1]
+        other_motion = "open" if motion != "open" else "close"
+        payload["scenes"][0]["visual_relation_to_beat"] = (
+            f"Physical {motion} action and then {other_motion} action map "
+            "failing build to reproducible configuration mismatch."
+        )
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_multiple_actions", raised.exception.reason_codes
+        )
+        self.assertEqual(
+            story._visual_relation_motion_classes(
+                "Physical open action maps titanium door opens and closes."
+            ),
+            frozenset({"open", "close"}),
+        )
+
+    def test_unbounded_relation_verb_never_reaches_render_prompts(self):
+        facts = (
+            "A failing software build falls after one reproducible configuration mismatch.",
+            *SAFE_FACTS[1:],
+        )
+        plan = planned(source(safe_facts=facts))
+        payload = json.loads(director_response(plan, facts))
+        payload["viewer_problem"] = "Reveal failing build and reproducible mismatch."
+        motion = story.DIRECTOR_ACTION_RECIPES[
+            story._story_arc_steps(payload["story_arc"], len(facts))[0][0]
+        ][1]
+        payload["scenes"][0]["visual_relation_to_beat"] = (
+            f"Physical {motion} action falls and maps failing build to "
+            "reproducible configuration mismatch."
+        )
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, facts
+        )
+        pack = story.plan_story_pack(
+            plan, facts, director_treatment=treatment
+        )
+
+        for prompt in (
+            pack.scenes[0].clean_prompt,
+            pack.scenes[0].keyframe_prompt,
+            pack.scenes[0].provider_prompt,
+        ):
+            self.assertNotIn("falls", prompt.casefold())
+            self.assertIn(pack.scenes[0].concrete_action, prompt)
+        self.assertIn("one physical action", pack.scenes[0].clean_prompt.casefold())
+        self.assertIn("one physical action", pack.scenes[0].provider_prompt.casefold())
+
+    def test_scene_must_cite_its_assigned_beat_fact(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["source_fact_refs"] = ["fact-2"]
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_source_fact_refs_invalid",
+            raised.exception.reason_codes,
+        )
+
+    def test_extra_reference_cannot_replace_assigned_fact_grounding(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["source_fact_refs"] = ["fact-1", "fact-2"]
+        payload["scenes"][0]["semantic_goal"] = (
+            "Compare configuration with known working release."
+        )
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_semantic_goal_unsupported",
+            raised.exception.reason_codes,
+        )
+
+    def test_treatment_is_bound_to_the_exact_plan_variant(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.plan_story_pack(
+                plan,
+                SAFE_FACTS,
+                variant_index=1,
+                director_treatment=treatment,
+            )
+
+        self.assertIn(
+            "director_treatment_plan_binding_invalid",
+            raised.exception.reason_codes,
+        )
+
+    def test_software_module_terms_cannot_authorize_literal_hardware(self):
+        self.assertEqual(
+            story._source_semantic_axis((
+                "A Python module import failed during the software build.",
+            )),
+            "software_validation",
+        )
+        self.assertEqual(
+            story._source_semantic_axis((
+                "The .NET assembly build failed regression tests.",
+            )),
+            "software_validation",
+        )
+        self.assertEqual(
+            story._source_semantic_axis(("A module changed position.",)),
+            "unknown",
+        )
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["visualization_kind"] = "literal"
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_literal_source_mismatch",
+            raised.exception.reason_codes,
+        )
+
+    def test_physical_metaphor_requires_an_explicit_grounded_relation(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0]["visualization_kind"] = "physical_metaphor"
+        payload["scenes"][0]["visual_relation_to_beat"] = ""
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_visual_relation_to_beat_missing",
+            raised.exception.reason_codes,
+        )
+
+    def test_unrelated_july_11_module_recovery_is_rejected_before_persistence(self):
+        plan = planned(source(
+            source_ref="agent_content:2026-07-11:synthetic-fixture",
+            safe_facts=JULY_11_PUBLICATION_FACTS,
+        ))
+        payload = json.loads(director_response(plan))
+        payload.update({
+            "core_thesis": (
+                "Duplicate publication: scheduled action held; existing schedule unchanged."
+            ),
+            "thesis_source_fact_refs": ["fact-2", "fact-3", "fact-4"],
+            "viewer_problem": "Reveal duplicate publication before delivery.",
+            "hook": "Reveal duplicate release identifier.",
+            "payoff": "Show existing schedule unchanged.",
+            "visual_concept": (
+                "Physical mechanism maps duplicate publication to unchanged schedule."
+            ),
+            "story_spine": (
+                "Duplicate publication, held publish action, unchanged schedule."
+            ),
+            "story_arc": "module_recovery_mixed",
+        })
+        goals = (
+            "Reveal approved draft in publication review queue.",
+            "Reveal duplicate release identifier in publication check.",
+            "Show publish action held before scheduled delivery.",
+            "Show unchanged schedule kept by operator.",
+            "Reveal rejected duplicate and no created publication.",
+        )
+        transitions = (
+            "opening",
+            "Publication review transitions to duplicate release identifier.",
+            "Publish action follows duplicate publication check.",
+            "Unchanged schedule follows held publish action.",
+            "Rejected duplicate follows unchanged schedule.",
+        )
+        for index, scene in enumerate(payload["scenes"]):
+            scene["semantic_goal"] = goals[index]
+            scene["source_fact_refs"] = [f"fact-{index + 1}"]
+            scene["relation_to_previous"] = transitions[index]
+            scene["expected_viewer_understanding"] = goals[index]
+            scene["visualization_kind"] = "physical_metaphor"
+            scene["visual_relation_to_beat"] = (
+                f"Physical mechanism metaphor maps this semantic beat: {goals[index]}"
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            pack_dir = Path(root) / "would-be-pack"
+            with self.assertRaises(story.DirectorValidationError) as raised:
+                story.parse_reels_director_response(
+                    json.dumps(payload), plan, JULY_11_PUBLICATION_FACTS
+                )
+            self.assertIn(
+                "director_story_arc_semantic_mismatch",
+                raised.exception.reason_codes,
+            )
+            self.assertFalse(pack_dir.exists())
 
     def test_unknown_or_free_form_story_arc_is_rejected(self):
         for value in (
@@ -371,26 +1020,26 @@ class StoryFirstTests(unittest.TestCase):
             "director_scene_1_schema_invalid", raised.exception.reason_codes
         )
 
-    def test_2026_07_08_route_accepts_concise_visual_concept(self):
+    def test_2026_07_08_route_rejects_generic_visual_concept(self):
         plan = planned(source(source_ref="agent_content:2026-07-08:fixture"))
         payload = json.loads(director_response(plan))
         payload["visual_concept"] = "Lab"
 
-        treatment = story.parse_reels_director_response(
-            json.dumps(payload), plan, SAFE_FACTS
-        )
-        pack = story.plan_story_pack(
-            plan, SAFE_FACTS, director_treatment=treatment
-        )
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), plan, SAFE_FACTS
+            )
 
-        self.assertEqual(treatment.visual_concept, "Lab")
-        self.assertEqual(pack.visual_concept, "Lab")
+        self.assertIn(
+            "director_visual_concept_generic",
+            raised.exception.reason_codes,
+        )
 
     def test_2026_07_08_route_accepts_detailed_visual_concept(self):
         plan = planned(source(source_ref="agent_content:2026-07-08:fixture"))
         payload = json.loads(director_response(plan))
         detailed_concept = " ".join(
-            ["physical causality expressed through one evolving laboratory mechanism"] * 8
+            ["configuration mismatch maps to physical mechanism"] * 8
         )
         self.assertGreater(len(detailed_concept), 240)
         payload["visual_concept"] = detailed_concept
@@ -410,12 +1059,14 @@ class StoryFirstTests(unittest.TestCase):
         payload = json.loads(director_response(plan))
         payload["visual_concept"] = "x" * 1201
 
-        with self.assertRaisesRegex(
-            story.StoryPlanError, "director_visual_concept_too_long"
-        ):
+        with self.assertRaises(story.DirectorValidationError) as raised:
             story.parse_reels_director_response(
                 json.dumps(payload), plan, SAFE_FACTS
             )
+        self.assertIn(
+            "director_visual_concept_too_long",
+            raised.exception.reason_codes,
+        )
 
     def test_admin_display_fields_are_derived_and_cannot_be_model_supplied(self):
         plan = planned()
@@ -553,7 +1204,7 @@ class StoryFirstTests(unittest.TestCase):
             self.assertIn("fitted matte-black technical overshirt", scene.keyframe_prompt)
             self.assertLessEqual(
                 len(scene.keyframe_prompt.encode("utf-16-le")) // 2,
-                800,
+                1000,
             )
             self.assertNotIn("tied to fact", scene.setting)
 
@@ -576,11 +1227,41 @@ class StoryFirstTests(unittest.TestCase):
             manifest = Path(root) / "story_manifest.json"
             for schema in story.SUPPORTED_STORY_SCHEMAS[1:]:
                 with self.subTest(schema=schema):
+                    payload = {"schema": schema, "plan_id": "legacy"}
                     manifest.write_text(
-                        json.dumps({"schema": schema, "plan_id": "legacy"}),
+                        json.dumps(payload),
                         encoding="utf-8",
                     )
                     self.assertEqual(story.read_manifest(manifest)["schema"], schema)
+                    self.assertFalse(
+                        story.manifest_has_current_production_contract(payload)
+                    )
+
+    def test_template_treatment_is_dry_run_readable_but_never_production_renderable(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        self.assertEqual(pack.director_version, story.TEMPLATE_DIRECTOR_VERSION)
+
+        with tempfile.TemporaryDirectory() as dry_root:
+            manifest = (
+                story.persist_dry_run(pack, Path(dry_root))
+                / "story_manifest.json"
+            )
+            payload = story.read_manifest(manifest)
+            self.assertEqual(
+                payload["director_version"],
+                story.TEMPLATE_DIRECTOR_VERSION,
+            )
+            self.assertFalse(
+                story.manifest_has_current_production_contract(payload)
+            )
+
+        with tempfile.TemporaryDirectory() as production_root:
+            with self.assertRaisesRegex(
+                story.StoryPlanError,
+                "template_treatment_production_forbidden",
+            ):
+                story.persist_story_queue(pack, Path(production_root))
+            self.assertEqual(list(Path(production_root).iterdir()), [])
 
     def test_current_pack_is_created_beside_old_base_id_without_overwriting_it(self):
         with tempfile.TemporaryDirectory() as root:
@@ -594,7 +1275,7 @@ class StoryFirstTests(unittest.TestCase):
             )
             before = old_manifest.read_bytes()
 
-            pack = story.plan_story_pack(plan, SAFE_FACTS)
+            pack = directed_pack(plan)
             current_dir = story.persist_story_queue(pack, Path(root))
 
             self.assertNotEqual(current_dir, old_dir)
@@ -659,7 +1340,10 @@ class StoryFirstTests(unittest.TestCase):
     def test_maximum_story_spine_and_derived_anchor_fit_provider_prompts(self):
         plan = planned()
         payload = json.loads(director_response(plan))
-        payload["story_spine"] = "s" * 180
+        payload["story_spine"] = (
+            "configuration " * 12 + "build result"
+        ).strip()
+        self.assertEqual(len(payload["story_spine"]), 180)
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
@@ -730,7 +1414,7 @@ class StoryFirstTests(unittest.TestCase):
             self.assertEqual(current["expected_outputs"]["stories"][0]["status"], "generated")
             self.assertEqual(current["expected_outputs"]["stories"][1]["status"], "renderer_failed")
 
-    def test_legacy_manifest_is_upgraded_without_losing_render_status(self):
+    def test_legacy_dry_run_remains_readable_without_becoming_renderable(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
         with tempfile.TemporaryDirectory() as root:
             pack_dir = story.persist_dry_run(pack, Path(root))
@@ -748,7 +1432,9 @@ class StoryFirstTests(unittest.TestCase):
 
             story.persist_dry_run(pack, Path(root))
             upgraded = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertTrue(story._manifest_has_current_reel_contract(upgraded))
+            self.assertFalse(
+                story.manifest_has_current_production_contract(upgraded)
+            )
             self.assertEqual(
                 upgraded["expected_outputs"]["stories"][0]["status"],
                 "generated",
@@ -756,7 +1442,7 @@ class StoryFirstTests(unittest.TestCase):
             self.assertEqual(list(pack_dir.rglob("*.mp4")), [])
 
     def test_public_current_contract_rejects_stale_v2_shapes(self):
-        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        pack = directed_pack()
         with tempfile.TemporaryDirectory() as root:
             manifest = story.persist_dry_run(pack, Path(root)) / "story_manifest.json"
             current = json.loads(manifest.read_text(encoding="utf-8"))
@@ -782,6 +1468,28 @@ class StoryFirstTests(unittest.TestCase):
         changed_thesis = json.loads(json.dumps(current))
         changed_thesis["central_thesis"] += " changed"
         self.assertFalse(story.manifest_has_current_production_contract(changed_thesis))
+
+        for field in ("central_thesis", "hook"):
+            wrong_type = json.loads(json.dumps(current))
+            wrong_type[field] = [wrong_type[field]]
+            wrong_type["immutable_plan_fingerprint"] = (
+                story._immutable_plan_fingerprint(wrong_type)
+            )
+            with self.subTest(wrong_top_level_type=field):
+                self.assertFalse(
+                    story.manifest_has_current_production_contract(wrong_type)
+                )
+
+        wrong_scene_type = json.loads(json.dumps(current))
+        wrong_scene_type["scenes"][0]["semantic_goal"] = [
+            wrong_scene_type["scenes"][0]["semantic_goal"]
+        ]
+        wrong_scene_type["immutable_plan_fingerprint"] = (
+            story._immutable_plan_fingerprint(wrong_scene_type)
+        )
+        self.assertFalse(
+            story.manifest_has_current_production_contract(wrong_scene_type)
+        )
 
         runtime_music = json.loads(json.dumps(current))
         runtime_music["music_plan"]["selected_track"] = {"track_id": "allowlisted-1"}
@@ -817,7 +1525,7 @@ class StoryFirstTests(unittest.TestCase):
     def test_seven_scene_directed_pack_has_current_production_contract(self):
         seven_facts = SAFE_FACTS + (
             "A sixth physical check preserved the corrected state.",
-            "A seventh observable result closed the same causal chain.",
+            "A seventh observable software result completed the same causal chain.",
         )
         plan = planned(source(safe_facts=seven_facts, causal_bits=7))
         treatment = story.parse_reels_director_response(
@@ -935,15 +1643,19 @@ class StoryFirstTests(unittest.TestCase):
             scenes=(broken_scene, *treatment.scenes[1:]),
         )
 
-        with self.assertRaisesRegex(
-            story.StoryPlanError,
-            "director_story_arc_invalid",
-        ):
+        with self.assertRaises(story.DirectorValidationError) as raised:
             story.plan_story_pack(plan, SAFE_FACTS, director_treatment=broken)
+        self.assertIn(
+            "director_story_arc_semantic_mismatch",
+            raised.exception.reason_codes,
+        )
 
     def test_queue_collision_with_changed_immutable_plan_fails_closed(self):
-        pack = story.plan_story_pack(planned(), SAFE_FACTS)
-        changed = dataclasses.replace(pack, central_thesis=pack.central_thesis + " changed")
+        pack = directed_pack()
+        changed = dataclasses.replace(
+            pack,
+            caption_plan={**pack.caption_plan, "main": pack.caption_plan["main"] + "!"},
+        )
         with tempfile.TemporaryDirectory() as root:
             manifest = story.persist_story_queue(pack, Path(root)) / "story_manifest.json"
             before = manifest.read_bytes()
@@ -955,7 +1667,7 @@ class StoryFirstTests(unittest.TestCase):
             self.assertEqual(manifest.read_bytes(), before)
 
     def test_queue_preflight_rejects_invalid_pack_before_creating_directory(self):
-        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        pack = directed_pack()
         invalid = dataclasses.replace(pack, reel_edits=())
 
         with tempfile.TemporaryDirectory() as root:

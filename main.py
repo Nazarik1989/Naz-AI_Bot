@@ -4368,7 +4368,7 @@ def reels_director_reason_codes(exc: Exception) -> tuple[str, ...]:
 def reels_director_reason_code(exc: Exception) -> str:
     reason_codes = reels_director_reason_codes(exc)
     action_markers = (
-        "interface_pantomime", "impossible_action", "multi_action",
+        "interface_pantomime", "impossible_action", "multi_action", "multiple_action",
         "physical_action_missing", "naz_action_subject_missing", "abstract_action",
         "action_recipe", "brand_marking",
         "physical_object_action_subject_invalid", "motion_subject_incompatible",
@@ -4387,7 +4387,7 @@ def reels_director_reason_summary(reason_code: str) -> str:
     if reason_code == "director_action_unfilmable" or any(
         marker in reason_code
         for marker in (
-            "interface_pantomime", "impossible_action", "multi_action",
+            "interface_pantomime", "impossible_action", "multi_action", "multiple_action",
             "physical_action_missing", "naz_action_subject_missing", "abstract_action",
             "action_recipe", "brand_marking",
             "physical_object_action_subject_invalid", "motion_subject_incompatible",
@@ -4397,6 +4397,35 @@ def reels_director_reason_summary(reason_code: str) -> str:
         return "сцена содержала непригодное для съёмки, перегруженное или физически неправдоподобное действие"
     if reason_code == "director_contract_invalid":
         return "несколько полей режиссёрского контракта не прошли проверку"
+    if reason_code == "director_raw_source_copy":
+        return "режиссёрский план дословно повторил внутренний исходник и был безопасно отклонён"
+    if reason_code == "director_unknown_numeric_claim":
+        return "режиссёрский план добавил число, которого нет в подтверждённых фактах"
+    if reason_code == "director_treatment_plan_binding_invalid":
+        return "режиссёрский план относится к другому плану или варианту"
+    if reason_code == "director_visual_concept_generic":
+        return "визуальная концепция слишком общая и не раскрывает конкретный смысл выпуска"
+    if reason_code in {
+        "director_treatment_required",
+        "director_treatment_invalid",
+        "director_treatment_semantic_contract_invalid",
+        "story_director_contract_stale",
+        "story_semantic_contract_stale",
+        "template_treatment_forbidden",
+        "template_treatment_production_forbidden",
+        "semantic_contract_version_invalid",
+    }:
+        return "режиссёрский план не содержит утверждённого смыслового контракта"
+    if any(
+        marker in reason_code
+        for marker in (
+            "core_thesis", "semantic_goal", "source_fact", "beat_",
+            "hook_payoff", "relation_to_previous", "visual_relation",
+            "physical_metaphor", "mechanical_arc", "story_arc_semantic_mismatch",
+            "unsupported_claim",
+        )
+    ):
+        return "смысл сцен не подтверждён исходными фактами или не образует одну связную историю"
     if "subject_identity" in reason_code:
         return "предметная и портретная постановка сцены противоречат друг другу"
     if "primary_setting" in reason_code:
@@ -4481,6 +4510,12 @@ async def process_agent_content_date(
         safe_facts = tuple(source_row.get("safe_facts", ()))
         try:
             director_treatment = await generate_reels_director_treatment(plan, safe_facts)
+            pack_dir = await asyncio.to_thread(
+                queue_story_first_pack,
+                plan,
+                safe_facts,
+                director_treatment,
+            )
         except (RuntimeError, story_production.StoryPlanError) as exc:
             reason_codes = reels_director_reason_codes(exc)
             reason_code = reels_director_reason_code(exc)
@@ -4505,12 +4540,6 @@ async def process_agent_content_date(
                 "Рендер не запускался, шаблонная замена не использована.",
             )
             return f"⚠️ Agent Content {resolved_date}: режиссёрский план отклонён."
-        pack_dir = await asyncio.to_thread(
-            queue_story_first_pack,
-            plan,
-            safe_facts,
-            director_treatment,
-        )
         payload = await asyncio.to_thread(
             story_production.read_manifest, pack_dir / "story_manifest.json"
         )
@@ -7410,7 +7439,11 @@ async def generate_reels_director_treatment(
                 "content": (
                     "You are Reels Maker and continuity director for Naz AI Lab. Direct one "
                     "silent-readable cause-and-effect micro-film with a stable set, wardrobe, "
-                    "identity and physical objective. Return one strict JSON treatment only. "
+                    "identity and physical objective. Ground one core thesis, hook, payoff and "
+                    "every scene's privacy-safe semantic goal in the supplied numbered facts. "
+                    "Use a physical metaphor only when the structured visual relation proves its "
+                    "connection to the semantic beat without inventing a fact or result. Return "
+                    "one strict JSON treatment only. "
                     "Never expose metadata, paths, secrets, private material, or internal planning."
                 ),
             },
@@ -7420,7 +7453,9 @@ async def generate_reels_director_treatment(
         temperature=0.45,
         model=CONTENT_MODEL_NAME,
         response_format=story_production.reels_director_response_format(
-            safe_facts, plan
+            safe_facts,
+            plan,
+            variant_index=variant_index,
         ),
     )
     return story_production.parse_reels_director_response(
@@ -7436,6 +7471,12 @@ def queue_story_first_pack(
     safe_facts: tuple[str, ...],
     director_treatment: story_production.DirectorTreatment | None = None,
 ) -> Path:
+    if director_treatment is None:
+        raise story_production.StoryPlanError("director_treatment_required")
+    if director_treatment.version != story_production.DIRECTOR_VERSION:
+        raise story_production.StoryPlanError(
+            "director_treatment_semantic_contract_invalid"
+        )
     pack = story_production.plan_story_pack(
         plan,
         safe_facts,
@@ -7447,9 +7488,9 @@ def queue_story_first_pack(
 def story_first_dry_run(
     plan: editorial_orchestrator.EditorialPlan,
     safe_facts: tuple[str, ...],
-) -> Path:
-    """Compatibility alias for callers introduced with the v1 planner."""
-    return queue_story_first_pack(plan, safe_facts)
+) -> story_production.StoryPackPlan:
+    """Compile an inspectable template in memory; never touch production storage."""
+    return story_production.plan_story_pack(plan, safe_facts)
 
 
 _CHRONICLE_METADATA_RE = re.compile(

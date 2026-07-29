@@ -446,6 +446,10 @@ def create_next_variant(
         facts = payload.get("safe_facts")
         if not isinstance(editorial, Mapping) or not isinstance(facts, list):
             raise story_production.StoryPlanError("story variant source contract missing")
+        if director_treatment is None:
+            raise story_production.StoryPlanError("director_treatment_required")
+        if director_treatment.version != story_production.DIRECTOR_VERSION:
+            raise story_production.StoryPlanError("story_director_contract_stale")
         plan = EditorialPlan.from_dict(editorial)
         next_index = int(payload.get("variant_index", 0)) + 1
         pack = story_production.plan_story_pack(
@@ -619,6 +623,22 @@ def safe_progress_summary(payload: Mapping[str, Any]) -> str:
     )
 
 
+def _safe_admin_semantic_text(payload: Mapping[str, Any], value: Any) -> str:
+    """Return display text only when it cannot quote a stored source fragment."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    facts = payload.get("safe_facts")
+    safe_facts = (
+        tuple(item for item in facts if isinstance(item, str))
+        if isinstance(facts, list)
+        else ()
+    )
+    if story_production._raw_source_fragment_in_text(text, safe_facts):
+        return ""
+    return text
+
+
 def safe_summary(payload: Mapping[str, Any]) -> str:
     jobs = payload.get("scene_jobs", []) if isinstance(payload.get("scene_jobs"), list) else []
     directed = payload.get("scenes", []) if isinstance(payload.get("scenes"), list) else []
@@ -645,19 +665,19 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
     model_mix = (
         f"Gen-4.5 {model_seconds['gen4.5']}s + Turbo {model_seconds['gen4_turbo']}s"
     )
-    concept = str(payload.get("visual_concept", "")).strip()
-    admin_concept = " ".join(str(payload.get("admin_concept_ru", "")).split())
+    concept = _safe_admin_semantic_text(payload, payload.get("visual_concept"))
+    admin_concept = _safe_admin_semantic_text(payload, payload.get("admin_concept_ru"))
     concept_label = admin_concept if re.search(r"[А-Яа-яЁё]", admin_concept) else ""
     if not concept_label:
         concept_label = VISUAL_CONCEPT_RU.get(concept, "")
-    thesis = " ".join(str(payload.get("central_thesis", "")).split())
+    thesis = _safe_admin_semantic_text(payload, payload.get("central_thesis"))
     if not concept_label and re.search(r"[А-Яа-яЁё]", thesis):
         concept_label = thesis[:120]
     if not concept_label:
         for scene in directed:
             if not isinstance(scene, Mapping):
                 continue
-            overlay = " ".join(str(scene.get("story_overlay", "")).split())
+            overlay = _safe_admin_semantic_text(payload, scene.get("story_overlay"))
             prefix, separator, remainder = overlay.partition(":")
             if separator and prefix.casefold() in SCENE_ROLE_RU:
                 overlay = remainder.strip()
@@ -668,6 +688,20 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         concept_label = _legacy_concept_ru(directed)
     if not concept_label:
         concept_label = "Рабочий эпизод превращается в проверяемый результат"
+    semantic_contract = (
+        str(payload.get("director_version", ""))
+        == story_production.DIRECTOR_VERSION
+    )
+    core_thesis = _safe_admin_semantic_text(
+        payload, payload.get("central_thesis")
+    )[:180]
+    hook = _safe_admin_semantic_text(payload, payload.get("hook"))[:160]
+    payoff = _safe_admin_semantic_text(payload, payload.get("payoff"))[:160]
+    semantic_overview = ""
+    if semantic_contract and core_thesis:
+        semantic_overview += f"Тезис: {core_thesis}\n"
+    if semantic_contract and hook and payoff:
+        semantic_overview += f"Зацепка → развязка: {hook} → {payoff}\n"
     statuses = "\n".join(
         f"• {SCENE_STATUS_RU.get(state, state)}: {count}"
         for state, count in sorted(counts.items())
@@ -676,26 +710,45 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
     for index, scene in enumerate(directed, 1):
         if isinstance(scene, Mapping):
             role = str(scene.get("role", "scene")).casefold()
-            overlay = " ".join(str(scene.get("admin_summary_ru", "")).split())
-            if not re.search(r"[А-Яа-яЁё]", overlay):
-                overlay = _legacy_scene_summary_ru(scene)
-            if not re.search(r"[А-Яа-яЁё]", overlay):
-                overlay = " ".join(str(scene.get("story_overlay", "")).split())
-            prefix, separator, remainder = overlay.partition(":")
-            if separator and prefix.casefold() in SCENE_ROLE_RU:
-                overlay = remainder.strip()
-            if not re.search(r"[А-Яа-яЁё]", overlay):
-                overlay = SCENE_FALLBACK_RU.get(
-                    role, "Показываем один понятный этап рабочего эпизода."
+            semantic_goal = _safe_admin_semantic_text(
+                payload, scene.get("semantic_goal")
+            )
+            relation = _safe_admin_semantic_text(
+                payload, scene.get("relation_to_previous")
+            )
+            if semantic_contract and semantic_goal:
+                overlay = semantic_goal
+            else:
+                overlay = _safe_admin_semantic_text(
+                    payload, scene.get("admin_summary_ru")
                 )
+                if not re.search(r"[А-Яа-яЁё]", overlay):
+                    overlay = _legacy_scene_summary_ru(scene)
+                if not re.search(r"[А-Яа-яЁё]", overlay):
+                    overlay = _safe_admin_semantic_text(
+                        payload, scene.get("story_overlay")
+                    )
+                prefix, separator, remainder = overlay.partition(":")
+                if separator and prefix.casefold() in SCENE_ROLE_RU:
+                    overlay = remainder.strip()
+                if not re.search(r"[А-Яа-яЁё]", overlay):
+                    overlay = SCENE_FALLBACK_RU.get(
+                        role, "Показываем один понятный этап рабочего эпизода."
+                    )
             subject = "Naz" if bool(scene.get("requires_naz_reference")) else "объект или механизм"
             shot_size = SHOT_SIZE_RU.get(str(scene.get("shot_size", "")).casefold(), "не задан")
             camera = CAMERA_MOTION_RU.get(
                 str(scene.get("camera_motion", "")).casefold(), "спокойное движение камеры"
             )
+            transition_line = (
+                f"   Переход: {relation[:112]}\n"
+                if semantic_contract and index > 1 and relation
+                else ""
+            )
             treatment.append(
                 f"{index}. {SCENE_ROLE_RU.get(role, 'СЦЕНА')}\n"
                 f"   Смысл: {overlay[:112]}\n"
+                f"{transition_line}"
                 f"   В кадре: {subject} · План: {shot_size} · Камера: {camera}"
             )
     pack_status = str(payload.get("pack_status", "unknown"))
@@ -705,6 +758,7 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         f"Вариант: {int(payload.get('variant_index', 0)) + 1}\n"
         f"Рубрика: {str(payload.get('rubric', ''))[:120]}\n"
         f"Сюжетная линия: {concept_label}\n"
+        f"{semantic_overview}"
         f"Статус: {PACK_STATUS_RU.get(pack_status, pack_status)}\n"
         f"Сцен: {len(jobs)}, запланировано секунд: {duration:g}\n"
         f"Сцен с Naz: {references}\n\n{statuses}\n\n"

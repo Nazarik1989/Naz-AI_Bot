@@ -3,7 +3,7 @@
 Story-first planning is part of the normal Agent Content route, but media work
 is deliberately separate. Reels Maker uses one bounded text-model request to
 produce a content-specific treatment, validates it, then atomically writes a
-`naz-story-pack-v6`
+`naz-story-pack-v7`
 manifest and returns. `naz_story_worker.py` resumes one state transition at a
 time and contains no Telegram or VK publication path.
 
@@ -43,15 +43,35 @@ administrator's private chat automatically; there is no manual download step.
 - New hybrid plans assign Gen-4.5 to Naz scenes and Turbo to object scenes
   before approval. The approval card shows that mix and its cost. A hybrid
   scene never changes model after approval.
-- Semantic-director v7 filters transport metadata before eligibility and lets
-  the director choose only one pre-vetted physical `story_arc`. The application
-  expands that arc into material-compatible actions, subject identity, one
-  location and mechanism, continuous states, Russian approval summaries and
-  observable final proof; none of those fields is free-form model output.
-  It revalidates that bounded scene contract and the immutable-plan fingerprint
-  on queue collisions before a pack can reach the paid worker. Schemas v1-v5
-  remain readable but are production read-only; older v6 director contracts
-  also fail the current provider preflight.
+- Semantic-director v8 grounds one `core_thesis`, hook and payoff in explicit
+  source-fact references. Every beat owns one scene with a privacy-safe
+  `semantic_goal`; every scene after the first explains its transition from the
+  previous scene. The application compiles keyframe and Runway prompts only
+  from that approved scene brief and never copies the raw private chronicle into
+  a provider prompt. A treatment is bound to its exact plan and variant and
+  cannot be reused for another variant.
+- Deterministic semantic preflight runs before production persistence. It
+  rejects missing or unknown source references, uncovered beats, duplicate
+  goals, unsupported numbers or claims, generic concepts such as `Lab`,
+  unrelated mechanical arcs and prompts that do not match the approved brief.
+  Each scene must cite its ordered beat fact. Substantive terms must come from
+  the cited facts; four-word source fragments and complete short facts are
+  rejected. A metaphor relation must carry at least two cited semantic anchors
+  and name exactly one approved physical motion, with no repeated or chained
+  action. `visual_relation_to_beat` is preflight evidence, not provider motion
+  prose: render prompts receive the privacy-safe semantic goal as non-motion
+  context plus exactly one canonical action compiled from the selected arc.
+  A physical metaphor is accepted only when it is explicitly marked
+  `physical_metaphor`, maps unambiguously to its beat, adds no fact or result and
+  passes that same fail-closed preflight. Literal hardware is allowed only when
+  that scene's cited facts contain unambiguous physical evidence; ambiguous
+  software `module`, `assembly` or `prototype` wording does not qualify.
+- Template treatments and older semantic contracts may be inspected through
+  `read_manifest` and dry-run tooling, but cannot be approved, replaced by a
+  production variant or rendered. Schema v7 with semantic-director v8 is the
+  only current paid-worker contract; v1-v6 manifests remain production
+  read-only. The Python compatibility helper `story_first_dry_run()` compiles
+  its template in memory and does not write into the production pack root.
 
 Run static validation:
 
@@ -118,15 +138,19 @@ profile):
 ```
 
 The approval card lists a content-directed visual concept plus every scene's
-location, physical action and camera, and the estimated Runway credits. The
-semantic director must express one silent-readable goal, obstacle, corrective
-test and visible proof. Every scene keeps the same primary setting and hands its
-end state to the next scene. Final Reel edits preserve that causal order and may
-only repeat adjacent reframed fragments when a short treatment needs seven cuts.
+privacy-safe semantic goal, transition, physical action and camera, and the
+estimated Runway credits. It also shows the grounded thesis and hook → payoff,
+without showing source facts or provider prompts. Display-time redaction also
+suppresses an exact or partial source fragment if a malformed or tampered
+payload reaches the summary code. The semantic director must
+express one silent-readable goal, obstacle, corrective test and visible proof.
+Every scene keeps the same primary setting and hands its end state to the next
+scene. Final Reel edits preserve that causal order and may only repeat adjacent
+reframed fragments when a short treatment needs seven cuts.
 The application injects one restrained matte-black Naz lab wardrobe across all
 human scenes. Transport metadata, paths, generic `fact N` placeholders, costume
 changes and backward timeline jumps are rejected. Naz AI Lab remains a coherent
-world chosen per episode, not one mandatory room for every episode. A v5
+world chosen per episode, not one mandatory room for every episode. A current v7
 pack first creates one asynchronous directed keyframe per scene with
 `gen4_image`; identity scenes keep the tagged `@Naz` reference while object-only
 scenes use the text-only form. It then animates that immutable keyframe with the
@@ -139,7 +163,7 @@ reference-quality retry may substitute the frontal private reference at runtime;
 it does not mutate the immutable scene treatment or copy either reference into
 Git. The concise identity recovery likewise leaves the manifest treatment
 unchanged and is never an automatic fallback.
-No keyframe or video task is submitted before explicit approval. v1/v2/v3/v4 packs
+No keyframe or video task is submitted before explicit approval. v1-v6 packs
 remain inspectable but are read-only and cannot silently use the old direct-avatar route.
 
 `NAZ_STORY_MUSIC_LIBRARY` may point to a private music folder. Each audio file
@@ -167,7 +191,8 @@ allowlist format remains supported:
 ```
 
 Missing or invalid music leaves CLEAN/STORY media intact and sets Reel state
-to `blocked_music`.
+to `blocked_music`. The production pipeline remains music-only: this semantic
+contract does not add voiceover and does not change the composer or audio path.
 
 ### Initial generated music library
 
@@ -217,5 +242,6 @@ are checksummed and are never regenerated merely to add text.
 
 Stop invoking the worker, restore `NAZ_STORY_RENDER_ENABLED=false`, and deploy
 the pre-change application SHA. Do not delete pack directories: their manifests
-and completed assets are resumable evidence. Existing v1 dry-run manifests are
-read-only compatible and are never upgraded in place.
+and completed assets are resumable evidence. Existing v1-v6 manifests remain
+read-only compatible and are never upgraded in place; rollback does not rewrite
+or downgrade a v7 manifest.

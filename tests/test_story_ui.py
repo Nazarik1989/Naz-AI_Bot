@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, patch
 import main
 import story_pack_control as control
 import story_production as story
-from tests.test_story_production import SAFE_FACTS, director_response, planned
+from tests.test_story_production import (
+    SAFE_FACTS,
+    directed_pack,
+    director_response,
+    planned,
+)
 
 
 def fake_update(user_id: int, text: str) -> SimpleNamespace:
@@ -70,7 +75,7 @@ class StoryMenuTests(unittest.TestCase):
 
     def test_legacy_confirm_button_only_returns_plan_scoped_card(self):
         with tempfile.TemporaryDirectory() as root:
-            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack = directed_pack()
             story.persist_story_queue(pack, Path(root))
             update = fake_update(1, main.BTN_REELS_CONFIRM)
             with patch.object(main, "ADMIN_ID", 1), patch.object(
@@ -94,7 +99,7 @@ class StoryMenuTests(unittest.TestCase):
 
     def test_legacy_variant_button_does_not_supersede_latest_plan(self):
         with tempfile.TemporaryDirectory() as root:
-            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack = directed_pack()
             story.persist_story_queue(pack, Path(root))
             update = fake_update(1, main.BTN_REELS_VARIANT)
             with patch.object(main, "ADMIN_ID", 1), patch.object(
@@ -114,7 +119,7 @@ class StoryMenuTests(unittest.TestCase):
 
     def test_reply_confirmation_is_not_sent_to_chat_or_provider(self):
         with tempfile.TemporaryDirectory() as root:
-            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack = directed_pack()
             pack_dir = story.persist_story_queue(pack, Path(root))
             summary = control.safe_summary(
                 story.read_manifest(pack_dir / "story_manifest.json")
@@ -143,8 +148,9 @@ class StoryMenuTests(unittest.TestCase):
 
     def test_callback_confirms_exact_plan_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as root:
-            first = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=0)
-            second = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=1)
+            plan = planned()
+            first = directed_pack(plan, variant_index=0)
+            second = directed_pack(plan, variant_index=1)
             self.assertNotEqual(first.plan_id, second.plan_id)
             story.persist_story_queue(first, Path(root))
             story.persist_story_queue(second, Path(root))
@@ -175,7 +181,7 @@ class StoryMenuTests(unittest.TestCase):
 
     def test_scoped_status_returns_compact_manifest_progress(self):
         with tempfile.TemporaryDirectory() as root:
-            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack = directed_pack()
             pack_dir = story.persist_story_queue(pack, Path(root))
             control.approve_pack(Path(root), pack.plan_id)
             payload = story.read_manifest(pack_dir / "story_manifest.json")
@@ -207,7 +213,7 @@ class StoryMenuTests(unittest.TestCase):
     def test_scoped_variant_runs_semantic_director_before_superseding(self):
         with tempfile.TemporaryDirectory() as root:
             plan = planned()
-            first = story.plan_story_pack(plan, SAFE_FACTS)
+            first = directed_pack(plan)
             story.persist_story_queue(first, Path(root))
             treatment = story.parse_reels_director_response(
                 director_response(plan, variant_index=1),
@@ -238,7 +244,7 @@ class StoryMenuTests(unittest.TestCase):
 
     def test_scoped_variant_rejects_stale_manifest_before_director_call(self):
         with tempfile.TemporaryDirectory() as root:
-            first = story.plan_story_pack(planned(), SAFE_FACTS)
+            first = directed_pack()
             pack_dir = story.persist_story_queue(first, Path(root))
             manifest = pack_dir / "story_manifest.json"
             payload = story.read_manifest(manifest)
@@ -265,8 +271,9 @@ class StoryMenuTests(unittest.TestCase):
 
     def test_manifest_plan_id_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
-            first = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=0)
-            second = story.plan_story_pack(planned(), SAFE_FACTS, variant_index=1)
+            plan = planned()
+            first = directed_pack(plan, variant_index=0)
+            second = directed_pack(plan, variant_index=1)
             first_dir = story.persist_story_queue(first, Path(root))
             second_dir = story.persist_story_queue(second, Path(root))
             first_manifest = first_dir / "story_manifest.json"
@@ -290,7 +297,7 @@ class StoryMenuTests(unittest.TestCase):
 
     def test_non_admin_callback_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
-            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack = directed_pack()
             pack_dir = story.persist_story_queue(pack, Path(root))
             update = fake_reels_callback(2, f"reels_confirm:{pack.plan_id}")
             with patch.object(main, "ADMIN_ID", 1), patch.object(
@@ -321,7 +328,7 @@ class StoryMenuTests(unittest.TestCase):
 class StoryDeliveryTests(unittest.TestCase):
     def test_completed_pack_is_sent_only_to_admin_private_chat(self):
         with tempfile.TemporaryDirectory() as root:
-            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack = directed_pack()
             pack_dir = story.persist_story_queue(pack, Path(root))
             manifest = pack_dir / "story_manifest.json"
             payload = story.read_manifest(manifest)
