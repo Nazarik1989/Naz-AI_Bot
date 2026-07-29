@@ -149,6 +149,24 @@ class NazVkMusicTests(unittest.TestCase):
             self.assertEqual(result["job_id"], job_id)
             self.assertEqual(music.load_shared_recent(shared), [])
 
+    def test_reservation_envelope_remains_readable_by_v1_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "rotation.json"
+            reservation = music.TrackReservation(
+                job_id=self.job_id(16),
+                track_query=music.APPROVED_TRACKS[0].query,
+                track_key=music._normal(music.APPROVED_TRACKS[0].query),
+                source_ref="systemd:rollback-compatible",
+                reserved_at=self.now.isoformat().replace("+00:00", "Z"),
+            )
+            music._save_reservations(state, [reservation])
+            payload = json.loads(state.read_text(encoding="utf-8"))
+
+        # This is the exact subset read by the previous v1 implementation.
+        self.assertEqual(payload["schema"], music.LEGACY_ROTATION_SCHEMA)
+        self.assertEqual(payload["recent_queries"], [])
+        self.assertEqual(payload["reservation_schema"], music.RESERVATION_SCHEMA)
+
     def test_active_reservation_is_excluded_without_changing_published_lru(self):
         daily = list(music.eligible_tracks(["daily"]))
         history = [music._normal(track.query) for track in daily[:-1]]
