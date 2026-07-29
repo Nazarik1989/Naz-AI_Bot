@@ -25,7 +25,11 @@ administrator's private chat automatically; there is no manual download step.
   generated seconds per UTC day by default. A legacy identity keyframe that
   failed on the old Turbo route may be retried once through `gen4_image` only
   after explicit confirmation; these migrations have a separate four-per-day
-  ceiling.
+  ceiling. If that retry returns `INTERNAL.BAD_OUTPUT` and a private reference
+  review identifies the off-axis input as the likely cause, an operator-only
+  control may retarget at most four unfinished jobs to the approved frontal
+  identity reference. That quality retry has its own four-per-day ceiling and
+  cannot be triggered by an accidental second Telegram button press.
 - `NAZ_VIDEO_AUTO_FALLBACK=true` is rejected. Gen-4.5 is never submitted until
   the administrator confirms the pending escalation with the existing
   `Подтвердить генерацию` button.
@@ -88,7 +92,10 @@ pack first creates one asynchronous directed keyframe per scene with
 scenes use the text-only form. It then animates that immutable keyframe with the
 video route. `gen4_image_turbo` is not used for new keyframes. A bounded retry
 of legacy Turbo identity failures stays in the same plan, preserves completed
-scenes and appears in the existing progress card.
+scenes and appears in the existing progress card. A separately approved
+reference-quality retry may substitute the frontal private reference at runtime;
+it does not mutate the immutable scene treatment or copy either reference into
+Git.
 No keyframe or video task is submitted before explicit approval. v1/v2/v3/v4 packs
 remain inspectable but are read-only and cannot silently use the old direct-avatar route.
 
