@@ -222,7 +222,8 @@ def _load_reservations(state_file: Path) -> tuple[list[TrackReservation], bool]:
         payload.get("reservation_schema") != RESERVATION_SCHEMA
         or set(payload)
         != {"schema", "recent_queries", "reservation_schema", "reservations"}
-        or payload.get("recent_queries") != []
+        or not isinstance(payload.get("recent_queries"), list)
+        or not all(isinstance(item, str) for item in payload["recent_queries"])
         or not isinstance(payload.get("reservations"), list)
         or len(payload["reservations"]) > len(APPROVED_TRACKS)
     ):
@@ -262,6 +263,11 @@ def _load_reservations(state_file: Path) -> tuple[list[TrackReservation], bool]:
         job_ids.add(reservation.job_id)
         track_keys.add(reservation.track_key)
         reservations.append(reservation)
+    expected_projection = [
+        item.track_query for item in reservations[-SHARED_COLLISION_LIMIT:]
+    ]
+    if payload["recent_queries"] != expected_projection:
+        raise TrackSelectionError("VK track reservation compatibility view is invalid")
     return reservations, False
 
 
@@ -311,11 +317,14 @@ def _save_reservations(
     state_file: Path,
     reservations: Iterable[TrackReservation],
 ) -> None:
+    items = list(reservations)
     payload = {
         "schema": ROTATION_SCHEMA,
-        "recent_queries": [],
+        "recent_queries": [
+            item.track_query for item in items[-SHARED_COLLISION_LIMIT:]
+        ],
         "reservation_schema": RESERVATION_SCHEMA,
-        "reservations": [item.to_dict() for item in reservations],
+        "reservations": [item.to_dict() for item in items],
     }
     descriptor, raw_temp = tempfile.mkstemp(prefix=f".{state_file.name}-", dir=state_file.parent)
     os.close(descriptor)

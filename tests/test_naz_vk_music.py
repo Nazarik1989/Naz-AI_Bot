@@ -131,7 +131,7 @@ class NazVkMusicTests(unittest.TestCase):
                     payload["reservation_schema"], music.RESERVATION_SCHEMA
                 )
                 self.assertEqual(payload["reservations"][0]["job_id"], job_id)
-                self.assertEqual(payload["recent_queries"], [])
+                self.assertEqual(payload["recent_queries"], [query])
                 return {"job_id": job_id, "track_query": query}
 
             with patch("naz_vk_music._utc_now", return_value=self.now):
@@ -164,7 +164,7 @@ class NazVkMusicTests(unittest.TestCase):
 
         # This is the exact subset read by the previous v1 implementation.
         self.assertEqual(payload["schema"], music.LEGACY_ROTATION_SCHEMA)
-        self.assertEqual(payload["recent_queries"], [])
+        self.assertEqual(payload["recent_queries"], [reservation.track_query])
         self.assertEqual(payload["reservation_schema"], music.RESERVATION_SCHEMA)
 
     def test_active_reservation_is_excluded_without_changing_published_lru(self):
