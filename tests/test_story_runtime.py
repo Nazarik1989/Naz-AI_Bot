@@ -666,11 +666,83 @@ class WorkerTests(unittest.TestCase):
             )
             request = provider.keyframe_submissions[0]
             self.assertEqual(request.reference_path, (ref_dir / "naz-secondary.jpg").resolve())
+            self.assertEqual(
+                request.reference_paths,
+                (
+                    (ref_dir / "naz-secondary.jpg").resolve(),
+                    (ref_dir / "naz-primary.jpg").resolve(),
+                ),
+            )
+            self.assertIn("@NazView2", request.prompt)
             self.assertIn("185 cm", request.prompt)
             self.assertIn("80 kg", request.prompt)
             self.assertEqual(provider.submissions, [])
             persisted = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertNotIn("185 cm", persisted["scenes"][0]["provider_prompt"])
+
+    def test_v2_reference_profile_supplies_three_private_identity_views(self):
+        with tempfile.TemporaryDirectory() as root:
+            ref_dir = Path(root) / "private-references"
+            ref_dir.mkdir()
+            names = {
+                "frontal_identity": "naz-front.jpg",
+                "three_quarter_identity": "naz-angle.jpg",
+                "full_body_identity": "naz-body.jpg",
+            }
+            for filename in names.values():
+                (ref_dir / filename).write_bytes(filename.encode("ascii"))
+            (ref_dir / "naz-reference-profile.json").write_text(json.dumps({
+                "schema": "naz-reference-profile.v2",
+                "persona": "naz",
+                "reference_files": names,
+                "body_profile": {
+                    "height_cm": 185,
+                    "weight_kg": 80,
+                    "build": "tall, lean-athletic",
+                    "visual_guidance": "Long balanced proportions; fit but not bulky.",
+                },
+            }), encoding="utf-8")
+            human_plan = dataclasses.replace(
+                planned(),
+                visual_subject_direction="the canonical Naz in the laboratory",
+            )
+            _, _, manifest = make_pack(
+                root, keyframes_ready=False, editorial_plan=human_plan
+            )
+            payload = story.read_manifest(manifest)
+            payload["scenes"][0].update({
+                "requires_naz_reference": True,
+                "reference_role": "three_quarter_identity",
+            })
+            payload["scene_jobs"][0].update({
+                "requires_naz_reference": True,
+                "reference_role": "three_quarter_identity",
+            })
+            story.atomic_json(manifest, payload)
+            provider = FakeVideoProvider()
+
+            worker.process_pack(
+                payload["plan_id"],
+                config=config(root, reference_path=ref_dir),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+
+            request = provider.keyframe_submissions[0]
+            self.assertEqual(
+                request.reference_paths,
+                tuple((ref_dir / names[role]).resolve() for role in (
+                    "three_quarter_identity", "frontal_identity", "full_body_identity"
+                )),
+            )
+            self.assertIn("@NazView2", request.prompt)
+            self.assertIn("@NazView3", request.prompt)
+            self.assertIn("185 cm", request.prompt)
+            self.assertIn("80 kg", request.prompt)
+            self.assertLessEqual(
+                utf16_code_units(request.prompt),
+                RUNWAY_PROMPT_MAX_UTF16_UNITS,
+            )
 
     def test_explicit_frontal_retry_uses_distinct_reference_and_budget_once(self):
         with tempfile.TemporaryDirectory() as root:

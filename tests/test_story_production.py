@@ -54,7 +54,6 @@ def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix=
         start_state = previous_end_state or "the validation mechanism is inactive and unresolved"
         end_state = f"coupling number {index} completes one stable motion"
         scenes.append({
-            "setting": f"distinct physical validation chamber number {index}",
             "subject_kind": "physical_object",
             "subject_detail": "one physical optical-titanium prototype",
             "concrete_action": f"{action_prefix} mechanical coupling number {index} under controlled load",
@@ -70,6 +69,7 @@ def director_response(plan, facts=SAFE_FACTS, *, variant_index=0, action_prefix=
         "visual_concept": "a failed configuration becoming one testable physical mechanism",
         "story_spine": "one failed configuration is isolated, corrected and verified under the same load",
         "continuity_anchor": "the same optical-titanium validation mechanism",
+        "primary_setting": "one physical Naz AI Lab validation chamber",
         "admin_concept_ru": "Ошибка конфигурации становится проверяемым механизмом",
         "scenes": scenes,
     })
@@ -96,6 +96,8 @@ class StoryFirstTests(unittest.TestCase):
         self.assertIn("admin_concept_ru", contract["schema"]["properties"])
         self.assertIn("story_spine", contract["schema"]["properties"])
         self.assertIn("continuity_anchor", contract["schema"]["properties"])
+        self.assertIn("primary_setting", contract["schema"]["properties"])
+        self.assertNotIn("setting", properties)
         self.assertEqual(
             contract["schema"]["properties"]["story_spine"]["maxLength"], 180
         )
@@ -222,11 +224,23 @@ class StoryFirstTests(unittest.TestCase):
                 json.dumps(payload), plan, SAFE_FACTS
             )
 
+    def test_director_applies_one_primary_setting_to_every_scene(self):
+        plan = planned()
+        payload = json.loads(director_response(plan))
+        payload["primary_setting"] = "one restrained Naz AI Lab server aisle"
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, SAFE_FACTS
+        )
+        self.assertEqual(
+            {scene.setting for scene in treatment.scenes},
+            {payload["primary_setting"]},
+        )
+
     def test_semantic_director_rejects_metadata_shaped_scene_content(self):
         plan = planned()
         payload = json.loads(director_response(plan))
-        payload["scenes"][0]["setting"] = "A real setting tied to fact 1"
-        with self.assertRaisesRegex(story.StoryPlanError, "director_scene_1_setting_metadata"):
+        payload["primary_setting"] = "A real setting tied to fact 1"
+        with self.assertRaisesRegex(story.StoryPlanError, "director_primary_setting_metadata"):
             story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
 
     def test_2026_07_08_route_accepts_concrete_technical_locations(self):
@@ -239,17 +253,17 @@ class StoryFirstTests(unittest.TestCase):
             "GitHub build bench",
             "code test chamber",
         )
-        for scene, location in zip(payload["scenes"], locations):
-            scene["setting"] = location
-
-        treatment = story.parse_reels_director_response(
-            json.dumps(payload), plan, SAFE_FACTS
-        )
-
-        self.assertEqual(
-            [scene.setting for scene in treatment.scenes],
-            list(locations),
-        )
+        for location in locations:
+            with self.subTest(location=location):
+                candidate = json.loads(json.dumps(payload))
+                candidate["primary_setting"] = location
+                treatment = story.parse_reels_director_response(
+                    json.dumps(candidate), plan, SAFE_FACTS
+                )
+                self.assertEqual(
+                    {scene.setting for scene in treatment.scenes},
+                    {location},
+                )
 
     def test_director_still_rejects_internal_transport_markers(self):
         plan = planned()
@@ -262,9 +276,9 @@ class StoryFirstTests(unittest.TestCase):
         ):
             with self.subTest(invalid_setting=invalid_setting):
                 payload = json.loads(director_response(plan))
-                payload["scenes"][0]["setting"] = invalid_setting
+                payload["primary_setting"] = invalid_setting
                 with self.assertRaisesRegex(
-                    story.StoryPlanError, "director_scene_1_setting_metadata"
+                    story.StoryPlanError, "director_primary_setting_metadata"
                 ):
                     story.parse_reels_director_response(
                         json.dumps(payload), plan, SAFE_FACTS
@@ -279,9 +293,9 @@ class StoryFirstTests(unittest.TestCase):
         ):
             with self.subTest(invalid_setting=invalid_setting):
                 payload = json.loads(director_response(plan))
-                payload["scenes"][0]["setting"] = invalid_setting
+                payload["primary_setting"] = invalid_setting
                 with self.assertRaisesRegex(
-                    story.StoryPlanError, "director_scene_1_setting_cliche"
+                    story.StoryPlanError, "director_primary_setting_cliche"
                 ):
                     story.parse_reels_director_response(
                         json.dumps(payload), plan, SAFE_FACTS
@@ -356,7 +370,7 @@ class StoryFirstTests(unittest.TestCase):
         plan = planned()
         payload = json.loads(director_response(plan))
         payload["visual_concept"] = "flowing code"
-        payload["scenes"][0]["setting"] = "setting tied to fact 1"
+        payload["primary_setting"] = "setting tied to fact 1"
         payload["scenes"][1]["subject_kind"] = "unknown_person"
 
         with self.assertRaises(story.DirectorValidationError) as raised:
@@ -366,7 +380,7 @@ class StoryFirstTests(unittest.TestCase):
 
         self.assertEqual(str(raised.exception), "director_contract_invalid")
         self.assertIn("director_visual_concept_cliche", raised.exception.reason_codes)
-        self.assertIn("director_scene_1_setting_metadata", raised.exception.reason_codes)
+        self.assertIn("director_primary_setting_metadata", raised.exception.reason_codes)
         self.assertIn("director_scene_2_subject_kind_invalid", raised.exception.reason_codes)
 
     def test_semantic_director_rejects_malformed_json_without_template_fallback(self):
@@ -382,6 +396,9 @@ class StoryFirstTests(unittest.TestCase):
         self.assertIn("one concise story_spine", prompt)
         self.assertIn("copy the preceding scene's end_state verbatim", prompt)
         self.assertIn("same physical object or system", prompt)
+        self.assertIn("viewer with sound off", prompt)
+        self.assertIn("Define primary_setting once", prompt)
+        self.assertIn("Never invent armour", prompt)
         self.assertNotIn("source_ref", prompt)
         self.assertNotIn("plan_id", prompt)
 
@@ -409,7 +426,7 @@ class StoryFirstTests(unittest.TestCase):
         plan = planned(source(causal_bits=1, safe_facts=SAFE_FACTS[:1], real_result=False))
         self.assertEqual(plan.production_mode, "standard")
 
-    def test_full_experiment_has_clean_story_and_nonsequential_reel_contracts(self):
+    def test_full_experiment_has_clean_story_and_causal_reel_contracts(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
         for scene in pack.scenes:
             self.assertIn("9:16", scene.clean_prompt)
@@ -422,10 +439,9 @@ class StoryFirstTests(unittest.TestCase):
         for edit in pack.reel_edits:
             self.assertTrue(edit.hook)
             self.assertTrue(edit.conclusion)
-            self.assertNotEqual(
-                [shot["scene_id"] for shot in edit.shots],
-                [scene.scene_id for scene in pack.scenes][: len(edit.shots)],
-            )
+            scene_order = {scene.scene_id: index for index, scene in enumerate(pack.scenes)}
+            positions = [scene_order[str(shot["source_scene_id"])] for shot in edit.shots]
+            self.assertEqual(positions, sorted(positions))
             self.assertTrue(all(0.4 <= float(shot["duration_seconds"]) <= 2.0 for shot in edit.shots))
             self.assertTrue(12.0 <= sum(float(shot["duration_seconds"]) for shot in edit.shots) <= 20.0)
             self.assertTrue(
@@ -457,6 +473,11 @@ class StoryFirstTests(unittest.TestCase):
             self.assertEqual(scene.identity_reference_usage, "identity_only")
             self.assertIn("@Naz", scene.keyframe_prompt)
             self.assertIn("replace the reference background", scene.keyframe_prompt)
+            self.assertIn("fitted matte-black technical overshirt", scene.keyframe_prompt)
+            self.assertLessEqual(
+                len(scene.keyframe_prompt.encode("utf-16-le")) // 2,
+                800,
+            )
             self.assertNotIn("tied to fact", scene.setting)
 
     def test_story_plan_id_is_schema_scoped_and_cannot_reuse_an_old_manifest(self):
@@ -579,15 +600,20 @@ class StoryFirstTests(unittest.TestCase):
         with self.assertRaises(story.StoryPlanError):
             story.validate_story_pack(broken)
 
-    def test_sequential_story_concatenation_is_rejected_even_when_reframed(self):
+    def test_reel_edit_preserves_the_directors_causal_scene_order(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        scene_order = {scene.scene_id: index for index, scene in enumerate(pack.scenes)}
+        for edit in pack.reel_edits:
+            positions = [scene_order[str(item["source_scene_id"])] for item in edit.shots]
+            self.assertEqual(positions[0], 0)
+            self.assertEqual(positions[-1], len(pack.scenes) - 1)
+            self.assertEqual(positions, sorted(positions))
+
+    def test_reel_edit_rejects_a_backwards_causal_jump(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
         edit = pack.reel_edits[0]
-        shots = []
-        for item, scene in zip(edit.shots, pack.scenes):
-            shot = dict(item)
-            shot["scene_id"] = scene.scene_id
-            shot["source_scene_id"] = scene.scene_id
-            shots.append(shot)
+        shots = [dict(item) for item in edit.shots]
+        shots[1], shots[4] = shots[4], shots[1]
         broken_edit = dataclasses.replace(edit, shots=tuple(shots))
         broken = dataclasses.replace(pack, reel_edits=(broken_edit, *pack.reel_edits[1:]))
         with self.assertRaises(story.StoryPlanError):

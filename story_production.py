@@ -27,7 +27,7 @@ PREVIOUS_STORY_SCHEMA = "naz-story-pack-v4"
 OLDER_STORY_SCHEMA = "naz-story-pack-v3"
 LEGACY_STORY_SCHEMA = "naz-story-pack-v2"
 ANCIENT_STORY_SCHEMA = "naz-story-pack-v1"
-DIRECTOR_VERSION = "reels-semantic-director-v2"
+DIRECTOR_VERSION = "reels-semantic-director-v3"
 TEMPLATE_DIRECTOR_VERSION = "reels-template-director-v1"
 RENDERER_UNAVAILABLE = "unavailable"
 DRAMATURGIC_ROLES = (
@@ -39,6 +39,10 @@ REEL_CROPS = ("tight-center", "left-detail", "right-detail", "wide-center")
 CAMERA_MOTIONS = ("slow push", "controlled pan", "handheld follow", "locked with real subject motion")
 DIRECTOR_SUBJECT_KINDS = ("naz_human", "physical_object")
 CANONICAL_NAZ_SUBJECT = "Naz, the same real adult human founder"
+CANONICAL_NAZ_WARDROBE = (
+    "the same fitted matte-black technical overshirt, plain black shirt, "
+    "tailored black trousers and minimal black boots"
+)
 SAFE_ZONES = ("upper-middle", "middle-left", "lower-middle above platform controls")
 VISUAL_TREATMENTS = {
     "constraint_recovery": {
@@ -148,6 +152,7 @@ class DirectorTreatment:
     visual_concept: str
     story_spine: str
     continuity_anchor: str
+    primary_setting: str
     admin_concept_ru: str
     scenes: tuple[DirectorScene, ...]
     version: str = DIRECTOR_VERSION
@@ -325,19 +330,21 @@ def reels_director_prompt(
     }
     return (
         "Act as Reels Maker, the film director for Naz AI Lab. Convert the supplied verified "
-        "episode into one coherent, content-specific 9:16 treatment. Do not reproduce file "
+        "episode into one immediately understandable, content-specific 9:16 micro-film. Do not reproduce file "
         "paths, headings, metadata, UI, code, dashboards, or the wording 'fact N'. Dramatize "
         "the causal meaning with physically filmable actions; do not merely decorate it with "
         "generic cyberpunk. Naz AI Lab is a flexible world, not one fixed server room. Choose "
-        "locations and props because they express this episode. Whenever Naz is required, he remains human. Use Deep "
+        "one primary location and props because they express this episode. Whenever Naz is required, he remains human. Use Deep "
         "Black, Electric Blue, Ultraviolet and Ice Silver with materially believable optical "
         "glass, titanium, anodized aluminium, carbon, technical polymers or ceramic. No gold, "
-        "copper branding, random robots, random boards, text, logos or overloaded HUDs.\n\n"
+        "copper branding, random robots, random boards, text, logos or overloaded HUDs. "
+        f"Canonical wardrobe throughout: {CANONICAL_NAZ_WARDROBE}. Never invent "
+        "armour, robes, glossy sci-fi costumes, ornamental uniforms or wardrobe changes.\n\n"
         "Return strict JSON only with this shape: "
-        '{"director_version":"reels-semantic-director-v2","visual_concept":"...",'
-        '"story_spine":"...","continuity_anchor":"...",'
+        '{"director_version":"reels-semantic-director-v3","visual_concept":"...",'
+        '"story_spine":"...","continuity_anchor":"...","primary_setting":"...",'
         '"admin_concept_ru":"...",'
-        '"scenes":[{"setting":"...","subject_kind":"naz_human|physical_object",'
+        '"scenes":[{"subject_kind":"naz_human|physical_object",'
         '"subject_detail":"...",'
         '"concrete_action":"...","start_state":"...","end_state":"...",'
         '"shot_size":"wide|medium|close|macro","camera_motion":'
@@ -345,21 +352,27 @@ def reels_director_prompt(
         '"admin_summary_ru":"..."}]}. '
         "Do not return role names: the application assigns them deterministically. Return exactly "
         "one scene for every ordered role and draft beat, preserving their supplied order. "
-        "First define one concise story_spine (at most 180 characters): a single concrete goal that "
-        "starts unresolved and reaches one observable outcome. Define one continuity_anchor (at "
+        "First define one concise story_spine (at most 180 characters) in cause-and-effect form: "
+        "Naz attempts one visible goal, meets one visible obstacle, performs one corrective test, "
+        "and reaches one observable proof. A viewer with sound off must understand this by scene 2. "
+        "Define one continuity_anchor (at "
         "most 90 characters): the same physical object or system "
         "whose state carries that goal through the whole Reel. Build one causal chain, not separate "
-        "illustrations. Scene 1 opens the chain. For every later scene, copy the preceding scene's "
+        "Define primary_setting once: the single physical set used for the complete micro-film. "
+        "illustrations. Scene 1 shows the goal and unresolved physical state, never a result. "
+        "For every later scene, copy the preceding scene's "
         "end_state verbatim into the new start_state, then advance it with one new action. Keep the "
-        "continuity_anchor present or causally active in every scene. Change location only when the "
-        "previous result motivates that move. Russian admin summaries must also read as consecutive "
+        "continuity_anchor present or causally active in every scene. The application applies "
+        "primary_setting to every scene; vary shot size inside that set instead of teleporting. "
+        "The final end_state must be visible proof that the opening goal succeeded or failed. "
+        "Russian admin summaries must also read as consecutive "
         "steps of this same story. "
         "For naz_human, subject_detail is simply Naz; identity is injected by the application. "
-        "For physical_object, subject_detail names one concrete non-human object. Every setting, "
-        "action and end state must be physical, content-specific and distinct. Obey "
+        "For physical_object, subject_detail names one concrete non-human object. Every action "
+        "and end state must be physical, content-specific and distinct. Obey "
         "identity_requirement exactly. Concise physical place names such as Naz AI Lab or server "
-        "room are valid settings; technical nouns are not transport metadata by themselves. "
-        "Write visual_concept, setting, subject_detail, concrete_action, start_state and end_state "
+        "room are valid primary_setting values; technical nouns are not transport metadata by themselves. "
+        "Write visual_concept, primary_setting, subject_detail, concrete_action, start_state and end_state "
         "in concise English. Write admin_concept_ru and every admin_summary_ru in concise natural "
         "Russian for the administrator, each no longer than 240 characters: describe what will "
         "visibly happen, not service metadata. "
@@ -375,11 +388,10 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "required": [
-            "setting", "subject_kind", "subject_detail", "concrete_action",
+            "subject_kind", "subject_detail", "concrete_action",
             "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
         ],
         "properties": {
-            "setting": {"type": "string"},
             "subject_kind": {"type": "string", "enum": list(DIRECTOR_SUBJECT_KINDS)},
             "subject_detail": {"type": "string"},
             "concrete_action": {"type": "string"},
@@ -400,13 +412,14 @@ def reels_director_response_format(safe_facts: Sequence[str]) -> dict[str, Any]:
                 "additionalProperties": False,
                 "required": [
                     "director_version", "visual_concept", "story_spine",
-                    "continuity_anchor", "admin_concept_ru", "scenes"
+                    "continuity_anchor", "primary_setting", "admin_concept_ru", "scenes"
                 ],
                 "properties": {
                     "director_version": {"type": "string", "enum": [DIRECTOR_VERSION]},
                     "visual_concept": {"type": "string"},
                     "story_spine": {"type": "string", "maxLength": 180},
                     "continuity_anchor": {"type": "string", "maxLength": 90},
+                    "primary_setting": {"type": "string", "maxLength": 180},
                     "admin_concept_ru": {"type": "string", "maxLength": 240},
                     "scenes": {
                         "type": "array",
@@ -498,7 +511,7 @@ def parse_reels_director_response(
     errors: list[str] = []
     if set(payload) != {
         "director_version", "visual_concept", "story_spine", "continuity_anchor",
-        "admin_concept_ru", "scenes"
+        "primary_setting", "admin_concept_ru", "scenes"
     }:
         errors.append("director_schema_invalid")
     visual_concept = _director_text(
@@ -519,6 +532,12 @@ def parse_reels_director_response(
         errors,
         maximum=90,
     )
+    primary_setting = _director_text(
+        payload.get("primary_setting"),
+        "director_primary_setting",
+        errors,
+        maximum=180,
+    )
     admin_concept_ru = _director_ru_text(
         payload.get("admin_concept_ru"),
         "director_admin_concept_ru",
@@ -528,11 +547,10 @@ def parse_reels_director_response(
     object_only_direction = _object_only_direction(plan.visual_subject_direction)
     human_led_direction = _human_led_direction(plan.visual_subject_direction)
     scenes: list[DirectorScene] = []
-    settings: list[str] = []
     actions: list[str] = []
     previous_end_state = ""
     expected_scene_fields = {
-        "setting", "subject_kind", "subject_detail", "concrete_action",
+        "subject_kind", "subject_detail", "concrete_action",
         "start_state", "end_state", "shot_size", "camera_motion", "admin_summary_ru",
     }
     for index, (row, expected_role) in enumerate(zip(rows, expected_roles)):
@@ -545,7 +563,6 @@ def parse_reels_director_response(
         if set(row) != expected_scene_fields:
             errors.append(f"{scene_prefix}_schema_invalid")
 
-        setting = _director_text(row.get("setting"), f"{scene_prefix}_setting", errors)
         subject_detail = _director_text(
             row.get("subject_detail"), f"{scene_prefix}_subject_detail", errors
         )
@@ -591,15 +608,13 @@ def parse_reels_director_response(
         if end_state:
             previous_end_state = end_state
 
-        if setting:
-            settings.append(setting)
         if action:
             actions.append(action)
         if len(errors) == scene_error_start:
             scenes.append(
                 DirectorScene(
                     role=expected_role,
-                    setting=setting,
+                    setting=primary_setting,
                     subject_kind=subject_kind,
                     subject=subject,
                     concrete_action=action,
@@ -611,8 +626,6 @@ def parse_reels_director_response(
                 )
             )
 
-    if len(settings) == count and len({item.casefold() for item in settings}) < min(3, count):
-        errors.append("director_settings_repetitive")
     if len(actions) == count and len({item.casefold() for item in actions}) != count:
         errors.append("director_actions_repetitive")
     if human_led_direction and not any(
@@ -625,6 +638,7 @@ def parse_reels_director_response(
         visual_concept=visual_concept,
         story_spine=story_spine,
         continuity_anchor=continuity_anchor,
+        primary_setting=primary_setting,
         admin_concept_ru=admin_concept_ru,
         scenes=tuple(scenes),
     )
@@ -793,7 +807,6 @@ def _scene(
         visual_concept = str(treatment["label"])
         story_spine = visual_concept
         continuity_anchor = "one evolving physical Naz AI Lab mechanism"
-    prompt_visual_concept = _provider_excerpt(visual_concept, 180)
     prompt_setting = _provider_excerpt(setting, 120)
     prompt_subject = _provider_excerpt(subject, 120)
     prompt_action = _provider_excerpt(action, 180)
@@ -805,7 +818,7 @@ def _scene(
         f"continuity_id={continuity_id}",
         f"story_spine={story_spine}",
         f"continuity_anchor={continuity_anchor}",
-        "same canonical Naz face, age, clothing and human-digital boundary across the pack",
+        f"same canonical Naz face, age and wardrobe across the pack: {CANONICAL_NAZ_WARDROBE}",
         "Deep Black, Electric Blue, Cobalt, Ultraviolet and Ice Silver only",
         "optical glass, titanium, aluminium, carbon and technical ceramic",
         "no cheap cyberpunk, random robots, random people, elderly people or stock imagery",
@@ -819,25 +832,23 @@ def _scene(
         "reactions or watermarks."
     )
     identity_instruction = (
-        "Use @Naz only for identity, age and build; replace the reference background, pose, light and framing. "
+        f"Use @Naz for identity and build only. Wardrobe: {CANONICAL_NAZ_WARDROBE}; "
+        "replace the reference background, pose and light. "
         if requires_reference else "No person is present. "
     )
+    subject_instruction = "" if requires_reference else f"Subject: {prompt_subject}. "
     keyframe_prompt = (
-        f"Cinematic vertical 9:16 keyframe. {identity_instruction}"
-        f"Concept: {prompt_visual_concept}. Location: {prompt_setting}. "
-        f"Subject: {prompt_subject}. Frozen action: {prompt_action}. "
-        f"Same story anchor: {prompt_continuity_anchor}. "
-        f"Shot: {shot_size}; motion room: {camera_motion}. "
-        "Human intelligence / machine precision. Deep Black #020309, Midnight Blue #070B20, "
-        "Electric Blue #185CFF, Ultraviolet #762DFF and Ice Silver #D7E5FF. "
-        "Optical glass, polished titanium, blue anodized aluminium, carbon and technical ceramic. "
-        "Black background; cold blue rim; blue-violet edge; high local contrast; one subject. "
-        "Photoreal physical lab; believable materials. No text, logos, HUD, code, copper, gold, "
-        "cheap cyberpunk, random boards, robots or extra people."
+        f"Cinematic vertical 9:16. {identity_instruction}"
+        f"Location: {prompt_setting}. {subject_instruction}Action: {prompt_action}. "
+        f"Story anchor: {prompt_continuity_anchor}. Shot: {shot_size}; camera: {camera_motion}. "
+        "Photoreal Naz AI Lab: human intelligence, machine precision. "
+        "Deep Black #020309, Electric Blue #185CFF, Ultraviolet #762DFF, Ice Silver #D7E5FF. "
+        "Real optical glass, titanium, blue aluminium, carbon, ceramic; cold rim light. "
+        "No text, logos, HUD, code, copper, gold, neon cliche, robots or extra people."
     )
     provider_prompt = (
         f"Animate the supplied directed keyframe as a vertical 9:16 CLEAN video master. Role: {role}. "
-        f"Keep the exact subject, Naz identity, laboratory architecture, materials and lighting from the keyframe. "
+        f"Keep the exact subject, Naz identity, wardrobe, laboratory architecture, materials and lighting from the keyframe. "
         f"Physical action: {prompt_action}. Camera: {camera_motion}. "
         f"Continue the same story spine ({story_spine}) and continuity anchor ({prompt_continuity_anchor}). "
         f"Begin in the supplied pose and end when {prompt_end_state}. "
@@ -875,22 +886,20 @@ def _scene(
 
 
 def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: bool) -> ReelEditPlan:
-    order = list(range(len(scenes)))
-    order.sort(key=lambda index: _rank(plan.plan_id, f"reel:{short}:{index}"))
-    if order == list(range(len(scenes))):
-        order = order[1:] + order[:1]
-    # Four-on-the-floor and half-time grids can pull a nominal two-second cut
-    # slightly earlier.  A 14-second short target still remains >=12 seconds
-    # after beat alignment across the approved BPM lanes.
-    target_seconds = 14.0 if short else 16.0
-    shot_count = int(target_seconds / 2.0)
-    # Reuse CLEAN masters deliberately when a pack has fewer cuts than the
-    # target Reel.  The crop, in-point and framing still change per fragment.
-    order = [order[index % len(order)] for index in range(shot_count)]
+    # The edit must preserve the director's cause-and-effect order. When a pack
+    # has fewer than seven scenes, adjacent reframed fragments may repeat a
+    # scene, but the timeline never jumps backwards or restarts after the proof.
+    shot_count = 7
+    quotient, remainder = divmod(shot_count, len(scenes))
+    order = [
+        scene_index
+        for scene_index in range(len(scenes))
+        for _ in range(quotient + (1 if scene_index < remainder else 0))
+    ]
     shots: list[dict[str, Any]] = []
     for position, scene_index in enumerate(order):
         scene = scenes[scene_index]
-        length = 2.0
+        length = 1.8 if short else 2.0
         source_shot_size = scene.shot_size
         source_index = SHOT_SIZES.index(source_shot_size)
         reel_shot_size = SHOT_SIZES[
@@ -974,6 +983,15 @@ def plan_story_pack(
             "continuity_anchor",
             maximum=90,
         )
+        primary_setting = _validated_director_text(
+            director_treatment.primary_setting,
+            "primary_setting",
+            maximum=180,
+        )
+        if any(
+            scene.setting != primary_setting for scene in director_treatment.scenes
+        ):
+            raise StoryPlanError("director_setting_continuity_broken")
         admin_concept_ru = _validated_director_ru_text(
             director_treatment.admin_concept_ru,
             "admin_concept_ru",
@@ -1088,10 +1106,15 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
             for item in edit.shots
         ):
             raise StoryPlanError("Reel must change shot size for at least one fragment")
-        sequential = [scene.scene_id for scene in pack.scenes][: len(edit.shots)]
         actual = [str(item["source_scene_id"]) for item in edit.shots]
-        if actual == sequential:
-            raise StoryPlanError("Reel cannot be a sequential Story concatenation")
+        scene_order = {scene.scene_id: index for index, scene in enumerate(pack.scenes)}
+        positions = [scene_order[scene_id] for scene_id in actual]
+        if (
+            positions[0] != 0
+            or positions[-1] != len(pack.scenes) - 1
+            or any(current > following for current, following in zip(positions, positions[1:]))
+        ):
+            raise StoryPlanError("Reel must preserve causal scene order")
         if not any(bool(item.get("crop_change_required")) and item.get("reel_crop") for item in edit.shots):
             raise StoryPlanError("Reel requires a real crop change")
         if any(not str(item.get("source", "")).endswith("_clean.mp4") for item in edit.shots):

@@ -54,6 +54,7 @@ class KeyframeRequest:
     scene_id: str
     prompt: str
     reference_path: Path | None = None
+    reference_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,13 +344,19 @@ class RunwayVideoProvider:
             "promptText": prompt,
             "ratio": "720:960",
         }
-        if request.reference_path:
+        references = request.reference_paths or (
+            (request.reference_path,) if request.reference_path is not None else ()
+        )
+        if len(references) > 3:
+            raise ProviderError("keyframe_reference_count_invalid")
+        if references:
             if "@Naz" not in prompt:
                 raise ProviderError("keyframe_identity_tag_missing")
-            payload["referenceImages"] = [{
-                "uri": self._reference_data_uri(request.reference_path),
-                "tag": "Naz",
-            }]
+            tags = ("Naz", "NazView2", "NazView3")
+            payload["referenceImages"] = [
+                {"uri": self._reference_data_uri(path), "tag": tags[index]}
+                for index, path in enumerate(references)
+            ]
         result = self._call("POST", "/text_to_image", payload)
         job_id = str(result.get("id", "")).strip()
         if not job_id:
