@@ -142,6 +142,17 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
             response_format,
         )
 
+    def test_unfilmable_director_actions_have_safe_russian_admin_summary(self):
+        error = story_production.DirectorValidationError((
+            "director_scene_1_interface_pantomime",
+            "director_scene_2_multi_action",
+        ))
+
+        code = main.reels_director_reason_code(error)
+
+        self.assertEqual(code, "director_action_unfilmable")
+        self.assertIn("непригодное для съёмки", main.reels_director_reason_summary(code))
+
     def test_director_dry_run_validates_in_memory_without_queue_or_history_writes(self):
         async def accepted_treatment(plan, facts):
             return story_production.parse_reels_director_response(

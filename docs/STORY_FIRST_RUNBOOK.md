@@ -34,12 +34,15 @@ administrator's private chat automatically; there is no manual download step.
   a final operator-only recovery may replace only the runtime keyframe prompt
   with a short prompt rebuilt from the immutable setting, action, end state and
   shot fields. It also has an independent four-per-day ceiling.
-- `NAZ_VIDEO_AUTO_FALLBACK=true` is rejected. Gen-4.5 is never submitted until
-  the administrator confirms the pending escalation with the existing
+- `NAZ_VIDEO_AUTO_FALLBACK=true` is rejected. Legacy plans submit Gen-4.5 only
+  after the administrator confirms the pending escalation with the existing
   `Подтвердить генерацию` button.
 - No Story/Reel autopublication exists. Completed media is delivered only to
   the configured administrator's private bot chat. VK music last-8 state is
   not read or consumed.
+- New hybrid plans assign Gen-4.5 to Naz scenes and Turbo to object scenes
+  before approval. The approval card shows that mix and its cost. A hybrid
+  scene never changes model after approval.
 
 Run static validation:
 
@@ -62,11 +65,12 @@ production without separate approval. Configure the exact font file through
 `NAZ_STORY_FONT_PATH`.
 
 Runway is the initial production adapter because it exposes asynchronous
-submit/retrieve/cancel tasks and downloadable video outputs. The fixed priority
-is `gen4_turbo,gen4.5`: Turbo is the primary five-second image-to-video route;
-Gen-4.5 is the separately confirmed secondary route and may also handle
-object-only text-to-video scenes. An incompatible object-only Turbo scene is
-stopped before the API call. OpenAI Videos/Sora is
+submit/retrieve/cancel tasks and downloadable video outputs. New hybrid packs
+use `gen4.5` directly for five-second Naz image-to-video scenes and
+`gen4_turbo` for five-second object image-to-video scenes. Every video scene is
+animated from its approved directed keyframe. The model choice is immutable in
+the manifest, is included in the approval estimate and has no automatic
+fallback. Legacy packs keep their reviewed manual escalation route. OpenAI Videos/Sora is
 not used: the official OpenAI deprecation notice schedules removal of the
 Videos API and Sora 2 model aliases on 24 September 2026 and lists no
 replacement.
@@ -117,7 +121,9 @@ world chosen per episode, not one mandatory room for every episode. A v5
 pack first creates one asynchronous directed keyframe per scene with
 `gen4_image`; identity scenes keep the tagged `@Naz` reference while object-only
 scenes use the text-only form. It then animates that immutable keyframe with the
-video route. `gen4_image_turbo` is not used for new keyframes. A bounded retry
+video route. The image-to-video prompt contains only one continuous physical
+action, one camera move and one visible finishing state; it does not repeat the
+full story summary. `gen4_image_turbo` is not used for new keyframes. A bounded retry
 of legacy Turbo identity failures stays in the same plan, preserves completed
 scenes and appears in the existing progress card. A separately approved
 reference-quality retry may substitute the frontal private reference at runtime;

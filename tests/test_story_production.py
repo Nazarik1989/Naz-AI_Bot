@@ -123,6 +123,9 @@ class StoryFirstTests(unittest.TestCase):
         payload = json.loads(director_response(plan))
         payload["scenes"][0]["subject_kind"] = "naz_human"
         payload["scenes"][0]["subject_detail"] = "Naz"
+        payload["scenes"][0]["concrete_action"] = (
+            "Naz calibrates mechanical coupling number 1 under controlled load"
+        )
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
         )
@@ -143,6 +146,7 @@ class StoryFirstTests(unittest.TestCase):
         for scene in payload["scenes"]:
             scene["subject_kind"] = "naz_human"
             scene["subject_detail"] = "Naz"
+            scene["concrete_action"] = "Naz " + scene["concrete_action"].lower()
 
         treatment = story.parse_reels_director_response(
             json.dumps(payload), plan, SAFE_FACTS
@@ -153,6 +157,68 @@ class StoryFirstTests(unittest.TestCase):
 
         self.assertTrue(all(story._is_naz_human_subject(scene.subject) for scene in treatment.scenes))
         self.assertTrue(all(scene.requires_naz_reference for scene in pack.scenes))
+
+    def test_director_rejects_interface_pantomime_before_media_generation(self):
+        plan = dataclasses.replace(
+            planned(),
+            visual_subject_direction="one specific work surface at the moment a result changes",
+        )
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0].update({
+            "subject_kind": "naz_human",
+            "subject_detail": "Naz",
+            "concrete_action": "Naz taps the laptop trackpad and waits",
+        })
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(json.dumps(payload), plan, SAFE_FACTS)
+
+        self.assertIn("director_scene_1_interface_pantomime", raised.exception.reason_codes)
+
+    def test_director_rejects_magic_and_multi_step_choreography(self):
+        for action, reason in (
+            ("The prototype magically self-assembles", "director_scene_1_impossible_action"),
+            ("Calibrate the coupling then rotate the housing", "director_scene_1_multi_action"),
+        ):
+            with self.subTest(action=action):
+                payload = json.loads(director_response(planned()))
+                payload["scenes"][0]["concrete_action"] = action
+                with self.assertRaises(story.DirectorValidationError) as raised:
+                    story.parse_reels_director_response(
+                        json.dumps(payload), planned(), SAFE_FACTS
+                    )
+                self.assertIn(reason, raised.exception.reason_codes)
+
+    def test_new_manifest_routes_naz_to_gen45_and_objects_to_turbo(self):
+        plan = dataclasses.replace(
+            planned(),
+            visual_subject_direction="one specific work surface at the moment a result changes",
+        )
+        payload = json.loads(director_response(plan))
+        payload["scenes"][0].update({
+            "subject_kind": "naz_human",
+            "subject_detail": "Naz",
+            "concrete_action": "Naz calibrates mechanical coupling number 1 under controlled load",
+        })
+        treatment = story.parse_reels_director_response(
+            json.dumps(payload), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(plan, SAFE_FACTS, director_treatment=treatment)
+        with tempfile.TemporaryDirectory() as root:
+            manifest = story.persist_story_queue(pack, Path(root)) / "story_manifest.json"
+            persisted = story.read_manifest(manifest)
+
+        routes = {
+            scene["scene_id"]: job["model_route"]["selected_model"]
+            for scene, job in zip(persisted["scenes"], persisted["scene_jobs"])
+        }
+        self.assertEqual(routes[persisted["scenes"][0]["scene_id"]], "gen4.5")
+        self.assertTrue(
+            all(
+                routes[scene["scene_id"]] == "gen4_turbo"
+                for scene in persisted["scenes"][1:]
+            )
+        )
 
     def test_explicit_object_only_direction_rejects_naz_subject(self):
         plan = dataclasses.replace(
@@ -203,10 +269,11 @@ class StoryFirstTests(unittest.TestCase):
             self.assertNotIn(scene.admin_summary_ru, scene.keyframe_prompt)
             self.assertNotIn(scene.admin_summary_ru, scene.provider_prompt)
             self.assertIn(pack.story_spine, scene.clean_prompt)
-            self.assertIn(pack.story_spine, scene.provider_prompt)
+            self.assertNotIn(pack.story_spine, scene.provider_prompt)
             self.assertIn(pack.continuity_anchor, scene.clean_prompt)
             self.assertIn(pack.continuity_anchor, scene.keyframe_prompt)
-            self.assertIn(pack.continuity_anchor, scene.provider_prompt)
+            self.assertNotIn(pack.continuity_anchor, scene.provider_prompt)
+            self.assertTrue(scene.provider_prompt.startswith("Continuous seamless five-second shot"))
         for previous, current in zip(pack.scenes, pack.scenes[1:]):
             self.assertEqual(current.start_state, previous.end_state)
         self.assertTrue(all("tied to fact" not in scene.setting for scene in pack.scenes))
@@ -555,6 +622,9 @@ class StoryFirstTests(unittest.TestCase):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)
         for scene in pack.scenes:
             self.assertIn("supplied directed keyframe", scene.provider_prompt)
+            self.assertIn("One physical action:", scene.provider_prompt)
+            self.assertNotIn("Role:", scene.provider_prompt)
+            self.assertNotIn("story spine", scene.provider_prompt.casefold())
             self.assertLessEqual(len(scene.provider_prompt.encode("utf-16-le")) // 2, 1000)
             self.assertLessEqual(len(scene.keyframe_prompt.encode("utf-16-le")) // 2, 1000)
 

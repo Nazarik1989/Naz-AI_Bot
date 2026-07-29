@@ -586,6 +586,22 @@ def _model_route(job: dict[str, Any], config: WorkerConfig) -> dict[str, Any]:
     route.setdefault("primary_failure_code", None)
     route.setdefault("secondary_requested_at", None)
     route.setdefault("secondary_approved_at", None)
+    strategy = route.get("scene_strategy")
+    if strategy is not None:
+        expected_model = (
+            CANONICAL_SECONDARY_MODEL
+            if bool(job.get("requires_naz_reference"))
+            else CANONICAL_PRIMARY_MODEL
+        )
+        if (
+            strategy != story_production.HYBRID_MODEL_ROUTE
+            or route.get("selected_model") != expected_model
+            or route.get("tier") != "primary"
+            or route.get("primary_failure_code") is not None
+            or route.get("secondary_requested_at") is not None
+            or route.get("secondary_approved_at") is not None
+        ):
+            raise RuntimeError("video_model_route_mismatch")
     return route
 
 
@@ -593,6 +609,8 @@ def _selected_model(job: dict[str, Any], config: WorkerConfig) -> str | None:
     if str(job.get("state")) == "awaiting_secondary_approval":
         return None
     route = _model_route(job, config)
+    if route.get("scene_strategy") == story_production.HYBRID_MODEL_ROUTE:
+        return str(route["selected_model"])
     if str(route.get("tier")) == "secondary":
         if (
             not route.get("secondary_requested_at")
@@ -610,6 +628,10 @@ def _request_secondary(
 ) -> bool:
     """Persist a manual escalation request; never construct/call secondary."""
     route = _model_route(job, config)
+    if route.get("scene_strategy") == story_production.HYBRID_MODEL_ROUTE:
+        # A new hybrid plan already has an explicitly approved model per scene.
+        # Never reinterpret an object-scene failure as permission to change it.
+        return False
     if (
         code not in SECONDARY_ESCALATION_CODES
         or config.auto_fallback
