@@ -226,10 +226,11 @@ def check_config(
     if not naz_vk_music.APPROVED_TRACKS or not naz_vk_music.APPROVED_QUERIES:
         raise PreflightError("approved music catalog is empty")
     shared_history = queue_root / "recent-tracks.json"
+    naz_vk_music.ensure_full_history_ready(shared_history)
     naz_vk_music.load_shared_recent(shared_history)
     private_history = Path(naz.NAZ_VK_TRACK_STATE_FILE)
     if private_history.exists():
-        naz_vk_music._load_recent(private_history)
+        naz_vk_music.validate_rotation_state(private_history)
     elif not private_history.parent.is_dir():
         raise PreflightError("Naz track history parent does not exist")
     checks.append("music catalog and histories")

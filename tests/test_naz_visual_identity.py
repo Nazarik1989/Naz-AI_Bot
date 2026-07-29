@@ -47,7 +47,10 @@ class NazVisualIdentityTests(unittest.TestCase):
     def test_material_uses_existing_schedules_and_three_frame_runtime(self) -> None:
         self.assertEqual(MATERIAL_RUBRIC["kind"], "daily")
         self.assertEqual(MATERIAL_RUBRIC["image_count"], "3")
-        self.assertEqual(naz_vk_music.RECENT_TRACK_LIMIT, 8)
+        self.assertEqual(
+            naz_vk_music.rotation_pool_size(["daily", "gaming"]),
+            len(naz_vk_music.APPROVED_TRACKS),
+        )
         self.assertEqual(main.AUTOPOST_TIMES, "10:00,14:00,18:00,22:00")
         self.assertEqual((main.NAZ_VK_DAILY_TIME, main.NAZ_VK_GAMING_TIME), ("10:30", "16:30"))
         self.assertNotIn(

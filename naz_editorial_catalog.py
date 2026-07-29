@@ -18,7 +18,7 @@ from editorial_orchestrator import EditorialContext, EditorialRubric, EditorialS
 POLICY_VERSIONS = {
     "content": "naz-content-v2.4-orchestrated",
     "visual": "naz-visual-canon-v1",
-    "music": "naz-vk-allowlist-last8-v1",
+    "music": "naz-vk-allowlist-full-catalog-lru-v3",
 }
 
 
