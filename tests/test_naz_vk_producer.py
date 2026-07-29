@@ -78,6 +78,10 @@ class StandaloneNazVkProducerTests(unittest.TestCase):
                 '{"tracks":[{"key":"already used"}]}\n',
                 encoding="utf-8",
             )
+            (queue / main.naz_vk_music.TRACK_HISTORY_BACKFILL_MARKER).write_text(
+                "ready\n",
+                encoding="utf-8",
+            )
             consumer_env = base / "consumer.env"
             consumer_env.write_text(
                 f"VK_GROUP_ID=123\nVK_BROWSER_PROFILE_DIR={base / 'profile'}\n",

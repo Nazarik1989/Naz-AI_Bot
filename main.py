@@ -3916,6 +3916,10 @@ async def create_naz_vk_job(
         for index, image in enumerate(images, start=1)
     ]
     now = datetime.now(ZoneInfo(NAZ_VK_TIMEZONE))
+    dedupe_key = hashlib.sha256(
+        f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")
+    ).hexdigest()
+    expected_job_id = vk_publish_queue.canonical_job_id(dedupe_key)
     try:
         job = naz_vk_music.enqueue_with_track_rotation(
             NAZ_VK_TRACK_STATE_FILE,
@@ -3923,6 +3927,8 @@ async def create_naz_vk_job(
             seed=plan.plan_id,
             post_topic=plan.topic,
             shared_history_file=NAZ_VK_QUEUE_DIR / "recent-tracks.json",
+            expected_job_id=expected_job_id,
+            source_ref=source_ref,
             enqueue_job=lambda track_query: vk_publish_queue.enqueue(
                 NAZ_VK_QUEUE_DIR,
                 target_group_id=NAZ_VK_PUBLIC_ID,
@@ -3931,7 +3937,7 @@ async def create_naz_vk_job(
                 track_query=track_query,
                 created_at=now,
                 not_before=not_before,
-                dedupe_key=hashlib.sha256(f"naz|{NAZ_VK_PUBLIC_ID}|{source_ref}".encode("utf-8")).hexdigest(),
+                dedupe_key=dedupe_key,
                 source_ref=source_ref,
                 plan_id=plan.plan_id,
                 editorial={

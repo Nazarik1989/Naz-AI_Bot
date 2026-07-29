@@ -66,11 +66,19 @@ class NazVkJobTests(unittest.TestCase):
         self.db_patch.stop()
         self.db_directory.cleanup()
 
+    @staticmethod
+    def prepare_queue(root: Path) -> None:
+        (root / "pending").mkdir(parents=True)
+        (root / naz_vk_music.TRACK_HISTORY_BACKFILL_MARKER).write_text(
+            "ready\n",
+            encoding="utf-8",
+        )
+
     def test_job_uses_approved_track_instead_of_post_topic(self):
         topic = "AI-бот и очередь публикаций"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "queue"
-            (root / "pending").mkdir(parents=True)
+            self.prepare_queue(root)
             state = Path(directory) / "rotation.json"
             with patch.multiple(
                 main,
@@ -91,7 +99,7 @@ class NazVkJobTests(unittest.TestCase):
     def test_missing_catalog_match_does_not_enqueue_job(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "queue"
-            (root / "pending").mkdir(parents=True)
+            self.prepare_queue(root)
             enqueue = Mock()
             with patch.multiple(
                 main,
@@ -116,7 +124,7 @@ class NazVkJobTests(unittest.TestCase):
     def test_gaming_job_uses_vk_gaming_prompt_and_records_rotation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "queue"
-            (root / "pending").mkdir(parents=True)
+            self.prepare_queue(root)
             generate = AsyncMock(return_value="Игровой VK-пост")
             record = Mock()
             with patch.multiple(
@@ -149,7 +157,7 @@ class NazVkJobTests(unittest.TestCase):
     def test_material_job_enqueues_three_frames_with_shared_music_rotation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "queue"
-            (root / "pending").mkdir(parents=True)
+            self.prepare_queue(root)
             images = AsyncMock(return_value=([b"macro", b"form", b"active"], "material prompt"))
             with patch.multiple(
                 main,
@@ -178,7 +186,7 @@ class NazVkJobTests(unittest.TestCase):
     def test_incomplete_material_series_is_not_enqueued(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "queue"
-            (root / "pending").mkdir(parents=True)
+            self.prepare_queue(root)
             with patch.multiple(
                 main,
                 NAZ_VK_ENABLED=True,
@@ -206,7 +214,7 @@ class NazVkJobTests(unittest.TestCase):
     def test_required_image_failure_never_creates_draft_or_queue_job(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "queue"
-            (root / "pending").mkdir(parents=True)
+            self.prepare_queue(root)
             save = Mock()
             enqueue = Mock()
             with patch.multiple(
@@ -236,7 +244,7 @@ class NazVkJobTests(unittest.TestCase):
     def test_text_music_policy_must_be_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "queue"
-            (root / "pending").mkdir(parents=True)
+            self.prepare_queue(root)
             with patch.multiple(
                 main,
                 NAZ_VK_ENABLED=True,

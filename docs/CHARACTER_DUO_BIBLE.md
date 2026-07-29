@@ -108,7 +108,7 @@ Naz shows prototypes, materials and objects from a future laboratory — not abs
 - Voice: one short Naz thought, grounded in physical reality.
 - Marking: minimal `MATERIAL / NAZ`, never a large logo or explanatory poster.
 - Motion: camera movement and editing follow the music and the object's physical behaviour.
-- Music: only the active approved allowlist; use the shared rotation that excludes the latest 8 tracks.
+- Music: only the active approved allowlist; use the shared receipt-backed full-catalog LRU rotation so every eligible track is published before the oldest one may return. Enqueue-time reservations prevent in-flight collisions but never spend publication cooldown.
 - Schedules: MATERIAL uses existing publication windows and never creates or moves Telegram/VK schedule slots.
 
 Reference line: «Идея становится настоящей, когда у неё появляются вес, допуски и первый рабочий прототип».
