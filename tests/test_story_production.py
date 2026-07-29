@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 import tempfile
 import unittest
@@ -185,6 +186,8 @@ class StoryFirstTests(unittest.TestCase):
         for action, reason in (
             ("The prototype magically self-assembles", "director_scene_1_impossible_action"),
             ("Calibrate the coupling then rotate the housing", "director_scene_1_multi_action"),
+            ("Calibrate the coupling and rotate the housing", "director_scene_1_multi_action"),
+            ("Calibrate the coupling while the housing rotates", "director_scene_1_multi_action"),
         ):
             with self.subTest(action=action):
                 payload = json.loads(director_response(planned()))
@@ -238,6 +241,23 @@ class StoryFirstTests(unittest.TestCase):
 
         self.assertIn(
             "director_scene_1_motion_class_mismatch",
+            raised.exception.reason_codes,
+        )
+
+    def test_director_rejects_two_actions_from_the_same_motion_class(self):
+        payload = json.loads(director_response(planned()))
+        payload["scenes"][0].update({
+            "motion_class": "rotate",
+            "concrete_action": "Rotate the routing ring and turn the locking collar",
+        })
+
+        with self.assertRaises(story.DirectorValidationError) as raised:
+            story.parse_reels_director_response(
+                json.dumps(payload), planned(), SAFE_FACTS
+            )
+
+        self.assertIn(
+            "director_scene_1_multi_action",
             raised.exception.reason_codes,
         )
 
@@ -311,6 +331,10 @@ class StoryFirstTests(unittest.TestCase):
         self.assertEqual(
             [scene.concrete_action for scene in pack.scenes],
             [scene.concrete_action for scene in treatment.scenes],
+        )
+        self.assertEqual(
+            [scene.motion_class for scene in pack.scenes],
+            [scene.motion_class for scene in treatment.scenes],
         )
         self.assertEqual(
             [scene.admin_summary_ru for scene in pack.scenes],
@@ -602,9 +626,27 @@ class StoryFirstTests(unittest.TestCase):
     def test_story_plan_id_is_schema_scoped_and_cannot_reuse_an_old_manifest(self):
         plan = planned()
         pack = story.plan_story_pack(plan, SAFE_FACTS)
+        old_v5_id = hashlib.sha256(
+            (
+                f"{plan.plan_id}|naz-story-pack-v5|reels-semantic-director-v3|"
+                "story-variant|0"
+            ).encode("utf-8")
+        ).hexdigest()[:24]
         self.assertNotEqual(pack.plan_id, plan.plan_id)
+        self.assertNotEqual(pack.plan_id, old_v5_id)
         self.assertEqual(pack.base_plan_id, plan.plan_id)
         self.assertEqual(len(pack.plan_id), 24)
+
+    def test_all_legacy_story_schemas_remain_readable(self):
+        with tempfile.TemporaryDirectory() as root:
+            manifest = Path(root) / "story_manifest.json"
+            for schema in story.SUPPORTED_STORY_SCHEMAS[1:]:
+                with self.subTest(schema=schema):
+                    manifest.write_text(
+                        json.dumps({"schema": schema, "plan_id": "legacy"}),
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(story.read_manifest(manifest)["schema"], schema)
 
     def test_current_pack_is_created_beside_old_base_id_without_overwriting_it(self):
         with tempfile.TemporaryDirectory() as root:
@@ -803,6 +845,137 @@ class StoryFirstTests(unittest.TestCase):
                 stale_model["scene_jobs"][0].pop("model_route")
             with self.subTest(missing_contract=missing_contract):
                 self.assertFalse(story.manifest_has_current_production_contract(stale_model))
+
+        changed_thesis = json.loads(json.dumps(current))
+        changed_thesis["central_thesis"] += " changed"
+        self.assertFalse(story.manifest_has_current_production_contract(changed_thesis))
+
+        runtime_music = json.loads(json.dumps(current))
+        runtime_music["music_plan"]["selected_track"] = {"track_id": "allowlisted-1"}
+        runtime_music["music_plan"]["selected_tracks"] = [
+            runtime_music["music_plan"]["selected_track"]
+        ]
+        self.assertTrue(story.manifest_has_current_production_contract(runtime_music))
+
+        legacy_route = json.loads(json.dumps(current))
+        legacy_route["model_policy"]["scene_route_policy"] = None
+        for job in legacy_route["scene_jobs"]:
+            job["model_route"]["scene_strategy"] = None
+            job["model_route"]["selected_model"] = None
+        self.assertFalse(story.manifest_has_current_production_contract(legacy_route))
+
+    def test_seven_scene_directed_pack_has_current_production_contract(self):
+        seven_facts = SAFE_FACTS + (
+            "A sixth physical check preserved the corrected state.",
+            "A seventh observable result closed the same causal chain.",
+        )
+        plan = planned(source(safe_facts=seven_facts, causal_bits=7))
+        treatment = story.parse_reels_director_response(
+            director_response(plan, seven_facts),
+            plan,
+            seven_facts,
+        )
+        pack = story.plan_story_pack(
+            plan,
+            seven_facts,
+            director_treatment=treatment,
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            manifest = (
+                story.persist_story_queue(pack, Path(root))
+                / "story_manifest.json"
+            )
+            payload = story.read_manifest(manifest)
+
+        self.assertEqual(len(payload["scenes"]), 7)
+        self.assertTrue(all(scene["motion_class"] == "calibrate" for scene in payload["scenes"]))
+        self.assertEqual(
+            [scene["motion_class"] for scene in payload["scenes"]],
+            [scene.motion_class for scene in treatment.scenes],
+        )
+        self.assertTrue(story.manifest_has_current_production_contract(payload))
+        scene_ids = [scene["scene_id"] for scene in payload["scenes"]]
+        self.assertTrue(all(
+            [shot["source_scene_id"] for shot in edit["shots"]] == scene_ids
+            for edit in payload["reel_edits"]
+        ))
+
+        backward = json.loads(json.dumps(payload))
+        backward["reel_edits"][0]["shots"][3]["source_scene_id"] = scene_ids[0]
+        backward["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(backward)
+        self.assertFalse(story.manifest_has_current_production_contract(backward))
+
+        skipped = json.loads(json.dumps(payload))
+        skipped["reel_edits"][0]["shots"][2]["source_scene_id"] = scene_ids[1]
+        skipped["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(skipped)
+        self.assertFalse(story.manifest_has_current_production_contract(skipped))
+
+    def test_persisted_director_motion_contract_rejects_missing_or_mismatched_fields(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+        pack = story.plan_story_pack(plan, SAFE_FACTS, director_treatment=treatment)
+        with tempfile.TemporaryDirectory() as root:
+            manifest = story.persist_story_queue(pack, Path(root)) / "story_manifest.json"
+            current = story.read_manifest(manifest)
+
+        for mutation in ("missing", "mismatch", "extra_motion"):
+            tampered = json.loads(json.dumps(current))
+            if mutation == "missing":
+                tampered["scenes"][0].pop("motion_class")
+            elif mutation == "mismatch":
+                tampered["scenes"][0]["motion_class"] = "slide"
+            else:
+                tampered["scenes"][0]["concrete_action"] += " and rotates the housing"
+            tampered["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(tampered)
+            with self.subTest(mutation=mutation):
+                self.assertFalse(story.manifest_has_current_production_contract(tampered))
+
+    def test_hand_built_director_treatment_cannot_bypass_motion_contract(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+        broken_scene = dataclasses.replace(treatment.scenes[0], motion_class="slide")
+        broken = dataclasses.replace(
+            treatment,
+            scenes=(broken_scene, *treatment.scenes[1:]),
+        )
+
+        with self.assertRaisesRegex(
+            story.StoryPlanError,
+            "scene motion contract is invalid",
+        ):
+            story.plan_story_pack(plan, SAFE_FACTS, director_treatment=broken)
+
+    def test_queue_collision_with_changed_immutable_plan_fails_closed(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        changed = dataclasses.replace(pack, central_thesis=pack.central_thesis + " changed")
+        with tempfile.TemporaryDirectory() as root:
+            manifest = story.persist_story_queue(pack, Path(root)) / "story_manifest.json"
+            before = manifest.read_bytes()
+            with self.assertRaisesRegex(
+                story.StoryPlanError,
+                "stored_manifest_contract_mismatch",
+            ):
+                story.persist_story_queue(changed, Path(root))
+            self.assertEqual(manifest.read_bytes(), before)
+
+    def test_queue_preflight_rejects_invalid_pack_before_creating_directory(self):
+        pack = story.plan_story_pack(planned(), SAFE_FACTS)
+        invalid = dataclasses.replace(pack, reel_edits=())
+
+        with tempfile.TemporaryDirectory() as root:
+            pack_dir = Path(root) / pack.plan_id
+            with self.assertRaisesRegex(
+                story.StoryPlanError,
+                "story_manifest_contract_stale",
+            ):
+                story.persist_story_queue(invalid, Path(root))
+
+            self.assertFalse(pack_dir.exists())
 
     def test_repeated_dry_run_is_idempotent_and_creates_no_fake_video(self):
         pack = story.plan_story_pack(planned(), SAFE_FACTS)

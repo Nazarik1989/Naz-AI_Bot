@@ -25,7 +25,7 @@ from story_video_provider import (
     SceneRequest,
     utf16_code_units,
 )
-from tests.test_story_production import SAFE_FACTS, planned
+from tests.test_story_production import SAFE_FACTS, director_response, planned
 
 
 class MockTransport:
@@ -122,6 +122,43 @@ class ProviderTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_invalid_director_motion_contract_never_reaches_provider(self):
+        plan = planned()
+        treatment = story.parse_reels_director_response(
+            director_response(plan), plan, SAFE_FACTS
+        )
+        for mutation in ("missing", "mismatch"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as root:
+                pack = story.plan_story_pack(
+                    plan, SAFE_FACTS, director_treatment=treatment
+                )
+                manifest = (
+                    story.persist_story_queue(pack, Path(root))
+                    / "story_manifest.json"
+                )
+                control.approve_pack(Path(root), pack.plan_id)
+                payload = story.read_manifest(manifest)
+                if mutation == "missing":
+                    payload["scenes"][0].pop("motion_class")
+                else:
+                    payload["scenes"][0]["motion_class"] = "slide"
+                story.atomic_json(manifest, payload)
+                provider = FakeVideoProvider()
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "story_manifest_contract_stale",
+                ):
+                    worker.process_pack(
+                        pack.plan_id,
+                        config=config(root),
+                        provider=provider,
+                        composer=DummyComposer(),
+                    )
+
+                self.assertEqual(provider.submit_count, 0)
+                self.assertEqual(provider.keyframe_submissions, [])
+
     def test_existing_approved_pack_compacts_keyframe_before_provider_submit(self):
         with tempfile.TemporaryDirectory() as root:
             pack, _, manifest = make_pack(root, keyframes_ready=False)
@@ -132,6 +169,7 @@ class WorkerTests(unittest.TestCase):
                 + "Cold laboratory continuity and precise materials. " * 22
                 + "No text, logos, HUD, code, copper, gold, robots or extra people."
             )
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
 
@@ -526,7 +564,7 @@ class WorkerTests(unittest.TestCase):
     def test_resume_after_partial_success_submits_next_scene_only(self):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root)
-            payload = json.loads(manifest.read_text())
+            payload = story.read_manifest(manifest)
             payload["scene_jobs"][0]["state"] = "completed"
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
@@ -559,7 +597,7 @@ class WorkerTests(unittest.TestCase):
             provider = FakeVideoProvider()
             plan_id = json.loads(manifest.read_text())["plan_id"]
             worker.process_pack(plan_id, config=config(root), provider=provider, composer=DummyComposer())
-            payload = json.loads(manifest.read_text())
+            payload = story.read_manifest(manifest)
             job_id = payload["scene_jobs"][0]["external_job_id"]
             payload["scene_jobs"][0]["submitted_at"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
             story.atomic_json(manifest, payload)
@@ -583,12 +621,13 @@ class WorkerTests(unittest.TestCase):
     def test_missing_reference_blocks_only_face_scene(self):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root, keyframes_ready=False)
-            payload = json.loads(manifest.read_text())
+            payload = story.read_manifest(manifest)
             payload["scene_jobs"][0]["requires_naz_reference"] = True
             payload["scene_jobs"][0]["reference_role"] = "frontal_identity"
             payload["scene_jobs"][0]["model_route"]["selected_model"] = "gen4.5"
             payload["scenes"][0]["requires_naz_reference"] = True
             payload["scenes"][0]["reference_role"] = "frontal_identity"
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
             worker.process_pack(payload["plan_id"], config=config(root), provider=provider, composer=DummyComposer())
@@ -693,6 +732,7 @@ class WorkerTests(unittest.TestCase):
                 "reference_role": "three_quarter_identity",
             })
             payload["scene_jobs"][0]["model_route"]["selected_model"] = "gen4.5"
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
             worker.process_pack(
@@ -754,6 +794,7 @@ class WorkerTests(unittest.TestCase):
                 "requires_naz_reference": True,
                 "reference_role": "three_quarter_identity",
             })
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
 
@@ -838,6 +879,7 @@ class WorkerTests(unittest.TestCase):
                 },
             })
             payload["pack_status"] = "partially_blocked"
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
             self.assertEqual(
                 control.confirm_generation(Path(root), pack.plan_id),
@@ -1051,8 +1093,9 @@ class WorkerTests(unittest.TestCase):
     def test_edited_secret_prompt_never_reaches_provider(self):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root)
-            payload = json.loads(manifest.read_text())
+            payload = story.read_manifest(manifest)
             payload["scenes"][0]["provider_prompt"] += " API key sk-1234567890abcdef"
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
             worker.process_pack(payload["plan_id"], config=config(root), provider=provider, composer=DummyComposer())
@@ -1065,7 +1108,7 @@ class WorkerTests(unittest.TestCase):
     def test_missing_music_preserves_scenes_and_blocks_reels(self):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root)
-            payload = json.loads(manifest.read_text())
+            payload = story.read_manifest(manifest)
             for job in payload["scene_jobs"]:
                 job["state"] = "completed"
                 job["actual_duration_seconds"] = float(job["planned_duration_seconds"])
@@ -1224,6 +1267,7 @@ class ControlTests(unittest.TestCase):
             failed["model_route"]["selected_model"] = "gen4.5"
             untouched_before = dict(untouched)
             payload["pack_status"] = "partially_blocked"
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
 
             self.assertEqual(
@@ -1279,6 +1323,7 @@ class ControlTests(unittest.TestCase):
                 })
                 job["model_route"]["selected_model"] = "gen4.5"
             payload["pack_status"] = "partially_blocked"
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
             before = manifest.read_bytes()
 
@@ -1343,6 +1388,7 @@ class ControlTests(unittest.TestCase):
                     })
             untouched_before = dict(payload["scene_jobs"][4])
             payload["pack_status"] = "partially_blocked"
+            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
 
             self.assertEqual(
