@@ -68,6 +68,7 @@ CANONICAL_PRIMARY_MODEL = "gen4_turbo"
 CANONICAL_SECONDARY_MODEL = "gen4.5"
 CANONICAL_MODEL_PRIORITY = (CANONICAL_PRIMARY_MODEL, CANONICAL_SECONDARY_MODEL)
 REFERENCE_KEYFRAME_RETRY_DAILY_LIMIT = 4
+FRONTAL_REFERENCE_RETRY_DAILY_LIMIT = 4
 SECONDARY_ESCALATION_CODES = frozenset({
     "video_prompt_image_required",
     "provider_terminal_failure",
@@ -319,7 +320,7 @@ def _keyframe_budget_usage(root: Path) -> int:
     return jobs
 
 
-def _reference_keyframe_retry_budget_usage(root: Path) -> int:
+def _keyframe_retry_budget_usage(root: Path, approval_scope: str) -> int:
     now = datetime.now(timezone.utc).date()
     jobs = 0
     for manifest in root.glob("*/story_manifest.json"):
@@ -335,7 +336,7 @@ def _reference_keyframe_retry_budget_usage(root: Path) -> int:
             for intent in intents:
                 if not isinstance(intent, dict):
                     continue
-                if intent.get("approval_scope") != "reference_model_retry":
+                if intent.get("approval_scope") != approval_scope:
                     continue
                 if intent.get("state") not in {"accepted", "ambiguous", "submitting"}:
                     continue
@@ -650,10 +651,21 @@ def _process_keyframe(
         return None
     if state in {"planned", "queued"}:
         reference_retry = bool(job.get("keyframe_retry_approved_at"))
+        retry_phase = str(job.get("keyframe_retry_phase") or "legacy_model")
+        attempts_before_submit = int(job.get("keyframe_attempts", 0))
+        legacy_retry = reference_retry and retry_phase == "legacy_model"
+        frontal_retry = reference_retry and retry_phase == "reference_quality"
+        valid_legacy_retry = legacy_retry and attempts_before_submit == 1
+        valid_frontal_retry = (
+            frontal_retry
+            and attempts_before_submit in {1, 2}
+            and job.get("keyframe_retry_reference_role") == "frontal_identity"
+            and bool(job.get("keyframe_frontal_retry_approved_at"))
+        )
         if reference_retry and not (
             bool(scene.get("requires_naz_reference"))
             and job.get("keyframe_retry_model") == "gen4_image"
-            and int(job.get("keyframe_attempts", 0)) == 1
+            and (valid_legacy_retry or valid_frontal_retry)
         ):
             job.update({
                 "state": "terminal_failed",
@@ -664,9 +676,15 @@ def _process_keyframe(
             _set_pack_status(payload)
             _write(manifest, payload)
             return None
+        retry_scope = (
+            "frontal_reference_retry" if frontal_retry else "reference_model_retry"
+        )
+        retry_limit = (
+            FRONTAL_REFERENCE_RETRY_DAILY_LIMIT
+            if frontal_retry else REFERENCE_KEYFRAME_RETRY_DAILY_LIMIT
+        )
         if reference_retry and (
-            _reference_keyframe_retry_budget_usage(config.pack_root)
-            >= REFERENCE_KEYFRAME_RETRY_DAILY_LIMIT
+            _keyframe_retry_budget_usage(config.pack_root, retry_scope) >= retry_limit
         ):
             job["keyframe_failure_code"] = "daily_keyframe_limit_reached"
             _write(manifest, payload)
@@ -680,7 +698,12 @@ def _process_keyframe(
         original: ReferenceSelection | None = None
         if bool(scene.get("requires_naz_reference")):
             role = str(scene.get("reference_role") or "frontal_identity")
-            original = _reference_catalog(config.reference_path).get(role)
+            selected_role = (
+                str(job.get("keyframe_retry_reference_role"))
+                if frontal_retry else role
+            )
+            catalog = _reference_catalog(config.reference_path)
+            original = catalog.get(selected_role)
             if not provider.supports_reference or original is None:
                 job.update({
                     "keyframe_state": "terminal_failed",
@@ -708,7 +731,7 @@ def _process_keyframe(
             "created_at": created_at, "state": "submitting", "failure_code": None,
         }
         if reference_retry:
-            submit_intent["approval_scope"] = "reference_model_retry"
+            submit_intent["approval_scope"] = retry_scope
         job.update({
             "keyframe_state": "submitting", "keyframe_attempts": attempt,
             "keyframe_external_job_id": None, "keyframe_submitted_at": created_at,

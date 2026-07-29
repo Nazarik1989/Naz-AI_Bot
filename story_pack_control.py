@@ -179,6 +179,43 @@ def _reference_keyframe_retry_candidates(payload: Mapping[str, Any]) -> list[dic
     return candidates
 
 
+def _frontal_reference_retry_candidates(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Find explicitly approved legacy retries that have not used the frontal reference."""
+    candidates: list[dict[str, Any]] = []
+    for job in payload.get("scene_jobs", []):
+        if not isinstance(job, dict) or not bool(job.get("requires_naz_reference")):
+            continue
+        if not job.get("keyframe_retry_approved_at") or job.get(
+            "keyframe_frontal_retry_approved_at"
+        ):
+            continue
+        if job.get("keyframe_retry_model") != "gen4_image":
+            continue
+        attempts = int(job.get("keyframe_attempts", 0))
+        intent = job.get("keyframe_submit_intent")
+        queued_legacy_retry = (
+            job.get("state") == "queued"
+            and job.get("keyframe_state") == "queued"
+            and attempts == 1
+            and not job.get("keyframe_external_job_id")
+            and isinstance(intent, Mapping)
+            and intent.get("model") == "gen4_image_turbo"
+            and job.get("keyframe_retry_phase") in {None, "legacy_model"}
+        )
+        failed_standard_retry = (
+            job.get("state") == "terminal_failed"
+            and job.get("keyframe_state") == "terminal_failed"
+            and job.get("keyframe_failure_code") == "provider_terminal_failure"
+            and attempts == 2
+            and isinstance(intent, Mapping)
+            and intent.get("model") == "gen4_image"
+            and intent.get("approval_scope") == "reference_model_retry"
+        )
+        if queued_legacy_retry or failed_standard_retry:
+            candidates.append(job)
+    return candidates
+
+
 def confirm_generation(root: Path, plan_id: str) -> str:
     """Context-aware confirmation with no provider/API call.
 
@@ -252,6 +289,7 @@ def confirm_generation(root: Path, plan_id: str) -> str:
                         "keyframe_provider_status": None,
                         "keyframe_failure_code": None,
                         "keyframe_retry_model": "gen4_image",
+                        "keyframe_retry_phase": "legacy_model",
                         "keyframe_retry_reason_code": "provider_terminal_failure",
                         "keyframe_retry_approved_at": confirmed_at,
                     })
@@ -262,6 +300,53 @@ def confirm_generation(root: Path, plan_id: str) -> str:
         payload["updated_at"] = _now()
         story_production.atomic_json(path, payload)
         return result
+
+
+def approve_frontal_reference_retry(root: Path, plan_id: str) -> str:
+    """Retarget only already-approved failed/queued reference retries.
+
+    This operator-only control is deliberately not wired to a Telegram button:
+    it requires separate explicit cost approval after reference-quality review.
+    It records approval but never calls a provider.
+    """
+    path = manifest_path(root, plan_id)
+    with _manifest_lock(path):
+        payload = story_production.read_manifest(path)
+        if not story_production.manifest_has_current_production_contract(payload):
+            raise story_production.StoryPlanError("story_manifest_contract_stale")
+        if str(payload.get("approval", {}).get("status")) != "approved":
+            raise story_production.StoryPlanError("story pack is not approved")
+        candidates = _frontal_reference_retry_candidates(payload)
+        if not candidates:
+            return "already_approved"
+        if len(candidates) > 4:
+            raise story_production.StoryPlanError(
+                "frontal reference retry limit exceeded"
+            )
+        confirmed_at = _now()
+        for job in candidates:
+            external_id = str(job.get("keyframe_external_job_id") or "")
+            history = job.setdefault("keyframe_provider_job_history", [])
+            if external_id and external_id not in history:
+                history.append(external_id)
+            job.update({
+                "state": "queued",
+                "failure_code": None,
+                "keyframe_state": "queued",
+                "keyframe_external_job_id": None,
+                "keyframe_submitted_at": None,
+                "keyframe_provider_status": None,
+                "keyframe_failure_code": None,
+                "keyframe_retry_model": "gen4_image",
+                "keyframe_retry_phase": "reference_quality",
+                "keyframe_retry_reference_role": "frontal_identity",
+                "keyframe_retry_reason_code": "provider_terminal_failure",
+                "keyframe_frontal_retry_approved_at": confirmed_at,
+            })
+        payload["pack_status"] = "queued"
+        payload["updated_at"] = confirmed_at
+        story_production.atomic_json(path, payload)
+        return "frontal_reference_keyframes_retry_approved"
 
 
 def create_next_variant(

@@ -672,10 +672,28 @@ class WorkerTests(unittest.TestCase):
             persisted = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertNotIn("185 cm", persisted["scenes"][0]["provider_prompt"])
 
-    def test_approved_reference_retry_bypasses_spent_primary_budget_once(self):
+    def test_explicit_frontal_retry_uses_distinct_reference_and_budget_once(self):
         with tempfile.TemporaryDirectory() as root:
-            reference = Path(root) / "naz-approved.jpg"
-            reference.write_bytes(b"private-reference")
+            ref_dir = Path(root) / "private-references"
+            ref_dir.mkdir()
+            primary = ref_dir / "naz-primary.jpg"
+            secondary = ref_dir / "naz-secondary.jpg"
+            primary.write_bytes(b"frontal-reference")
+            secondary.write_bytes(b"three-quarter-reference")
+            (ref_dir / "naz-reference-profile.json").write_text(json.dumps({
+                "schema": "naz-reference-profile.v1",
+                "persona": "naz",
+                "reference_files": {
+                    "primary": primary.name,
+                    "secondary": secondary.name,
+                },
+                "body_profile": {
+                    "height_cm": 185,
+                    "weight_kg": 80,
+                    "build": "tall, lean-athletic",
+                    "visual_guidance": "Long balanced proportions; fit but not bulky.",
+                },
+            }), encoding="utf-8")
             pack, _, manifest = make_pack(root, keyframes_ready=False)
             payload = story.read_manifest(manifest)
             failed_index = 0
@@ -721,7 +739,7 @@ class WorkerTests(unittest.TestCase):
             status = worker.process_pack(
                 pack.plan_id,
                 config=config(
-                    root, reference_path=reference, daily_keyframe_limit=1
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
                 ),
                 provider=provider,
                 composer=DummyComposer(),
@@ -729,6 +747,10 @@ class WorkerTests(unittest.TestCase):
 
             self.assertEqual(status, "queued")
             self.assertEqual(len(provider.keyframe_submissions), 1)
+            self.assertEqual(
+                provider.keyframe_submissions[0].reference_path,
+                secondary.resolve(),
+            )
             current = story.read_manifest(manifest)["scene_jobs"][failed_index]
             self.assertEqual(current["keyframe_state"], "submitted")
             self.assertEqual(current["keyframe_attempts"], 2)
@@ -745,7 +767,7 @@ class WorkerTests(unittest.TestCase):
             worker.process_pack(
                 pack.plan_id,
                 config=config(
-                    root, reference_path=reference, daily_keyframe_limit=1
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
                 ),
                 provider=provider,
                 composer=DummyComposer(),
@@ -756,7 +778,7 @@ class WorkerTests(unittest.TestCase):
             worker.process_pack(
                 pack.plan_id,
                 config=config(
-                    root, reference_path=reference, daily_keyframe_limit=1
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
                 ),
                 provider=provider,
                 composer=DummyComposer(),
@@ -764,7 +786,51 @@ class WorkerTests(unittest.TestCase):
             failed_again = story.read_manifest(manifest)["scene_jobs"][failed_index]
             self.assertEqual(failed_again["keyframe_state"], "terminal_failed")
             self.assertEqual(
-                control.confirm_generation(Path(root), pack.plan_id),
+                control.approve_frontal_reference_retry(Path(root), pack.plan_id),
+                "frontal_reference_keyframes_retry_approved",
+            )
+
+            worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+            self.assertEqual(len(provider.keyframe_submissions), 2)
+            self.assertEqual(
+                provider.keyframe_submissions[1].reference_path,
+                primary.resolve(),
+            )
+            frontal = story.read_manifest(manifest)["scene_jobs"][failed_index]
+            self.assertEqual(frontal["keyframe_attempts"], 3)
+            self.assertEqual(
+                frontal["keyframe_submit_intent"]["approval_scope"],
+                "frontal_reference_retry",
+            )
+
+            worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+            self.assertEqual(len(provider.keyframe_submissions), 2)
+
+            provider.fail(frontal["keyframe_external_job_id"])
+            worker.process_pack(
+                pack.plan_id,
+                config=config(
+                    root, reference_path=ref_dir, daily_keyframe_limit=1
+                ),
+                provider=provider,
+                composer=DummyComposer(),
+            )
+            self.assertEqual(
+                control.approve_frontal_reference_retry(Path(root), pack.plan_id),
                 "already_approved",
             )
 
@@ -1067,6 +1133,90 @@ class ControlTests(unittest.TestCase):
             ):
                 control.confirm_generation(Path(root), pack.plan_id)
             self.assertEqual(manifest.read_bytes(), before)
+
+    def test_operator_retargets_current_mixed_retry_set_to_frontal_reference(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            payload = story.read_manifest(manifest)
+            approved_at = datetime.now(timezone.utc).isoformat()
+            for index in range(4):
+                scene = payload["scenes"][index]
+                job = payload["scene_jobs"][index]
+                scene.update({
+                    "requires_naz_reference": True,
+                    "reference_role": "three_quarter_identity",
+                    "identity_reference_usage": "identity_only",
+                })
+                job.update({
+                    "requires_naz_reference": True,
+                    "reference_role": "three_quarter_identity",
+                    "keyframe_retry_model": "gen4_image",
+                    "keyframe_retry_approved_at": approved_at,
+                })
+                if index == 0:
+                    job.update({
+                        "state": "terminal_failed",
+                        "failure_code": "provider_terminal_failure",
+                        "keyframe_state": "terminal_failed",
+                        "keyframe_external_job_id": "standard-reference-job",
+                        "keyframe_attempts": 2,
+                        "keyframe_failure_code": "provider_terminal_failure",
+                        "keyframe_submit_intent": {
+                            "intent_id": "standard-reference-intent",
+                            "model": "gen4_image",
+                            "created_at": approved_at,
+                            "state": "accepted",
+                            "approval_scope": "reference_model_retry",
+                            "external_job_id": "standard-reference-job",
+                            "failure_code": None,
+                        },
+                    })
+                else:
+                    job.update({
+                        "state": "queued",
+                        "keyframe_state": "queued",
+                        "keyframe_external_job_id": None,
+                        "keyframe_attempts": 1,
+                        "keyframe_failure_code": None,
+                        "keyframe_submit_intent": {
+                            "intent_id": f"legacy-turbo-{index}",
+                            "model": "gen4_image_turbo",
+                            "created_at": approved_at,
+                            "state": "accepted",
+                            "failure_code": None,
+                        },
+                    })
+            untouched_before = dict(payload["scene_jobs"][4])
+            payload["pack_status"] = "partially_blocked"
+            story.atomic_json(manifest, payload)
+
+            self.assertEqual(
+                control.approve_frontal_reference_retry(Path(root), pack.plan_id),
+                "frontal_reference_keyframes_retry_approved",
+            )
+            current = story.read_manifest(manifest)
+            self.assertEqual(current["pack_status"], "queued")
+            self.assertEqual(
+                [job["keyframe_attempts"] for job in current["scene_jobs"][:4]],
+                [2, 1, 1, 1],
+            )
+            for job in current["scene_jobs"][:4]:
+                self.assertEqual(job["state"], "queued")
+                self.assertEqual(job["keyframe_state"], "queued")
+                self.assertEqual(job["keyframe_retry_phase"], "reference_quality")
+                self.assertEqual(
+                    job["keyframe_retry_reference_role"], "frontal_identity"
+                )
+                self.assertTrue(job["keyframe_frontal_retry_approved_at"])
+            self.assertIn(
+                "standard-reference-job",
+                current["scene_jobs"][0]["keyframe_provider_job_history"],
+            )
+            self.assertEqual(current["scene_jobs"][4], untouched_before)
+            self.assertEqual(
+                control.approve_frontal_reference_retry(Path(root), pack.plan_id),
+                "already_approved",
+            )
 
     def test_approval_controls_reject_stale_v2_before_mutation(self):
         for action in (control.approve_pack, control.confirm_generation):
