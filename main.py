@@ -71,6 +71,7 @@ import editorial_orchestrator
 import gaming_vertical
 import naz_editorial_catalog
 import naz_vk_music
+import operator_events
 import scheduled_work
 import semantic_autopost
 import story_production
@@ -182,6 +183,12 @@ MONITORED_SOURCES_FILE = Path(os.getenv("MONITORED_SOURCES_FILE", "monitored_sou
 SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip())
 AGENT_CONTENT_INBOX = Path(os.getenv("AGENT_CONTENT_INBOX", "content_inbox/agent_content").strip())
 AGENT_CONTENT_PROJECT = os.getenv("AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean").strip()
+NAZ_OPERATOR_EVENT_ROOT = Path(
+    os.getenv("NAZ_OPERATOR_EVENT_ROOT", "content_inbox/operator_events").strip()
+)
+NAZ_CHARACTER_REELS_MODE = operator_events.normalize_character_reels_mode(
+    os.getenv("NAZ_CHARACTER_REELS_MODE", "off")
+)
 
 AUTOPOST_ENABLED = env_bool("NAZ_TELEGRAM_AUTO_ON", env_bool("AUTOPOST_ENABLED", True))
 AUTOPOST_TIMES = os.getenv("NAZ_TELEGRAM_AUTO_TIMES", os.getenv("AUTOPOST_TIMES", "10:00,14:00,18:00,22:00")).strip()
@@ -229,6 +236,7 @@ NAZ_SCHEDULED_WORK_DIR = Path(
         ),
     ).strip()
 )
+NAZ_OPERATOR_EVENT_BINDING_ROOT = NAZ_SCHEDULED_WORK_DIR / "operator-event-bindings"
 CROSSPOST_EXCHANGE_ENABLED = env_bool("CROSSPOST_EXCHANGE_ENABLED", True)
 CROSSPOST_EXCHANGE_AUTO_PUBLISH = env_bool("CROSSPOST_EXCHANGE_AUTO_PUBLISH", True)
 CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
@@ -4506,6 +4514,45 @@ async def process_agent_content_date(
         image_qa_status="not_run",
         history_commit_status="pending" if publish else "not_run",
     )
+    if NAZ_CHARACTER_REELS_MODE != "off":
+        try:
+            operator_event_batch = await asyncio.to_thread(
+                operator_events.bind_plan_to_operator_events,
+                mode=NAZ_CHARACTER_REELS_MODE,
+                source_root=NAZ_OPERATOR_EVENT_ROOT,
+                private_root=NAZ_OPERATOR_EVENT_BINDING_ROOT,
+                markdown_root=AGENT_CONTENT_INBOX,
+                project=AGENT_CONTENT_PROJECT,
+                date_text=resolved_date,
+                plan_id=plan.plan_id,
+                story_dirs=tuple(agent_content_source_dirs_for_date(resolved_date)),
+            )
+        except Exception as exc:  # noqa: BLE001 - shadow failure must not break drafts
+            logger.warning(
+                "OPERATOR_EVENT_SHADOW failed closed | plan_id=%s | "
+                "reason_code=operator_event_shadow_error | error=%s",
+                plan.plan_id,
+                type(exc).__name__,
+            )
+        else:
+            logger.info(
+                "OPERATOR_EVENT_SHADOW | plan_id=%s | mode=%s | discovered=%s | "
+                "bound=%s | already_bound=%s | rejected=%s | reason_codes=%s | "
+                "reason_codes_by_event=%s",
+                plan.plan_id,
+                operator_event_batch.mode,
+                operator_event_batch.discovered_count,
+                operator_event_batch.bound_count,
+                operator_event_batch.already_bound_count,
+                operator_event_batch.rejected_count,
+                ",".join(operator_event_batch.reason_codes) or "none",
+                ";".join(
+                    f"{event_id}:{','.join(codes)}"
+                    for event_id, codes in sorted(
+                        operator_event_batch.reason_codes_by_event.items()
+                    )
+                ) or "none",
+            )
     if plan.production_mode == "story_first":
         safe_facts = tuple(source_row.get("safe_facts", ()))
         try:
