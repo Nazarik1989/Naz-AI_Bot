@@ -22,12 +22,13 @@ from story_pack_lock import ensure_private_group_access
 from story_video_provider import ProviderError, compact_runway_prompt
 
 
-STORY_SCHEMA = "naz-story-pack-v6"
-PREVIOUS_STORY_SCHEMA = "naz-story-pack-v5"
-OLDER_STORY_SCHEMA = "naz-story-pack-v4"
-LEGACY_STORY_SCHEMA = "naz-story-pack-v3"
-ANCIENT_STORY_SCHEMA = "naz-story-pack-v2"
-FIRST_STORY_SCHEMA = "naz-story-pack-v1"
+STORY_SCHEMA = "naz-story-pack-v7"
+PREVIOUS_STORY_SCHEMA = "naz-story-pack-v6"
+OLDER_STORY_SCHEMA = "naz-story-pack-v5"
+LEGACY_STORY_SCHEMA = "naz-story-pack-v4"
+ANCIENT_STORY_SCHEMA = "naz-story-pack-v3"
+FIRST_STORY_SCHEMA = "naz-story-pack-v2"
+ORIGINAL_STORY_SCHEMA = "naz-story-pack-v1"
 SUPPORTED_STORY_SCHEMAS = (
     STORY_SCHEMA,
     PREVIOUS_STORY_SCHEMA,
@@ -35,8 +36,10 @@ SUPPORTED_STORY_SCHEMAS = (
     LEGACY_STORY_SCHEMA,
     ANCIENT_STORY_SCHEMA,
     FIRST_STORY_SCHEMA,
+    ORIGINAL_STORY_SCHEMA,
 )
-DIRECTOR_VERSION = "reels-semantic-director-v7"
+DIRECTOR_VERSION = "reels-semantic-director-v8"
+SEMANTIC_CONTRACT_VERSION = "reels-semantic-plan-v1"
 TEMPLATE_DIRECTOR_VERSION = "reels-template-director-v1"
 MOTION_CONTRACT_VERSION = "bounded-story-arc-v4"
 VIDEO_MOTION_PROMPT_VERSION = "runway-image-to-video-motion-v2"
@@ -67,6 +70,8 @@ DIRECTOR_SELF_MOTION_CLASSES = (
     "close", "lower", "open", "oscillate", "rotate", "slide",
 )
 DIRECTOR_BRAND_MARKINGS = ("none", "naz_ai_lab")
+VISUALIZATION_KINDS = ("literal", "physical_metaphor")
+CORE_THESIS_REF = "core_thesis"
 
 # Each recipe is a pre-vetted, single-predicate piece of blocking. The text
 # director selects a recipe; it never composes materials, props or grammar.
@@ -321,6 +326,15 @@ DIRECTOR_STORY_ARCS: Mapping[str, Mapping[str, Any]] = {
     },
 }
 DIRECTOR_STORY_ARC_NAMES = tuple(DIRECTOR_STORY_ARCS)
+DIRECTOR_ARC_SEMANTIC_AXES: Mapping[str, frozenset[str]] = {
+    "module_recovery_mixed": frozenset({"physical_mechanism", "software_validation"}),
+    "module_recovery_human": frozenset({"physical_mechanism", "software_validation"}),
+    "connector_calibration_human": frozenset({"physical_mechanism", "software_validation"}),
+    "automated_validation_cycle": frozenset({
+        "physical_mechanism", "software_validation", "publication_workflow",
+    }),
+    "actuator_proof_cycle": frozenset({"physical_mechanism", "software_validation"}),
+}
 DIRECTOR_RECIPE_SUMMARIES_RU: Mapping[str, str] = {
     "naz_opens_glass_cover": "Наз открывает дымчатую стеклянную крышку и оставляет узел доступным для проверки.",
     "naz_removes_module_from_slot": "Наз вынимает титановый модуль из керамического паза.",
@@ -441,6 +455,13 @@ class DirectorValidationError(StoryPlanError):
 @dataclass(frozen=True, slots=True)
 class DirectorScene:
     role: str
+    beat_id: str
+    semantic_goal: str
+    source_fact_refs: tuple[str, ...]
+    relation_to_previous: str
+    expected_viewer_understanding: str
+    visualization_kind: str
+    visual_relation_to_beat: str
     setting: str
     subject_kind: str
     subject: str
@@ -455,7 +476,14 @@ class DirectorScene:
 
 @dataclass(frozen=True, slots=True)
 class DirectorTreatment:
+    plan_id: str
+    variant_index: int
     visual_concept: str
+    core_thesis: str
+    thesis_source_fact_refs: tuple[str, ...]
+    viewer_problem: str
+    hook: str
+    payoff: str
     story_spine: str
     story_arc: str
     continuity_anchor: str
@@ -471,6 +499,13 @@ class DirectorTreatment:
 class ScenePlan:
     scene_id: str
     role: str
+    beat_id: str
+    semantic_goal: str
+    source_fact_refs: tuple[str, ...]
+    relation_to_previous: str
+    expected_viewer_understanding: str
+    visualization_kind: str
+    visual_relation_to_beat: str
     standalone_meaning: str
     subject_kind: str
     motion_class: str | None
@@ -524,6 +559,10 @@ class StoryPackPlan:
     safe_facts: tuple[str, ...]
     editorial_plan: Mapping[str, Any]
     central_thesis: str
+    thesis_source_fact_refs: tuple[str, ...]
+    viewer_problem: str
+    hook: str
+    payoff: str
     visual_concept: str
     story_spine: str
     story_arc: str
@@ -591,13 +630,236 @@ def draft_story_beats(value: str) -> tuple[str, ...]:
 
 
 _DIRECTOR_TRANSPORT_RE = re.compile(
-    r"(?i)(?:\bfact\s*\d+\b|tied to fact|perform and reveal|folders?:|user focus:|"
+    r"(?i)(?:\bfact[\s_-]*\d+\b|tied to fact|perform and reveal|folders?:|user focus:|"
     r"project:|\.md\b|\.json\b|source_ref|plan_id)"
 )
 _DIRECTOR_FORBIDDEN_CLICHE_RE = re.compile(
     r"(?i)(?:screen interface|(?:overloaded\s+)?\bhud\b|random circuit|"
     r"flowing code|code rain)"
 )
+_SEMANTIC_WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
+_SEMANTIC_NUMBER_RE = re.compile(r"(?<![\w-])\d+(?:[.,]\d+)?%?")
+_SEMANTIC_STOP_WORDS = {
+    "about", "after", "again", "also", "because", "before", "becomes",
+    "being", "between", "each", "from", "into", "only", "same", "that",
+    "their", "then", "this", "through", "under", "with", "without",
+    "один", "одна", "одно", "одного", "этот", "эта", "это", "после",
+    "перед", "между", "через", "который", "которая", "только", "того",
+    "свой", "свою", "однако", "затем", "чтобы", "когда", "потому",
+    "physical", "visual", "represents", "shows", "viewer", "scene",
+    "mechanism", "object", "result", "state", "process",
+}
+_PHYSICAL_RELATION_RE = re.compile(
+    r"(?i)(?:physical|mechanic|mechanis|module|connector|actuator|rotor|assembly|prototype|"
+    r"физичес|материал|механ|модул|разъ[её]м|узел|прототип|ротор|привод)"
+)
+_STRONG_PHYSICAL_SOURCE_RE = re.compile(
+    r"(?i)(?:\bphysical\b|\bmechanic(?:al|s)?\b|\bactuators?\b|"
+    r"\brotors?\b|\btitanium\b|\bceramic\b|"
+    r"\baluminium\b|\bcarbon\b|механ|физичес|титан|"
+    r"керами|алюмин|карбон|ротор|привод)"
+)
+_SOFTWARE_SOURCE_RE = re.compile(
+    r"(?i)(?:build|configuration|release|regression|software|service|deploy|debug|"
+    r"error|failure|failed|code|api|provider|test|retry|repository|github|"
+    r"сборк|конфигура|релиз|регресс|сервис|депло|ошиб|сбой|код|тест|повтор|"
+    r"репозитор|провайдер|модел)"
+)
+_PUBLICATION_SOURCE_RE = re.compile(
+    r"(?i)(?:\bpublish(?:ed|es|ing)?\b|\bpublications?\b|\bposts?\b|"
+    r"\btelegram\b|\breels?\b|\bcontent rotation\b|\bschedules?\b|"
+    r"\bduplicate posts?\b|\bautopost\b|публикац|опублик|\bпост(?:а|у|ом|ы)?\b|телеграм|рилс|"
+    r"ротаци|расписан|автопост|дубл)"
+)
+_GENERIC_VISUAL_CONCEPTS = {
+    "lab", "naz ai lab", "laboratory", "technology", "future lab",
+    "cyberpunk lab", "ai laboratory", "digital future", "innovation",
+}
+_MOTION_RELATION_MARKERS: Mapping[str, tuple[str, ...]] = {
+    "align": ("align", "выравн"),
+    "bend": ("bend", "bent", "сгиб"),
+    "carry": ("carr", "перенос"),
+    "close": ("clos", "закрыв"),
+    "connect": ("connect", "соедин"),
+    "cut": (" cut ", "разрез", "режет"),
+    "disconnect": ("disconnect", "отсоедин"),
+    "fold": ("fold", "склад"),
+    "grip": ("grip", "захват"),
+    "insert": ("insert", "встав", "устанав"),
+    "lift": ("lift", "подним"),
+    "lock": (" lock", "фиксир", "запир"),
+    "lower": ("lower", "опуск"),
+    "open": ("open", "открыв"),
+    "oscillate": ("oscillat", "колеб"),
+    "place": ("place", "размещ", "кладет"),
+    "pour": ("pour", "налива"),
+    "press": ("press", "нажим"),
+    "pull": ("pull", "тянет"),
+    "push": ("push", "толка"),
+    "remove": ("remov", "вынима", "снима"),
+    "rotate": ("rotat", "вращ", "поворач"),
+    "slide": ("slid", "скольз", "сдвиг"),
+    "unlock": ("unlock", "разблок"),
+}
+_MULTI_ACTION_RELATION_RE = re.compile(
+    r"(?i)(?:\btwice\b|\bagain\b|\band then\b|\bfollowed by\b|"
+    r"\bдважды\b|\bснова\b|\bи затем\b|\bпосле чего\b)"
+)
+
+
+def _fact_ids(count: int) -> tuple[str, ...]:
+    return tuple(f"fact-{index}" for index in range(1, count + 1))
+
+
+def _beat_ids(plan_id: str, count: int) -> tuple[str, ...]:
+    return tuple(
+        f"beat-{index:02d}-{role}"
+        for index, role in enumerate(_roles(plan_id, count), start=1)
+    )
+
+
+def _semantic_tokens(value: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in _SEMANTIC_WORD_RE.findall(str(value).casefold().replace("ё", "е")):
+        if raw.isdigit() or len(raw) < 4 or raw in _SEMANTIC_STOP_WORDS:
+            continue
+        # A small language-agnostic prefix stem is deterministic and tolerates
+        # ordinary English/Russian inflection without claiming full NLP.
+        tokens.add(raw[:6] if len(raw) > 6 else raw)
+    return tokens
+
+
+# Deterministic, non-claiming language that may connect source terms into a
+# privacy-safe semantic brief. Any other content word must be present in the
+# cited source facts; this deliberately favours false rejection over invention.
+_SEMANTIC_RELATION_VOCABULARY = _semantic_tokens("""
+    action beat causal chain connection episode expose final follow hook mapping meaning
+    next opening payoff reveal safe semantic stage transition visualise visualize
+    physical material mechanism metaphor relation correspond represent map maps show viewer understand
+    align bend carry close connect cut disconnect fold grip insert lift lock lower open
+    oscillate place pour press pull push remove rotate slide unlock
+    действие переход бит причинный цепочка связь показать эпизод раскрыть финальный
+    следовать зацепка соответствие смысл следующий открытие развязка безопасный смысловой
+    этап визуализировать физический материал зритель понимать
+    механизм метафора отношение соответствовать обозначать тест выравнивать сгибать
+    переносить закрывать соединять разрезать отсоединять складывать захватывать вставлять
+    поднимать фиксировать опускать открывать колебаться размещать наливать нажимать тянуть
+    толкать вынимать вращать скользить разблокировать
+""")
+
+
+def _semantic_text_is_grounded(
+    value: str,
+    facts_by_ref: Mapping[str, str],
+    refs: Sequence[str],
+) -> bool:
+    source_tokens = set().union(
+        *(_semantic_tokens(facts_by_ref.get(ref, "")) for ref in refs)
+    ) if refs else set()
+    value_tokens = _semantic_tokens(value)
+    required_anchor_count = min(2, len(source_tokens))
+    if (
+        not value_tokens
+        or not source_tokens
+        or len(value_tokens & source_tokens) < required_anchor_count
+    ):
+        return False
+    unsupported = value_tokens - source_tokens - _SEMANTIC_RELATION_VOCABULARY
+    return not unsupported
+
+
+def _raw_source_fragment_in_text(value: str, facts: Sequence[str]) -> bool:
+    """Detect exact short facts and substantial verbatim fragments fail-closed."""
+    value_words = _SEMANTIC_WORD_RE.findall(str(value).casefold())
+    for fact in facts:
+        fact_words = _SEMANTIC_WORD_RE.findall(str(fact).casefold())
+        if not fact_words:
+            continue
+        if any(
+            value_words[offset:offset + len(fact_words)] == fact_words
+            for offset in range(len(value_words) - len(fact_words) + 1)
+        ):
+            return True
+        if len(fact_words) < 4:
+            continue
+        for index in range(len(fact_words) - 3):
+            fragment = fact_words[index:index + 4]
+            if len(" ".join(fragment)) < 20:
+                continue
+            if any(
+                value_words[offset:offset + 4] == fragment
+                for offset in range(len(value_words) - 3)
+            ):
+                return True
+    return False
+
+
+def _unknown_semantic_numbers(values: Sequence[str], facts: Sequence[str]) -> tuple[str, ...]:
+    known = set(_SEMANTIC_NUMBER_RE.findall(" ".join(facts)))
+    unknown = {
+        number
+        for value in values
+        for number in _SEMANTIC_NUMBER_RE.findall(value)
+        if number not in known
+    }
+    return tuple(sorted(unknown))
+
+
+def _source_semantic_axis(facts: Sequence[str]) -> str:
+    source = " ".join(facts)
+    # Publishing terms take precedence: a post/rotation episode must not be
+    # silently converted into a fictional repair merely because it also names
+    # a bot, test or repository.
+    if _PUBLICATION_SOURCE_RE.search(source):
+        return "publication_workflow"
+    if _STRONG_PHYSICAL_SOURCE_RE.search(source):
+        return "physical_mechanism"
+    if _SOFTWARE_SOURCE_RE.search(source):
+        return "software_validation"
+    return "unknown"
+
+
+def _visual_concept_is_generic(value: str) -> bool:
+    normalized = " ".join(_SEMANTIC_WORD_RE.findall(str(value).casefold()))
+    return normalized in _GENERIC_VISUAL_CONCEPTS or len(_semantic_tokens(value)) < 2
+
+
+def _visual_relation_names_action(value: str, motion_class: str) -> bool:
+    tokens = _SEMANTIC_WORD_RE.findall(str(value).casefold().replace("ё", "е"))
+    return any(
+        token.startswith(marker.strip())
+        for marker in _MOTION_RELATION_MARKERS.get(motion_class, ())
+        for token in tokens
+    )
+
+
+def _visual_relation_motion_classes(value: str) -> frozenset[str]:
+    named = {
+        motion_class
+        for motion_class in _MOTION_RELATION_MARKERS
+        if _visual_relation_names_action(value, motion_class)
+    }
+    return frozenset(named)
+
+
+def _normalized_ref_list(
+    value: Any,
+    *,
+    allowed: Sequence[str],
+    code: str,
+    errors: list[str],
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        errors.append(code)
+        return ()
+    refs = tuple(str(item).strip() for item in value)
+    if (
+        any(ref not in allowed for ref in refs)
+        or len(set(refs)) != len(refs)
+    ):
+        errors.append(code)
+        return ()
+    return refs
 _DIRECTOR_INTERFACE_ACTION_RE = re.compile(
     r"(?i)(?=.*\b(?:types?|clicks?|taps?|press(?:es)?|swipes?|scrolls?|refreshes?)\b)"
     r"(?=.*\b(?:keyboard|trackpad|screen|laptop|phone|browser|terminal|interface)\b)"
@@ -794,6 +1056,8 @@ def reels_director_prompt(
     count = max(4, min(7, len(facts)))
     story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
     roles = _roles(story_plan_id, count)
+    beat_ids = _beat_ids(story_plan_id, count)
+    fact_ids = _fact_ids(count)
     available_story_arcs = _story_arc_names_for_plan(plan)
     story_arc_catalog = {
         name: {
@@ -808,15 +1072,20 @@ def reels_director_prompt(
     brief = {
         "persona": "Naz, a real adult human founder",
         "topic": plan.topic,
-        "thesis": plan.thesis_direction,
+        "editorial_thesis_direction": plan.thesis_direction,
         "tension": plan.tension,
         "imagery": plan.imagery,
         "visual_subject_direction": plan.visual_subject_direction,
         "visual_relation": plan.visual_relation,
         "available_story_arcs": story_arc_catalog,
         "variant_index": variant_index,
-        "ordered_roles": roles,
-        "draft_beats": list(facts[:count]),
+        "ordered_beats": [
+            {"beat_id": beat_id, "role": role, "source_fact_ref": fact_id}
+            for beat_id, role, fact_id in zip(beat_ids, roles, fact_ids)
+        ],
+        "source_facts": {
+            fact_id: fact for fact_id, fact in zip(fact_ids, facts[:count])
+        },
     }
     return (
         "Act as Reels Maker, the film director for Naz AI Lab. Convert the supplied verified "
@@ -835,19 +1104,51 @@ def reels_director_prompt(
         "cause the stated visible end state. Do not use symbolic gestures, passive watching, "
         "typing, clicking, trackpads, screen pantomime, magical transformation, floating parts, "
         "self-assembly or multi-step choreography. Props obey gravity and ordinary mechanics.\n\n"
+        "First derive exactly one short core_thesis from one or more source_facts and cite every "
+        "fact-N reference used by core_thesis, viewer_problem, hook or payoff. story_spine and "
+        "visual_concept may use terms from any supplied source fact. editorial_thesis_direction "
+        "is only an editorial axis, not the episode thesis. The hook and payoff both point to "
+        "core_thesis and resolve the same claim. Do not "
+        "invent numbers, named results or claims absent from cited facts. visual_concept must be "
+        "content-specific; generic labels such as Lab, technology or digital future fail.\n\n"
+        "For every ordered beat return its exact beat_id, a privacy-safe semantic_goal, one or "
+        "more source_fact_refs, expected_viewer_understanding and visual_relation_to_beat. The "
+        "source_fact_refs must include that ordered beat's supplied source_fact_ref; additional "
+        "references are allowed. The "
+        "first relation_to_previous is exactly 'opening'; every later one explains the transition "
+        "from the previous semantic goal and repeats at least one cited content term from both "
+        "the previous and current goals. Goals must be distinct. Every substantive noun, verb "
+        "and quality term in semantic fields must occur in the cited source facts; use only "
+        "neutral connective, cinematic-relation and physical-action words around them. Reorder "
+        "and compress source terms: never copy any exact sequence of four or more source words, "
+        "and never copy a short source fact in full. Do not quote raw private notes in visual "
+        "fields.\n\n"
         "Do not write concrete_action, subject prose, materials, props, states, settings or any "
         "free-form action phrase. Choose exactly one story_arc from available_story_arcs. Each "
         "arc is a complete pre-vetted physical chain: one location, one mechanism, compatible "
         "materials, ordered actions, continuous states and observable final proof. The application "
         "expands it into scenes and identity requirements. Do not combine actions from different "
-        "arcs or invent a second plot. Object-only steps move through a visible mechanical drive.\n\n"
+        "arcs or invent a second plot. Object-only steps move through a visible mechanical drive. "
+        "Set visualization_kind to literal only when the cited fact really describes that physical "
+        "mechanism. Otherwise physical_metaphor is allowed only when visual_relation_to_beat "
+        "names that beat's ordered physical action and states its unambiguous correspondence "
+        "without adding a result. It must name only that one motion: no second action, 'again', "
+        "'twice', 'and then' or choreography. This relation is preflight evidence only and is "
+        "never copied into a render prompt. If no fixed arc maps to the "
+        "episode, the treatment must fail closed rather than become decoration.\n\n"
         "Return strict JSON only with this shape: "
-        f'{{"director_version":"{DIRECTOR_VERSION}","visual_concept":"...",'
+        f'{{"director_version":"{DIRECTOR_VERSION}","core_thesis":"...",'
+        '"thesis_source_fact_refs":["fact-1"],"viewer_problem":"...",'
+        '"hook":"...","hook_thesis_ref":"core_thesis","payoff":"...",'
+        '"payoff_thesis_ref":"core_thesis","visual_concept":"...",'
         '"story_spine":"...","story_arc":"module_recovery_mixed",'
-        '"scenes":[{"shot_size":"wide|medium|close|macro","camera_motion":'
+        '"scenes":[{"beat_id":"beat-01-hook","semantic_goal":"...",'
+        '"source_fact_refs":["fact-1"],"relation_to_previous":"opening",'
+        '"expected_viewer_understanding":"...","visualization_kind":"literal|physical_metaphor",'
+        '"visual_relation_to_beat":"...","shot_size":"wide|medium|close|macro","camera_motion":'
         '"slow push|controlled pan|handheld follow|locked with real subject motion"}]}. '
         "Do not return role names: the application assigns them deterministically. Return exactly "
-        "one scene for every ordered role and draft beat, preserving their supplied order. "
+        "one scene for every ordered beat, preserving supplied beat IDs and order. "
         "First define one concise story_spine (at most 180 characters) in cause-and-effect form: "
         "Naz or the physical system pursues one visible goal, meets one visible obstacle, "
         "performs one corrective test, "
@@ -866,16 +1167,40 @@ def reels_director_prompt(
 def reels_director_response_format(
     safe_facts: Sequence[str],
     plan: EditorialPlan | None = None,
+    *,
+    variant_index: int = 0,
 ) -> dict[str, Any]:
     """OpenAI-compatible strict schema for the single director response."""
     count = max(4, min(7, len(tuple(safe_facts))))
+    story_plan_id = (
+        _variant_plan_id(plan.plan_id, variant_index) if plan is not None else "schema"
+    )
+    beat_ids = _beat_ids(story_plan_id, count)
+    fact_ids = _fact_ids(count)
     scene_schema = {
         "type": "object",
         "additionalProperties": False,
         "required": [
+            "beat_id", "semantic_goal", "source_fact_refs",
+            "relation_to_previous", "expected_viewer_understanding",
+            "visualization_kind", "visual_relation_to_beat",
             "shot_size", "camera_motion",
         ],
         "properties": {
+            "beat_id": {"type": "string", "enum": list(beat_ids)},
+            "semantic_goal": {"type": "string", "maxLength": 240},
+            "source_fact_refs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": count,
+                "items": {"type": "string", "enum": list(fact_ids)},
+            },
+            "relation_to_previous": {"type": "string", "maxLength": 240},
+            "expected_viewer_understanding": {"type": "string", "maxLength": 240},
+            "visualization_kind": {
+                "type": "string", "enum": list(VISUALIZATION_KINDS),
+            },
+            "visual_relation_to_beat": {"type": "string", "maxLength": 300},
             "shot_size": {"type": "string", "enum": list(SHOT_SIZES)},
             "camera_motion": {"type": "string", "enum": list(CAMERA_MOTIONS)},
         },
@@ -889,11 +1214,29 @@ def reels_director_response_format(
                 "type": "object",
                 "additionalProperties": False,
                 "required": [
-                    "director_version", "visual_concept", "story_spine",
-                    "story_arc", "scenes"
+                    "director_version", "core_thesis", "thesis_source_fact_refs",
+                    "viewer_problem", "hook", "hook_thesis_ref", "payoff",
+                    "payoff_thesis_ref", "visual_concept", "story_spine",
+                    "story_arc", "scenes",
                 ],
                 "properties": {
                     "director_version": {"type": "string", "enum": [DIRECTOR_VERSION]},
+                    "core_thesis": {"type": "string", "maxLength": 300},
+                    "thesis_source_fact_refs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": count,
+                        "items": {"type": "string", "enum": list(fact_ids)},
+                    },
+                    "viewer_problem": {"type": "string", "maxLength": 240},
+                    "hook": {"type": "string", "maxLength": 240},
+                    "hook_thesis_ref": {
+                        "type": "string", "enum": [CORE_THESIS_REF],
+                    },
+                    "payoff": {"type": "string", "maxLength": 240},
+                    "payoff_thesis_ref": {
+                        "type": "string", "enum": [CORE_THESIS_REF],
+                    },
                     "visual_concept": {"type": "string", "maxLength": 1200},
                     "story_spine": {"type": "string", "maxLength": 180},
                     "story_arc": {
@@ -981,24 +1324,52 @@ def parse_reels_director_response(
     if not isinstance(payload, Mapping) or payload.get("director_version") != DIRECTOR_VERSION:
         raise DirectorValidationError(("director_schema_invalid",))
     facts = tuple(_safe_fact(item) for item in safe_facts)
+    if len(facts) < 4:
+        raise DirectorValidationError(("director_source_facts_insufficient",))
     count = max(4, min(7, len(facts)))
-    expected_roles = _roles(_variant_plan_id(plan.plan_id, variant_index), count)
+    story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
+    expected_roles = _roles(story_plan_id, count)
+    expected_beat_ids = _beat_ids(story_plan_id, count)
+    allowed_fact_refs = _fact_ids(count)
     rows = payload.get("scenes")
     if not isinstance(rows, list) or len(rows) != count:
         raise DirectorValidationError(("director_scene_count_invalid",))
 
     errors: list[str] = []
     if set(payload) != {
-        "director_version", "visual_concept", "story_spine", "story_arc",
-        "scenes"
+        "director_version", "core_thesis", "thesis_source_fact_refs",
+        "viewer_problem", "hook", "hook_thesis_ref", "payoff",
+        "payoff_thesis_ref", "visual_concept", "story_spine", "story_arc",
+        "scenes",
     }:
         errors.append("director_schema_invalid")
+    core_thesis = _director_text(
+        payload.get("core_thesis"), "director_core_thesis", errors, maximum=300,
+    )
+    thesis_source_fact_refs = _normalized_ref_list(
+        payload.get("thesis_source_fact_refs"),
+        allowed=allowed_fact_refs,
+        code="director_thesis_source_fact_refs_invalid",
+        errors=errors,
+    )
+    viewer_problem = _director_text(
+        payload.get("viewer_problem"), "director_viewer_problem", errors, maximum=240,
+    )
+    hook = _director_text(payload.get("hook"), "director_hook", errors, maximum=240)
+    payoff = _director_text(payload.get("payoff"), "director_payoff", errors, maximum=240)
+    if (
+        payload.get("hook_thesis_ref") != CORE_THESIS_REF
+        or payload.get("payoff_thesis_ref") != CORE_THESIS_REF
+    ):
+        errors.append("director_hook_payoff_mismatch")
     visual_concept = _director_text(
         payload.get("visual_concept"),
         "director_visual_concept",
         errors,
         maximum=1200,
     )
+    if visual_concept and _visual_concept_is_generic(visual_concept):
+        errors.append("director_visual_concept_generic")
     story_spine = _director_text(
         payload.get("story_spine"),
         "director_story_spine",
@@ -1042,10 +1413,13 @@ def parse_reels_director_response(
     end_state_codes: list[str] = []
     previous_state_code = initial_state_code
     expected_scene_fields = {
+        "beat_id", "semantic_goal", "source_fact_refs",
+        "relation_to_previous", "expected_viewer_understanding",
+        "visualization_kind", "visual_relation_to_beat",
         "shot_size", "camera_motion",
     }
-    for index, (row, expected_role, arc_step) in enumerate(
-        zip(rows, expected_roles, arc_steps)
+    for index, (row, expected_role, expected_beat_id, arc_step) in enumerate(
+        zip(rows, expected_roles, expected_beat_ids, arc_steps)
     ):
         scene_number = index + 1
         scene_prefix = f"director_scene_{scene_number}"
@@ -1055,6 +1429,48 @@ def parse_reels_director_response(
             continue
         if set(row) != expected_scene_fields:
             errors.append(f"{scene_prefix}_schema_invalid")
+
+        beat_id = str(row.get("beat_id", "")).strip()
+        if beat_id != expected_beat_id:
+            errors.append(f"{scene_prefix}_beat_id_invalid")
+        semantic_goal = _director_text(
+            row.get("semantic_goal"),
+            f"{scene_prefix}_semantic_goal",
+            errors,
+            maximum=240,
+        )
+        source_fact_refs = _normalized_ref_list(
+            row.get("source_fact_refs"),
+            allowed=allowed_fact_refs,
+            code=f"{scene_prefix}_source_fact_refs_invalid",
+            errors=errors,
+        )
+        relation_to_previous = _director_text(
+            row.get("relation_to_previous"),
+            f"{scene_prefix}_relation_to_previous",
+            errors,
+            maximum=240,
+        )
+        if index == 0:
+            if relation_to_previous.casefold() != "opening":
+                errors.append(f"{scene_prefix}_relation_to_previous_invalid")
+        elif not relation_to_previous or relation_to_previous.casefold() == "opening":
+            errors.append(f"{scene_prefix}_relation_to_previous_missing")
+        expected_viewer_understanding = _director_text(
+            row.get("expected_viewer_understanding"),
+            f"{scene_prefix}_expected_viewer_understanding",
+            errors,
+            maximum=240,
+        )
+        visualization_kind = str(row.get("visualization_kind", "")).strip().casefold()
+        if visualization_kind not in VISUALIZATION_KINDS:
+            errors.append(f"{scene_prefix}_visualization_kind_invalid")
+        visual_relation_to_beat = _director_text(
+            row.get("visual_relation_to_beat"),
+            f"{scene_prefix}_visual_relation_to_beat",
+            errors,
+            maximum=300,
+        )
 
         action_recipe, end_state_code = arc_step
         start_state = _bounded_state_phrase(continuity_anchor, previous_state_code)
@@ -1112,6 +1528,13 @@ def parse_reels_director_response(
             scenes.append(
                 DirectorScene(
                     role=expected_role,
+                    beat_id=beat_id,
+                    semantic_goal=semantic_goal,
+                    source_fact_refs=source_fact_refs,
+                    relation_to_previous=relation_to_previous,
+                    expected_viewer_understanding=expected_viewer_understanding,
+                    visualization_kind=visualization_kind,
+                    visual_relation_to_beat=visual_relation_to_beat,
                     setting=primary_setting,
                     subject_kind=subject_kind,
                     subject=subject,
@@ -1137,9 +1560,16 @@ def parse_reels_director_response(
         errors.append("director_story_arc_invalid")
     if errors:
         raise DirectorValidationError(errors)
-    return DirectorTreatment(
+    treatment = DirectorTreatment(
+        plan_id=story_plan_id,
+        variant_index=variant_index,
         story_arc=selected_story_arc,
         visual_concept=visual_concept,
+        core_thesis=core_thesis,
+        thesis_source_fact_refs=thesis_source_fact_refs,
+        viewer_problem=viewer_problem,
+        hook=hook,
+        payoff=payoff,
         story_spine=story_spine,
         continuity_anchor=continuity_anchor,
         initial_state_code=initial_state_code,
@@ -1148,6 +1578,15 @@ def parse_reels_director_response(
         admin_concept_ru=admin_concept_ru,
         scenes=tuple(scenes),
     )
+    semantic_errors = semantic_preflight_reason_codes(
+        treatment,
+        facts,
+        plan=plan,
+        variant_index=variant_index,
+    )
+    if semantic_errors:
+        raise DirectorValidationError(semantic_errors)
+    return treatment
 
 
 def validate_provider_prompt(value: str) -> str:
@@ -1245,6 +1684,269 @@ def _story_arc_steps(
     return selected
 
 
+def _semantic_goals_repeat(left: str, right: str) -> bool:
+    left_tokens = _semantic_tokens(left) - _SEMANTIC_RELATION_VOCABULARY
+    right_tokens = _semantic_tokens(right) - _SEMANTIC_RELATION_VOCABULARY
+    if not left_tokens or not right_tokens:
+        return False
+    overlap = len(left_tokens & right_tokens)
+    return (
+        " ".join(left.casefold().split()) == " ".join(right.casefold().split())
+        or overlap / max(1, min(len(left_tokens), len(right_tokens))) >= 0.85
+    )
+
+
+def semantic_preflight_reason_codes(
+    treatment: DirectorTreatment,
+    safe_facts: Sequence[str],
+    *,
+    plan: EditorialPlan,
+    variant_index: int = 0,
+) -> tuple[str, ...]:
+    """Deterministically reject ungrounded semantic plans before persistence.
+
+    This is deliberately conservative. It verifies references, lexical evidence,
+    transitions and the declared literal/metaphor relation; it does not add a
+    second model call or try to rescue a doubtful treatment.
+    """
+    facts = tuple(_safe_fact(item) for item in safe_facts)
+    count = max(4, min(7, len(facts)))
+    allowed_refs = _fact_ids(count)
+    facts_by_ref = dict(zip(allowed_refs, facts[:count]))
+    story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
+    expected_roles = _roles(story_plan_id, count)
+    expected_beats = _beat_ids(story_plan_id, count)
+    errors: list[str] = []
+    numeric_claim_invalid = False
+
+    if treatment.plan_id != story_plan_id or treatment.variant_index != variant_index:
+        errors.append("director_treatment_plan_binding_invalid")
+
+    thesis_refs = tuple(treatment.thesis_source_fact_refs)
+    thesis_facts = tuple(
+        facts_by_ref[ref] for ref in thesis_refs if ref in facts_by_ref
+    )
+    if (
+        not thesis_refs
+        or any(ref not in facts_by_ref for ref in thesis_refs)
+        or len(set(thesis_refs)) != len(thesis_refs)
+    ):
+        errors.append("director_thesis_source_fact_refs_invalid")
+    elif not _semantic_text_is_grounded(treatment.core_thesis, facts_by_ref, thesis_refs):
+        errors.append("director_core_thesis_unsupported")
+
+    for name, value in (
+        ("viewer_problem", treatment.viewer_problem),
+        ("hook", treatment.hook),
+        ("payoff", treatment.payoff),
+    ):
+        if not value or not _semantic_text_is_grounded(value, facts_by_ref, thesis_refs):
+            errors.append(f"director_{name}_unsupported")
+        if _unknown_semantic_numbers((value,), thesis_facts):
+            numeric_claim_invalid = True
+    for name, value in (
+        ("story_spine", treatment.story_spine),
+        ("visual_concept", treatment.visual_concept),
+    ):
+        if not value or not _semantic_text_is_grounded(value, facts_by_ref, allowed_refs):
+            errors.append(f"director_{name}_unsupported")
+        if _unknown_semantic_numbers((value,), facts[:count]):
+            numeric_claim_invalid = True
+    if _unknown_semantic_numbers((treatment.core_thesis,), thesis_facts):
+        numeric_claim_invalid = True
+
+    thesis_tokens = _semantic_tokens(treatment.core_thesis)
+    thesis_source_tokens = set().union(
+        *(_semantic_tokens(facts_by_ref.get(ref, "")) for ref in thesis_refs)
+    ) if thesis_refs else set()
+    thesis_content_tokens = (
+        thesis_tokens & thesis_source_tokens
+    ) - _SEMANTIC_RELATION_VOCABULARY
+    if (
+        not (_semantic_tokens(treatment.hook) & thesis_content_tokens)
+        or not (_semantic_tokens(treatment.payoff) & thesis_content_tokens)
+    ):
+        errors.append("director_hook_payoff_mismatch")
+    if _visual_concept_is_generic(treatment.visual_concept):
+        errors.append("director_visual_concept_generic")
+
+    if len(treatment.scenes) != count:
+        errors.append("director_scene_count_invalid")
+        return tuple(dict.fromkeys(errors))
+
+    semantic_values = [
+        treatment.core_thesis,
+        treatment.viewer_problem,
+        treatment.hook,
+        treatment.payoff,
+        treatment.story_spine,
+        treatment.visual_concept,
+    ]
+    goals: list[str] = []
+    previous_goal = ""
+    previous_refs: tuple[str, ...] = ()
+    source_axis = _source_semantic_axis(facts[:count])
+    arc_semantically_allowed = (
+        source_axis in DIRECTOR_ARC_SEMANTIC_AXES.get(treatment.story_arc, frozenset())
+    )
+    for index, scene in enumerate(treatment.scenes):
+        prefix = f"director_scene_{index + 1}"
+        if scene.role != expected_roles[index] or scene.beat_id != expected_beats[index]:
+            errors.append(f"{prefix}_beat_id_invalid")
+        refs = tuple(scene.source_fact_refs)
+        scene_facts = tuple(
+            facts_by_ref[ref] for ref in refs if ref in facts_by_ref
+        )
+        assigned_ref = allowed_refs[index]
+        assigned_fact_tokens = _semantic_tokens(facts_by_ref.get(assigned_ref, ""))
+        assigned_anchor_count = min(2, len(assigned_fact_tokens))
+        assigned_source_axis = _source_semantic_axis(
+            (facts_by_ref.get(assigned_ref, ""),)
+        )
+        if assigned_source_axis not in DIRECTOR_ARC_SEMANTIC_AXES.get(
+            treatment.story_arc, frozenset()
+        ):
+            arc_semantically_allowed = False
+        if (
+            not refs
+            or any(ref not in facts_by_ref for ref in refs)
+            or len(set(refs)) != len(refs)
+            or assigned_ref not in refs
+        ):
+            errors.append(f"{prefix}_source_fact_refs_invalid")
+        elif not _semantic_text_is_grounded(scene.semantic_goal, facts_by_ref, refs):
+            errors.append(f"{prefix}_semantic_goal_unsupported")
+        elif len(
+            _semantic_tokens(scene.semantic_goal) & assigned_fact_tokens
+        ) < assigned_anchor_count:
+            errors.append(f"{prefix}_semantic_goal_unsupported")
+        if not _semantic_text_is_grounded(
+            scene.expected_viewer_understanding, facts_by_ref, refs,
+        ):
+            errors.append(f"{prefix}_expected_viewer_understanding_unsupported")
+        elif len(
+            _semantic_tokens(scene.expected_viewer_understanding)
+            & assigned_fact_tokens
+        ) < assigned_anchor_count:
+            errors.append(f"{prefix}_expected_viewer_understanding_unsupported")
+        if not _semantic_text_is_grounded(scene.visual_relation_to_beat, facts_by_ref, refs):
+            errors.append(f"{prefix}_visual_relation_unsupported")
+        if _unknown_semantic_numbers(
+            (
+                scene.semantic_goal,
+                scene.expected_viewer_understanding,
+                scene.visual_relation_to_beat,
+            ),
+            scene_facts,
+        ):
+            numeric_claim_invalid = True
+        if not _PHYSICAL_RELATION_RE.search(scene.visual_relation_to_beat):
+            errors.append(f"{prefix}_visual_relation_unsupported")
+            arc_semantically_allowed = False
+        if not _visual_relation_names_action(
+            scene.visual_relation_to_beat, scene.motion_class,
+        ):
+            arc_semantically_allowed = False
+        named_motion_classes = _visual_relation_motion_classes(
+            scene.visual_relation_to_beat
+        )
+        if (
+            named_motion_classes - {scene.motion_class}
+            or _MULTI_ACTION_RELATION_RE.search(scene.visual_relation_to_beat)
+        ):
+            errors.append(f"{prefix}_multiple_actions")
+            arc_semantically_allowed = False
+        cited_tokens = set().union(
+            *(_semantic_tokens(facts_by_ref.get(ref, "")) for ref in refs)
+        ) if refs else set()
+        relation_tokens = _semantic_tokens(scene.visual_relation_to_beat)
+        semantic_goal_tokens = _semantic_tokens(scene.semantic_goal)
+        if not (relation_tokens & semantic_goal_tokens & cited_tokens):
+            errors.append(f"{prefix}_visual_relation_unsupported")
+            arc_semantically_allowed = False
+        if (
+            len(relation_tokens & assigned_fact_tokens) < assigned_anchor_count
+            or not (
+                relation_tokens
+                & semantic_goal_tokens
+                & assigned_fact_tokens
+            )
+        ):
+            errors.append(f"{prefix}_visual_relation_unsupported")
+            arc_semantically_allowed = False
+        if scene.visualization_kind not in VISUALIZATION_KINDS:
+            errors.append(f"{prefix}_visualization_kind_invalid")
+        elif scene.visualization_kind == "physical_metaphor":
+            required_anchor_count = min(2, len(cited_tokens))
+            if (
+                len(relation_tokens & cited_tokens) < required_anchor_count
+            ):
+                errors.append(f"{prefix}_visual_relation_unsupported")
+                arc_semantically_allowed = False
+        elif scene.visualization_kind == "literal":
+            scene_source_axis = _source_semantic_axis(
+                tuple(facts_by_ref.get(ref, "") for ref in refs)
+            )
+            if scene_source_axis != "physical_mechanism":
+                errors.append(f"{prefix}_literal_source_mismatch")
+                arc_semantically_allowed = False
+
+        if index == 0:
+            if scene.relation_to_previous.casefold() != "opening":
+                errors.append(f"{prefix}_relation_to_previous_invalid")
+        else:
+            relation_tokens = _semantic_tokens(scene.relation_to_previous)
+            previous_content_tokens = (
+                _semantic_tokens(previous_goal) - _SEMANTIC_RELATION_VOCABULARY
+            )
+            current_content_tokens = (
+                _semantic_tokens(scene.semantic_goal) - _SEMANTIC_RELATION_VOCABULARY
+            )
+            transition_refs = tuple(dict.fromkeys((*previous_refs, *refs)))
+            transition_facts = tuple(
+                facts_by_ref[ref]
+                for ref in transition_refs
+                if ref in facts_by_ref
+            )
+            if (
+                not scene.relation_to_previous
+                or scene.relation_to_previous.casefold() == "opening"
+                or not (relation_tokens & previous_content_tokens)
+                or not (relation_tokens & current_content_tokens)
+                or not _semantic_text_is_grounded(
+                    scene.relation_to_previous, facts_by_ref, transition_refs,
+                )
+            ):
+                errors.append(f"{prefix}_relation_to_previous_missing")
+            if _unknown_semantic_numbers(
+                (scene.relation_to_previous,), transition_facts,
+            ):
+                numeric_claim_invalid = True
+
+        semantic_values.extend((
+            scene.semantic_goal,
+            scene.relation_to_previous,
+            scene.expected_viewer_understanding,
+            scene.visual_relation_to_beat,
+        ))
+        if any(_semantic_goals_repeat(scene.semantic_goal, goal) for goal in goals):
+            errors.append("director_semantic_goal_duplicate")
+        goals.append(scene.semantic_goal)
+        previous_goal = scene.semantic_goal
+        previous_refs = refs
+
+    if not arc_semantically_allowed:
+        errors.append("director_story_arc_semantic_mismatch")
+    if any(
+        _raw_source_fragment_in_text(value, facts[:count])
+        for value in semantic_values
+    ):
+        errors.append("director_raw_source_copy")
+    if numeric_claim_invalid:
+        errors.append("director_unknown_numeric_claim")
+    return tuple(dict.fromkeys(errors))
+
+
 def _mentions_human_subject(subject: str) -> bool:
     return bool(
         re.search(
@@ -1304,6 +2006,101 @@ def _provider_excerpt(value: str, maximum: int) -> str:
     if " " in compacted:
         compacted = compacted.rsplit(" ", 1)[0].rstrip(" ,;:-")
     return compacted
+
+
+def _compile_scene_prompts(
+    *,
+    role: str,
+    visual_mode: str,
+    visual_relation: str,
+    semantic_goal: str,
+    visual_relation_to_beat: str,
+    subject_kind: str,
+    subject: str,
+    setting: str,
+    action: str,
+    start_state: str,
+    end_state: str,
+    shot_size: str,
+    camera_motion: str,
+    continuity_anchor: str,
+    requires_reference: bool,
+) -> tuple[str, str, str]:
+    """Compile every render prompt from one approved, privacy-safe scene brief."""
+    # The relation is evidence for semantic preflight, not motion prose. Passing
+    # it downstream could smuggle a second source-grounded verb beside the one
+    # canonical action supplied by the selected arc.
+    del visual_relation_to_beat
+    prompt_setting = _provider_excerpt(setting, 120)
+    prompt_subject = _provider_excerpt(subject, 120)
+    prompt_action = _provider_excerpt(action, 180)
+    prompt_start_state = _provider_excerpt(start_state, 180)
+    prompt_end_state = _provider_excerpt(end_state, 180)
+    prompt_continuity_anchor = _provider_excerpt(continuity_anchor, 90)
+    prompt_semantic_goal = _provider_excerpt(semantic_goal, 180)
+
+    clean_prompt = (
+        f"Vertical 9:16 CLEAN video master. {visual_mode}. Role: {role}. "
+        f"Narrative meaning only; never animate it as an extra action: {prompt_semantic_goal}. "
+        f"Subject: {subject}. "
+        f"Setting: {setting}. Start state: {start_state}. One physical action: {action}. "
+        f"End state: {end_state}. {visual_relation} "
+        "Real motion/action is mandatory. No text, captions, logos, platform buttons, stickers, "
+        "reactions or watermarks."
+    )
+    identity_instruction = (
+        f"Use @Naz for identity and build only. Wardrobe: {CANONICAL_NAZ_WARDROBE}; "
+        "replace the reference background, pose and light. "
+        if requires_reference else "No person is present. "
+    )
+    subject_instruction = (
+        ""
+        if requires_reference
+        else (
+            f"Subject: {prompt_subject}. Show its visible physical hinge, rail or actuator; "
+            "nothing floats or moves by itself. "
+        )
+    )
+    keyframe_prompt = (
+        f"Cinematic vertical 9:16. {identity_instruction}"
+        f"Narrative meaning only; do not depict an extra action: {prompt_semantic_goal}. "
+        f"Location: {prompt_setting}. "
+        f"{subject_instruction}Start state: {prompt_start_state}. Action: {prompt_action}. "
+        f"Story anchor: {prompt_continuity_anchor}. Shot: {shot_size}; camera: {camera_motion}. "
+        "Photoreal Naz AI Lab: human intelligence, machine precision. "
+        "Deep Black #020309, Electric Blue #185CFF, Ultraviolet #762DFF, Ice Silver #D7E5FF. "
+        "Real optical glass, titanium, blue aluminium, carbon, ceramic; cold rim light. "
+        "No text, logos, HUD, code, copper, gold, neon cliche, robots or extra people."
+    )
+    motion_continuity = (
+        "Naz keeps the exact face, build and matte-black wardrobe from the first frame. "
+        "His hands contact only the visible prop and move with believable weight. "
+        if requires_reference
+        else (
+            "The same single physical object remains in frame and moves with believable weight. "
+            "Its visible mechanical actuator, hinge or rail drives the one motion; no self-animation. "
+        )
+    )
+    provider_prompt = (
+        "Continuous seamless five-second shot from the supplied directed keyframe. "
+        f"Narrative meaning only; do not animate it as another action: {prompt_semantic_goal}. "
+        f"{CAMERA_MOTION_PROMPTS[camera_motion]}. One physical action: {prompt_action}. "
+        f"The action starts with this visible state: {prompt_start_state}. "
+        f"The action finishes with this visible state: {prompt_end_state}. "
+        f"{motion_continuity}"
+        "The first-frame architecture, materials and lighting remain stable for the entire take."
+    )
+    try:
+        return (
+            clean_prompt,
+            compact_runway_prompt(
+                keyframe_prompt,
+                too_long_code="keyframe_prompt_too_long",
+            ),
+            compact_runway_prompt(provider_prompt),
+        )
+    except ProviderError as exc:
+        raise StoryPlanError(exc.code) from exc
 
 
 def _scene(
@@ -1368,13 +2165,18 @@ def _scene(
         visual_concept = str(treatment["label"])
         story_spine = visual_concept
         continuity_anchor = "one evolving physical Naz AI Lab mechanism"
-    prompt_setting = _provider_excerpt(setting, 120)
-    prompt_subject = _provider_excerpt(subject, 120)
-    prompt_action = _provider_excerpt(action, 180)
-    prompt_continuity_anchor = _provider_excerpt(continuity_anchor, 90)
-    prompt_end_state = _provider_excerpt(end_state, 180)
-    standalone = f"{role}: {fact}"[:180]
-    overlay = standalone[:72]
+    semantic_goal = (
+        directed_scene.semantic_goal
+        if directed_scene is not None
+        else f"Advance the approved {role} beat through one observable state change."
+    )
+    visual_relation_to_beat = (
+        directed_scene.visual_relation_to_beat
+        if directed_scene is not None
+        else "The physical action directly illustrates the approved beat."
+    )
+    standalone = f"{role}: {semantic_goal}"[:180]
+    overlay = semantic_goal[:72]
     continuity = (
         f"continuity_id={continuity_id}",
         f"story_spine={story_spine}",
@@ -1384,63 +2186,40 @@ def _scene(
         "optical glass, titanium, aluminium, carbon and technical ceramic",
         "no cheap cyberpunk, random robots, random people, elderly people or stock imagery",
     )
-    clean_prompt = (
-        f"Vertical 9:16 CLEAN video master. {plan.visual_mode}. Role: {role}. "
-        f"Concrete action and verified fact: {fact}. Subject: {subject}. Setting: {setting}. "
-        "Start with the fact not yet resolved; end with a visibly changed state. "
-        f"{plan.visual_relation} Canonical Naz continuity: {'; '.join(continuity)}. "
-        "Real motion/action is mandatory. No text, captions, logos, platform buttons, stickers, "
-        "reactions or watermarks."
+    clean_prompt, keyframe_prompt, provider_prompt = _compile_scene_prompts(
+        role=role,
+        visual_mode=plan.visual_mode,
+        visual_relation=plan.visual_relation,
+        semantic_goal=semantic_goal,
+        visual_relation_to_beat=visual_relation_to_beat,
+        subject_kind=subject_kind,
+        subject=subject,
+        setting=setting,
+        action=action,
+        start_state=start_state,
+        end_state=end_state,
+        shot_size=shot_size,
+        camera_motion=camera_motion,
+        continuity_anchor=continuity_anchor,
+        requires_reference=requires_reference,
     )
-    identity_instruction = (
-        f"Use @Naz for identity and build only. Wardrobe: {CANONICAL_NAZ_WARDROBE}; "
-        "replace the reference background, pose and light. "
-        if requires_reference else "No person is present. "
-    )
-    subject_instruction = (
-        ""
-        if requires_reference
-        else (
-            f"Subject: {prompt_subject}. Show its visible physical hinge, rail or actuator; "
-            "nothing floats or moves by itself. "
-        )
-    )
-    keyframe_prompt = (
-        f"Cinematic vertical 9:16. {identity_instruction}"
-        f"Location: {prompt_setting}. {subject_instruction}Action: {prompt_action}. "
-        f"Story anchor: {prompt_continuity_anchor}. Shot: {shot_size}; camera: {camera_motion}. "
-        "Photoreal Naz AI Lab: human intelligence, machine precision. "
-        "Deep Black #020309, Electric Blue #185CFF, Ultraviolet #762DFF, Ice Silver #D7E5FF. "
-        "Real optical glass, titanium, blue aluminium, carbon, ceramic; cold rim light. "
-        "No text, logos, HUD, code, copper, gold, neon cliche, robots or extra people."
-    )
-    motion_continuity = (
-        "Naz keeps the exact face, build and matte-black wardrobe from the first frame. "
-        "His hands contact only the visible prop and move with believable weight. "
-        if requires_reference
-        else (
-            "The same single physical object remains in frame and moves with believable weight. "
-            "Its visible mechanical actuator, hinge or rail drives the one motion; no self-animation. "
-        )
-    )
-    provider_prompt = (
-        "Continuous seamless five-second shot from the supplied directed keyframe. "
-        f"{CAMERA_MOTION_PROMPTS[camera_motion]}. "
-        f"One physical action: {prompt_action}. "
-        f"The action finishes with this visible state: {prompt_end_state}. "
-        f"{motion_continuity}"
-        "The first-frame architecture, materials and lighting remain stable for the entire take."
-    )
-    try:
-        keyframe_prompt = compact_runway_prompt(
-            keyframe_prompt,
-            too_long_code="keyframe_prompt_too_long",
-        )
-        provider_prompt = compact_runway_prompt(provider_prompt)
-    except ProviderError as exc:
-        raise StoryPlanError(exc.code) from exc
     return ScenePlan(
         scene_id=f"{index + 1:02d}_{role}", role=role, standalone_meaning=standalone,
+        beat_id=(directed_scene.beat_id if directed_scene is not None else f"beat-{index + 1:02d}-{role}"),
+        semantic_goal=semantic_goal,
+        source_fact_refs=(
+            directed_scene.source_fact_refs if directed_scene is not None else (f"fact-{index + 1}",)
+        ),
+        relation_to_previous=(
+            directed_scene.relation_to_previous if directed_scene is not None else "opening" if index == 0 else "template"
+        ),
+        expected_viewer_understanding=(
+            directed_scene.expected_viewer_understanding if directed_scene is not None else semantic_goal
+        ),
+        visualization_kind=(
+            directed_scene.visualization_kind if directed_scene is not None else "literal"
+        ),
+        visual_relation_to_beat=visual_relation_to_beat,
         subject_kind=subject_kind,
         motion_class=motion_class,
         concrete_action=action,
@@ -1456,7 +2235,12 @@ def _scene(
         story_overlay=overlay,
         text_safe_zone=SAFE_ZONES[_rank(plan.plan_id, f"safe:{index}") % len(SAFE_ZONES)],
         music_cue=f"cue {index + 1}: follow action change; tags={','.join(plan.track_tags)}",
-        source_fact_ref=f"{plan.source_ref}#fact-{index + 1}", footage_type="generative",
+        source_fact_ref=(
+            f"{plan.source_ref}#{directed_scene.source_fact_refs[0]}"
+            if directed_scene is not None
+            else f"{plan.source_ref}#fact-{index + 1}"
+        ),
+        footage_type="generative",
         continuity_constraints=continuity, secret_warning=False, copyright_warning=False,
         suggested_interactive_sticker="question" if role in {"hypothesis", "test"} else "none",
         requires_naz_reference=requires_reference, reference_role=reference_role,
@@ -1543,6 +2327,14 @@ def plan_story_pack(
     if director_treatment is not None:
         if director_treatment.version != DIRECTOR_VERSION or len(director_treatment.scenes) != count:
             raise StoryPlanError("director_treatment_invalid")
+        semantic_errors = semantic_preflight_reason_codes(
+            director_treatment,
+            facts,
+            plan=plan,
+            variant_index=variant_index,
+        )
+        if semantic_errors:
+            raise DirectorValidationError(semantic_errors)
         if any(
             scene.subject_kind not in DIRECTOR_SUBJECT_KINDS
             or (scene.subject_kind == "naz_human" and scene.subject != CANONICAL_NAZ_SUBJECT)
@@ -1558,6 +2350,27 @@ def plan_story_pack(
             director_treatment.story_spine,
             "story_spine",
             maximum=180,
+        )
+        central_thesis = _validated_director_text(
+            director_treatment.core_thesis,
+            "core_thesis",
+            maximum=300,
+        )
+        thesis_source_fact_refs = tuple(director_treatment.thesis_source_fact_refs)
+        viewer_problem = _validated_director_text(
+            director_treatment.viewer_problem,
+            "viewer_problem",
+            maximum=240,
+        )
+        hook = _validated_director_text(
+            director_treatment.hook,
+            "hook",
+            maximum=240,
+        )
+        payoff = _validated_director_text(
+            director_treatment.payoff,
+            "payoff",
+            maximum=240,
         )
         story_arc = director_treatment.story_arc
         if story_arc not in _story_arc_names_for_plan(plan):
@@ -1639,6 +2452,11 @@ def plan_story_pack(
         goal_state_code = ""
         admin_concept_ru = ""
         director_version = TEMPLATE_DIRECTOR_VERSION
+        central_thesis = plan.thesis_direction
+        thesis_source_fact_refs = ()
+        viewer_problem = ""
+        hook = plan.hook
+        payoff = plan.ending
     continuity_id = hashlib.sha256(f"naz|{plan.plan_id}|continuity".encode("utf-8")).hexdigest()[:20]
     roles = _roles(story_plan_id, count)
     scenes = tuple(
@@ -1662,7 +2480,11 @@ def plan_story_pack(
         destination=plan.platform, scheduled_slot=plan.slot, rubric=plan.rubric,
         source_type=plan.source_type, source_ref=plan.source_ref, safe_facts=facts,
         editorial_plan=plan.to_dict(),
-        central_thesis=plan.thesis_direction,
+        central_thesis=central_thesis,
+        thesis_source_fact_refs=thesis_source_fact_refs,
+        viewer_problem=viewer_problem,
+        hook=hook,
+        payoff=payoff,
         visual_concept=visual_concept,
         story_spine=story_spine,
         story_arc=story_arc,
@@ -1676,7 +2498,7 @@ def plan_story_pack(
             _reel_edit(variant_plan, scenes, short=False),
             _reel_edit(variant_plan, scenes, short=True),
         ),
-        caption_plan={"main": f"{plan.hook} — {plan.thesis_direction}", "short": f"{plan.ending}: {plan.topic}"},
+        caption_plan={"main": f"{hook} — {central_thesis}", "short": f"{payoff}: {plan.topic}"},
         music_plan={"tags": list(plan.track_tags), "allowlist_required": True,
                     "consume_publication_rotation": False, "selected_track": None},
         safety_flags=("safe_source_refs_only", "no_private_content", "no_drawn_interactive_ui"),
@@ -1684,6 +2506,7 @@ def plan_story_pack(
         policy_versions={
             "orchestrator": plan.orchestrator_version, "content": plan.content_policy_version,
             "visual": plan.visual_policy_version, "music": plan.music_policy_version,
+            "semantic": SEMANTIC_CONTRACT_VERSION,
         },
         renderer=renderer_status(),
     )
@@ -1722,6 +2545,61 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
         previous_end_state = _bounded_state_phrase(
             pack.continuity_anchor, pack.initial_state_code
         )
+        try:
+            editorial_plan = EditorialPlan.from_dict(pack.editorial_plan)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise StoryPlanError("editorial_plan_contract_invalid") from exc
+        persisted_treatment = DirectorTreatment(
+            plan_id=pack.plan_id,
+            variant_index=pack.variant_index,
+            visual_concept=pack.visual_concept,
+            core_thesis=pack.central_thesis,
+            thesis_source_fact_refs=tuple(pack.thesis_source_fact_refs),
+            viewer_problem=pack.viewer_problem,
+            hook=pack.hook,
+            payoff=pack.payoff,
+            story_spine=pack.story_spine,
+            story_arc=pack.story_arc,
+            continuity_anchor=pack.continuity_anchor,
+            initial_state_code=pack.initial_state_code,
+            goal_state_code=pack.goal_state_code,
+            primary_setting=arc_setting,
+            admin_concept_ru=pack.admin_concept_ru,
+            scenes=tuple(
+                DirectorScene(
+                    role=scene.role,
+                    beat_id=scene.beat_id,
+                    semantic_goal=scene.semantic_goal,
+                    source_fact_refs=tuple(scene.source_fact_refs),
+                    relation_to_previous=scene.relation_to_previous,
+                    expected_viewer_understanding=scene.expected_viewer_understanding,
+                    visualization_kind=scene.visualization_kind,
+                    visual_relation_to_beat=scene.visual_relation_to_beat,
+                    setting=scene.setting,
+                    subject_kind=scene.subject_kind,
+                    subject=scene.subject,
+                    motion_class=str(scene.motion_class or ""),
+                    concrete_action=scene.concrete_action,
+                    start_state=scene.start_state,
+                    end_state=scene.end_state,
+                    shot_size=scene.shot_size,
+                    camera_motion=scene.camera_motion,
+                    admin_summary_ru=scene.admin_summary_ru,
+                )
+                for scene in pack.scenes
+            ),
+            version=pack.director_version,
+        )
+        semantic_errors = semantic_preflight_reason_codes(
+            persisted_treatment,
+            pack.safe_facts,
+            plan=editorial_plan,
+            variant_index=pack.variant_index,
+        )
+        if semantic_errors:
+            raise DirectorValidationError(semantic_errors)
+        if pack.policy_versions.get("semantic") != SEMANTIC_CONTRACT_VERSION:
+            raise StoryPlanError("semantic_contract_version_invalid")
     elif pack.story_arc or pack.initial_state_code or pack.goal_state_code:
         raise StoryPlanError("template scene cannot claim semantic state contract")
     for scene_index, scene in enumerate(pack.scenes):
@@ -1791,10 +2669,37 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
             raise StoryPlanError("secret warning in scene")
         if "9:16" not in scene.clean_prompt or "Real motion" not in scene.clean_prompt:
             raise StoryPlanError("CLEAN master contract is incomplete")
-        if not validate_provider_prompt(scene.provider_prompt) or fact_text_in_provider_prompt(scene):
+        if (
+            not validate_provider_prompt(scene.provider_prompt)
+            or fact_text_in_provider_prompt(scene)
+            or _raw_fact_in_render_prompts(scene, pack.safe_facts)
+        ):
             raise StoryPlanError("provider prompt is not privacy-minimized")
         if not validate_provider_prompt(scene.keyframe_prompt):
             raise StoryPlanError("keyframe prompt is unsafe")
+        expected_prompts = _compile_scene_prompts(
+            role=scene.role,
+            visual_mode=str(pack.editorial_plan.get("visual_mode", "")),
+            visual_relation=str(pack.editorial_plan.get("visual_relation", "")),
+            semantic_goal=scene.semantic_goal,
+            visual_relation_to_beat=scene.visual_relation_to_beat,
+            subject_kind=scene.subject_kind,
+            subject=scene.subject,
+            setting=scene.setting,
+            action=scene.concrete_action,
+            start_state=scene.start_state,
+            end_state=scene.end_state,
+            shot_size=scene.shot_size,
+            camera_motion=scene.camera_motion,
+            continuity_anchor=pack.continuity_anchor,
+            requires_reference=scene.requires_naz_reference,
+        )
+        if (
+            scene.clean_prompt,
+            scene.keyframe_prompt,
+            scene.provider_prompt,
+        ) != expected_prompts:
+            raise StoryPlanError("scene_prompt_not_compiled_from_approved_brief")
         if scene.requires_naz_reference is not (scene.identity_reference_usage == "identity_only"):
             raise StoryPlanError("identity reference must be used for identity only")
         if scene.requires_naz_reference and "@Naz" not in scene.keyframe_prompt:
@@ -1854,10 +2759,24 @@ def validate_story_pack(pack: StoryPackPlan) -> None:
 
 
 def fact_text_in_provider_prompt(scene: ScenePlan) -> bool:
-    """Ensure the outbound prompt does not repeat the local factual sentence."""
-    _, _, fact = scene.standalone_meaning.partition(":")
-    normalized_fact = " ".join(fact.split()).casefold()
-    return bool(len(normalized_fact) >= 24 and normalized_fact in scene.provider_prompt.casefold())
+    """Reject transport references; approved semantic goals may reach Runway."""
+    source_ref = " ".join(scene.source_fact_ref.split()).casefold()
+    prompt = scene.provider_prompt.casefold()
+    return bool(
+        (source_ref and source_ref in prompt)
+        or _DIRECTOR_TRANSPORT_RE.search(scene.provider_prompt)
+    )
+
+
+def _raw_fact_in_render_prompts(scene: ScenePlan, safe_facts: Sequence[str]) -> bool:
+    return any(
+        _raw_source_fragment_in_text(prompt, safe_facts)
+        for prompt in (
+            scene.clean_prompt,
+            scene.keyframe_prompt,
+            scene.provider_prompt,
+        )
+    )
 
 
 def _atomic_text(path: Path, value: str) -> None:
@@ -1915,7 +2834,8 @@ def update_manifest(path: Path, mutator: Callable[[dict[str, Any]], None]) -> di
 _IMMUTABLE_PLAN_FIELDS = (
     "plan_id", "base_plan_id", "variant_index", "continuity_id", "persona",
     "destination", "scheduled_slot", "rubric", "source_type", "source_ref",
-    "safe_facts", "editorial_plan", "central_thesis", "visual_concept",
+    "safe_facts", "editorial_plan", "central_thesis", "thesis_source_fact_refs",
+    "viewer_problem", "hook", "payoff", "visual_concept",
     "story_spine", "story_arc", "continuity_anchor", "initial_state_code", "goal_state_code",
     "admin_concept_ru", "director_version",
     "scene_count", "scenes", "reel_edits", "caption_plan",
@@ -1955,13 +2875,35 @@ def _duration_in_range(value: Any, minimum: float, maximum: float) -> bool:
 
 
 def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool:
-    """Return whether a v6 manifest is safe for the current paid worker.
+    """Return whether a semantic-v8/v7 manifest is safe for the paid worker.
 
     This deliberately checks the persisted production envelope, not just the
     editorial plan.  Older manifests can still be inspected or repaired by a
     dry-run, but cannot be approved or reach a provider accidentally.
     """
     if payload.get("schema") != STORY_SCHEMA:
+        return False
+    required_top_level_strings = (
+        "plan_id", "base_plan_id", "director_version", "central_thesis",
+        "viewer_problem", "hook", "payoff", "visual_concept", "story_spine",
+        "story_arc", "continuity_anchor", "initial_state_code", "goal_state_code",
+        "admin_concept_ru",
+    )
+    if any(
+        not isinstance(payload.get(field), str) or not payload[field].strip()
+        for field in required_top_level_strings
+    ):
+        return False
+    if (
+        not isinstance(payload.get("variant_index"), int)
+        or isinstance(payload.get("variant_index"), bool)
+        or not isinstance(payload.get("thesis_source_fact_refs"), list)
+        or not payload["thesis_source_fact_refs"]
+        or not all(
+            isinstance(ref, str) and ref.strip()
+            for ref in payload["thesis_source_fact_refs"]
+        )
+    ):
         return False
     fingerprint = payload.get("immutable_plan_fingerprint")
     if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
@@ -1979,16 +2921,14 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     visual_strategy = payload.get("visual_strategy")
     if not all(isinstance(value, list) for value in (scenes, edits, scene_jobs, reel_jobs)):
         return False
-    director_version = str(payload.get("director_version", ""))
-    concept = str(payload.get("visual_concept", ""))
-    story_arc = str(payload.get("story_arc", ""))
-    continuity_anchor = str(payload.get("continuity_anchor", ""))
-    initial_state_code = str(payload.get("initial_state_code", ""))
-    goal_state_code = str(payload.get("goal_state_code", ""))
-    if director_version == TEMPLATE_DIRECTOR_VERSION and concept not in {
-        str(treatment["label"]) for treatment in VISUAL_TREATMENTS.values()
-    }:
+    director_version = payload["director_version"]
+    if director_version != DIRECTOR_VERSION:
         return False
+    concept = payload["visual_concept"]
+    story_arc = payload["story_arc"]
+    continuity_anchor = payload["continuity_anchor"]
+    initial_state_code = payload["initial_state_code"]
+    goal_state_code = payload["goal_state_code"]
     if director_version == DIRECTOR_VERSION:
         if story_arc not in DIRECTOR_STORY_ARCS:
             return False
@@ -2017,10 +2957,6 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             != str(arc.get("description_ru", ""))
         ):
             return False
-    elif director_version != TEMPLATE_DIRECTOR_VERSION:
-        return False
-    elif story_arc or initial_state_code or goal_state_code:
-        return False
     if not 4 <= len(scenes) <= 7 or payload.get("scene_count") != len(scenes) or not edits:
         return False
     if not isinstance(model_policy, dict) or (
@@ -2053,6 +2989,22 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     )
     bounded_end_state_codes: list[str] = []
     for scene_index, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            return False
+        required_scene_strings = (
+            "scene_id", "role", "beat_id", "semantic_goal",
+            "relation_to_previous", "expected_viewer_understanding",
+            "visualization_kind", "visual_relation_to_beat", "setting",
+            "subject_kind", "subject", "motion_class", "concrete_action",
+            "start_state", "end_state", "shot_size", "camera_motion",
+            "admin_summary_ru", "clean_prompt", "keyframe_prompt",
+            "provider_prompt", "source_fact_ref",
+        )
+        if any(
+            not isinstance(scene.get(field), str) or not scene[field].strip()
+            for field in required_scene_strings
+        ):
+            return False
         requires_reference = scene.get("requires_naz_reference")
         role = str(scene.get("reference_role", ""))
         shot_size = str(scene.get("shot_size", ""))
@@ -2072,6 +3024,14 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             or not end_state
             or not str(scene.get("keyframe_prompt", ""))
             or scene.get("identity_reference_usage") not in {"identity_only", "none"}
+        ):
+            return False
+        source_fact_refs = scene.get("source_fact_refs")
+        if (
+            not isinstance(source_fact_refs, list)
+            or not source_fact_refs
+            or not all(isinstance(ref, str) and ref.strip() for ref in source_fact_refs)
+            or scene.get("visualization_kind") not in VISUALIZATION_KINDS
         ):
             return False
         if (
@@ -2146,6 +3106,100 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         or not bounded_end_state_codes
         or bounded_end_state_codes[-1] != goal_state_code
     ):
+        return False
+    editorial_payload = payload.get("editorial_plan")
+    policy_versions = payload.get("policy_versions")
+    safe_facts = payload.get("safe_facts")
+    if (
+        not isinstance(editorial_payload, dict)
+        or not isinstance(policy_versions, dict)
+        or policy_versions.get("semantic") != SEMANTIC_CONTRACT_VERSION
+        or not isinstance(safe_facts, list)
+        or not all(isinstance(fact, str) and fact.strip() for fact in safe_facts)
+    ):
+        return False
+    try:
+        editorial_plan = EditorialPlan.from_dict(editorial_payload)
+        persisted_treatment = DirectorTreatment(
+            plan_id=str(payload.get("plan_id", "")),
+            variant_index=int(payload.get("variant_index", -1)),
+            visual_concept=concept,
+            core_thesis=payload["central_thesis"],
+            thesis_source_fact_refs=tuple(payload.get("thesis_source_fact_refs", ())),
+            viewer_problem=payload["viewer_problem"],
+            hook=payload["hook"],
+            payoff=payload["payoff"],
+            story_spine=payload["story_spine"],
+            story_arc=story_arc,
+            continuity_anchor=continuity_anchor,
+            initial_state_code=initial_state_code,
+            goal_state_code=goal_state_code,
+            primary_setting=arc_setting,
+            admin_concept_ru=payload["admin_concept_ru"],
+            scenes=tuple(
+                DirectorScene(
+                    role=scene["role"],
+                    beat_id=scene["beat_id"],
+                    semantic_goal=scene["semantic_goal"],
+                    source_fact_refs=tuple(scene.get("source_fact_refs", ())),
+                    relation_to_previous=scene["relation_to_previous"],
+                    expected_viewer_understanding=scene["expected_viewer_understanding"],
+                    visualization_kind=scene["visualization_kind"],
+                    visual_relation_to_beat=scene["visual_relation_to_beat"],
+                    setting=scene["setting"],
+                    subject_kind=scene["subject_kind"],
+                    subject=scene["subject"],
+                    motion_class=scene["motion_class"],
+                    concrete_action=scene["concrete_action"],
+                    start_state=scene["start_state"],
+                    end_state=scene["end_state"],
+                    shot_size=scene["shot_size"],
+                    camera_motion=scene["camera_motion"],
+                    admin_summary_ru=scene["admin_summary_ru"],
+                )
+                for scene in scenes
+            ),
+            version=director_version,
+        )
+        if semantic_preflight_reason_codes(
+            persisted_treatment,
+            tuple(str(item) for item in safe_facts),
+            plan=editorial_plan,
+            variant_index=int(payload.get("variant_index", 0)),
+        ):
+            return False
+        for scene in scenes:
+            expected_prompts = _compile_scene_prompts(
+                role=str(scene.get("role", "")),
+                visual_mode=str(editorial_payload.get("visual_mode", "")),
+                visual_relation=str(editorial_payload.get("visual_relation", "")),
+                semantic_goal=str(scene.get("semantic_goal", "")),
+                visual_relation_to_beat=str(scene.get("visual_relation_to_beat", "")),
+                subject_kind=str(scene.get("subject_kind", "")),
+                subject=str(scene.get("subject", "")),
+                setting=str(scene.get("setting", "")),
+                action=str(scene.get("concrete_action", "")),
+                start_state=str(scene.get("start_state", "")),
+                end_state=str(scene.get("end_state", "")),
+                shot_size=str(scene.get("shot_size", "")),
+                camera_motion=str(scene.get("camera_motion", "")),
+                continuity_anchor=continuity_anchor,
+                requires_reference=bool(scene.get("requires_naz_reference")),
+            )
+            if (
+                str(scene.get("clean_prompt", "")),
+                str(scene.get("keyframe_prompt", "")),
+                str(scene.get("provider_prompt", "")),
+            ) != expected_prompts:
+                return False
+            prompt_text = "\n".join(expected_prompts).casefold()
+            if any(
+                len(normalized) >= 24 and normalized in prompt_text
+                for fact in safe_facts
+                if (normalized := " ".join(str(fact).split()).casefold())
+            ):
+                return False
+    except (DirectorValidationError, StoryPlanError, TypeError, ValueError):
         return False
     if len(scene_jobs) != len(scenes):
         return False
@@ -2356,6 +3410,8 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
 
 def persist_story_queue(pack: StoryPackPlan, storage_root: Path) -> Path:
     """Atomically create a resumable current-schema item, or return that exact pack."""
+    if pack.director_version != DIRECTOR_VERSION:
+        raise StoryPlanError("template_treatment_production_forbidden")
     root = Path(storage_root).expanduser().resolve()
     pack_dir = (root / pack.plan_id).resolve()
     if root not in pack_dir.parents:

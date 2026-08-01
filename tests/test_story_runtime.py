@@ -25,7 +25,12 @@ from story_video_provider import (
     SceneRequest,
     utf16_code_units,
 )
-from tests.test_story_production import SAFE_FACTS, director_response, planned
+from tests.test_story_production import (
+    SAFE_FACTS,
+    director_response,
+    planned,
+    select_story_arc,
+)
 
 
 class MockTransport:
@@ -66,8 +71,15 @@ def config(root, **changes):
     return dataclasses.replace(value, **changes)
 
 
-def make_pack(root, *, approved=True, keyframes_ready=True, editorial_plan=None):
-    pack = story.plan_story_pack(editorial_plan or planned(), SAFE_FACTS)
+def make_pack(
+    root,
+    *,
+    approved=True,
+    keyframes_ready=True,
+    editorial_plan=None,
+    story_arc=None,
+):
+    pack = current_pack(editorial_plan, story_arc=story_arc)
     pack_dir = story.persist_story_queue(pack, Path(root))
     if approved:
         control.approve_pack(Path(root), pack.plan_id)
@@ -79,6 +91,27 @@ def make_pack(root, *, approved=True, keyframes_ready=True, editorial_plan=None)
             job.update({"keyframe_state": "ready", "keyframe_checksum": checksum(keyframe)})
         story.atomic_json(pack_dir / "story_manifest.json", payload)
     return pack, pack_dir, pack_dir / "story_manifest.json"
+
+
+def current_pack(editorial_plan=None, *, variant_index=0, story_arc=None):
+    plan = editorial_plan or planned()
+    response = json.loads(
+        director_response(plan, variant_index=variant_index)
+    )
+    if story_arc is not None:
+        select_story_arc(response, story_arc)
+    treatment = story.parse_reels_director_response(
+        json.dumps(response),
+        plan,
+        SAFE_FACTS,
+        variant_index=variant_index,
+    )
+    return story.plan_story_pack(
+        plan,
+        SAFE_FACTS,
+        variant_index=variant_index,
+        director_treatment=treatment,
+    )
 
 
 class ProviderTests(unittest.TestCase):
@@ -200,7 +233,7 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(provider.submit_count, 0)
                 self.assertEqual(provider.keyframe_submissions, [])
 
-    def test_existing_approved_pack_compacts_keyframe_before_provider_submit(self):
+    def test_edited_keyframe_prompt_is_rejected_before_provider_submit(self):
         with tempfile.TemporaryDirectory() as root:
             pack, _, manifest = make_pack(root, keyframes_ready=False)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -214,23 +247,18 @@ class WorkerTests(unittest.TestCase):
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
 
-            status = worker.process_pack(
-                pack.plan_id,
-                config=config(root),
-                provider=provider,
-                composer=DummyComposer(),
-            )
+            with self.assertRaisesRegex(
+                RuntimeError, "story_manifest_contract_stale"
+            ):
+                worker.process_pack(
+                    pack.plan_id,
+                    config=config(root),
+                    provider=provider,
+                    composer=DummyComposer(),
+                )
 
-            self.assertEqual(status, "queued")
-            self.assertEqual(len(provider.keyframe_submissions), 1)
-            submitted_prompt = provider.keyframe_submissions[0].prompt
-            self.assertLessEqual(
-                utf16_code_units(submitted_prompt),
-                RUNWAY_PROMPT_MAX_UTF16_UNITS,
-            )
-            self.assertTrue(submitted_prompt.endswith(
-                "No text, logos, HUD, code, copper, gold, robots or extra people."
-            ))
+            self.assertEqual(provider.keyframe_submissions, [])
+            self.assertEqual(provider.submit_count, 0)
 
     def test_directed_keyframe_completes_before_video_and_is_reused_as_first_frame(self):
         with tempfile.TemporaryDirectory() as root:
@@ -659,24 +687,29 @@ class WorkerTests(unittest.TestCase):
             worker.process_pack(plan_id, config=config(root), provider=provider, composer=DummyComposer())
             self.assertEqual(json.loads(manifest.read_text())["scene_jobs"][0]["state"], "terminal_failed")
 
-    def test_missing_reference_blocks_only_face_scene(self):
+    def test_missing_reference_blocks_only_human_scenes(self):
         with tempfile.TemporaryDirectory() as root:
-            _, _, manifest = make_pack(root, keyframes_ready=False)
+            _, _, manifest = make_pack(
+                root,
+                keyframes_ready=False,
+                story_arc="module_recovery_mixed",
+            )
             payload = story.read_manifest(manifest)
-            payload["scene_jobs"][0]["requires_naz_reference"] = True
-            payload["scene_jobs"][0]["reference_role"] = "frontal_identity"
-            payload["scene_jobs"][0]["model_route"]["selected_model"] = "gen4.5"
-            payload["scenes"][0]["requires_naz_reference"] = True
-            payload["scenes"][0]["reference_role"] = "frontal_identity"
-            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
-            story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
-            worker.process_pack(payload["plan_id"], config=config(root), provider=provider, composer=DummyComposer())
-            worker.process_pack(payload["plan_id"], config=config(root), provider=provider, composer=DummyComposer())
+            for _ in payload["scene_jobs"]:
+                worker.process_pack(
+                    payload["plan_id"],
+                    config=config(root),
+                    provider=provider,
+                    composer=DummyComposer(),
+                )
             current = json.loads(manifest.read_text())["scene_jobs"]
-            self.assertEqual(current[0]["state"], "blocked_reference")
-            self.assertEqual(current[1]["state"], "queued")
-            self.assertEqual(current[1]["keyframe_state"], "submitted")
+            self.assertTrue(all(
+                job["state"] == "blocked_reference"
+                for job in current[:4]
+            ))
+            self.assertEqual(current[4]["state"], "queued")
+            self.assertEqual(current[4]["keyframe_state"], "submitted")
             self.assertEqual(provider.submissions, [])
 
     def test_turbo_text_only_scene_gets_a_directed_keyframe_before_video(self):
@@ -762,19 +795,12 @@ class WorkerTests(unittest.TestCase):
                     "visual_guidance": "Long balanced proportions; fit but not bulky.",
                 },
             }), encoding="utf-8")
-            _, _, manifest = make_pack(root, keyframes_ready=False)
+            _, _, manifest = make_pack(
+                root,
+                keyframes_ready=False,
+                story_arc="module_recovery_mixed",
+            )
             payload = json.loads(manifest.read_text(encoding="utf-8"))
-            payload["scenes"][0].update({
-                "requires_naz_reference": True,
-                "reference_role": "three_quarter_identity",
-            })
-            payload["scene_jobs"][0].update({
-                "requires_naz_reference": True,
-                "reference_role": "three_quarter_identity",
-            })
-            payload["scene_jobs"][0]["model_route"]["selected_model"] = "gen4.5"
-            payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
-            story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
             worker.process_pack(
                 payload["plan_id"],
@@ -884,24 +910,14 @@ class WorkerTests(unittest.TestCase):
                     "visual_guidance": "Long balanced proportions; fit but not bulky.",
                 },
             }), encoding="utf-8")
-            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            pack, _, manifest = make_pack(
+                root,
+                keyframes_ready=False,
+                story_arc="module_recovery_mixed",
+            )
             payload = story.read_manifest(manifest)
             failed_index = 0
-            payload["scenes"][failed_index].update({
-                "requires_naz_reference": True,
-                "reference_role": "three_quarter_identity",
-                "identity_reference_usage": "identity_only",
-                "keyframe_prompt": payload["scenes"][failed_index]["keyframe_prompt"].replace(
-                    "No person is present.",
-                    "@Naz is present; replace the reference background.",
-                ),
-            })
             failed = payload["scene_jobs"][failed_index]
-            failed.update({
-                "requires_naz_reference": True,
-                "reference_role": "three_quarter_identity",
-            })
-            failed["model_route"]["selected_model"] = "gen4.5"
             failed.update({
                 "state": "terminal_failed",
                 "failure_code": "provider_terminal_failure",
@@ -1131,7 +1147,7 @@ class WorkerTests(unittest.TestCase):
                 )
             self.assertEqual(provider.submit_count, 0)
 
-    def test_edited_secret_prompt_never_reaches_provider(self):
+    def test_edited_secret_prompt_makes_manifest_stale_before_provider(self):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root)
             payload = story.read_manifest(manifest)
@@ -1139,12 +1155,17 @@ class WorkerTests(unittest.TestCase):
             payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
             provider = FakeVideoProvider()
-            worker.process_pack(payload["plan_id"], config=config(root), provider=provider, composer=DummyComposer())
-            current = json.loads(manifest.read_text())["scene_jobs"][0]
+            with self.assertRaisesRegex(
+                RuntimeError, "story_manifest_contract_stale"
+            ):
+                worker.process_pack(
+                    payload["plan_id"],
+                    config=config(root),
+                    provider=provider,
+                    composer=DummyComposer(),
+                )
             self.assertEqual(provider.submit_count, 0)
-            self.assertEqual(current["failure_code"], "provider_prompt_unsafe")
-            self.assertEqual(current["state"], "terminal_failed")
-            self.assertIsNone(current["model_route"]["secondary_requested_at"])
+            self.assertEqual(provider.keyframe_submissions, [])
 
     def test_missing_music_preserves_scenes_and_blocks_reels(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1174,10 +1195,10 @@ class WorkerTests(unittest.TestCase):
     def test_queue_ignores_old_waiting_and_superseded_packs_for_new_approved_pack(self):
         with tempfile.TemporaryDirectory() as root:
             plan = planned()
-            waiting = story.plan_story_pack(plan, SAFE_FACTS, variant_index=0)
+            waiting = current_pack(plan, variant_index=0)
             story.persist_story_queue(waiting, Path(root))
 
-            superseded = story.plan_story_pack(plan, SAFE_FACTS, variant_index=1)
+            superseded = current_pack(plan, variant_index=1)
             superseded_manifest = (
                 story.persist_story_queue(superseded, Path(root)) / "story_manifest.json"
             )
@@ -1186,7 +1207,7 @@ class WorkerTests(unittest.TestCase):
             stale["pack_status"] = "superseded"
             story.atomic_json(superseded_manifest, stale)
 
-            approved = story.plan_story_pack(plan, SAFE_FACTS, variant_index=2)
+            approved = current_pack(plan, variant_index=2)
             story.persist_story_queue(approved, Path(root))
             control.approve_pack(Path(root), approved.plan_id)
 
@@ -1212,7 +1233,7 @@ class SharedQueuePermissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.object(
             story, "ensure_private_group_access"
         ) as shared_access:
-            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack = current_pack()
             pack_dir = story.persist_story_queue(pack, Path(root))
 
         calls = {(call.args[0], call.kwargs["directory"]) for call in shared_access.call_args_list}
@@ -1229,7 +1250,7 @@ class SharedQueuePermissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
             root_path.chmod(0o2770)
-            pack = story.plan_story_pack(planned(), SAFE_FACTS)
+            pack = current_pack()
             pack_dir = story.persist_story_queue(pack, root_path)
             manifest = pack_dir / "story_manifest.json"
 
@@ -1271,24 +1292,17 @@ class ControlTests(unittest.TestCase):
 
     def test_confirmation_requeues_only_legacy_turbo_reference_failures_once(self):
         with tempfile.TemporaryDirectory() as root:
-            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            pack, _, manifest = make_pack(
+                root,
+                keyframes_ready=False,
+                story_arc="module_recovery_mixed",
+            )
             payload = story.read_manifest(manifest)
             failed_index = 0
             untouched_index = 1
-            payload["scenes"][failed_index].update({
-                "requires_naz_reference": True,
-                "reference_role": "three_quarter_identity",
-                "identity_reference_usage": "identity_only",
-                "keyframe_prompt": payload["scenes"][failed_index]["keyframe_prompt"].replace(
-                    "No person is present.",
-                    "@Naz is present; replace the reference background.",
-                ),
-            })
             failed = payload["scene_jobs"][failed_index]
             untouched = payload["scene_jobs"][untouched_index]
             failed.update({
-                "requires_naz_reference": True,
-                "reference_role": "three_quarter_identity",
                 "state": "terminal_failed",
                 "failure_code": "provider_terminal_failure",
                 "keyframe_state": "terminal_failed",
@@ -1305,7 +1319,6 @@ class ControlTests(unittest.TestCase):
                     "failure_code": None,
                 },
             })
-            failed["model_route"]["selected_model"] = "gen4.5"
             untouched_before = dict(untouched)
             payload["pack_status"] = "partially_blocked"
             payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
@@ -1336,19 +1349,15 @@ class ControlTests(unittest.TestCase):
 
     def test_confirmation_fails_closed_above_reference_retry_cap(self):
         with tempfile.TemporaryDirectory() as root:
-            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            pack, _, manifest = make_pack(
+                root,
+                keyframes_ready=False,
+                story_arc="module_recovery_human",
+            )
             payload = story.read_manifest(manifest)
             for index in range(5):
-                scene = payload["scenes"][index]
                 job = payload["scene_jobs"][index]
-                scene.update({
-                    "requires_naz_reference": True,
-                    "reference_role": "three_quarter_identity",
-                    "identity_reference_usage": "identity_only",
-                })
                 job.update({
-                    "requires_naz_reference": True,
-                    "reference_role": "three_quarter_identity",
                     "state": "terminal_failed",
                     "failure_code": "provider_terminal_failure",
                     "keyframe_state": "terminal_failed",
@@ -1362,7 +1371,6 @@ class ControlTests(unittest.TestCase):
                         "failure_code": None,
                     },
                 })
-                job["model_route"]["selected_model"] = "gen4.5"
             payload["pack_status"] = "partially_blocked"
             payload["immutable_plan_fingerprint"] = story._immutable_plan_fingerprint(payload)
             story.atomic_json(manifest, payload)
@@ -1376,24 +1384,19 @@ class ControlTests(unittest.TestCase):
 
     def test_operator_retargets_current_mixed_retry_set_to_frontal_reference(self):
         with tempfile.TemporaryDirectory() as root:
-            pack, _, manifest = make_pack(root, keyframes_ready=False)
+            pack, _, manifest = make_pack(
+                root,
+                keyframes_ready=False,
+                story_arc="module_recovery_human",
+            )
             payload = story.read_manifest(manifest)
             approved_at = datetime.now(timezone.utc).isoformat()
             for index in range(4):
-                scene = payload["scenes"][index]
                 job = payload["scene_jobs"][index]
-                scene.update({
-                    "requires_naz_reference": True,
-                    "reference_role": "three_quarter_identity",
-                    "identity_reference_usage": "identity_only",
-                })
                 job.update({
-                    "requires_naz_reference": True,
-                    "reference_role": "three_quarter_identity",
                     "keyframe_retry_model": "gen4_image",
                     "keyframe_retry_approved_at": approved_at,
                 })
-                job["model_route"]["selected_model"] = "gen4.5"
                 if index == 0:
                     job.update({
                         "state": "terminal_failed",
@@ -1516,16 +1519,83 @@ class ControlTests(unittest.TestCase):
                     action(Path(root), pack.plan_id)
                 self.assertEqual(manifest.read_bytes(), before)
 
+    def test_template_contract_is_readable_but_all_production_controls_reject_it(self):
+        for action_name in ("approve", "confirm", "variant"):
+            with self.subTest(action=action_name), tempfile.TemporaryDirectory() as root:
+                plan = planned()
+                pack, _, manifest = make_pack(
+                    root, approved=False, editorial_plan=plan
+                )
+                payload = story.read_manifest(manifest)
+                payload["director_version"] = story.TEMPLATE_DIRECTOR_VERSION
+                payload["immutable_plan_fingerprint"] = (
+                    story._immutable_plan_fingerprint(payload)
+                )
+                story.atomic_json(manifest, payload)
+                self.assertEqual(
+                    story.read_manifest(manifest)["director_version"],
+                    story.TEMPLATE_DIRECTOR_VERSION,
+                )
+                before = manifest.read_bytes()
+
+                if action_name == "approve":
+                    action = lambda: control.approve_pack(Path(root), pack.plan_id)
+                elif action_name == "confirm":
+                    action = lambda: control.confirm_generation(Path(root), pack.plan_id)
+                else:
+                    treatment = story.parse_reels_director_response(
+                        director_response(plan, variant_index=1),
+                        plan,
+                        SAFE_FACTS,
+                        variant_index=1,
+                    )
+                    action = lambda: control.create_next_variant(
+                        Path(root),
+                        pack.plan_id,
+                        director_treatment=treatment,
+                    )
+
+                with self.assertRaisesRegex(
+                    story.StoryPlanError, "story_manifest_contract_stale"
+                ):
+                    action()
+                self.assertEqual(manifest.read_bytes(), before)
+
     def test_other_variant_is_free_and_supersedes_previous_plan(self):
         with tempfile.TemporaryDirectory() as root:
-            pack, _, manifest = make_pack(root, approved=False)
-            new_dir = control.create_next_variant(Path(root), pack.plan_id)
+            plan = planned()
+            pack, _, manifest = make_pack(
+                root, approved=False, editorial_plan=plan
+            )
+            treatment = story.parse_reels_director_response(
+                director_response(plan, variant_index=1),
+                plan,
+                SAFE_FACTS,
+                variant_index=1,
+            )
+            new_dir = control.create_next_variant(
+                Path(root), pack.plan_id, director_treatment=treatment
+            )
             old = json.loads(manifest.read_text())
             new = json.loads((new_dir / "story_manifest.json").read_text())
             self.assertEqual(old["pack_status"], "superseded")
             self.assertNotEqual(old["plan_id"], new["plan_id"])
             self.assertEqual(new["approval"]["status"], "awaiting_approval")
-            self.assertNotEqual(old["scenes"], new["scenes"])
+            self.assertEqual(new["variant_index"], 1)
+            self.assertEqual(new["director_version"], story.DIRECTOR_VERSION)
+
+    def test_other_variant_requires_current_semantic_treatment(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack, _, manifest = make_pack(root, approved=False)
+            before = manifest.read_bytes()
+
+            with self.assertRaisesRegex(
+                story.StoryPlanError, "director_treatment_required"
+            ):
+                control.create_next_variant(Path(root), pack.plan_id)
+
+            self.assertEqual(manifest.read_bytes(), before)
+            self.assertEqual(len(control.list_manifests(Path(root))), 1)
 
     def test_other_variant_rejects_tampered_immutable_source_before_replanning(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1558,11 +1628,52 @@ class ControlTests(unittest.TestCase):
             self.assertNotIn(payload["scenes"][0]["provider_prompt"], summary)
             self.assertNotIn(payload["scenes"][0]["keyframe_prompt"], summary)
             self.assertIn("Режиссёрский план", summary)
+            self.assertIn(f"Тезис: {payload['central_thesis']}", summary)
             self.assertIn(
-                control.VISUAL_CONCEPT_RU[payload["visual_concept"]], summary
+                f"Зацепка → развязка: {payload['hook']} → {payload['payoff']}",
+                summary,
             )
+            self.assertIn(payload["scenes"][0]["semantic_goal"], summary)
+            self.assertIn(payload["scenes"][1]["relation_to_previous"], summary)
+            self.assertIn(payload["admin_concept_ru"], summary)
             self.assertIn("Оценка Runway", summary)
             self.assertIn("Аватар используется только для внешности", summary)
+
+    def test_safe_summary_redacts_tampered_raw_facts_including_short_fact(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, _, manifest = make_pack(root, approved=False)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            facts = [*payload["safe_facts"], "Build failed."]
+            payload["safe_facts"] = facts
+
+            for fact in facts:
+                with self.subTest(fact=fact):
+                    tampered = json.loads(json.dumps(payload))
+                    tampered["central_thesis"] = fact
+                    tampered["hook"] = fact
+                    tampered["payoff"] = fact
+                    tampered["scenes"][0]["semantic_goal"] = fact
+                    tampered["scenes"][1]["relation_to_previous"] = fact
+
+                    summary = control.safe_summary(tampered)
+
+                    self.assertNotIn(fact, summary)
+
+            for copied_variant in (
+                "Build failed",
+                "BUILD FAILED!",
+                "Build   failed",
+            ):
+                with self.subTest(copied_variant=copied_variant):
+                    tampered = json.loads(json.dumps(payload))
+                    tampered["scenes"][0]["semantic_goal"] = copied_variant
+
+                    summary = control.safe_summary(tampered)
+
+                    self.assertNotIn(
+                        "build failed",
+                        " ".join(summary.split()).casefold(),
+                    )
 
     def test_safe_progress_summary_reports_real_manifest_stages(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1606,15 +1717,18 @@ class ControlTests(unittest.TestCase):
             self.assertIn(f"Gen-4.5 {seconds}s + Turbo {turbo_seconds}s", summary)
             self.assertIn(f"video {expected_video}", summary)
 
-    def test_safe_summary_localizes_director_card_without_changing_render_fields(self):
+    def test_safe_summary_shows_semantic_contract_without_render_fields(self):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root, approved=False)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             payload["visual_concept"] = "A founder verifies a live service at a workbench"
             payload["central_thesis"] = "Рабочий результат проверяется реальным действием"
+            payload["hook"] = "Сервис выглядит готовым, но ещё не проверен"
+            payload["payoff"] = "Повторная проверка подтверждает результат"
             payload["admin_concept_ru"] = "Человек проверяет живой сервис реальным действием"
             first = payload["scenes"][0]
             first.update({
+                "semantic_goal": "Показать, что живой сервис ещё нужно проверить",
                 "admin_summary_ru": "Naz проверяет живой сервис на рабочем ноутбуке",
                 "story_overlay": "hook: Naz проверяет живой сервис на рабочем ноутбуке",
                 "requires_naz_reference": True,
@@ -1627,8 +1741,13 @@ class ControlTests(unittest.TestCase):
             summary = control.safe_summary(payload)
 
             self.assertIn("Сюжетная линия: Человек проверяет живой сервис", summary)
+            self.assertIn(f"Тезис: {payload['central_thesis']}", summary)
+            self.assertIn(
+                f"Зацепка → развязка: {payload['hook']} → {payload['payoff']}",
+                summary,
+            )
             self.assertIn("1. ЗАЦЕПКА", summary)
-            self.assertIn("Смысл: Naz проверяет живой сервис", summary)
+            self.assertIn(f"Смысл: {first['semantic_goal']}", summary)
             self.assertIn("В кадре: Naz · План: средний", summary)
             self.assertIn("Камера: медленное приближение", summary)
             self.assertNotIn(payload["visual_concept"], summary)
@@ -1639,6 +1758,7 @@ class ControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root, approved=False)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["director_version"] = "reels-semantic-director-v7"
             payload["visual_concept"] = "An opaque internal director concept"
             payload["central_thesis"] = "An internal English thesis"
             payload.pop("admin_concept_ru", None)
@@ -1668,8 +1788,10 @@ class ControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             _, _, manifest = make_pack(root, approved=False)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["director_version"] = "reels-semantic-director-v7"
             payload["visual_concept"] = "A human founder verifies a live service"
             payload["central_thesis"] = "Internal English thesis"
+            payload.pop("admin_concept_ru", None)
             for scene in payload["scenes"]:
                 scene.pop("admin_summary_ru", None)
                 scene["story_overlay"] = "hook: Internal English scene"
@@ -2016,8 +2138,9 @@ class ManifestTests(unittest.TestCase):
                 self.assertTrue(job["story_path"].endswith("_story.mp4"))
                 self.assertEqual(job["visual_identity_qa"]["status"], "not_run")
             for scene in payload["scenes"]:
-                factual_sentence = scene["standalone_meaning"].partition(":")[2].strip()
-                self.assertNotIn(factual_sentence, scene["provider_prompt"])
+                for raw_fact in SAFE_FACTS:
+                    self.assertNotIn(raw_fact, scene["provider_prompt"])
+                    self.assertNotIn(raw_fact, scene["keyframe_prompt"])
 
     def test_secrets_are_rejected_before_manifest_or_provider(self):
         with tempfile.TemporaryDirectory() as root:
