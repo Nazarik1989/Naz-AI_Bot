@@ -14,6 +14,7 @@ import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import character_state as naz_character
@@ -2316,6 +2317,99 @@ def save_generated_post(
                 utc_now(),
             ),
         )
+
+
+class StandardOnlyPlanQueryError(RuntimeError):
+    """The maintenance idempotency state could not be read unambiguously."""
+
+
+@contextmanager
+def _standard_only_read_db() -> Iterable[sqlite3.Connection]:
+    """Open the initialized database read-only and never commit or migrate it."""
+    if str(DB_PATH) == ":memory:":
+        raise StandardOnlyPlanQueryError("standard-only database is not file-backed")
+    try:
+        uri = f"{Path(DB_PATH).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except (OSError, sqlite3.Error) as exc:
+        raise StandardOnlyPlanQueryError(
+            "standard-only database is unavailable"
+        ) from exc
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        yield conn
+    except sqlite3.Error as exc:
+        raise StandardOnlyPlanQueryError(
+            "standard-only database state is unavailable"
+        ) from exc
+    finally:
+        conn.close()
+
+
+def get_standard_only_plan_records(
+    user_id: int,
+    plan_id: str,
+) -> List[Dict[str, Any]]:
+    """Return candidate canonical records for the maintenance idempotency gate."""
+    with _standard_only_read_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, task, plan_id, editorial_plan_json, published_to_channel,
+                   created_at
+            FROM generated_posts
+            WHERE user_id = ? AND (
+                plan_id = ?
+                OR task = 'agent_content_standard_only'
+                OR (
+                    json_valid(editorial_plan_json)
+                    AND json_extract(
+                        editorial_plan_json, '$.production_policy'
+                    ) = 'standard_only'
+                )
+            )
+            ORDER BY id ASC
+            """,
+            (int(user_id), str(plan_id)[:64]),
+        ).fetchall()
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item: Dict[str, Any] = dict(row)
+        raw_payload = str(item.pop("editorial_plan_json", "") or "")
+        malformed = False
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            payload = {}
+            malformed = True
+        if not isinstance(payload, dict):
+            payload = {}
+            malformed = True
+        item["editorial_plan"] = payload
+        item["editorial_plan_malformed"] = malformed
+        result.append(item)
+    return result
+
+
+def get_editorial_release_event_read_only(
+    user_id: int,
+    plan_id: str,
+    platform: str,
+) -> Optional[Dict[str, Any]]:
+    """Read one existing release identity without initialization or commits."""
+    with _standard_only_read_db() as conn:
+        row = conn.execute(
+            """
+            SELECT user_id, plan_id, platform, slot, slot_captured_at,
+                   generation_package_status, image_qa_status, telegram_chat_id,
+                   telegram_message_id, vk_job_id, vk_receipt_id,
+                   history_commit_status, updated_at
+            FROM editorial_release_events
+            WHERE user_id=? AND plan_id=? AND platform=?
+            """,
+            (int(user_id), str(plan_id)[:64], str(platform)[:16]),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def get_unpublished_vk_jobs(user_id: int, limit: int = 100) -> List[Dict[str, Any]]:

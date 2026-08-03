@@ -23,7 +23,7 @@ import random
 import re
 import tempfile
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from functools import wraps
 from html import unescape
@@ -4459,6 +4459,124 @@ def reels_director_reason_summary(reason_code: str) -> str:
     return "провайдер не вернул пригодный структурированный режиссёрский план"
 
 
+STANDARD_ONLY_PLAN_CREATE_ALLOWED = "standard_only_plan_create_allowed"
+STANDARD_ONLY_PLAN_CREATED = "standard_only_plan_created"
+STANDARD_ONLY_PLAN_CREATED_DELIVERY_FAILED = (
+    "standard_only_plan_created_delivery_failed"
+)
+STANDARD_ONLY_PLAN_ALREADY_EXISTS = "standard_only_plan_already_exists"
+STANDARD_ONLY_PLAN_PARTIAL_EXISTING = "standard_only_plan_partial_existing"
+STANDARD_ONLY_PLAN_IDENTITY_CONFLICT = "standard_only_plan_identity_conflict"
+STANDARD_ONLY_PLAN_LOCKS: Dict[Tuple[int, str], asyncio.Lock] = {}
+
+
+class StandardOnlyPlanResult(str):
+    """Stable reason code with safe plan identity for the command boundary."""
+
+    def __new__(cls, reason_code: str, plan_id: str = ""):
+        value = super().__new__(cls, reason_code)
+        value.plan_id = str(plan_id)
+        return value
+
+
+def standard_only_plan_result(reason_code: str, plan_id: str = "") -> str:
+    return StandardOnlyPlanResult(reason_code, plan_id)
+
+
+def standard_only_plan_status_text(result: str) -> str:
+    """Return one privacy-safe final command status for a non-draft outcome."""
+    reason_code = str(result)
+    raw_plan_id = str(getattr(result, "plan_id", ""))
+    safe_plan_id = raw_plan_id if re.fullmatch(r"[a-f0-9]{24}", raw_plan_id) else ""
+    identity = f"plan_id={safe_plan_id}" if safe_plan_id else "plan_id unavailable"
+    if reason_code == STANDARD_ONLY_PLAN_ALREADY_EXISTS:
+        return f"ℹ️ {reason_code}: {identity}; canonical plan already exists."
+    if reason_code == STANDARD_ONLY_PLAN_PARTIAL_EXISTING:
+        return f"⚠️ {reason_code}: {identity}; generation was not started."
+    if reason_code == STANDARD_ONLY_PLAN_IDENTITY_CONFLICT:
+        return f"⚠️ {reason_code}: {identity}; manual audit is required."
+    if reason_code == STANDARD_ONLY_PLAN_CREATED_DELIVERY_FAILED:
+        return (
+            f"⚠️ {reason_code}: {identity}; canonical plan was saved, but the "
+            "private admin draft was not delivered. Do not repeat generation "
+            "automatically."
+        )
+    if reason_code.startswith("standard_only_plan_generation_"):
+        return f"⚠️ {reason_code}: {identity}; canonical plan was not persisted."
+    return "⚠️ Standard-only maintenance did not complete; no automatic retry."
+
+
+def standard_only_plan_idempotency_status(
+    user_id: int,
+    plan: editorial_orchestrator.EditorialPlan,
+) -> str:
+    """Classify persisted state before the maintenance route may call a model."""
+    try:
+        editorial_orchestrator.validate_plan(plan)
+    except (TypeError, ValueError):
+        return standard_only_plan_result(
+            STANDARD_ONLY_PLAN_IDENTITY_CONFLICT, plan.plan_id
+        )
+    if plan.production_policy != editorial_orchestrator.EditorialPlanPolicy.STANDARD_ONLY:
+        return standard_only_plan_result(
+            STANDARD_ONLY_PLAN_IDENTITY_CONFLICT, plan.plan_id
+        )
+
+    full_records: List[editorial_orchestrator.EditorialPlan] = []
+    identity_conflict = False
+    try:
+        rows = memory.get_standard_only_plan_records(user_id, plan.plan_id)
+        release_event = memory.get_editorial_release_event_read_only(
+            user_id, plan.plan_id, plan.platform
+        )
+    except memory.StandardOnlyPlanQueryError:
+        return standard_only_plan_result(
+            STANDARD_ONLY_PLAN_IDENTITY_CONFLICT, plan.plan_id
+        )
+    expected_payload = plan.to_dict()
+    for row in rows:
+        payload = row.get("editorial_plan")
+        row_plan_id = str(row.get("plan_id") or "")
+        malformed = bool(row.get("editorial_plan_malformed"))
+        payload_source_ref = (
+            str(payload.get("source_ref") or "") if isinstance(payload, dict) else ""
+        )
+        if malformed:
+            identity_conflict = True
+            continue
+        if row_plan_id != plan.plan_id and payload_source_ref != plan.source_ref:
+            continue
+        if not isinstance(payload, dict) or not payload:
+            identity_conflict = True
+            continue
+        try:
+            stored = editorial_orchestrator.EditorialPlan.from_dict(payload)
+        except (TypeError, ValueError):
+            identity_conflict = True
+            continue
+        if (
+            row_plan_id != plan.plan_id
+            or stored.to_dict() != expected_payload
+        ):
+            identity_conflict = True
+            continue
+        full_records.append(stored)
+
+    if identity_conflict or len(full_records) > 1:
+        return standard_only_plan_result(
+            STANDARD_ONLY_PLAN_IDENTITY_CONFLICT, plan.plan_id
+        )
+    if len(full_records) == 1:
+        return standard_only_plan_result(
+            STANDARD_ONLY_PLAN_ALREADY_EXISTS, plan.plan_id
+        )
+    if release_event is not None:
+        return standard_only_plan_result(
+            STANDARD_ONLY_PLAN_PARTIAL_EXISTING, plan.plan_id
+        )
+    return standard_only_plan_result(STANDARD_ONLY_PLAN_CREATE_ALLOWED, plan.plan_id)
+
+
 async def process_agent_content_date(
     bot,
     user_id: int,
@@ -4466,7 +4584,17 @@ async def process_agent_content_date(
     *,
     force: bool = False,
     publish: bool = False,
+    production_policy: str = editorial_orchestrator.EditorialPlanPolicy.AUTO,
 ) -> str:
+    production_policy = editorial_orchestrator.EditorialPlanPolicy.normalize(
+        production_policy
+    )
+    standard_only = (
+        production_policy
+        == editorial_orchestrator.EditorialPlanPolicy.STANDARD_ONLY
+    )
+    if standard_only and publish:
+        return standard_only_plan_result(STANDARD_ONLY_PLAN_IDENTITY_CONFLICT)
     if not agent_content_source_dirs_for_date(date_text):
         return f"⚠️ Agent Content: нет папки за {date_text}."
 
@@ -4509,18 +4637,43 @@ async def process_agent_content_date(
         ),
         source_rows=(source_row,),
         character=character,
+        production_policy=production_policy,
+        source_metadata={
+            source_ref: {
+                "project": AGENT_CONTENT_PROJECT,
+                "date": resolved_date,
+            }
+        },
     )
-    memory.update_editorial_release_event(
-        user_id=user_id,
-        plan_id=plan.plan_id,
-        platform="telegram",
-        slot=plan.slot,
-        slot_captured_at=memory.utc_now(),
-        generation_package_status="not_run",
-        image_qa_status="not_run",
-        history_commit_status="pending" if publish else "not_run",
-    )
-    if NAZ_CHARACTER_REELS_MODE != "off":
+    if standard_only:
+        lock_key = (int(user_id), str(resolved_date))
+        lock = STANDARD_ONLY_PLAN_LOCKS.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            idempotency_status = standard_only_plan_idempotency_status(user_id, plan)
+            if idempotency_status != STANDARD_ONLY_PLAN_CREATE_ALLOWED:
+                return idempotency_status
+            memory.update_editorial_release_event(
+                user_id=user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                slot=plan.slot,
+                slot_captured_at=memory.utc_now(),
+                generation_package_status="not_run",
+                image_qa_status="not_run",
+                history_commit_status="not_run",
+            )
+    else:
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            slot=plan.slot,
+            slot_captured_at=memory.utc_now(),
+            generation_package_status="not_run",
+            image_qa_status="not_run",
+            history_commit_status="pending" if publish else "not_run",
+        )
+    if not standard_only and NAZ_CHARACTER_REELS_MODE != "off":
         try:
             operator_event_batch = await asyncio.to_thread(
                 operator_events.bind_plan_to_operator_events,
@@ -4626,6 +4779,10 @@ async def process_agent_content_date(
             generation_package_status="invalid",
             history_commit_status="not_run",
         )
+        if standard_only:
+            return standard_only_plan_result(
+                "standard_only_plan_generation_invalid", plan.plan_id
+            )
         await notify_admin(
             bot,
             f"⚠️ Agent Content {resolved_date}: модель дважды вернула технически непригодный пакет. Черновик и публичный DIAG не созданы.",
@@ -4639,11 +4796,31 @@ async def process_agent_content_date(
             generation_package_status="rejected",
             history_commit_status="not_run",
         )
+        if standard_only:
+            return standard_only_plan_result(
+                "standard_only_plan_generation_rejected", plan.plan_id
+            )
         await notify_admin(
             bot,
             f"⚠️ Agent Content {resolved_date}: локальная quality-проверка отклонила пакет ({exc}). История не изменена.",
         )
         return f"⚠️ Agent Content {resolved_date}: local quality reject."
+    except Exception:  # noqa: BLE001 - the identity must remain fail-closed
+        if not standard_only:
+            raise
+        memory.update_editorial_release_event(
+            user_id=user_id,
+            plan_id=plan.plan_id,
+            platform="telegram",
+            generation_package_status="unavailable",
+            history_commit_status="not_run",
+        )
+        logger.exception(
+            "STANDARD_ONLY generation unavailable | plan_id=%s", plan.plan_id
+        )
+        return standard_only_plan_result(
+            "standard_only_plan_generation_unavailable", plan.plan_id
+        )
 
     plan_dict = plan.to_dict()
     memory.update_editorial_release_event(
@@ -4657,7 +4834,11 @@ async def process_agent_content_date(
         memory.save_generated_post(
             user_id=user_id,
             expert_mode=get_user_expert_mode(user_id),
-            task="agent_content_editor",
+            task=(
+                "agent_content_standard_only"
+                if standard_only
+                else "agent_content_editor"
+            ),
             topic=plan.topic,
             content=package.final_text,
             image_count=0,
@@ -4667,17 +4848,47 @@ async def process_agent_content_date(
             plan_id=plan.plan_id,
             editorial_plan=plan_dict,
         )
-        await notify_admin_generated(
-            bot,
-            f"📥 Agent Content {resolved_date}: orchestrated draft готов для plan_id {plan.plan_id}.\n\n"
+        draft_text = (
+            f"📥 Agent Content {resolved_date}: orchestrated draft готов для "
+            f"plan_id {plan.plan_id}.\n\n"
             f"{package.final_text[:3200]}\n\n"
             "Чтобы внести правки — ответь на это сообщение новым текстом. "
-            "Чтобы опубликовать текущую утверждённую версию — ответь на неё командой /publish_revision.",
-            mode="agent_content_sync",
-            topic=plan.topic,
-            source_ref=plan.plan_id,
+            "Чтобы опубликовать текущую утверждённую версию — ответь на неё "
+            "командой /publish_revision."
         )
-        mark_agent_content_seen(resolved_date, manifest_hash)
+        if standard_only:
+            try:
+                await send_generated_text_to_chat(
+                    bot,
+                    user_id,
+                    user_id,
+                    draft_text,
+                    mode="agent_content_standard_only",
+                    topic=plan.topic,
+                    source_ref=plan.plan_id,
+                )
+            except TelegramError as exc:
+                logger.warning(
+                    "STANDARD_ONLY admin draft delivery failed | plan_id=%s | error=%s",
+                    plan.plan_id,
+                    type(exc).__name__,
+                )
+                return standard_only_plan_result(
+                    STANDARD_ONLY_PLAN_CREATED_DELIVERY_FAILED,
+                    plan.plan_id,
+                )
+        else:
+            await notify_admin_generated(
+                bot,
+                draft_text,
+                mode="agent_content_sync",
+                topic=plan.topic,
+                source_ref=plan.plan_id,
+            )
+        if not standard_only:
+            mark_agent_content_seen(resolved_date, manifest_hash)
+        if standard_only:
+            return standard_only_plan_result(STANDARD_ONLY_PLAN_CREATED, plan.plan_id)
         return f"✅ Agent Content {resolved_date}: orchestrated draft imported."
 
     images, _ = await generate_images_with_retries(
@@ -4751,6 +4962,67 @@ async def sync_agent_content_command(update: Update, context: ContextTypes.DEFAU
         publish=AGENT_CONTENT_AUTO_PUBLISH,
     )
     await reply_long(update, result, MAIN_KEYBOARD)
+
+
+def explicit_completed_agent_content_date(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> str:
+    args = tuple(context.args or ())
+    if len(args) != 1 or not AGENT_CONTENT_DATE_PATTERN.fullmatch(str(args[0])):
+        return ""
+    date_text = str(args[0])
+    try:
+        parsed = datetime.strptime(date_text, "%Y-%m-%d").date()
+        current = datetime.now(ZoneInfo(BOT_TIMEZONE)).date()
+    except ValueError:
+        return ""
+    return date_text if parsed < current else ""
+
+
+async def sync_agent_content_standard_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Create one idempotent admin draft with the standard-only policy."""
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(
+            update,
+            "🔒 standard-only импорт доступен только админу.",
+            MAIN_KEYBOARD,
+        )
+        return
+    date_text = explicit_completed_agent_content_date(context)
+    if not date_text:
+        await reply_long(
+            update,
+            "⚠️ Укажи ровно одну завершённую дату: "
+            "/sync_agent_content_standard YYYY-MM-DD.",
+            MAIN_KEYBOARD,
+        )
+        return
+
+    try:
+        result = await process_agent_content_date(
+            context.bot,
+            update.effective_user.id,
+            date_text,
+            force=True,
+            publish=False,
+            production_policy=(
+                editorial_orchestrator.EditorialPlanPolicy.STANDARD_ONLY
+            ),
+        )
+    except Exception:  # noqa: BLE001 - never expose model or persistence details
+        logger.exception("standard-only Agent Content command failed")
+        result = "standard_only_plan_generation_unavailable"
+    if result != STANDARD_ONLY_PLAN_CREATED:
+        await reply_long(
+            update,
+            standard_only_plan_status_text(result),
+            MAIN_KEYBOARD,
+        )
 
 
 async def imagepost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7331,6 +7603,8 @@ def scheduled_plan(
     crosspost_plan_id: str = "",
     persona_rubric_rows: Optional[Iterable[Dict[str, Any]]] = None,
     persona_source_rows: Optional[Iterable[Dict[str, Any]]] = None,
+    production_policy: str = editorial_orchestrator.EditorialPlanPolicy.AUTO,
+    source_metadata: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> editorial_orchestrator.EditorialPlan:
     """The sole creative decision entrypoint for scheduled Naz routes."""
     rubric_rows = tuple(rubric_rows)
@@ -7358,6 +7632,20 @@ def scheduled_plan(
         crosspost_plan_id=crosspost_plan_id,
         persona_rubric_rows=persona_rubric_rows,
         persona_source_rows=persona_source_rows,
+    )
+    normalized_source_metadata = {
+        str(source_ref): {
+            "project": str(metadata.get("project") or ""),
+            "date": str(metadata.get("date") or ""),
+        }
+        for source_ref, metadata in (source_metadata or {}).items()
+    }
+    context = replace(
+        context,
+        production_policy=editorial_orchestrator.EditorialPlanPolicy.normalize(
+            production_policy
+        ),
+        source_metadata=normalized_source_metadata,
     )
     return editorial_orchestrator.plan_release(context)
 
@@ -8605,6 +8893,7 @@ def help_commands_text() -> str:
         "Content-agent:\n"
         "/agent_content [YYYY-MM-DD] [фокус] — редакторский пакет из inbox; без даты берёт случайный день\n"
         "/sync_agent_content [YYYY-MM-DD] — срочно перечитать папку дня и импортировать draft\n"
+        "/sync_agent_content_standard YYYY-MM-DD — создать один standard-only admin draft\n"
         "/publish_agent_content [YYYY-MM-DD] [фокус] — опубликовать безопасный Telegram-пост\n\n"
         "Админ:\n"
         "/stats — статистика"
@@ -8729,6 +9018,11 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("publish_source", publish_source_command))
     application.add_handler(CommandHandler("agent_content", agent_content_command))
     application.add_handler(CommandHandler("sync_agent_content", sync_agent_content_command))
+    application.add_handler(
+        CommandHandler(
+            "sync_agent_content_standard", sync_agent_content_standard_command
+        )
+    )
     application.add_handler(CommandHandler("publish_agent_content", publish_agent_content_command))
     application.add_handler(CommandHandler("publish_revision", publish_revision_command))
 

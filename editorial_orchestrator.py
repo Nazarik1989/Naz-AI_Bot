@@ -50,6 +50,27 @@ class GenerationPackageError(ValueError):
     """A model response is technically invalid and may be retried once."""
 
 
+class EditorialPlanPolicy:
+    """Supported immutable production policies for editorial planning."""
+
+    AUTO = "auto"
+    STANDARD_ONLY = "standard_only"
+    STANDARD_ONLY_IDENTITY = "standard_only-v1"
+    VALUES = frozenset({AUTO, STANDARD_ONLY})
+
+    @classmethod
+    def normalize(cls, value: object) -> str:
+        normalized = str(value).strip().casefold()
+        if normalized not in cls.VALUES:
+            raise EditorialPlanError("unknown editorial production policy")
+        return normalized
+
+    @classmethod
+    def identity_marker(cls, value: object) -> str:
+        normalized = cls.normalize(value)
+        return cls.AUTO if normalized == cls.AUTO else cls.STANDARD_ONLY_IDENTITY
+
+
 @dataclass(frozen=True, slots=True)
 class EditorialSource:
     source_ref: str
@@ -92,6 +113,8 @@ class EditorialContext:
     preferred: Mapping[str, str] = field(default_factory=dict)
     policy_versions: Mapping[str, str] = field(default_factory=dict)
     crosspost_plan_id: str = ""
+    production_policy: str = EditorialPlanPolicy.AUTO
+    source_metadata: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +157,9 @@ class EditorialPlan:
     content_policy_version: str
     visual_policy_version: str
     music_policy_version: str
+    production_policy: str = EditorialPlanPolicy.AUTO
+    source_project: str = ""
+    source_date: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -144,7 +170,15 @@ class EditorialPlan:
     def from_dict(cls, value: Mapping[str, Any]) -> "EditorialPlan":
         payload = dict(value)
         payload["track_tags"] = tuple(str(item) for item in payload.get("track_tags", ()))
-        return cls(**payload)
+        payload.setdefault("production_policy", EditorialPlanPolicy.AUTO)
+        payload.setdefault("source_project", "")
+        payload.setdefault("source_date", "")
+        payload["production_policy"] = EditorialPlanPolicy.normalize(
+            payload["production_policy"]
+        )
+        plan = cls(**payload)
+        validate_plan(plan)
+        return plan
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,8 +254,15 @@ def _choose(
 
 
 def _plan_id(context: EditorialContext) -> str:
+    production_policy = EditorialPlanPolicy.normalize(context.production_policy)
     if context.crosspost_plan_id:
-        return context.crosspost_plan_id
+        if production_policy == EditorialPlanPolicy.AUTO:
+            return context.crosspost_plan_id
+        identity = (
+            f"{context.crosspost_plan_id}|production-policy:"
+            f"{EditorialPlanPolicy.identity_marker(production_policy)}"
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
     identity = "|".join(
         (
             ORCHESTRATOR_VERSION,
@@ -231,6 +272,11 @@ def _plan_id(context: EditorialContext) -> str:
             context.seed,
         )
     )
+    if production_policy != EditorialPlanPolicy.AUTO:
+        identity += (
+            "|production-policy:"
+            + EditorialPlanPolicy.identity_marker(production_policy)
+        )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
@@ -275,6 +321,7 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         raise EditorialPlanError("unknown persona")
     if context.platform not in {"telegram", "vk"}:
         raise EditorialPlanError("unsupported scheduled platform")
+    production_policy = EditorialPlanPolicy.normalize(context.production_policy)
     history = tuple(context.published_history[-PUBLISHED_HISTORY_LIMIT:])
     plan_id = _plan_id(context)
     compatible_rubrics = [
@@ -314,7 +361,11 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
     source = next(item for item in sources if item.source_ref == source_ref)
 
     selected: dict[str, str] = {}
-    story_first = context.persona == "naz" and story_first_eligible(source)
+    story_first = (
+        production_policy == EditorialPlanPolicy.AUTO
+        and context.persona == "naz"
+        and story_first_eligible(source)
+    )
     selected["content_format"] = _choose(
         plan_id=plan_id,
         axis="content_format",
@@ -392,6 +443,7 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         for item in selected.pop("track_tags").split(",")
         if item.strip()
     )
+    source_metadata = context.source_metadata.get(source.source_ref, {})
     plan = EditorialPlan(
         plan_id=plan_id,
         persona=context.persona,
@@ -408,6 +460,9 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         content_policy_version=str(context.policy_versions.get("content", "content-v1")),
         visual_policy_version=str(context.policy_versions.get("visual", "visual-v1")),
         music_policy_version=str(context.policy_versions.get("music", "music-v1")),
+        production_policy=production_policy,
+        source_project=str(source_metadata.get("project", "")),
+        source_date=str(source_metadata.get("date", "")),
         **selected,
     )
     validate_plan(plan)
@@ -415,8 +470,13 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
 
 
 def validate_plan(plan: EditorialPlan) -> None:
+    production_policy = EditorialPlanPolicy.normalize(plan.production_policy)
     if not plan.plan_id or not plan.source_ref or not plan.topic:
         raise EditorialPlanError("plan identity and source are required")
+    if production_policy == EditorialPlanPolicy.STANDARD_ONLY and (
+        plan.production_mode != "standard" or plan.content_format != "text_post"
+    ):
+        raise EditorialPlanError("standard-only plan must use standard text production")
     if not plan.visual_subject_direction or not plan.visual_relation:
         raise EditorialPlanError("visual subject and thesis relation are required")
     visual = f"{plan.visual_subject_direction} {plan.visual_relation}".casefold()
