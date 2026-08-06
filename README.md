@@ -202,3 +202,11 @@ Voice, image, publishing and cross-agent features are optional and should be ena
 Active development. The current main branch includes project-first Relay intake, deterministic Editorial Orchestrator routing, versioned post/image drafts, approval-gated Story/Reels production, memory, voice/image integrations, delegated contacts, NAZ × VOID exchange and the isolated VK queue pipeline. The relevant portfolio audit passed 154 tests with one local multimedia test skipped because FFmpeg was unavailable on the review machine (2026-07-25).
 
 Built by [Nazar Zykov](https://github.com/Nazarik1989).
+
+---
+
+## Naz AI Lab
+
+This project is part of [Naz AI Lab](https://naz-ai-lab.ru/) — the digital laboratory of [Nazar Zykov](https://naz-ai-lab.ru/creator/).
+
+[Official project page](https://naz-ai-lab.ru/projects/naz-ai-bot/) · [All Naz AI Lab projects](https://naz-ai-lab.ru/projects/)
