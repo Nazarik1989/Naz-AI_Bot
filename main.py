@@ -76,6 +76,7 @@ import scheduled_work
 import semantic_autopost
 import story_production
 import story_pack_control
+import reels_failure_quarantine
 import visual_archive
 import vk_publish_queue
 from prompts import (
@@ -4363,6 +4364,114 @@ def mark_agent_content_seen(date_text: str, manifest_hash: str) -> None:
     write_json_file(AGENT_CONTENT_STATE_FILE, seen)
 
 
+def reels_quarantine_policy() -> reels_failure_quarantine.QuarantinePathPolicy:
+    """Resolve the three non-overlapping quarantine roots for one local transaction."""
+    return reels_failure_quarantine.default_path_policy(AGENT_CONTENT_INBOX)
+
+
+AGENT_CONTENT_ROUTE_OFF = "off"
+AGENT_CONTENT_ROUTE_MANUAL = "manual"
+AGENT_CONTENT_ROUTE_SHADOW = "shadow"
+AGENT_CONTENT_ROUTE_PRODUCING = "producing"
+AGENT_CONTENT_ROUTE_MODES = frozenset({
+    AGENT_CONTENT_ROUTE_OFF,
+    AGENT_CONTENT_ROUTE_MANUAL,
+    AGENT_CONTENT_ROUTE_SHADOW,
+    AGENT_CONTENT_ROUTE_PRODUCING,
+})
+
+
+@dataclass(slots=True)
+class AgentContentAttemptLifecycle:
+    policy: reels_failure_quarantine.QuarantinePathPolicy | None = None
+    claim: reels_failure_quarantine.AttemptClaim | None = None
+
+    def activate(
+        self,
+        policy: reels_failure_quarantine.QuarantinePathPolicy,
+        claim: reels_failure_quarantine.AttemptClaim,
+    ) -> None:
+        if self.claim is not None:
+            raise RuntimeError("agent_content_attempt_already_active")
+        self.policy = policy
+        self.claim = claim
+
+    def clear(self, claim: reels_failure_quarantine.AttemptClaim) -> None:
+        if self.claim == claim:
+            self.policy = None
+            self.claim = None
+
+    def finalize_active(self) -> bool:
+        policy = self.policy
+        claim = self.claim
+        if policy is None or claim is None:
+            return True
+        try:
+            reels_failure_quarantine.finalize_cancelled_attempt(policy, claim)
+        except reels_failure_quarantine.QuarantineError as exc:
+            logger.warning(
+                "Reels attempt cleanup failed | reason=%s",
+                exc.reason_code,
+            )
+            return False
+        self.clear(claim)
+        return True
+
+
+def classify_agent_content_route(
+    *,
+    production_policy: str,
+    character_reels_mode: str,
+    source: editorial_orchestrator.EditorialSource,
+) -> str:
+    """Choose the route without consulting quarantine or creating a plan."""
+    normalized_policy = editorial_orchestrator.EditorialPlanPolicy.normalize(
+        production_policy
+    )
+    normalized_mode = operator_events.normalize_character_reels_mode(
+        character_reels_mode
+    )
+    if (
+        normalized_policy
+        == editorial_orchestrator.EditorialPlanPolicy.STANDARD_ONLY
+        or editorial_orchestrator.story_first_eligible(source)
+    ):
+        return AGENT_CONTENT_ROUTE_PRODUCING
+    return normalized_mode
+
+
+async def finalize_reels_quarantine_notification(
+    bot,
+    policy: reels_failure_quarantine.QuarantinePathPolicy,
+    claim: reels_failure_quarantine.NotificationClaim,
+    text: str,
+) -> None:
+    """Attempt one privacy-safe notification and durably finalize its claim."""
+    outcome = reels_failure_quarantine.NOTIFICATION_SENT
+    try:
+        await notify_admin(bot, text)
+    except Exception as exc:  # noqa: BLE001 - external boundary is recorded safely
+        outcome = reels_failure_quarantine.NOTIFICATION_FAILED
+        logger.warning(
+            "Reels quarantine notification failed | kind=%s | error=%s",
+            claim.kind,
+            type(exc).__name__,
+        )
+    try:
+        await asyncio.to_thread(
+            reels_failure_quarantine.finalize_notification,
+            policy,
+            claim.notification_id,
+            outcome,
+        )
+    except reels_failure_quarantine.QuarantineError as exc:
+        logger.warning(
+            "Reels quarantine notification finalize failed | kind=%s | reason=%s",
+            claim.kind,
+            exc.reason_code,
+        )
+
+
 def current_bot_date() -> str:
     return datetime.now(ZoneInfo(BOT_TIMEZONE)).date().isoformat()
 
@@ -4577,7 +4686,190 @@ def standard_only_plan_idempotency_status(
     return standard_only_plan_result(STANDARD_ONLY_PLAN_CREATE_ALLOWED, plan.plan_id)
 
 
-async def process_agent_content_date(
+async def process_standard_only_agent_content_plan(
+    bot,
+    user_id: int,
+    resolved_date: str,
+    *,
+    policy: reels_failure_quarantine.QuarantinePathPolicy,
+    candidate: reels_failure_quarantine.EligibleCandidate,
+    plan: editorial_orchestrator.EditorialPlan,
+    character: naz_character.CharacterState,
+    safe_context: str,
+    attempt_lifecycle: AgentContentAttemptLifecycle,
+) -> str:
+    """Run standard-only generation behind identity-before-claim ordering."""
+    lock_key = (int(user_id), str(resolved_date))
+    lock = STANDARD_ONLY_PLAN_LOCKS.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        idempotency_status = standard_only_plan_idempotency_status(user_id, plan)
+        if idempotency_status != STANDARD_ONLY_PLAN_CREATE_ALLOWED:
+            return idempotency_status
+
+        quarantine_claim = reels_failure_quarantine.claim_ready_candidate(
+            policy,
+            candidate=candidate,
+        )
+        if quarantine_claim is None:
+            # Another process may have won the durable claim between the
+            # read-only identity check and this mutation.  Re-read persisted
+            # standard-only state, then fail closed if it is not visible yet.
+            idempotency_status = standard_only_plan_idempotency_status(user_id, plan)
+            if idempotency_status != STANDARD_ONLY_PLAN_CREATE_ALLOWED:
+                return idempotency_status
+            return standard_only_plan_result(
+                STANDARD_ONLY_PLAN_PARTIAL_EXISTING,
+                plan.plan_id,
+            )
+        attempt_lifecycle.activate(policy, quarantine_claim)
+        try:
+            # Close the database race after winning the durable claim.  This
+            # is the same canonical preflight, not a quarantine reimplementation.
+            idempotency_status = standard_only_plan_idempotency_status(user_id, plan)
+            if idempotency_status != STANDARD_ONLY_PLAN_CREATE_ALLOWED:
+                return idempotency_status
+
+            memory.update_editorial_release_event(
+                user_id=user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                slot=plan.slot,
+                slot_captured_at=memory.utc_now(),
+                generation_package_status="not_run",
+                image_qa_status="not_run",
+                history_commit_status="not_run",
+            )
+
+            try:
+                package = await generate_scheduled_package(
+                    plan,
+                    character,
+                    source_material=safe_context,
+                )
+            except ScheduledTechnicalFailure:
+                memory.update_editorial_release_event(
+                    user_id=user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    generation_package_status="invalid",
+                    history_commit_status="not_run",
+                )
+                return standard_only_plan_result(
+                    "standard_only_plan_generation_invalid",
+                    plan.plan_id,
+                )
+            except ScheduledContentReject:
+                memory.update_editorial_release_event(
+                    user_id=user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    generation_package_status="rejected",
+                    history_commit_status="not_run",
+                )
+                return standard_only_plan_result(
+                    "standard_only_plan_generation_rejected",
+                    plan.plan_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - partial identity is durable and fail-closed
+                memory.update_editorial_release_event(
+                    user_id=user_id,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    generation_package_status="unavailable",
+                    history_commit_status="not_run",
+                )
+                logger.exception(
+                    "STANDARD_ONLY generation unavailable | plan_id=%s",
+                    plan.plan_id,
+                )
+                return standard_only_plan_result(
+                    "standard_only_plan_generation_unavailable",
+                    plan.plan_id,
+                )
+
+            plan_dict = plan.to_dict()
+            memory.update_editorial_release_event(
+                user_id=user_id,
+                plan_id=plan.plan_id,
+                platform="telegram",
+                generation_package_status="accepted",
+                image_qa_status="not_run",
+            )
+            memory.save_generated_post(
+                user_id=user_id,
+                expert_mode=get_user_expert_mode(user_id),
+                task="agent_content_standard_only",
+                topic=plan.topic,
+                content=package.final_text,
+                image_count=0,
+                published_to_channel=False,
+                semantic_theme=plan.semantic_theme,
+                semantic_card=plan.semantic_card,
+                plan_id=plan.plan_id,
+                editorial_plan=plan_dict,
+            )
+
+            # The canonical plan, not Telegram delivery, is the durable success
+            # boundary.  Finalize before the best-effort private send.
+            reels_failure_quarantine.mark_attempt_consumed(
+                policy,
+                quarantine_claim,
+            )
+            attempt_lifecycle.clear(quarantine_claim)
+            quarantine_claim = None
+
+            draft_text = (
+                f"рџ“Ґ Agent Content {resolved_date}: orchestrated draft РіРѕС‚РѕРІ РґР»СЏ "
+                f"plan_id {plan.plan_id}.\n\n"
+                f"{package.final_text[:3200]}\n\n"
+                "Р§С‚РѕР±С‹ РІРЅРµСЃС‚Рё РїСЂР°РІРєРё вЂ” РѕС‚РІРµС‚СЊ РЅР° СЌС‚Рѕ СЃРѕРѕР±С‰РµРЅРёРµ РЅРѕРІС‹Рј С‚РµРєСЃС‚РѕРј. "
+                "Р§С‚РѕР±С‹ РѕРїСѓР±Р»РёРєРѕРІР°С‚СЊ С‚РµРєСѓС‰СѓСЋ СѓС‚РІРµСЂР¶РґС‘РЅРЅСѓСЋ РІРµСЂСЃРёСЋ вЂ” РѕС‚РІРµС‚СЊ РЅР° РЅРµС‘ "
+                "РєРѕРјР°РЅРґРѕР№ /publish_revision."
+            )
+            try:
+                await send_generated_text_to_chat(
+                    bot,
+                    user_id,
+                    user_id,
+                    draft_text,
+                    mode="agent_content_standard_only",
+                    topic=plan.topic,
+                    source_ref=plan.plan_id,
+                )
+            except TelegramError as exc:
+                logger.warning(
+                    "STANDARD_ONLY admin draft delivery failed | plan_id=%s | error=%s",
+                    plan.plan_id,
+                    type(exc).__name__,
+                )
+                return standard_only_plan_result(
+                    STANDARD_ONLY_PLAN_CREATED_DELIVERY_FAILED,
+                    plan.plan_id,
+                )
+            return standard_only_plan_result(STANDARD_ONLY_PLAN_CREATED, plan.plan_id)
+        finally:
+            if quarantine_claim is not None:
+                idempotency_status = standard_only_plan_idempotency_status(
+                    user_id,
+                    plan,
+                )
+                if idempotency_status == STANDARD_ONLY_PLAN_ALREADY_EXISTS:
+                    try:
+                        reels_failure_quarantine.mark_attempt_consumed(
+                            policy,
+                            quarantine_claim,
+                        )
+                    except reels_failure_quarantine.QuarantineError:
+                        attempt_lifecycle.finalize_active()
+                    else:
+                        attempt_lifecycle.clear(quarantine_claim)
+                else:
+                    attempt_lifecycle.finalize_active()
+
+
+async def _process_agent_content_date(
     bot,
     user_id: int,
     date_text: str,
@@ -4585,6 +4877,8 @@ async def process_agent_content_date(
     force: bool = False,
     publish: bool = False,
     production_policy: str = editorial_orchestrator.EditorialPlanPolicy.AUTO,
+    eligible_candidate: reels_failure_quarantine.EligibleCandidate | None = None,
+    attempt_lifecycle: AgentContentAttemptLifecycle,
 ) -> str:
     production_policy = editorial_orchestrator.EditorialPlanPolicy.normalize(
         production_policy
@@ -4595,32 +4889,114 @@ async def process_agent_content_date(
     )
     if standard_only and publish:
         return standard_only_plan_result(STANDARD_ONLY_PLAN_IDENTITY_CONFLICT)
-    if not agent_content_source_dirs_for_date(date_text):
+
+    route_source_dirs = agent_content_source_dirs_for_date(date_text)
+    route_safe_context, route_risks, route_resolved_date = (
+        collect_project_first_agent_materials(
+            date_text,
+            "ежедневный импорт content-agent",
+            route_source_dirs,
+        )
+    )
+    route_manifest_hash = _agent_content_hash_for_dirs(date_text, route_source_dirs)
+    route_source_ref = f"agent_content:{route_resolved_date}:{route_manifest_hash}"
+    route_source_row = chronicle_source_row(
+        source_ref=route_source_ref,
+        safe_context=route_safe_context,
+        risks=route_risks,
+        topic=f"рабочая хроника Naz {route_resolved_date}",
+    )
+    route_source = editorial_orchestrator.EditorialSource(**route_source_row)
+    route_mode = classify_agent_content_route(
+        production_policy=production_policy,
+        character_reels_mode=NAZ_CHARACTER_REELS_MODE,
+        source=route_source,
+    )
+    try:
+        policy = (
+            reels_quarantine_policy()
+            if route_mode == AGENT_CONTENT_ROUTE_PRODUCING
+            else None
+        )
+        candidate = eligible_candidate
+        if route_mode != AGENT_CONTENT_ROUTE_PRODUCING:
+            candidate = None
+        elif standard_only:
+            validated_candidate = await asyncio.to_thread(
+                reels_failure_quarantine.select_idempotency_candidate,
+                policy,
+                project_name=AGENT_CONTENT_PROJECT,
+                date_text=date_text,
+            )
+            if candidate is None:
+                candidate = validated_candidate
+            elif candidate != validated_candidate:
+                candidate = None
+        else:
+            validated_candidate = await asyncio.to_thread(
+                reels_failure_quarantine.select_ready_candidate,
+                policy,
+                project_name=AGENT_CONTENT_PROJECT,
+                date_text=date_text,
+            )
+            if candidate is None:
+                candidate = validated_candidate
+            elif candidate != validated_candidate:
+                candidate = None
+        if standard_only and (
+            type(candidate) is not reels_failure_quarantine.EligibleCandidate
+            or candidate.date_text != date_text
+        ):
+            return (
+                f"ℹ️ Agent Content {date_text}: material не имеет valid "
+                "narrative_ready eligibility; Reels Maker пропущен."
+            )
+    except reels_failure_quarantine.QuarantineError as exc:
+        logger.warning("Reels eligibility rejected | reason=%s", exc.reason_code)
+        return f"ℹ️ Agent Content {date_text}: Reels eligibility отклонена безопасно."
+
+    # A validated candidate binds reads to one exact source unit. Legacy
+    # non-producing text routes keep their project-first source selection and
+    # never acquire a Reels processing claim.
+    if type(candidate) is reels_failure_quarantine.EligibleCandidate:
+        source_dirs = [policy.inbox_root.joinpath(*candidate.source_ref.split("/"))]
+    else:
+        source_dirs = agent_content_source_dirs_for_date(date_text)
+    if not source_dirs:
         return f"⚠️ Agent Content: нет папки за {date_text}."
 
-    manifest_hash = agent_content_hash_for_date(date_text)
+    manifest_hash = route_manifest_hash
     seen = load_agent_content_seen()
     matching_seen_hash = agent_content_matching_seen_hash(
         date_text, seen.get(date_text, "")
     )
-    if not force and matching_seen_hash:
-        if seen.get(date_text) != matching_seen_hash:
-            mark_agent_content_seen(date_text, matching_seen_hash)
+    if not standard_only and not force and matching_seen_hash == manifest_hash:
+        if seen.get(date_text) != manifest_hash:
+            mark_agent_content_seen(date_text, manifest_hash)
         return f"ℹ️ Agent Content {date_text}: manifest не изменился, пропускаю."
 
-    safe_context, risks, resolved_date = collect_agent_materials(
-        date_text, "ежедневный импорт content-agent"
-    )
+    safe_context = route_safe_context
+    risks = route_risks
+    resolved_date = route_resolved_date
     if not safe_context:
         return f"⚠️ Agent Content: нет безопасных материалов за {date_text}."
     source_ref = f"agent_content:{resolved_date}:{manifest_hash}"
     character = naz_character.apply_event(memory.load_character_state(user_id), "new_topic")
-    source_row = chronicle_source_row(
-        source_ref=source_ref,
-        safe_context=safe_context,
-        risks=risks,
-        topic=f"рабочая хроника Naz {resolved_date}",
+    source_row = route_source_row
+    potential_story_first = (
+        not standard_only
+        and editorial_orchestrator.story_first_eligible(
+            editorial_orchestrator.EditorialSource(**source_row)
+        )
     )
+    if (
+        potential_story_first
+        and type(candidate) is not reels_failure_quarantine.EligibleCandidate
+    ):
+        return (
+            f"ℹ️ Agent Content {date_text}: material не имеет valid "
+            "narrative_ready eligibility; Reels Maker пропущен."
+        )
     plan = scheduled_plan(
         user_id=user_id,
         platform="telegram",
@@ -4646,23 +5022,43 @@ async def process_agent_content_date(
         },
     )
     if standard_only:
-        lock_key = (int(user_id), str(resolved_date))
-        lock = STANDARD_ONLY_PLAN_LOCKS.setdefault(lock_key, asyncio.Lock())
-        async with lock:
-            idempotency_status = standard_only_plan_idempotency_status(user_id, plan)
-            if idempotency_status != STANDARD_ONLY_PLAN_CREATE_ALLOWED:
-                return idempotency_status
-            memory.update_editorial_release_event(
-                user_id=user_id,
-                plan_id=plan.plan_id,
-                platform="telegram",
-                slot=plan.slot,
-                slot_captured_at=memory.utc_now(),
-                generation_package_status="not_run",
-                image_qa_status="not_run",
-                history_commit_status="not_run",
+        return await process_standard_only_agent_content_plan(
+            bot,
+            user_id,
+            resolved_date,
+            policy=policy,
+            candidate=candidate,
+            plan=plan,
+            character=character,
+            safe_context=safe_context,
+            attempt_lifecycle=attempt_lifecycle,
+        )
+    quarantine_claim = None
+    if plan.production_mode == "story_first":
+        if type(candidate) is not reels_failure_quarantine.EligibleCandidate:
+            return (
+                f"ℹ️ Agent Content {date_text}: material не имеет valid "
+                "narrative_ready eligibility; Reels Maker пропущен."
             )
-    else:
+        quarantine_claim = reels_failure_quarantine.claim_ready_candidate(
+            policy,
+            candidate,
+        )
+        if quarantine_claim is None:
+            return (
+                f"ℹ️ Agent Content {date_text}: eligible material уже claimed "
+                "или недоступен."
+            )
+        attempt_lifecycle.activate(policy, quarantine_claim)
+
+    def release_active_claim() -> None:
+        nonlocal quarantine_claim
+        claim = quarantine_claim
+        if claim is None:
+            return
+        if attempt_lifecycle.finalize_active():
+            quarantine_claim = None
+    try:
         memory.update_editorial_release_event(
             user_id=user_id,
             plan_id=plan.plan_id,
@@ -4673,7 +5069,10 @@ async def process_agent_content_date(
             image_qa_status="not_run",
             history_commit_status="pending" if publish else "not_run",
         )
-    if not standard_only and NAZ_CHARACTER_REELS_MODE != "off":
+    except BaseException:
+        release_active_claim()
+        raise
+    if NAZ_CHARACTER_REELS_MODE != "off":
         try:
             operator_event_batch = await asyncio.to_thread(
                 operator_events.bind_plan_to_operator_events,
@@ -4722,6 +5121,9 @@ async def process_agent_content_date(
                 safe_facts,
                 director_treatment,
             )
+        except asyncio.CancelledError:
+            release_active_claim()
+            raise
         except (RuntimeError, story_production.StoryPlanError) as exc:
             reason_codes = reels_director_reason_codes(exc)
             reason_code = reels_director_reason_code(exc)
@@ -4739,16 +5141,57 @@ async def process_agent_content_date(
                 ",".join(reason_codes),
                 type(exc).__name__,
             )
-            await notify_admin(
-                bot,
-                f"⚠️ Reels Maker не собрал безопасный режиссёрский план для {resolved_date}. "
-                f"Причина: {reels_director_reason_summary(reason_code)}. "
-                "Рендер не запускался, шаблонная замена не использована.",
-            )
+            try:
+                notification_id = reels_failure_quarantine.mark_attempt_blocked(
+                    policy,
+                    quarantine_claim,
+                    reason_codes,
+                )
+                attempt_lifecycle.clear(quarantine_claim)
+                quarantine_claim = None
+                notification_claim = await asyncio.to_thread(
+                    reels_failure_quarantine.claim_notification,
+                    policy,
+                    notification_id=notification_id,
+                )
+                if notification_claim is not None:
+                    await finalize_reels_quarantine_notification(
+                        bot,
+                        policy,
+                        notification_claim,
+                        "Reels Maker отклонил один narrative-ready материал. "
+                        "Renderer и публикация не запускались.",
+                    )
+            except reels_failure_quarantine.QuarantineError as state_exc:
+                logger.warning(
+                    "Reels rejection state update failed | reason=%s",
+                    state_exc.reason_code,
+                )
+                release_active_claim()
             return f"⚠️ Agent Content {resolved_date}: режиссёрский план отклонён."
-        payload = await asyncio.to_thread(
-            story_production.read_manifest, pack_dir / "story_manifest.json"
-        )
+        except Exception:
+            release_active_claim()
+            raise
+        try:
+            payload = await asyncio.to_thread(
+                story_production.read_manifest, pack_dir / "story_manifest.json"
+            )
+            reels_failure_quarantine.mark_attempt_consumed(
+                policy,
+                quarantine_claim,
+            )
+            attempt_lifecycle.clear(quarantine_claim)
+            quarantine_claim = None
+        except asyncio.CancelledError:
+            release_active_claim()
+            raise
+        except reels_failure_quarantine.QuarantineError as exc:
+            logger.warning("Reels consumed state failed | reason=%s", exc.reason_code)
+            release_active_claim()
+            return f"⚠️ Agent Content {resolved_date}: StoryPack сохранён, registry не подтверждён."
+        except Exception:
+            release_active_claim()
+            raise
         if ADMIN_ID:
             try:
                 await bot.send_message(
@@ -4779,10 +5222,6 @@ async def process_agent_content_date(
             generation_package_status="invalid",
             history_commit_status="not_run",
         )
-        if standard_only:
-            return standard_only_plan_result(
-                "standard_only_plan_generation_invalid", plan.plan_id
-            )
         await notify_admin(
             bot,
             f"⚠️ Agent Content {resolved_date}: модель дважды вернула технически непригодный пакет. Черновик и публичный DIAG не созданы.",
@@ -4796,32 +5235,11 @@ async def process_agent_content_date(
             generation_package_status="rejected",
             history_commit_status="not_run",
         )
-        if standard_only:
-            return standard_only_plan_result(
-                "standard_only_plan_generation_rejected", plan.plan_id
-            )
         await notify_admin(
             bot,
             f"⚠️ Agent Content {resolved_date}: локальная quality-проверка отклонила пакет ({exc}). История не изменена.",
         )
         return f"⚠️ Agent Content {resolved_date}: local quality reject."
-    except Exception:  # noqa: BLE001 - the identity must remain fail-closed
-        if not standard_only:
-            raise
-        memory.update_editorial_release_event(
-            user_id=user_id,
-            plan_id=plan.plan_id,
-            platform="telegram",
-            generation_package_status="unavailable",
-            history_commit_status="not_run",
-        )
-        logger.exception(
-            "STANDARD_ONLY generation unavailable | plan_id=%s", plan.plan_id
-        )
-        return standard_only_plan_result(
-            "standard_only_plan_generation_unavailable", plan.plan_id
-        )
-
     plan_dict = plan.to_dict()
     memory.update_editorial_release_event(
         user_id=user_id,
@@ -4834,11 +5252,7 @@ async def process_agent_content_date(
         memory.save_generated_post(
             user_id=user_id,
             expert_mode=get_user_expert_mode(user_id),
-            task=(
-                "agent_content_standard_only"
-                if standard_only
-                else "agent_content_editor"
-            ),
+            task="agent_content_editor",
             topic=plan.topic,
             content=package.final_text,
             image_count=0,
@@ -4856,39 +5270,26 @@ async def process_agent_content_date(
             "Чтобы опубликовать текущую утверждённую версию — ответь на неё "
             "командой /publish_revision."
         )
-        if standard_only:
+        await notify_admin_generated(
+            bot,
+            draft_text,
+            mode="agent_content_sync",
+            topic=plan.topic,
+            source_ref=plan.plan_id,
+        )
+        if quarantine_claim is not None:
             try:
-                await send_generated_text_to_chat(
-                    bot,
-                    user_id,
-                    user_id,
-                    draft_text,
-                    mode="agent_content_standard_only",
-                    topic=plan.topic,
-                    source_ref=plan.plan_id,
+                reels_failure_quarantine.mark_attempt_consumed(
+                    policy,
+                    quarantine_claim,
                 )
-            except TelegramError as exc:
-                logger.warning(
-                    "STANDARD_ONLY admin draft delivery failed | plan_id=%s | error=%s",
-                    plan.plan_id,
-                    type(exc).__name__,
-                )
-                return standard_only_plan_result(
-                    STANDARD_ONLY_PLAN_CREATED_DELIVERY_FAILED,
-                    plan.plan_id,
-                )
-        else:
-            await notify_admin_generated(
-                bot,
-                draft_text,
-                mode="agent_content_sync",
-                topic=plan.topic,
-                source_ref=plan.plan_id,
-            )
-        if not standard_only:
-            mark_agent_content_seen(resolved_date, manifest_hash)
-        if standard_only:
-            return standard_only_plan_result(STANDARD_ONLY_PLAN_CREATED, plan.plan_id)
+                attempt_lifecycle.clear(quarantine_claim)
+                quarantine_claim = None
+            except reels_failure_quarantine.QuarantineError as exc:
+                logger.warning("Reels consumed state failed | reason=%s", exc.reason_code)
+                release_active_claim()
+                return f"⚠️ Agent Content {resolved_date}: draft сохранён, registry не подтверждён."
+        mark_agent_content_seen(resolved_date, manifest_hash)
         return f"✅ Agent Content {resolved_date}: orchestrated draft imported."
 
     images, _ = await generate_images_with_retries(
@@ -4940,8 +5341,48 @@ async def process_agent_content_date(
     memory.save_character_state(user_id, character)
     memory.apply_character_event(user_id, "publish")
     queue_naz_post_for_void(package.final_text, source="agent_content_auto_publish", topic=plan.topic)
+    if quarantine_claim is not None:
+        try:
+            reels_failure_quarantine.mark_attempt_consumed(
+                policy,
+                quarantine_claim,
+            )
+            attempt_lifecycle.clear(quarantine_claim)
+            quarantine_claim = None
+        except reels_failure_quarantine.QuarantineError as exc:
+            logger.warning("Reels consumed state failed | reason=%s", exc.reason_code)
+            release_active_claim()
+            return f"⚠️ Agent Content {resolved_date}: publication завершена, registry не подтверждён."
     mark_agent_content_seen(resolved_date, manifest_hash)
     return f"✅ Agent Content {resolved_date}: imported and published."
+
+
+async def process_agent_content_date(
+    bot,
+    user_id: int,
+    date_text: str,
+    *,
+    force: bool = False,
+    publish: bool = False,
+    production_policy: str = editorial_orchestrator.EditorialPlanPolicy.AUTO,
+    eligible_candidate: reels_failure_quarantine.EligibleCandidate | None = None,
+) -> str:
+    """Run one route with exact synchronous cleanup around every active claim."""
+    # The delegated implementation remains the sole scheduled_plan( boundary.
+    attempt_lifecycle = AgentContentAttemptLifecycle()
+    try:
+        return await _process_agent_content_date(
+            bot,
+            user_id,
+            date_text,
+            force=force,
+            publish=publish,
+            production_policy=production_policy,
+            eligible_candidate=eligible_candidate,
+            attempt_lifecycle=attempt_lifecycle,
+        )
+    finally:
+        attempt_lifecycle.finalize_active()
 
 
 async def sync_agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4952,7 +5393,26 @@ async def sync_agent_content_command(update: Update, context: ContextTypes.DEFAU
         return
 
     date_hint, _ = parse_agent_content_args(context)
-    date_text = date_hint or choose_agent_content_date_for_sync()
+    try:
+        policy = reels_quarantine_policy()
+        await asyncio.to_thread(
+            reels_failure_quarantine.reconcile_complete_backlog,
+            policy,
+        )
+        candidate = await asyncio.to_thread(
+            reels_failure_quarantine.select_ready_candidate,
+            policy,
+            project_name=AGENT_CONTENT_PROJECT,
+            date_text=date_hint,
+        )
+    except reels_failure_quarantine.QuarantineError as exc:
+        logger.warning("AGENT_CONTENT_COMMAND blocked | reason=%s", exc.reason_code)
+        await reply_long(update, "⚠️ Agent Content registry/eligibility не прошли безопасную проверку.", MAIN_KEYBOARD)
+        return
+    if candidate is None:
+        await reply_long(update, "ℹ️ Нет eligible narrative-ready Agent Content; Reels Maker не запускался.", MAIN_KEYBOARD)
+        return
+    date_text = candidate.date_text
     await reply_long(update, f"📥 Проверяю Agent Content за {date_text}...")
     result = await process_agent_content_date(
         context.bot,
@@ -4960,6 +5420,7 @@ async def sync_agent_content_command(update: Update, context: ContextTypes.DEFAU
         date_text,
         force=True,
         publish=AGENT_CONTENT_AUTO_PUBLISH,
+        eligible_candidate=candidate,
     )
     await reply_long(update, result, MAIN_KEYBOARD)
 
@@ -8460,25 +8921,72 @@ async def source_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @scheduled_work_marker("agent_content_sync")
 async def agent_content_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_user_id = ADMIN_ID or 0
-    if not admin_user_id:
-        logger.warning("AGENT_CONTENT_SYNC skipped: ADMIN_ID empty")
+    try:
+        policy = reels_quarantine_policy()
+        reconciliation = await asyncio.to_thread(
+            reels_failure_quarantine.reconcile_complete_backlog,
+            policy,
+        )
+    except reels_failure_quarantine.QuarantineError as exc:
+        logger.warning("AGENT_CONTENT_QUARANTINE blocked | reason=%s", exc.reason_code)
+        return
+    except Exception as exc:  # noqa: BLE001 - fail closed before date selection
+        logger.warning(
+            "AGENT_CONTENT_QUARANTINE failed safely | error=%s",
+            type(exc).__name__,
+        )
         return
 
-    date_text = choose_agent_content_date_for_sync() if AGENT_CONTENT_RANDOM_SYNC else current_bot_date()
-    logger.info("AGENT_CONTENT_SYNC started | date=%s | random=%s", date_text, AGENT_CONTENT_RANDOM_SYNC)
+    admin_user_id = ADMIN_ID or 0
+    if not admin_user_id:
+        logger.warning(
+            "AGENT_CONTENT_SYNC skipped: ADMIN_ID empty | discovered=%s | raw=%s",
+            reconciliation.discovered_count,
+            reconciliation.raw_count,
+        )
+        return
+
     try:
+        notification_claim = await asyncio.to_thread(
+            reels_failure_quarantine.claim_notification,
+            policy,
+            kind=reels_failure_quarantine.RAW_AGGREGATE_KIND,
+        )
+        if notification_claim is not None:
+            await finalize_reels_quarantine_notification(
+                context.bot,
+                policy,
+                notification_claim,
+                f"{reconciliation.raw_count} материалов ожидают Narrative Normalizer. "
+                "Для этих raw-материалов Reels Maker и Renderer не запускались.",
+            )
+        candidate = await asyncio.to_thread(
+            reels_failure_quarantine.select_ready_candidate,
+            policy,
+            project_name=AGENT_CONTENT_PROJECT,
+        )
+        if candidate is None:
+            logger.info(
+                "AGENT_CONTENT_SYNC no eligible narrative-ready candidate | discovered=%s | raw=%s",
+                reconciliation.discovered_count,
+                reconciliation.raw_count,
+            )
+            return
+        date_text = candidate.date_text
+        logger.info("AGENT_CONTENT_SYNC started | date=%s | source=eligible_registry", date_text)
         result = await process_agent_content_date(
             context.bot,
             admin_user_id,
             date_text,
             force=False,
             publish=AGENT_CONTENT_AUTO_PUBLISH,
+            eligible_candidate=candidate,
         )
         logger.info("AGENT_CONTENT_SYNC done | %s", result)
+    except reels_failure_quarantine.QuarantineError as exc:
+        logger.warning("AGENT_CONTENT_SYNC blocked | reason=%s", exc.reason_code)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("AGENT_CONTENT_SYNC failed: %s", exc)
-        await notify_admin(context.bot, f"⚠️ AGENT_CONTENT_SYNC failed: {type(exc).__name__}: {exc}")
+        logger.warning("AGENT_CONTENT_SYNC failed safely | error=%s", type(exc).__name__)
 
 
 @scheduled_work_marker("story_private_delivery")

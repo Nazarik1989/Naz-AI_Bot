@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import main
 import operator_events
+import reels_failure_quarantine as rq
 
 
 PROJECT = "Naz_AI_Bot_clean"
@@ -134,6 +135,41 @@ class OperatorEventTests(unittest.TestCase):
         )
         return path
 
+    def ready_candidate(self):
+        outbox = self.root / "narrative-outbox"
+        package = outbox / "packages" / f"{DATE}.json"
+        package.parent.mkdir(parents=True, exist_ok=True)
+        package.write_text('{"kind":"narrative"}', encoding="utf-8")
+        manifest = {
+            "schema_version": rq.MANIFEST_SCHEMA_VERSION,
+            "source_ref": f"{PROJECT}/{DATE}",
+            "source_digest": rq.source_digest(self.story_day),
+            "narrative_package_ref": f"packages/{DATE}.json",
+            "narrative_package_digest": rq.narrative_package_digest(package),
+            "status": rq.CLASS_READY,
+            "contract_versions": {
+                "director": "director-v1",
+                "narrative": "narrative-v1",
+            },
+        }
+        (self.story_day / "narrative_ready.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        policy = rq.QuarantinePathPolicy(
+            self.markdown_root,
+            self.root / "quarantine-state" / "registry.json",
+            outbox,
+        )
+        rq.reconcile_complete_backlog(policy)
+        candidate = rq.select_ready_candidate(
+            policy,
+            project_name=PROJECT,
+            date_text=DATE,
+        )
+        self.assertIsNotNone(candidate)
+        return policy, candidate
+
     def bind_batch(self, *, mode="shadow", plan_id=PLAN_ID):
         return operator_events.bind_plan_to_operator_events(
             mode=mode,
@@ -166,6 +202,57 @@ class OperatorEventTests(unittest.TestCase):
         self.assertEqual(result.status, "disabled")
         self.assertEqual(result.discovered_count, 0)
         self.assertFalse(absent.exists())
+
+    def test_agent_content_route_decision_is_pure_closed_and_exact(self):
+        nonproducing = main.editorial_orchestrator.EditorialSource(
+            source_ref="agent_content:fixture",
+            topic="Safe text source",
+            source_type="work_chronicle",
+        )
+        for mode in ("off", "manual", "shadow"):
+            self.assertEqual(
+                main.classify_agent_content_route(
+                    production_policy="auto",
+                    character_reels_mode=mode,
+                    source=nonproducing,
+                ),
+                mode,
+            )
+        self.assertEqual(
+            main.classify_agent_content_route(
+                production_policy="auto",
+                character_reels_mode="unknown",
+                source=nonproducing,
+            ),
+            "off",
+        )
+        producing = main.editorial_orchestrator.EditorialSource(
+            source_ref="agent_content:fixture",
+            topic="Bounded story-first source",
+            source_type="work_chronicle",
+            safe_facts=("a", "b", "c", "d"),
+            source_verified=True,
+            concrete_action=True,
+            visualizable_process=True,
+            causal_bits=4,
+            real_result=True,
+        )
+        self.assertEqual(
+            main.classify_agent_content_route(
+                production_policy="auto",
+                character_reels_mode="shadow",
+                source=producing,
+            ),
+            "producing",
+        )
+        self.assertEqual(
+            main.classify_agent_content_route(
+                production_policy="standard_only",
+                character_reels_mode="off",
+                source=nonproducing,
+            ),
+            "producing",
+        )
 
     def test_valid_shadow_binding_is_idempotent_and_preserves_null_unknowns(self):
         self.write_story()
@@ -699,7 +786,14 @@ class OperatorEventTests(unittest.TestCase):
             "character_manual_phase_not_implemented", result.reason_codes
         )
 
-    def _run_text_route(self, *, mode, payload, second_payload=None):
+    def _run_text_route(
+        self,
+        *,
+        mode,
+        payload,
+        second_payload=None,
+        registry_case="missing_registry",
+    ):
         self.write_story()
         self.write_sidecar(payload)
         if second_payload is not None:
@@ -709,6 +803,7 @@ class OperatorEventTests(unittest.TestCase):
                 "second.md",
             )
             self.write_sidecar(second_payload)
+        self.assertFalse((self.story_day / "narrative_ready.json").exists())
         plan = SimpleNamespace(
             plan_id=PLAN_ID,
             slot="agent_content_sync",
@@ -721,6 +816,26 @@ class OperatorEventTests(unittest.TestCase):
         package = SimpleNamespace(final_text="Existing text draft remains unchanged.")
         bot = SimpleNamespace(send_message=AsyncMock())
         safe_context = "A bounded editorial context used by the existing text pipeline."
+        registry_path = self.root / "quarantine-state" / "registry.json"
+        if registry_case == "no_manifest":
+            registry_path.parent.mkdir(parents=True, exist_ok=True)
+            registry_path.write_text(
+                json.dumps(rq.MaterialRegistry.empty().to_dict(), sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        elif registry_case == "corrupt_registry":
+            registry_path.parent.mkdir(parents=True, exist_ok=True)
+            registry_path.write_bytes(b"{corrupt-registry")
+        elif registry_case == "invalid_registry_path":
+            registry_path.mkdir(parents=True)
+        elif registry_case != "missing_registry":
+            self.fail(f"unknown registry fixture: {registry_case}")
+        if registry_path.is_file():
+            registry_before = ("file", registry_path.read_bytes())
+        elif registry_path.is_dir():
+            registry_before = ("directory", tuple(registry_path.iterdir()))
+        else:
+            registry_before = ("absent", None)
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(main, "NAZ_CHARACTER_REELS_MODE", mode))
@@ -728,15 +843,50 @@ class OperatorEventTests(unittest.TestCase):
             stack.enter_context(patch.object(main, "NAZ_OPERATOR_EVENT_BINDING_ROOT", self.private_root))
             stack.enter_context(patch.object(main, "AGENT_CONTENT_INBOX", self.markdown_root))
             stack.enter_context(patch.object(main, "AGENT_CONTENT_PROJECT", PROJECT))
+            quarantine_policy = stack.enter_context(patch.object(
+                main,
+                "reels_quarantine_policy",
+                side_effect=AssertionError(
+                    "non-producing route must not resolve quarantine policy"
+                ),
+            ))
+            registry_read = stack.enter_context(patch.object(
+                rq,
+                "read_registry",
+                side_effect=AssertionError(
+                    "non-producing route must not read quarantine registry"
+                ),
+            ))
+            manifest_parser = stack.enter_context(patch.object(
+                rq,
+                "_load_manifest",
+                side_effect=AssertionError(
+                    "non-producing route must not parse narrative manifest"
+                ),
+            ))
+            ready_selector = stack.enter_context(patch.object(
+                rq,
+                "select_ready_candidate",
+                side_effect=AssertionError(
+                    "non-producing route must not select quarantine candidate"
+                ),
+            ))
+            claim = stack.enter_context(patch.object(
+                rq,
+                "claim_ready_candidate",
+                side_effect=AssertionError(
+                    "non-producing route must not claim quarantine candidate"
+                ),
+            ))
             stack.enter_context(patch.object(
                 main, "agent_content_source_dirs_for_date", return_value=[self.story_day]
             ))
             stack.enter_context(patch.object(
-                main, "agent_content_hash_for_date", return_value="aggregate-manifest-hash"
+                main, "_agent_content_hash_for_dirs", return_value="aggregate-manifest-hash"
             ))
             stack.enter_context(patch.object(main, "load_agent_content_seen", return_value={}))
             stack.enter_context(patch.object(
-                main, "collect_agent_materials", return_value=(safe_context, [], DATE)
+                main, "collect_project_first_agent_materials", return_value=(safe_context, [], DATE)
             ))
             stack.enter_context(patch.object(
                 main.naz_character, "apply_event",
@@ -796,6 +946,89 @@ class OperatorEventTests(unittest.TestCase):
         draft_notifier.assert_awaited_once()
         failure_notifier.assert_not_awaited()
         channel_publisher.assert_not_awaited()
+        quarantine_policy.assert_not_called()
+        registry_read.assert_not_called()
+        manifest_parser.assert_not_called()
+        ready_selector.assert_not_called()
+        claim.assert_not_called()
+        if registry_path.is_file():
+            registry_after = ("file", registry_path.read_bytes())
+        elif registry_path.is_dir():
+            registry_after = ("directory", tuple(registry_path.iterdir()))
+        else:
+            registry_after = ("absent", None)
+        self.assertEqual(registry_after, registry_before)
+        return result
+
+    def _run_producing_route_after_claim(self, payload):
+        self.write_story()
+        self.write_sidecar(payload)
+        policy, candidate = self.ready_candidate()
+        plan = SimpleNamespace(
+            plan_id=PLAN_ID,
+            slot="agent_content_sync",
+            production_mode="story_first",
+        )
+        bot = SimpleNamespace(send_message=AsyncMock())
+        director = AsyncMock(side_effect=RuntimeError("synthetic director reject"))
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(main, "NAZ_CHARACTER_REELS_MODE", "shadow"))
+            stack.enter_context(patch.object(main, "NAZ_OPERATOR_EVENT_ROOT", self.source_root))
+            stack.enter_context(patch.object(main, "NAZ_OPERATOR_EVENT_BINDING_ROOT", self.private_root))
+            stack.enter_context(patch.object(main, "AGENT_CONTENT_INBOX", self.markdown_root))
+            stack.enter_context(patch.object(main, "AGENT_CONTENT_PROJECT", PROJECT))
+            stack.enter_context(patch.object(main, "reels_quarantine_policy", return_value=policy))
+            stack.enter_context(patch.object(main, "_agent_content_hash_for_dirs", return_value="aggregate-manifest-hash"))
+            stack.enter_context(patch.object(main, "load_agent_content_seen", return_value={}))
+            stack.enter_context(patch.object(
+                main,
+                "collect_project_first_agent_materials",
+                return_value=("A bounded story-first source used after eligibility.", [], DATE),
+            ))
+            stack.enter_context(patch.object(
+                main,
+                "chronicle_source_row",
+                return_value={
+                    "source_ref": f"agent_content:{DATE}:aggregate-manifest-hash",
+                    "topic": "A bounded story-first source",
+                    "source_type": "work_chronicle",
+                    "rubric_keys": (),
+                    "safe_facts": (
+                        "First the builder tested one bounded local input.",
+                        "Then the builder changed one visible configuration.",
+                        "After that change the same local test completed.",
+                        "The verified result worked on the repeated check.",
+                    ),
+                    "source_verified": True,
+                    "concrete_action": True,
+                    "visualizable_process": True,
+                    "causal_bits": 4,
+                    "real_result": True,
+                    "contains_secrets": False,
+                    "contains_private_data": False,
+                },
+            ))
+            stack.enter_context(patch.object(main.naz_character, "apply_event", return_value=object()))
+            stack.enter_context(patch.object(main.memory, "load_character_state", return_value=object()))
+            stack.enter_context(patch.object(main, "scheduled_plan", return_value=plan))
+            stack.enter_context(patch.object(main.memory, "update_editorial_release_event"))
+            stack.enter_context(patch.object(main, "generate_reels_director_treatment", new=director))
+            stack.enter_context(patch.object(main, "queue_story_first_pack"))
+            stack.enter_context(patch.object(main, "notify_admin", new=AsyncMock()))
+            stack.enter_context(patch.object(main, "mark_agent_content_seen"))
+            result = asyncio.run(main.process_agent_content_date(
+                bot,
+                42,
+                DATE,
+                force=True,
+                publish=False,
+                eligible_candidate=candidate,
+            ))
+        record = rq.read_registry(policy.registry_path).records[0]
+        self.assertEqual(record.status, rq.STATUS_BLOCKED)
+        self.assertEqual(record.attempt_count, 1)
+        self.assertEqual(record.active_attempt_id, "")
+        director.assert_awaited_once()
         return result
 
     def test_shadow_route_adds_no_director_story_pack_or_media_calls(self):
@@ -823,6 +1056,7 @@ class OperatorEventTests(unittest.TestCase):
         self._run_text_route(
             mode="shadow",
             payload=event_set(contract_version="operator-event-set.v0"),
+            registry_case="corrupt_registry",
         )
 
     def test_manual_route_remains_non_producing(self):
@@ -832,6 +1066,212 @@ class OperatorEventTests(unittest.TestCase):
         self.assertIn(
             "character_manual_phase_not_implemented", record["reason_codes"]
         )
+
+    def test_off_route_does_not_require_ready_manifest(self):
+        self._run_text_route(mode="off", payload=event_set())
+        self.assertFalse((self.story_day / "narrative_ready.json").exists())
+
+    def test_manual_route_does_not_require_ready_manifest(self):
+        self._run_text_route(mode="manual", payload=event_set())
+        self.assertFalse((self.story_day / "narrative_ready.json").exists())
+
+    def test_shadow_route_does_not_require_ready_manifest(self):
+        self._run_text_route(mode="shadow", payload=event_set())
+        self.assertFalse((self.story_day / "narrative_ready.json").exists())
+
+    def test_operator_event_success_boundary_runs_after_valid_claim(self):
+        self._run_producing_route_after_claim(event_set(ready=True))
+        records = list((self.private_root / PLAN_ID).glob("*.json"))
+        self.assertEqual(len(records), 1)
+        stored = json.loads(records[0].read_text(encoding="utf-8"))
+        self.assertEqual(stored["binding_status"], "bound")
+
+    def test_operator_event_failure_boundary_runs_after_valid_claim(self):
+        self._run_producing_route_after_claim(
+            event_set(contract_version="operator-event-set.v0")
+        )
+        records = list((self.private_root / PLAN_ID).glob("*.json"))
+        self.assertEqual(len(records), 1)
+        stored = json.loads(records[0].read_text(encoding="utf-8"))
+        self.assertEqual(stored["binding_status"], "rejected")
+
+    def test_producing_operator_event_cancellation_releases_processing_claim(self):
+        self.write_story()
+        self.write_sidecar(event_set(ready=True))
+        policy, candidate = self.ready_candidate()
+        source = policy.inbox_root.joinpath(*candidate.source_ref.split("/"))
+        raw_before = {
+            path.relative_to(source).as_posix(): path.read_bytes()
+            for path in source.rglob("*")
+            if path.is_file()
+        }
+        plan = SimpleNamespace(
+            plan_id=PLAN_ID,
+            slot="agent_content_sync",
+            production_mode="story_first",
+        )
+        bot = SimpleNamespace(send_message=AsyncMock())
+        original_binding = operator_events.bind_plan_to_operator_events
+        binding_calls = 0
+
+        def cancel_once(**kwargs):
+            nonlocal binding_calls
+            binding_calls += 1
+            if binding_calls == 1:
+                raise asyncio.CancelledError()
+            return original_binding(**kwargs)
+
+        director = AsyncMock(side_effect=RuntimeError("synthetic director reject"))
+        queue = Mock()
+        seen = Mock()
+        notification = AsyncMock()
+        text_provider = AsyncMock()
+        image_provider = AsyncMock()
+        legacy_provider = AsyncMock()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(main, "NAZ_CHARACTER_REELS_MODE", "shadow"))
+            stack.enter_context(patch.object(main, "NAZ_OPERATOR_EVENT_ROOT", self.source_root))
+            stack.enter_context(patch.object(main, "NAZ_OPERATOR_EVENT_BINDING_ROOT", self.private_root))
+            stack.enter_context(patch.object(main, "AGENT_CONTENT_INBOX", self.markdown_root))
+            stack.enter_context(patch.object(main, "AGENT_CONTENT_PROJECT", PROJECT))
+            stack.enter_context(patch.object(main, "reels_quarantine_policy", return_value=policy))
+            stack.enter_context(patch.object(main, "_agent_content_hash_for_dirs", return_value="aggregate-manifest-hash"))
+            stack.enter_context(patch.object(main, "load_agent_content_seen", return_value={}))
+            stack.enter_context(patch.object(
+                main,
+                "collect_project_first_agent_materials",
+                return_value=("A bounded story-first source used after eligibility.", [], DATE),
+            ))
+            stack.enter_context(patch.object(
+                main,
+                "chronicle_source_row",
+                return_value={
+                    "source_ref": f"agent_content:{DATE}:aggregate-manifest-hash",
+                    "topic": "A bounded story-first source",
+                    "source_type": "work_chronicle",
+                    "rubric_keys": (),
+                    "safe_facts": (
+                        "First the builder tested one bounded local input.",
+                        "Then the builder changed one visible configuration.",
+                        "After that change the same local test completed.",
+                        "The verified result worked on the repeated check.",
+                    ),
+                    "source_verified": True,
+                    "concrete_action": True,
+                    "visualizable_process": True,
+                    "causal_bits": 4,
+                    "real_result": True,
+                    "contains_secrets": False,
+                    "contains_private_data": False,
+                },
+            ))
+            stack.enter_context(patch.object(main.naz_character, "apply_event", return_value=object()))
+            stack.enter_context(patch.object(main.memory, "load_character_state", return_value=object()))
+            stack.enter_context(patch.object(main, "scheduled_plan", return_value=plan))
+            stack.enter_context(patch.object(main.memory, "update_editorial_release_event"))
+            stack.enter_context(patch.object(
+                main.operator_events,
+                "bind_plan_to_operator_events",
+                new=cancel_once,
+            ))
+            stack.enter_context(patch.object(main, "generate_reels_director_treatment", new=director))
+            stack.enter_context(patch.object(main, "queue_story_first_pack", new=queue))
+            stack.enter_context(patch.object(main, "notify_admin", new=notification))
+            stack.enter_context(patch.object(main, "mark_agent_content_seen", new=seen))
+            stack.enter_context(patch.object(main, "generate_scheduled_package", new=text_provider))
+            stack.enter_context(patch.object(main, "generate_images_with_retries", new=image_provider))
+            stack.enter_context(patch.object(main, "generate_image_bytes", new=legacy_provider))
+
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                asyncio.run(main.process_agent_content_date(
+                    bot,
+                    42,
+                    DATE,
+                    force=True,
+                    publish=False,
+                    eligible_candidate=candidate,
+                ))
+
+            self.assertIs(type(raised.exception), asyncio.CancelledError)
+            self.assertIsNone(raised.exception.__cause__)
+            after_cancel = rq.read_registry(policy.registry_path).records[0]
+            self.assertEqual(after_cancel.status, rq.STATUS_READY)
+            self.assertEqual(after_cancel.active_attempt_id, "")
+            self.assertEqual(after_cancel.attempt_count, 1)
+            self.assertEqual(after_cancel.source_digest, candidate.source_digest)
+            self.assertEqual(
+                after_cancel.narrative_package_digest,
+                candidate.narrative_package_digest,
+            )
+            self.assertEqual(rq.select_ready_candidate(
+                policy,
+                project_name=PROJECT,
+                date_text=DATE,
+            ), candidate)
+            director.assert_not_awaited()
+            queue.assert_not_called()
+            text_provider.assert_not_awaited()
+            image_provider.assert_not_awaited()
+            legacy_provider.assert_not_awaited()
+            seen.assert_not_called()
+            notification.assert_not_awaited()
+
+            result = asyncio.run(main.process_agent_content_date(
+                bot,
+                42,
+                DATE,
+                force=True,
+                publish=False,
+                eligible_candidate=candidate,
+            ))
+
+        self.assertIn("режиссёрский план отклонён", result)
+        final = rq.read_registry(policy.registry_path).records[0]
+        self.assertEqual(final.status, rq.STATUS_BLOCKED)
+        self.assertEqual(final.active_attempt_id, "")
+        self.assertEqual(final.attempt_count, 2)
+        self.assertEqual(binding_calls, 2)
+        director.assert_awaited_once()
+        queue.assert_not_called()
+        seen.assert_not_called()
+        raw_after = {
+            path.relative_to(source).as_posix(): path.read_bytes()
+            for path in source.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(raw_after, raw_before)
+        self.assertEqual(
+            list(policy.registry_path.parent.glob("*.lock")),
+            [],
+        )
+        self.assertEqual(
+            list(policy.registry_path.parent.glob(".*.tmp")),
+            [],
+        )
+
+
+def _install_nonproducing_quarantine_matrix_tests():
+    for mode in ("off", "manual", "shadow"):
+        for registry_case in (
+            "no_manifest",
+            "missing_registry",
+            "corrupt_registry",
+            "invalid_registry_path",
+        ):
+            def test_route(self, *, _mode=mode, _registry_case=registry_case):
+                self._run_text_route(
+                    mode=_mode,
+                    payload=event_set(),
+                    registry_case=_registry_case,
+                )
+
+            test_route.__name__ = (
+                f"test_{mode}_{registry_case}_bypasses_quarantine_eligibility"
+            )
+            setattr(OperatorEventTests, test_route.__name__, test_route)
+
+
+_install_nonproducing_quarantine_matrix_tests()
 
 
 if __name__ == "__main__":

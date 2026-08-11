@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import editorial_orchestrator
 import main
 import memory
+import reels_failure_quarantine as rq
 import story_production
 from tests.test_story_production import director_response
 from tools import reels_director_dry_run
@@ -143,6 +144,44 @@ class AgentContentReelsTriggerTests(unittest.TestCase):
             risks=risks,
             topic="Проверенный рабочий эпизод Naz",
         )
+
+    def ready_candidate(self, date_text: str, source_text: str):
+        """Build the real source/outbox/manifest/registry path used by Reels."""
+        inbox = Path(self.temp.name) / "agent-inbox"
+        outbox = Path(self.temp.name) / "narrative-outbox"
+        policy = rq.QuarantinePathPolicy(
+            inbox,
+            Path(self.temp.name) / "quarantine-state" / "registry.json",
+            outbox,
+        )
+        source_ref = f"Naz_AI_Bot_clean/{date_text}"
+        source = inbox / "Naz_AI_Bot_clean" / date_text
+        source.mkdir(parents=True)
+        (source / "material.md").write_text(source_text, encoding="utf-8")
+        package_ref = f"packages/{date_text}.json"
+        package = outbox / "packages" / f"{date_text}.json"
+        package.parent.mkdir(parents=True, exist_ok=True)
+        package.write_text('{"kind":"narrative"}', encoding="utf-8")
+        manifest = {
+            "schema_version": rq.MANIFEST_SCHEMA_VERSION,
+            "source_ref": source_ref,
+            "source_digest": rq.source_digest(source),
+            "narrative_package_ref": package_ref,
+            "narrative_package_digest": rq.narrative_package_digest(package),
+            "status": rq.CLASS_READY,
+            "contract_versions": {"director": "director-v1", "narrative": "narrative-v1"},
+        }
+        (source / "narrative_ready.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        )
+        rq.reconcile_complete_backlog(policy)
+        candidate = rq.select_ready_candidate(
+            policy,
+            project_name="Naz_AI_Bot_clean",
+            date_text=date_text,
+        )
+        self.assertIsNotNone(candidate)
+        return policy, candidate, inbox
 
     def test_russian_inflected_actions_preserve_story_evidence(self):
         row = self.source_row()
@@ -481,19 +520,22 @@ User focus: ежедневный импорт content-agent
         raw_director = july_11_unrelated_module_response(row["safe_facts"])
         bot = SimpleNamespace(send_message=AsyncMock())
         pack_root = Path(self.temp.name) / "story-packs"
+        policy, _candidate, inbox = self.ready_candidate(
+            "2026-07-11", JULY_11_PRODUCTION_STYLE_CHRONICLE
+        )
 
         with patch.object(main, "ADMIN_ID", 42), patch.object(
             main, "NAZ_STORY_PACK_ROOT", pack_root
         ), patch.object(
-            main, "agent_content_source_dirs_for_date", return_value=[Path("fixture")]
+            main, "AGENT_CONTENT_INBOX", inbox
         ), patch.object(
-            main, "agent_content_hash_for_date", return_value="fixture-hash"
+            main, "AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean"
+        ), patch.object(
+            main, "reels_quarantine_policy", return_value=policy
+        ), patch.object(
+            main, "_agent_content_hash_for_dirs", return_value="fixture-hash"
         ), patch.object(
             main, "load_agent_content_seen", return_value={}
-        ), patch.object(
-            main,
-            "collect_agent_materials",
-            return_value=(JULY_11_PRODUCTION_STYLE_CHRONICLE, [], "2026-07-11"),
         ), patch.object(
             main, "call_gpt", new=AsyncMock(return_value=raw_director)
         ) as director_call, patch.object(
@@ -556,6 +598,9 @@ User focus: ежедневный импорт content-agent
         mark_seen.assert_not_called()
         manifests = list(pack_root.glob("*/story_manifest.json"))
         self.assertEqual(manifests, [])
+        record = next(item for item in rq.read_registry(policy.registry_path).records if item.source_ref.endswith("2026-07-11"))
+        self.assertEqual(record.status, rq.STATUS_BLOCKED)
+        self.assertEqual(record.attempt_count, 1)
         text_post.assert_not_awaited()
         image_provider.assert_not_awaited()
         legacy_image_provider.assert_not_awaited()
@@ -579,18 +624,20 @@ User focus: ежедневный импорт content-agent
         for case_name, response, expected_reason in cases:
             with self.subTest(case=case_name):
                 bot = SimpleNamespace(send_message=AsyncMock())
+                date_text = "2026-07-25" if case_name == "generic_visual_concept" else "2026-07-26"
+                policy, _candidate, inbox = self.ready_candidate(
+                    date_text, WORK_CHRONICLE
+                )
                 with patch.object(main, "ADMIN_ID", 42), patch.object(
-                    main,
-                    "agent_content_source_dirs_for_date",
-                    return_value=[Path("fixture")],
+                    main, "AGENT_CONTENT_INBOX", inbox
                 ), patch.object(
-                    main, "agent_content_hash_for_date", return_value="fixture-hash"
+                    main, "AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean"
+                ), patch.object(
+                    main, "reels_quarantine_policy", return_value=policy
+                ), patch.object(
+                    main, "_agent_content_hash_for_dirs", return_value="fixture-hash"
                 ), patch.object(
                     main, "load_agent_content_seen", return_value={}
-                ), patch.object(
-                    main,
-                    "collect_agent_materials",
-                    return_value=(WORK_CHRONICLE, [], "2026-07-25"),
                 ), patch.object(
                     main,
                     "call_gpt",
@@ -610,7 +657,7 @@ User focus: ежедневный импорт content-agent
                 ) as warning:
                     result = asyncio.run(
                         main.process_agent_content_date(
-                            bot, 42, "2026-07-25", force=True, publish=False
+                            bot, 42, date_text, force=True, publish=False
                         )
                     )
 
@@ -627,6 +674,12 @@ User focus: ежедневный импорт content-agent
                 text_post.assert_not_awaited()
                 image_provider.assert_not_awaited()
                 legacy_image_provider.assert_not_awaited()
+                record = next(
+                    item
+                    for item in rq.read_registry(policy.registry_path).records
+                    if item.source_ref.endswith(date_text)
+                )
+                self.assertEqual(record.status, rq.STATUS_BLOCKED)
 
     def test_story_queue_requires_current_semantic_director_treatment(self):
         plan = main.scheduled_plan(
@@ -661,17 +714,20 @@ User focus: ежедневный импорт content-agent
         raw_payload["scenes"][4]["action_recipe"] = "coupling_to_rotate_housing"
         raw_payload["scenes"][6]["action_recipe"] = "latch_until_housing_opens"
         bot = SimpleNamespace(send_message=AsyncMock())
+        policy, _candidate, inbox = self.ready_candidate(
+            "2026-07-11", JULY_11_PRODUCTION_STYLE_CHRONICLE
+        )
 
         with patch.object(main, "ADMIN_ID", 42), patch.object(
-            main, "agent_content_source_dirs_for_date", return_value=[Path("fixture")]
+            main, "AGENT_CONTENT_INBOX", inbox
         ), patch.object(
-            main, "agent_content_hash_for_date", return_value="fixture-hash"
+            main, "AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean"
+        ), patch.object(
+            main, "reels_quarantine_policy", return_value=policy
+        ), patch.object(
+            main, "_agent_content_hash_for_dirs", return_value="fixture-hash"
         ), patch.object(
             main, "load_agent_content_seen", return_value={}
-        ), patch.object(
-            main,
-            "collect_agent_materials",
-            return_value=(JULY_11_PRODUCTION_STYLE_CHRONICLE, [], "2026-07-11"),
         ), patch.object(
             main,
             "call_gpt",
@@ -711,6 +767,18 @@ User focus: ежедневный импорт content-agent
         text_post.assert_not_awaited()
         image_provider.assert_not_awaited()
         legacy_image_provider.assert_not_awaited()
+        record = next(item for item in rq.read_registry(policy.registry_path).records if item.source_ref.endswith("2026-07-11"))
+        self.assertEqual(record.status, rq.STATUS_BLOCKED)
+        self.assertEqual(record.attempt_count, 1)
+        with patch.object(main, "reels_quarantine_policy", return_value=policy), patch.object(
+            main, "AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean"
+        ), patch.object(
+            main, "AGENT_CONTENT_INBOX", inbox
+        ):
+            second = asyncio.run(main.process_agent_content_date(bot, 42, "2026-07-11", force=True, publish=False))
+        self.assertIn("valid narrative_ready eligibility", second)
+        self.assertEqual(director_call.await_count, 1)
+        self.assertEqual(bot.send_message.await_count, 1)
 
     def test_story_first_trigger_uses_one_director_call_without_media_provider_calls(self):
         bot = SimpleNamespace(send_message=AsyncMock())
@@ -724,12 +792,15 @@ User focus: ежедневный импорт content-agent
             "approval": {"status": "awaiting_approval"},
             "scene_jobs": [],
         }
+        policy, _candidate, inbox = self.ready_candidate("2026-07-25", WORK_CHRONICLE)
         with patch.object(main, "ADMIN_ID", 42), patch.object(
-            main, "agent_content_source_dirs_for_date", return_value=[Path("fixture")]
-        ), patch.object(main, "agent_content_hash_for_date", return_value="fixture-hash"), patch.object(
-            main, "load_agent_content_seen", return_value={}
+            main, "AGENT_CONTENT_INBOX", inbox
         ), patch.object(
-            main, "collect_agent_materials", return_value=(WORK_CHRONICLE, [], "2026-07-25")
+            main, "AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean"
+        ), patch.object(
+            main, "reels_quarantine_policy", return_value=policy
+        ), patch.object(
+            main, "load_agent_content_seen", return_value={}
         ), patch.object(
             main,
             "generate_reels_director_treatment",
@@ -767,15 +838,20 @@ User focus: ежедневный импорт content-agent
         text_model.assert_not_awaited()
         image_model.assert_not_awaited()
         provider.assert_not_awaited()
+        record = next(item for item in rq.read_registry(policy.registry_path).records if item.source_ref.endswith("2026-07-25"))
+        self.assertEqual(record.status, rq.STATUS_CONSUMED)
 
     def test_invalid_director_plan_fails_closed_without_template_queue(self):
         bot = SimpleNamespace(send_message=AsyncMock())
+        policy, _candidate, inbox = self.ready_candidate("2026-07-25", WORK_CHRONICLE)
         with patch.object(main, "ADMIN_ID", 42), patch.object(
-            main, "agent_content_source_dirs_for_date", return_value=[Path("fixture")]
-        ), patch.object(main, "agent_content_hash_for_date", return_value="fixture-hash"), patch.object(
-            main, "load_agent_content_seen", return_value={}
+            main, "AGENT_CONTENT_INBOX", inbox
         ), patch.object(
-            main, "collect_agent_materials", return_value=(WORK_CHRONICLE, [], "2026-07-25")
+            main, "AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean"
+        ), patch.object(
+            main, "reels_quarantine_policy", return_value=policy
+        ), patch.object(
+            main, "load_agent_content_seen", return_value={}
         ), patch.object(
             main,
             "generate_reels_director_treatment",
@@ -792,7 +868,10 @@ User focus: ежедневный импорт content-agent
         self.assertIn("режиссёрский план отклонён", result)
         queue.assert_not_called()
         mark_seen.assert_not_called()
-        self.assertIn("Рендер не запускался", bot.send_message.await_args.kwargs["text"])
+        self.assertIn("Renderer", bot.send_message.await_args.kwargs["text"])
+        record = next(item for item in rq.read_registry(policy.registry_path).records if item.source_ref.endswith("2026-07-25"))
+        self.assertEqual(record.status, rq.STATUS_BLOCKED)
+        self.assertEqual(record.attempt_count, 1)
 
 
 if __name__ == "__main__":

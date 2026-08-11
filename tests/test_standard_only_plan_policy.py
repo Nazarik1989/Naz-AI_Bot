@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ import character_state
 import editorial_orchestrator as eo
 import main
 import memory
+import reels_failure_quarantine as rq
 from telegram.error import TelegramError
 
 
@@ -257,6 +259,44 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
         stack = ExitStack()
         stack.enter_context(patch.object(memory, "DB_PATH", str(db_path)))
         memory.init_db()
+        inbox = db_path.parent / "agent-inbox"
+        outbox = db_path.parent / "narrative-outbox"
+        source = inbox / PROJECT / DATE_TEXT
+        source.mkdir(parents=True, exist_ok=True)
+        (source / "material.md").write_text(
+            "synthetic safe material",
+            encoding="utf-8",
+        )
+        package = outbox / "packages" / f"{DATE_TEXT}.json"
+        package.parent.mkdir(parents=True, exist_ok=True)
+        package.write_text('{"kind":"narrative"}', encoding="utf-8")
+        manifest = {
+            "schema_version": rq.MANIFEST_SCHEMA_VERSION,
+            "source_ref": f"{PROJECT}/{DATE_TEXT}",
+            "source_digest": rq.source_digest(source),
+            "narrative_package_ref": f"packages/{DATE_TEXT}.json",
+            "narrative_package_digest": rq.narrative_package_digest(package),
+            "status": rq.CLASS_READY,
+            "contract_versions": {
+                "director": "director-v1",
+                "narrative": "narrative-v1",
+            },
+        }
+        (source / "narrative_ready.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        quarantine_policy = rq.QuarantinePathPolicy(
+            inbox,
+            db_path.parent / "quarantine-state" / "registry.json",
+            outbox,
+        )
+        rq.reconcile_complete_backlog(quarantine_policy)
+        stack.enter_context(
+            patch.object(main, "reels_quarantine_policy", return_value=quarantine_policy)
+        )
+        stack.enter_context(patch.object(main, "AGENT_CONTENT_INBOX", inbox))
+        stack.enter_context(patch.object(main, "AGENT_CONTENT_PROJECT", PROJECT))
         generation_mock = generation or AsyncMock(return_value=generated_package())
         draft = (
             stack.enter_context(
@@ -287,20 +327,13 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
         crosspost = stack.enter_context(patch.object(main, "queue_naz_post_for_void"))
         mark_seen = stack.enter_context(patch.object(main, "mark_agent_content_seen"))
         stack.enter_context(
-            patch.object(
-                main,
-                "agent_content_source_dirs_for_date",
-                return_value=[Path("synthetic") / PROJECT / DATE_TEXT],
-            )
-        )
-        stack.enter_context(
-            patch.object(main, "agent_content_hash_for_date", return_value="synthetic-hash")
+            patch.object(main, "_agent_content_hash_for_dirs", return_value="synthetic-hash")
         )
         stack.enter_context(patch.object(main, "load_agent_content_seen", return_value={}))
         stack.enter_context(
             patch.object(
                 main,
-                "collect_agent_materials",
+                "collect_project_first_agent_materials",
                 return_value=("synthetic safe material", [], DATE_TEXT),
             )
         )
@@ -333,6 +366,7 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
             "public_send": public_send,
             "crosspost": crosspost,
             "mark_seen": mark_seen,
+            "quarantine_policy": quarantine_policy,
         }
 
     async def run_standard(self, user_id: int = 7, bot: object | None = None) -> str:
@@ -378,6 +412,11 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
             conn.close()
         return int(posts), int(artifacts), int(versions)
 
+    def quarantine_record(self, calls: dict[str, object]) -> rq.MaterialRecord:
+        policy = calls["quarantine_policy"]
+        assert type(policy) is rq.QuarantinePathPolicy
+        return rq.read_registry(policy.registry_path).records[0]
+
     def persist_plan(
         self,
         plan: eo.EditorialPlan,
@@ -396,17 +435,20 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_standard_only_policy_is_persisted_in_plan_payload(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             db_path = Path(root) / "naz.sqlite3"
-            stack, _ = self.runtime_stack(db_path)
+            stack, calls = self.runtime_stack(db_path)
             with stack:
                 self.assertEqual(await self.run_standard(), main.STANDARD_ONLY_PLAN_CREATED)
                 plan = memory.get_standard_only_plan_records(7, self.expected_plan().plan_id)[0][
                     "editorial_plan"
                 ]
+                quarantine_record = self.quarantine_record(calls)
             self.assertEqual(plan["production_policy"], "standard_only")
             self.assertEqual(plan["production_mode"], "standard")
             self.assertEqual(plan["source_ref"], SOURCE_REF)
             self.assertEqual(plan["source_project"], PROJECT)
             self.assertEqual(plan["source_date"], DATE_TEXT)
+            self.assertEqual(quarantine_record.status, rq.STATUS_CONSUMED)
+            self.assertEqual(quarantine_record.attempt_count, 1)
 
     async def test_standard_only_route_uses_standard_model_only(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -451,6 +493,7 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
                 first_generation = calls["generation"].await_count
                 first_draft_sends = bot_send.await_count
                 first_status = str(reply_text.await_args.args[0])
+                first_quarantine = self.quarantine_record(calls)
 
                 self.assertEqual(first_counts, (1, 1, 1))
                 self.assertEqual(len(first_records), 1)
@@ -467,6 +510,9 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn(plan.plan_id, first_status)
                 self.assertIn("canonical plan was saved", first_status)
+                self.assertEqual(first_quarantine.status, rq.STATUS_CONSUMED)
+                self.assertEqual(first_quarantine.attempt_count, 1)
+                self.assertEqual(first_quarantine.active_attempt_id, "")
 
                 reply_text.reset_mock()
                 await main.sync_agent_content_standard_command(update, context)
@@ -531,13 +577,27 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
                 first_counts = self.counts(db_path)
                 second = await self.run_standard()
                 second_counts = self.counts(db_path)
+                quarantine_record = self.quarantine_record(calls)
             self.assertEqual(first, main.STANDARD_ONLY_PLAN_CREATED)
             self.assertEqual(second, main.STANDARD_ONLY_PLAN_ALREADY_EXISTS)
             self.assertEqual(calls["generation"].await_count, 1)
             self.assertEqual(calls["draft"].await_count, 1)
             self.assertEqual(first_counts, (1, 0, 0))
             self.assertEqual(second_counts, first_counts)
+            self.assertEqual(quarantine_record.status, rq.STATUS_CONSUMED)
+            self.assertEqual(quarantine_record.attempt_count, 1)
+            self.assertEqual(quarantine_record.active_attempt_id, "")
             calls["mark_seen"].assert_not_called()
+
+    async def test_no_handled_exit_leaves_active_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            stack, calls = self.runtime_stack(Path(root) / "naz.sqlite3")
+            with stack:
+                result = await self.run_standard()
+                record = self.quarantine_record(calls)
+            self.assertEqual(result, main.STANDARD_ONLY_PLAN_CREATED)
+            self.assertEqual(record.status, rq.STATUS_CONSUMED)
+            self.assertEqual(record.active_attempt_id, "")
 
     async def test_identical_canonical_payload_is_already_exists(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -551,6 +611,108 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(getattr(result, "plan_id", ""), plan.plan_id)
             calls["generation"].assert_not_awaited()
             calls["draft"].assert_not_awaited()
+
+    async def test_standard_preflight_before_quarantine_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            db_path = Path(root) / "naz.sqlite3"
+            stack, calls = self.runtime_stack(db_path)
+            with stack:
+                plan = self.expected_plan()
+                self.persist_plan(plan)
+                with patch.object(
+                    rq,
+                    "claim_ready_candidate",
+                    wraps=rq.claim_ready_candidate,
+                ) as claim:
+                    result = await self.run_standard()
+                record = self.quarantine_record(calls)
+            self.assertEqual(result, main.STANDARD_ONLY_PLAN_ALREADY_EXISTS)
+            claim.assert_not_called()
+            calls["generation"].assert_not_awaited()
+            self.assertEqual(record.status, rq.STATUS_READY)
+            self.assertEqual(record.attempt_count, 0)
+
+    async def test_partial_existing_uses_no_provider_or_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            db_path = Path(root) / "naz.sqlite3"
+            stack, calls = self.runtime_stack(db_path)
+            with stack:
+                plan = self.expected_plan()
+                memory.update_editorial_release_event(
+                    user_id=7,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    slot=plan.slot,
+                    generation_package_status="not_run",
+                    history_commit_status="not_run",
+                )
+                with patch.object(
+                    rq,
+                    "claim_ready_candidate",
+                    wraps=rq.claim_ready_candidate,
+                ) as claim:
+                    result = await self.run_standard()
+                record = self.quarantine_record(calls)
+            self.assertEqual(result, main.STANDARD_ONLY_PLAN_PARTIAL_EXISTING)
+            claim.assert_not_called()
+            calls["generation"].assert_not_awaited()
+            self.assertEqual(record.status, rq.STATUS_READY)
+            self.assertEqual(record.attempt_count, 0)
+
+    async def test_conflict_existing_uses_no_provider_or_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            db_path = Path(root) / "naz.sqlite3"
+            stack, calls = self.runtime_stack(db_path)
+            with stack:
+                plan = self.expected_plan()
+                payload = plan.to_dict()
+                payload["topic"] = "conflicting topic"
+                self.persist_plan(plan, payload)
+                with patch.object(
+                    rq,
+                    "claim_ready_candidate",
+                    wraps=rq.claim_ready_candidate,
+                ) as claim:
+                    result = await self.run_standard()
+                record = self.quarantine_record(calls)
+            self.assertEqual(result, main.STANDARD_ONLY_PLAN_IDENTITY_CONFLICT)
+            claim.assert_not_called()
+            calls["generation"].assert_not_awaited()
+            self.assertEqual(record.status, rq.STATUS_READY)
+            self.assertEqual(record.attempt_count, 0)
+
+    async def test_claim_second_preflight_closes_race(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            db_path = Path(root) / "naz.sqlite3"
+            stack, calls = self.runtime_stack(db_path)
+            real_claim = rq.claim_ready_candidate
+
+            def claim_then_persist_partial(policy, candidate):
+                claim = real_claim(policy, candidate)
+                self.assertIsNotNone(claim)
+                plan = self.expected_plan()
+                memory.update_editorial_release_event(
+                    user_id=7,
+                    plan_id=plan.plan_id,
+                    platform="telegram",
+                    slot=plan.slot,
+                    generation_package_status="not_run",
+                    history_commit_status="not_run",
+                )
+                return claim
+
+            with stack, patch.object(
+                rq,
+                "claim_ready_candidate",
+                side_effect=claim_then_persist_partial,
+            ):
+                result = await self.run_standard()
+                record = self.quarantine_record(calls)
+            self.assertEqual(result, main.STANDARD_ONLY_PLAN_PARTIAL_EXISTING)
+            calls["generation"].assert_not_awaited()
+            self.assertEqual(record.status, rq.STATUS_READY)
+            self.assertEqual(record.attempt_count, 1)
+            self.assertEqual(record.active_attempt_id, "")
 
     async def test_any_canonical_payload_difference_is_identity_conflict(self) -> None:
         mutations = {
@@ -626,6 +788,7 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
                     self.run_standard(),
                 )
                 persisted_counts = self.counts(db_path)
+                quarantine_record = self.quarantine_record(calls)
             self.assertCountEqual(
                 results,
                 (
@@ -636,6 +799,9 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(persisted_counts, (1, 0, 0))
             calls["generation"].assert_awaited_once()
             calls["draft"].assert_awaited_once()
+            self.assertEqual(quarantine_record.status, rq.STATUS_CONSUMED)
+            self.assertEqual(quarantine_record.attempt_count, 1)
+            self.assertEqual(quarantine_record.active_attempt_id, "")
 
     async def test_partial_identity_blocks_retry(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -704,6 +870,7 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
             with stack:
                 first = await self.run_standard()
                 second = await self.run_standard()
+                quarantine_record = self.quarantine_record(calls)
             self.assertEqual(first, "standard_only_plan_generation_unavailable")
             self.assertEqual(second, main.STANDARD_ONLY_PLAN_PARTIAL_EXISTING)
             self.assertEqual(calls["generation"].await_count, 1)
@@ -712,6 +879,9 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
             calls["public_send"].assert_not_awaited()
             calls["mark_seen"].assert_not_called()
             self.assertEqual(self.counts(Path(root) / "naz.sqlite3"), (0, 0, 0))
+            self.assertEqual(quarantine_record.status, rq.STATUS_READY)
+            self.assertEqual(quarantine_record.attempt_count, 1)
+            self.assertEqual(quarantine_record.active_attempt_id, "")
 
     async def test_ambiguous_database_state_blocks_model_call(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -737,10 +907,64 @@ class StandardOnlyRouteTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await self.run_standard()
                 second = await asyncio.wait_for(self.run_standard(), timeout=1)
+                quarantine_record = self.quarantine_record(calls)
             self.assertEqual(second, main.STANDARD_ONLY_PLAN_PARTIAL_EXISTING)
             self.assertEqual(calls["generation"].await_count, 1)
             calls["draft"].assert_not_awaited()
             calls["mark_seen"].assert_not_called()
+            self.assertEqual(quarantine_record.status, rq.STATUS_READY)
+            self.assertEqual(quarantine_record.attempt_count, 1)
+            self.assertEqual(quarantine_record.active_attempt_id, "")
+
+    async def test_delivery_cancellation_keeps_consumed_canonical_plan(self) -> None:
+        delivery = AsyncMock(side_effect=asyncio.CancelledError())
+        with tempfile.TemporaryDirectory() as root:
+            stack, calls = self.runtime_stack(Path(root) / "naz.sqlite3")
+            with stack, patch.object(
+                main,
+                "send_generated_text_to_chat",
+                new=delivery,
+            ):
+                with self.assertRaises(asyncio.CancelledError) as raised:
+                    await self.run_standard()
+                second = await self.run_standard()
+                quarantine_record = self.quarantine_record(calls)
+            self.assertIs(type(raised.exception), asyncio.CancelledError)
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertEqual(second, main.STANDARD_ONLY_PLAN_ALREADY_EXISTS)
+            self.assertEqual(calls["generation"].await_count, 1)
+            delivery.assert_awaited_once()
+            calls["mark_seen"].assert_not_called()
+            self.assertEqual(quarantine_record.status, rq.STATUS_CONSUMED)
+            self.assertEqual(quarantine_record.active_attempt_id, "")
+            self.assertEqual(quarantine_record.attempt_count, 1)
+
+    async def test_cancellation_after_canonical_persist_marks_attempt_consumed(self) -> None:
+        original_save = memory.save_generated_post
+
+        def persist_then_cancel(*args, **kwargs) -> None:
+            original_save(*args, **kwargs)
+            raise asyncio.CancelledError()
+
+        with tempfile.TemporaryDirectory() as root:
+            stack, calls = self.runtime_stack(Path(root) / "naz.sqlite3")
+            with stack, patch.object(
+                memory,
+                "save_generated_post",
+                side_effect=persist_then_cancel,
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.run_standard()
+            stack, rerun_calls = self.runtime_stack(Path(root) / "naz.sqlite3")
+            with stack:
+                second = await self.run_standard()
+                quarantine_record = self.quarantine_record(rerun_calls)
+            self.assertEqual(second, main.STANDARD_ONLY_PLAN_ALREADY_EXISTS)
+            self.assertEqual(calls["generation"].await_count, 1)
+            self.assertEqual(rerun_calls["generation"].await_count, 0)
+            self.assertEqual(quarantine_record.status, rq.STATUS_CONSUMED)
+            self.assertEqual(quarantine_record.active_attempt_id, "")
+            self.assertEqual(quarantine_record.attempt_count, 1)
 
     async def test_admin_only_and_explicit_date_required(self) -> None:
         update = SimpleNamespace(
