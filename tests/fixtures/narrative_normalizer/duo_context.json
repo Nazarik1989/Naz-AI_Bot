@@ -1,0 +1,11 @@
+{
+  "fixture": "duo_context",
+  "context_fixture": "duo_context",
+  "source_ref": "Naz_AI_Bot_clean/2026-08-06",
+  "facts": [
+    "Two reviewers examined the same prototype from different desks.",
+    "They marked the same fragile step for another test.",
+    "Their notes used different wording but proposed the same next action."
+  ],
+  "extra_lines": []
+}

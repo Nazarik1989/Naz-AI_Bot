@@ -1,0 +1,11 @@
+{
+  "fixture": "changed_source",
+  "context_fixture": "quiet_object",
+  "source_ref": "Naz_AI_Bot_clean/2026-08-09",
+  "facts": [
+    "A worn notebook remained beside the keyboard throughout the work.",
+    "Three short observations were written down before any conclusion.",
+    "The notebook was closed after the final check."
+  ],
+  "extra_lines": []
+}

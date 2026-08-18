@@ -1,0 +1,9 @@
+{
+  "fixture": "insufficient_facts",
+  "context_fixture": "quiet_object",
+  "source_ref": "Naz_AI_Bot_clean/2026-08-07",
+  "facts": [
+    "Only one confirmed observation was available."
+  ],
+  "extra_lines": []
+}

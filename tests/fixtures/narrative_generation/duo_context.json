@@ -1,0 +1,16 @@
+{
+  "fixture": "duo_context",
+  "source_ref": "fixture:duo-context",
+  "plan_id": "plan-duo-context",
+  "facts": [
+    ["fact-1", "Two reviewers examined the same prototype from different desks."],
+    ["fact-2", "They marked the same fragile step for another test."],
+    ["fact-3", "Their notes used different wording but proposed the same next action."]
+  ],
+  "theme": "agreement without sameness",
+  "visual_subject": "two sets of notes converging on one prototype step",
+  "naz_prompt": "Naz may bring momentum, hesitation, humor, or silence according to the facts.",
+  "void_prompt": "VOID may agree without becoming a compulsory counterpoint or lesson-giver.",
+  "relationship_prompt": "The pair may cooperate without disagreement; distinct voices do not require conflict.",
+  "allow_duo": true
+}

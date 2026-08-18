@@ -18,8 +18,12 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
+import narrative_normalizer_review_state as normalizer_review_state
+import narrative_normalizer_trust as normalizer_trust
+
 
 MANIFEST_SCHEMA_VERSION = "naz-narrative-ready-v1"
+NARRATIVE_SOURCE_CONTRACT_VERSION = "agent-content-source-v1"
 REGISTRY_SCHEMA_VERSION = "reels-material-registry-v1"
 ELIGIBILITY_CONTRACT_VERSION = "reels-eligibility-v2"
 AGGREGATE_POLICY_VERSION = "raw-backlog-aggregate-v1"
@@ -295,32 +299,61 @@ class QuarantinePathPolicy:
     inbox_root: Path
     registry_path: Path
     narrative_outbox_root: Path
+    narrative_trust_service: normalizer_trust.NarrativeTrustService | None = None
+    narrative_review_authority_root: Path | None = None
 
     def __post_init__(self) -> None:
         original_inbox = Path(self.inbox_root)
         original_registry = Path(self.registry_path)
         original_outbox = Path(self.narrative_outbox_root)
+        original_authority = (
+            None
+            if self.narrative_review_authority_root is None
+            else Path(self.narrative_review_authority_root)
+        )
+        if (
+            self.narrative_trust_service is not None
+            and type(self.narrative_trust_service) is not normalizer_trust.NarrativeTrustService
+        ):
+            raise RegistryError("quarantine_narrative_trust_invalid")
         if _has_existing_symlink_component(original_inbox):
             raise RegistryError("quarantine_inbox_path_invalid")
         if _has_existing_symlink_component(original_outbox):
             raise RegistryError("quarantine_narrative_outbox_invalid")
+        if original_authority is not None and _has_existing_symlink_component(original_authority):
+            raise RegistryError("quarantine_review_authority_invalid")
         if _has_existing_symlink_component(original_registry.parent):
             raise RegistryError("quarantine_registry_path_invalid")
         inbox = _resolved(original_inbox)
         registry = _resolved(original_registry)
         outbox = _resolved(original_outbox)
+        authority = None if original_authority is None else _resolved(original_authority)
         registry_root = registry.parent
         if registry.name in {"", ".", ".."} or registry.suffix.lower() != ".json":
             raise RegistryError("quarantine_registry_path_invalid")
         if _overlaps(registry_root, inbox) or _overlaps(registry_root, outbox) or _overlaps(inbox, outbox):
             raise RegistryError("quarantine_registry_path_invalid")
+        if authority is not None:
+            code_root = Path(__file__).resolve().parent
+            if (
+                _overlaps(authority, inbox)
+                or _overlaps(authority, outbox)
+                or _overlaps(authority, registry_root)
+                or _overlaps(authority, code_root)
+            ):
+                raise RegistryError("quarantine_review_authority_invalid")
         if inbox.exists() and (not inbox.is_dir() or inbox.is_symlink()):
             raise RegistryError("quarantine_inbox_path_invalid")
         if outbox.exists() and (not outbox.is_dir() or outbox.is_symlink()):
             raise RegistryError("quarantine_narrative_outbox_invalid")
+        if authority is not None and authority.exists() and (
+            not authority.is_dir() or authority.is_symlink()
+        ):
+            raise RegistryError("quarantine_review_authority_invalid")
         object.__setattr__(self, "inbox_root", inbox)
         object.__setattr__(self, "registry_path", registry)
         object.__setattr__(self, "narrative_outbox_root", outbox)
+        object.__setattr__(self, "narrative_review_authority_root", authority)
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +413,17 @@ class NarrativeReadyManifest:
 
     def contract_version(self, name: str) -> str:
         return dict(self.contract_versions)[name]
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "source_ref": self.source_ref,
+            "source_digest": self.source_digest,
+            "narrative_package_ref": self.narrative_package_ref,
+            "narrative_package_digest": self.narrative_package_digest,
+            "status": self.status,
+            "contract_versions": dict(self.contract_versions),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1151,20 +1195,257 @@ def _load_manifest(path: Path) -> NarrativeReadyManifest:
     return NarrativeReadyManifest.from_mapping(payload)
 
 
+def narrative_source_identity(
+    source_ref: str,
+    source_digest_value: str,
+    source_contract_version: str = NARRATIVE_SOURCE_CONTRACT_VERSION,
+) -> str:
+    """Versioned identity shared by production discovery and the normalizer."""
+    ref = _safe_logical_ref(source_ref, "narrative_source_ref")
+    digest = _plain_hex64(source_digest_value, "narrative_source_digest")
+    version = _safe_version(source_contract_version, "narrative_source_contract_version")
+    raw = ref.encode("utf-8") + b"\0" + digest.encode("ascii") + b"\0" + version.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _enumerate_source_paths(inbox: Path) -> tuple[Path, ...]:
+    if not inbox.exists():
+        return ()
+    if inbox.is_symlink() or not inbox.is_dir():
+        raise EligibilityError("quarantine_inbox_invalid")
+    try:
+        first_level = sorted(inbox.iterdir(), key=lambda item: item.name.casefold())
+    except OSError as exc:
+        raise EligibilityError("quarantine_inbox_unavailable") from exc
+    result: list[Path] = []
+    for first in first_level:
+        if first.is_symlink():
+            raise EligibilityError("quarantine_source_symlink_invalid")
+        if not first.is_dir():
+            continue
+        if _DATE.fullmatch(first.name):
+            result.append(first)
+            continue
+        if _SAFE_COMPONENT.fullmatch(first.name) is None:
+            continue
+        try:
+            second_level = sorted(first.iterdir(), key=lambda item: item.name.casefold())
+        except OSError as exc:
+            raise EligibilityError("quarantine_inbox_unavailable") from exc
+        for second in second_level:
+            if second.is_symlink():
+                raise EligibilityError("quarantine_source_symlink_invalid")
+            if second.is_dir() and _DATE.fullmatch(second.name):
+                result.append(second)
+    return tuple(sorted(set(result), key=lambda item: item.relative_to(inbox).as_posix().casefold()))
+
+
+def _legacy_digest_is_unambiguous(policy: QuarantinePathPolicy, source_digest_value: str) -> bool:
+    matches = 0
+    for candidate in _enumerate_source_paths(policy.inbox_root):
+        if source_digest(candidate) == source_digest_value:
+            matches += 1
+            if matches > 1:
+                return False
+    return matches == 1
+
+
+def _narrative_ready_manifest_path(
+    policy: QuarantinePathPolicy,
+    source_path: Path,
+    source_ref: str,
+    source_digest_value: str,
+) -> Path | None:
+    """Locate the exact manifest in the legacy source or immutable outbox layout.
+
+    The outbox location lets approval remain outside the raw inbox.  It does not
+    introduce another schema: both locations are parsed by NarrativeReadyManifest.
+    Two simultaneous manifests are ambiguous and therefore fail closed.
+    """
+    _plain_hex64(source_digest_value, "narrative_source_digest")
+    legacy = source_path / "narrative_ready.json"
+    identity = narrative_source_identity(source_ref, source_digest_value)
+    external = policy.narrative_outbox_root / identity / "narrative_ready.json"
+    digest_legacy = policy.narrative_outbox_root / source_digest_value / "narrative_ready.json"
+    for parent in (external.parent, digest_legacy.parent):
+        if not os.path.lexists(parent):
+            continue
+        if parent.is_symlink() or not parent.is_dir():
+            raise EligibilityError("narrative_manifest_invalid")
+        try:
+            outbox = policy.narrative_outbox_root.resolve(strict=True)
+            resolved_parent = parent.resolve(strict=True)
+        except (FileNotFoundError, OSError) as exc:
+            raise EligibilityError("narrative_manifest_invalid") from exc
+        if not _is_within(resolved_parent, outbox):
+            raise EligibilityError("narrative_manifest_invalid")
+        _reject_symlink_chain(outbox, parent, "narrative_manifest_invalid")
+    present: list[Path] = []
+    for candidate in (legacy, external, digest_legacy):
+        if os.path.lexists(candidate):
+            if candidate.is_symlink() or not candidate.is_file():
+                raise EligibilityError("narrative_manifest_invalid")
+            if candidate in {external, digest_legacy}:
+                try:
+                    outbox = policy.narrative_outbox_root.resolve(strict=True)
+                    resolved = candidate.resolve(strict=True)
+                except (FileNotFoundError, OSError) as exc:
+                    raise EligibilityError("narrative_manifest_invalid") from exc
+                if not _is_within(resolved, outbox):
+                    raise EligibilityError("narrative_manifest_invalid")
+                _reject_symlink_chain(outbox, candidate, "narrative_manifest_invalid")
+            if candidate == digest_legacy and not _legacy_digest_is_unambiguous(policy, source_digest_value):
+                raise EligibilityError("narrative_manifest_ambiguous")
+            present.append(candidate)
+    if len(present) > 1:
+        raise EligibilityError("narrative_manifest_ambiguous")
+    return present[0] if present else None
+
+
 def validate_narrative_ready_manifest(
     policy: QuarantinePathPolicy,
     source_ref: str,
+    *,
+    trust_service: normalizer_trust.NarrativeTrustService | None = None,
+    expected_review_event: normalizer_review_state.ReviewEvent | None = None,
 ) -> NarrativeReadyManifest:
     source_path = _resolve_ref(
         policy.inbox_root, source_ref, require_directory=True, reason="narrative_source_ref_invalid"
     )
-    manifest_path = source_path / "narrative_ready.json"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
+    actual_source_digest = source_digest(source_path)
+    manifest_path = _narrative_ready_manifest_path(
+        policy,
+        source_path,
+        source_ref,
+        actual_source_digest,
+    )
+    if manifest_path is None:
         raise EligibilityError("narrative_manifest_missing")
     manifest = _load_manifest(manifest_path)
+    validated = validate_narrative_ready_payload(policy, source_ref, manifest.to_mapping())
+    identity = narrative_source_identity(source_ref, actual_source_digest)
+    identity_manifest = policy.narrative_outbox_root / identity / "narrative_ready.json"
+    if manifest_path == identity_manifest:
+        _validate_normalizer_approval_pair(
+            policy,
+            source_ref,
+            validated,
+            manifest_path,
+            trust_service=trust_service,
+            expected_review_event=expected_review_event,
+        )
+    return validated
+
+
+def _hash_regular_file(path: Path) -> str:
+    if not os.path.lexists(path) or path.is_symlink() or not path.is_file():
+        raise EligibilityError("narrative_approval_attestation_invalid")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _validate_normalizer_approval_pair(
+    policy: QuarantinePathPolicy,
+    source_ref: str,
+    manifest: NarrativeReadyManifest,
+    manifest_path: Path,
+    *,
+    trust_service: normalizer_trust.NarrativeTrustService | None,
+    expected_review_event: normalizer_review_state.ReviewEvent | None,
+) -> None:
+    service = trust_service if trust_service is not None else policy.narrative_trust_service
+    if type(service) is not normalizer_trust.NarrativeTrustService:
+        raise EligibilityError("narrative_approval_trust_missing")
+    identity = narrative_source_identity(source_ref, manifest.source_digest)
+    draft = policy.narrative_outbox_root / identity
+    attestation_path = draft / "approval-attestation.json"
+    try:
+        if draft.is_symlink() or not draft.is_dir():
+            raise EligibilityError("narrative_approval_attestation_invalid")
+        if not os.path.lexists(attestation_path) or attestation_path.is_symlink() or not attestation_path.is_file():
+            raise EligibilityError("narrative_approval_attestation_invalid")
+        raw = json.loads(attestation_path.read_bytes().decode("utf-8"))
+        attestation = normalizer_review_state.approval_attestation_from_payload(
+            raw,
+            service,
+            ready_manifest_contract=MANIFEST_SCHEMA_VERSION,
+            source_contract=NARRATIVE_SOURCE_CONTRACT_VERSION,
+        )
+        claim_path = policy.narrative_outbox_root / ".normalizer-state" / "claims" / f"{identity}.json"
+        claim_payload = json.loads(claim_path.read_bytes().decode("utf-8"))
+        if type(claim_payload) is not dict:
+            raise EligibilityError("narrative_approval_attestation_invalid")
+        authority_root = policy.narrative_review_authority_root
+        if authority_root is None:
+            raise EligibilityError("narrative_approval_attestation_invalid")
+        ledger = normalizer_review_state.ReviewStateStore(
+            authority_root,
+            service,
+        ).read(identity, expected_draft_identity=attestation.draft_identity)
+    except EligibilityError:
+        raise
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        normalizer_review_state.ReviewStateError,
+    ):
+        raise EligibilityError("narrative_approval_attestation_invalid") from None
+    latest = ledger.latest
+    if expected_review_event is not None:
+        if (
+            type(expected_review_event) is not normalizer_review_state.ReviewEvent
+            or expected_review_event.source_identity != identity
+            or expected_review_event.draft_identity != attestation.draft_identity
+            or expected_review_event.previous_revision != latest.revision
+            or expected_review_event.previous_event_digest != latest.event_digest
+            or expected_review_event.state != normalizer_review_state.STATE_APPROVED
+        ):
+            raise EligibilityError("narrative_approval_attestation_invalid")
+        latest = expected_review_event
+    if (
+        attestation.source_identity != identity
+        or attestation.source_ref != source_ref
+        or attestation.source_digest != manifest.source_digest
+        or attestation.package_digest != manifest.narrative_package_digest
+        or attestation.narrative_ready_manifest_digest != _hash_regular_file(manifest_path)
+        or attestation.story_markdown_digest != _hash_regular_file(draft / "story.md")
+        or attestation.draft_manifest_digest != _hash_regular_file(draft / "draft-manifest.json")
+        or attestation.review_digest != _hash_regular_file(draft / "review.json")
+        or attestation.completed_claim_digest != _hash_regular_file(claim_path)
+        or claim_payload.get("state") != "completed"
+        or claim_payload.get("source_identity") != identity
+        or claim_payload.get("draft_identity") != attestation.draft_identity
+        or claim_payload.get("artifact_binding_digest") != attestation.artifact_binding_digest
+        or claim_payload.get("key_id") != service.key_id
+        or latest.state != normalizer_review_state.STATE_APPROVED
+        or latest.revision != attestation.review_revision
+        or latest.event_digest != attestation.review_event_digest
+        or latest.operator_request_id != attestation.approval_request_id
+    ):
+        raise EligibilityError("narrative_approval_attestation_invalid")
+
+
+def validate_narrative_ready_payload(
+    policy: QuarantinePathPolicy,
+    source_ref: str,
+    payload: object,
+) -> NarrativeReadyManifest:
+    """Production eligibility validation for an in-memory or staged manifest."""
+    if type(policy) is not QuarantinePathPolicy:
+        raise EligibilityError("narrative_manifest_invalid")
+    source_path = _resolve_ref(
+        policy.inbox_root, source_ref, require_directory=True, reason="narrative_source_ref_invalid"
+    )
+    actual_source_digest = source_digest(source_path)
+    try:
+        manifest = NarrativeReadyManifest.from_mapping(payload)
+    except QuarantineError:
+        raise
     if manifest.source_ref != source_ref:
         raise EligibilityError("narrative_manifest_source_ref_mismatch")
-    actual_source_digest = source_digest(source_path)
     if manifest.source_digest != actual_source_digest:
         raise EligibilityError("narrative_manifest_source_digest_mismatch")
     package_path = _resolve_ref(
@@ -1228,10 +1509,31 @@ def discover_all_agent_material_sources(
     for source_path in sorted(set(source_paths), key=lambda item: item.relative_to(inbox).as_posix().casefold()):
         ref = _source_ref(inbox, source_path)
         digest = source_digest(source_path)
-        manifest_path = source_path / "narrative_ready.json"
-        if manifest_path.exists():
-            manifest = validate_narrative_ready_manifest(policy, ref)
-            classification = CLASS_READY
+        manifest_path = _narrative_ready_manifest_path(
+            policy,
+            source_path,
+            ref,
+            digest,
+        )
+        if manifest_path is not None:
+            try:
+                manifest = validate_narrative_ready_manifest(policy, ref)
+                classification = CLASS_READY
+            except EligibilityError:
+                # A Normalizer identity-layout candidate is only an eligibility
+                # hint until its HMAC attestation and current review event pass.
+                # Invalid/missing trust must keep this one source raw without
+                # aborting reconciliation for the rest of the inbox.  Legacy
+                # source-side/digest-only failures retain their prior behavior.
+                identity_manifest = (
+                    policy.narrative_outbox_root
+                    / narrative_source_identity(ref, digest)
+                    / "narrative_ready.json"
+                )
+                if manifest_path != identity_manifest:
+                    raise
+                manifest = None
+                classification = CLASS_RAW
         else:
             manifest = None
             classification = CLASS_RAW
@@ -2072,9 +2374,17 @@ def default_narrative_outbox_path() -> Path:
     ))
 
 
+def default_review_authority_path() -> Path | None:
+    value = os.getenv("NARRATIVE_NORMALIZER_REVIEW_AUTHORITY_ROOT")
+    if value is None or not value.strip():
+        return None
+    return Path(value)
+
+
 def default_path_policy(inbox_root: Path) -> QuarantinePathPolicy:
     return QuarantinePathPolicy(
         Path(inbox_root),
         default_registry_path(),
         default_narrative_outbox_path(),
+        narrative_review_authority_root=default_review_authority_path(),
     )

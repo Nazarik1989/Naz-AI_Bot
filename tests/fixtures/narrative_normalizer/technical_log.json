@@ -1,0 +1,13 @@
+{
+  "fixture": "technical_log",
+  "context_fixture": "env_utf8",
+  "source_ref": "Naz_AI_Bot_clean/2026-08-01",
+  "facts": [
+    "The .env file was created with an atomic replacement.",
+    "The file was encoded as UTF-8 without a byte-order mark.",
+    "The working directory and its parent were both checked.",
+    "A rerun confirmed the same result.",
+    "A manual inspection was used instead of blind trust."
+  ],
+  "extra_lines": []
+}

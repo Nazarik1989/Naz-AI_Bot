@@ -1,0 +1,18 @@
+{
+  "fixture": "env_utf8",
+  "source_ref": "fixture:env-utf8",
+  "plan_id": "plan-env-utf8",
+  "facts": [
+    ["fact-1", "The .env file was created with an atomic replacement."],
+    ["fact-2", "The file was encoded as UTF-8 without a byte-order mark."],
+    ["fact-3", "The working directory and its parent were both checked."],
+    ["fact-4", "A rerun confirmed the same result."],
+    ["fact-5", "A manual inspection was used instead of blind trust."]
+  ],
+  "theme": "careful verification",
+  "visual_subject": "a configuration file, terminal checks, and a manual inspection step",
+  "naz_prompt": "Naz may interpret careful verification with practical curiosity; no fixed moral or role is required.",
+  "void_prompt": "VOID may notice the difference between a passing rerun and justified confidence; restraint is allowed.",
+  "relationship_prompt": "If both appear, their relation may be cooperative, parallel, or quietly complementary.",
+  "allow_duo": true
+}

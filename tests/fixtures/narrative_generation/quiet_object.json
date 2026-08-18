@@ -1,0 +1,16 @@
+{
+  "fixture": "quiet_object",
+  "source_ref": "fixture:quiet-object",
+  "plan_id": "plan-quiet-object",
+  "facts": [
+    ["fact-1", "A worn notebook remained beside the keyboard throughout the work."],
+    ["fact-2", "Three short observations were written down before any conclusion."],
+    ["fact-3", "The notebook was closed after the final check."]
+  ],
+  "theme": "attention without spectacle",
+  "visual_subject": "a worn notebook beside a working keyboard",
+  "naz_prompt": "Naz may stay quiet and attentive around a small work ritual; do not force a lesson.",
+  "void_prompt": "VOID may remain secondary or absent; stillness is a valid response.",
+  "relationship_prompt": "No interaction is required for this material.",
+  "allow_duo": false
+}
