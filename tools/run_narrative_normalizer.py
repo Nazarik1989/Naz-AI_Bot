@@ -31,12 +31,14 @@ def _parser() -> argparse.ArgumentParser:
         target = execution.add_mutually_exclusive_group(required=True)
         target.add_argument("--all", action="store_true")
         target.add_argument("--source-ref")
+        target.add_argument("--source-identity", dest="source_identities", action="append")
         execution.add_argument("--limit", type=int)
         execution.add_argument("--workers", type=int, default=1)
         execution.add_argument("--dry-run", action="store_true")
         execution.add_argument("--retry-uncertain", action="store_true")
         execution.add_argument("--retry-failed", action="store_true")
         execution.add_argument("--enable-local-execution", action="store_true")
+        execution.add_argument("--enable-live-provider", action="store_true")
         execution.add_argument("--adapter")
 
     sub.add_parser("list")
@@ -365,6 +367,14 @@ def run(argv: list[str] | None = None) -> int:
                 rows = tuple(item for item in rows if item[0] == args.source_ref)
                 if not rows:
                     raise normalizer.NarrativeNormalizerError("narrative_normalizer_source_invalid")
+            elif args.source_identities:
+                by_identity = {
+                    normalizer.source_identity(ref, digest): (ref, digest)
+                    for ref, digest in rows
+                }
+                if any(identity not in by_identity for identity in args.source_identities):
+                    raise normalizer.NarrativeNormalizerError("narrative_normalizer_source_invalid")
+                rows = tuple(by_identity[identity] for identity in args.source_identities)
             if args.limit is not None:
                 if args.limit < 1:
                     raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
@@ -449,12 +459,54 @@ def run(argv: list[str] | None = None) -> int:
                 })
                 _emit(summary)
                 return 0
-            if not args.enable_local_execution or not args.adapter:
+            if not args.adapter:
                 raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
-            _require_review_authority(policy)
-            trust_service = _load_trust_service(args)
-            policy = replace(policy, narrative_trust_service=trust_service)
-            dependencies = normalizer.load_adapter(args.adapter)
+            production_adapter_spec = (
+                "narrative_normalizer_provider:production_adapter_factory"
+            )
+            live_summary: dict[str, object] | None = None
+            dependencies: object
+            if args.adapter == production_adapter_spec:
+                _require_review_authority(policy)
+                trust_service = _load_trust_service(args)
+                policy = replace(policy, narrative_trust_service=trust_service)
+                try:
+                    import narrative_normalizer_provider as production_provider
+
+                    requested_identities = tuple(args.source_identities or ())
+                    resolved_identities = tuple(
+                        normalizer.source_identity(ref, digest) for ref, digest in rows
+                    )
+                    if args.limit is not None or requested_identities != resolved_identities:
+                        raise production_provider.NormalizerProviderError(
+                            production_provider.PROVIDER_CONFIGURATION_INVALID
+                        )
+                    authorization = production_provider.authorize_live_provider_run(
+                        adapter_spec=args.adapter,
+                        local_execution_enabled=args.enable_local_execution,
+                        live_provider_enabled=args.enable_live_provider,
+                        source_identities=requested_identities,
+                        env=os.environ,
+                        trust_service=trust_service,
+                        review_authority_root=policy.narrative_review_authority_root,
+                    )
+                    live_summary = authorization.safe_summary()
+                    _emit({"live_provider_preflight": live_summary})
+                    dependencies = production_provider.production_adapter_factory(
+                        authorization
+                    )
+                    live_summary = None
+                except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                    raise
+                except Exception:
+                    raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
+            else:
+                if args.enable_live_provider or not args.enable_local_execution:
+                    raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
+                _require_review_authority(policy)
+                trust_service = _load_trust_service(args)
+                policy = replace(policy, narrative_trust_service=trust_service)
+                dependencies = normalizer.load_adapter(args.adapter)
             if type(dependencies) is not tuple or len(dependencies) not in {2, 3}:
                 raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
             if len(dependencies) == 2:

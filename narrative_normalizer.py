@@ -21,6 +21,7 @@ import tempfile
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
@@ -5667,6 +5668,21 @@ class _EvidenceCapturingGenerationService(generation.NarrativeGenerationService)
         return result, _CapturedCP2Evidence(drafts, adjudications)
 
 
+def _provider_source_scope(
+    service: generation.NarrativeGenerationService,
+    source_identity_value: str,
+):
+    """Bind optional provider authorization without changing CP1/CP2 contracts."""
+
+    client = getattr(service, "_client", None)
+    source_scope = getattr(client, "authorized_source_scope", None)
+    if source_scope is None:
+        return nullcontext()
+    if not callable(source_scope):
+        _raise("narrative_normalizer_generation_failed")
+    return source_scope(source_identity_value)
+
+
 class NarrativeNormalizerService:
     def __init__(
         self,
@@ -5985,7 +6001,8 @@ class NarrativeNormalizerService:
             if not fast_path:
                 assert self.evidence_service is not None
                 try:
-                    resolution = self.evidence_service.resolve(documents)
+                    with _provider_source_scope(self.generation_service, identity):
+                        resolution = self.evidence_service.resolve(documents)
                 except evidence.EvidenceContractError:
                     reason = "narrative_normalizer_evidence_invalid"
                     self._record_failed_claim_locked(
@@ -6041,9 +6058,10 @@ class NarrativeNormalizerService:
                 if fast_normalization_input is not None
                 else build_normalization_input(source, self.context_provider)
             )
-            result, captured_evidence = self.generation_service.generate_with_evidence(
-                normalization_input.generation_input
-            )
+            with _provider_source_scope(self.generation_service, identity):
+                result, captured_evidence = self.generation_service.generate_with_evidence(
+                    normalization_input.generation_input
+                )
             model_calls += result.model_call_count
             if result.model_call_count not in {2, 3}:
                 _raise("narrative_normalizer_model_budget_exceeded")
