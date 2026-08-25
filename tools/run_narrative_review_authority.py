@@ -18,6 +18,7 @@ from narrative_review_authority_server import PeerRolePolicy, ReviewAuthoritySer
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Run the standalone Narrative Review Authority Broker")
     value.add_argument("--authority-root", required=True)
+    value.add_argument("--narrative-outbox-root", required=True)
     value.add_argument("--key-file", required=True)
     value.add_argument("--socket", required=True)
     value.add_argument("--git-root", required=True)
@@ -52,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         broker = authority.load_authority(
             authority_root=args.authority_root,
             key_file=args.key_file,
+            narrative_outbox_root=args.narrative_outbox_root,
             git_root=args.git_root,
             protected_roots=args.protected_root,
         )

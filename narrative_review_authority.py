@@ -23,10 +23,12 @@ import narrative_normalizer_trust as trust
 import narrative_review_authority_protocol as protocol
 
 
-BROKER_CONTRACT_VERSION = "narrative-review-authority-v1"
-STORAGE_ADAPTER_VERSION = "narrative-review-authority-state-adapter-v1"
-PREPARED_APPROVAL_VERSION = "narrative-review-authority-prepared-approval-v1"
-VERIFY_READY_VERSION = "narrative-review-authority-ready-verdict-v1"
+BROKER_CONTRACT_VERSION = "narrative-review-authority-v2"
+STORAGE_ADAPTER_VERSION = "narrative-review-authority-state-adapter-v2"
+PREPARED_APPROVAL_VERSION = "narrative-review-authority-prepared-approval-v2"
+VERIFY_READY_VERSION = "narrative-review-authority-ready-verdict-v2"
+NARRATIVE_OUTBOX_LAYOUT_VERSION = "normalizer-outbox-source-identity-v1"
+MAX_NARRATIVE_PACKAGE_BYTES = 2_000_000
 
 AUTHORITY_INVALID = "review_authority_invalid"
 AUTHORITY_PATH_INVALID = "review_authority_path_invalid"
@@ -43,17 +45,19 @@ _SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _EVENT_FILE = re.compile(r"(?P<revision>[0-9]{8})-(?P<digest>[0-9a-f]{64})\.json\Z")
 _DRAFT_KEYS = frozenset({
     "source_identity", "source_ref", "source_digest", "draft_identity",
-    "package_digest", "story_markdown_digest", "draft_manifest_digest",
+    "draft_package_digest", "story_markdown_digest", "draft_manifest_digest",
     "review_digest", "completed_claim_digest", "artifact_binding_digest",
     "contract_versions", "operator_request_id", "timestamp",
 })
 _REVIEW_KEYS = frozenset({
-    "source_identity", "draft_identity", "new_state", "operator_request_id",
+    "source_identity", "draft_identity", "draft_package_digest",
+    "new_state", "operator_request_id",
     "reason_codes", "timestamp", "expected_revision", "expected_event_digest",
 })
 _PREPARE_KEYS = frozenset({
     "source_identity", "source_ref", "source_digest", "draft_identity",
-    "package_digest", "narrative_ready_manifest_digest", "story_markdown_digest",
+    "draft_package_digest", "narrative_package_digest",
+    "narrative_ready_manifest_digest", "story_markdown_digest",
     "draft_manifest_digest", "review_digest", "completed_claim_digest",
     "artifact_binding_digest", "ready_manifest_contract", "source_contract",
     "draft_contract_versions",
@@ -61,9 +65,14 @@ _PREPARE_KEYS = frozenset({
 })
 _COMMIT_KEYS = frozenset({
     "prepared", "ready_manifest", "ready_manifest_digest", "attestation_digest",
+    "draft_package_digest", "narrative_package_digest",
 })
 _VERIFY_KEYS = frozenset({"ready_manifest", "attestation"})
 _LATEST_KEYS = frozenset({"source_identity", "draft_identity"})
+_READY_KEYS = frozenset({
+    "schema_version", "source_ref", "source_digest", "narrative_package_ref",
+    "narrative_package_digest", "status", "contract_versions",
+})
 
 
 class AuthorityError(ValueError):
@@ -128,6 +137,10 @@ def _digest(value: object) -> str:
     return hashlib.sha256(protocol.canonical(value)).hexdigest()
 
 
+def _canonical_file_digest(value: object) -> str:
+    return hashlib.sha256(protocol.canonical(value) + b"\n").hexdigest()
+
+
 def _contracts(value: object) -> dict[str, str]:
     if type(value) is not dict or not value or len(value) > 16:
         _fail()
@@ -146,6 +159,24 @@ def _reasons(value: object) -> tuple[str, ...]:
     if result != tuple(sorted(set(result))):
         _fail()
     return result
+
+
+def _ready_manifest(value: object, *, contract: str) -> dict[str, object]:
+    ready = _keys(value, _READY_KEYS)
+    if (
+        _text(ready["schema_version"]) != _text(contract)
+        or _source_ref(ready["source_ref"]) != ready["source_ref"]
+        or _hex(ready["source_digest"]) != ready["source_digest"]
+        or _source_ref(ready["narrative_package_ref"]) != ready["narrative_package_ref"]
+        or _hex(ready["narrative_package_digest"]) != ready["narrative_package_digest"]
+        or type(ready["status"]) is not str
+        or ready["status"] != "ready"
+    ):
+        _fail(AUTHORITY_ATTESTATION_INVALID)
+    contracts = _contracts(ready["contract_versions"])
+    if frozenset(contracts) != {"director", "narrative"}:
+        _fail(AUTHORITY_ATTESTATION_INVALID)
+    return ready
 
 
 def _json_file(path: Path) -> object:
@@ -236,6 +267,128 @@ def validate_authority_root(
             _fail(AUTHORITY_PATH_INVALID)
         cursor = cursor.parent
     return root
+
+
+def validate_narrative_outbox_root(
+    narrative_outbox_root: str | os.PathLike[str], *,
+    authority_root: str | os.PathLike[str],
+    git_root: str | os.PathLike[str] | None = None,
+    protected_roots: Iterable[str | os.PathLike[str]] = (),
+) -> Path:
+    root = _validate_absolute_path(narrative_outbox_root, allow_missing=False)
+    authority = _validate_absolute_path(authority_root, allow_missing=True)
+    blocked = [authority]
+    if git_root is not None:
+        blocked.append(_validate_absolute_path(git_root, allow_missing=False))
+    blocked.extend(_validate_absolute_path(item, allow_missing=True) for item in protected_roots)
+    if root.is_symlink() or not root.is_dir():
+        _fail(AUTHORITY_PATH_INVALID)
+    for other in blocked:
+        if root == other or root in other.parents or other in root.parents:
+            _fail(AUTHORITY_PATH_INVALID)
+    cursor = root
+    while cursor != cursor.parent:
+        if (cursor / ".git").exists():
+            _fail(AUTHORITY_PATH_INVALID)
+        cursor = cursor.parent
+    return root
+
+
+class NarrativePackageReader:
+    """Read-only resolver for the reviewed source-identity outbox layout."""
+
+    __slots__ = ("root",)
+
+    def __init__(
+        self, narrative_outbox_root: str | os.PathLike[str], *,
+        authority_root: str | os.PathLike[str],
+        git_root: str | os.PathLike[str] | None = None,
+        protected_roots: Iterable[str | os.PathLike[str]] = (),
+    ):
+        self.root = validate_narrative_outbox_root(
+            narrative_outbox_root,
+            authority_root=authority_root,
+            git_root=git_root,
+            protected_roots=protected_roots,
+        )
+
+    @staticmethod
+    def _no_symlink_components(path: Path) -> None:
+        cursor = path
+        while True:
+            if os.path.lexists(cursor) and cursor.is_symlink():
+                _fail(AUTHORITY_PERSISTENCE_INVALID)
+            if cursor == cursor.parent:
+                break
+            cursor = cursor.parent
+
+    def digest(self, source_identity: str, draft_identity: str) -> str:
+        source = _hex(source_identity)
+        _hex(draft_identity)
+        source_root = self.root / source
+        story_path = source_root / "story.json"
+        descriptor = -1
+        try:
+            self._no_symlink_components(story_path)
+            root_info = os.lstat(self.root)
+            source_info = os.lstat(source_root)
+            story_info = os.lstat(story_path)
+            if (
+                not stat.S_ISDIR(root_info.st_mode)
+                or not stat.S_ISDIR(source_info.st_mode)
+                or stat.S_ISLNK(source_info.st_mode)
+                or not stat.S_ISREG(story_info.st_mode)
+                or stat.S_ISLNK(story_info.st_mode)
+                or source_root.name != source
+                or source_root.parent.resolve(strict=True) != self.root.resolve(strict=True)
+                or story_path.name != "story.json"
+                or story_info.st_size < 1
+                or story_info.st_size > MAX_NARRATIVE_PACKAGE_BYTES
+            ):
+                _fail(AUTHORITY_PERSISTENCE_INVALID)
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(story_path, flags)
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_size != story_info.st_size
+                or (before.st_dev, before.st_ino) != (story_info.st_dev, story_info.st_ino)
+            ):
+                _fail(AUTHORITY_PERSISTENCE_INVALID)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(65_536, MAX_NARRATIVE_PACKAGE_BYTES + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_NARRATIVE_PACKAGE_BYTES:
+                    _fail(AUTHORITY_PERSISTENCE_INVALID)
+            after = os.fstat(descriptor)
+            final_info = os.lstat(story_path)
+            if (
+                total != before.st_size
+                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                or (final_info.st_dev, final_info.st_ino, final_info.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)
+                or not stat.S_ISREG(final_info.st_mode)
+                or stat.S_ISLNK(final_info.st_mode)
+            ):
+                _fail(AUTHORITY_PERSISTENCE_INVALID)
+            raw = b"".join(chunks)
+            parsed = json.loads(raw.decode("utf-8"))
+            if raw != protocol.canonical(parsed) + b"\n":
+                _fail(AUTHORITY_PERSISTENCE_INVALID)
+            return hashlib.sha256(raw).hexdigest()
+        except AuthorityError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, protocol.ProtocolError):
+            raise AuthorityError(AUTHORITY_PERSISTENCE_INVALID) from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 class _ProcessFileLock:
@@ -339,11 +492,17 @@ class ReviewStateAdapter:
             parsed: list[state.ReviewEvent] = []
             for revision, digest, path in indexed:
                 event = state.review_event_from_payload(_json_file(path), self.service)
-                if event.revision != revision or event.event_digest != digest or event.source_identity != identity:
+                if (
+                    event.revision != revision
+                    or event.event_digest != digest
+                    or event.source_identity != identity
+                    or event.draft_package_digest is None
+                ):
                     _fail(AUTHORITY_PERSISTENCE_INVALID)
                 if parsed and (
                     event.previous_revision != parsed[-1].revision
                     or event.previous_event_digest != parsed[-1].event_digest
+                    or event.draft_package_digest != parsed[-1].draft_package_digest
                 ):
                     _fail(AUTHORITY_PERSISTENCE_INVALID)
                 parsed.append(event)
@@ -363,7 +522,7 @@ class ReviewStateAdapter:
             raise AuthorityError(AUTHORITY_PERSISTENCE_INVALID) from None
 
     def append(self, event: state.ReviewEvent) -> tuple[state.ReviewLedger, bool]:
-        if type(event) is not state.ReviewEvent:
+        if type(event) is not state.ReviewEvent or event.draft_package_digest is None:
             _fail()
         with self.locked(event.source_identity):
             self._layout(event.source_identity)
@@ -387,6 +546,7 @@ class ReviewStateAdapter:
                         _fail(AUTHORITY_STATE_CONFLICT)
                 if (
                     event.draft_identity != ledger.draft_identity
+                    or event.draft_package_digest != ledger.latest.draft_package_digest
                     or event.revision != ledger.latest.revision + 1
                     or event.previous_revision != ledger.latest.revision
                     or event.previous_event_digest != ledger.latest.event_digest
@@ -422,12 +582,23 @@ class _RequestRecord:
 class ReviewAuthority:
     """Role-gated broker core.  This object alone contains the trust service."""
 
-    __slots__ = ("__service", "_store", "_requests", "_request_condition")
+    __slots__ = ("__service", "_packages", "_store", "_requests", "_request_condition")
 
-    def __init__(self, authority_root: Path, service: trust.NarrativeTrustService):
+    def __init__(
+        self, authority_root: Path, service: trust.NarrativeTrustService, *,
+        narrative_outbox_root: Path,
+        git_root: Path | None = None,
+        protected_roots: Iterable[Path] = (),
+    ):
         if not isinstance(authority_root, Path) or type(service) is not trust.NarrativeTrustService:
             _fail()
         object.__setattr__(self, "_ReviewAuthority__service", service)
+        self._packages = NarrativePackageReader(
+            narrative_outbox_root,
+            authority_root=authority_root,
+            git_root=git_root,
+            protected_roots=protected_roots,
+        )
         self._store = ReviewStateAdapter(authority_root, service)
         self._requests: dict[str, _RequestRecord] = {}
         self._request_condition = threading.Condition()
@@ -441,6 +612,7 @@ class ReviewAuthority:
         return {
             "source_identity": ledger.source_identity,
             "draft_identity": ledger.draft_identity,
+            "draft_package_digest": latest.draft_package_digest,
             "revision": latest.revision,
             "state": latest.state,
             "event_digest": latest.event_digest,
@@ -491,7 +663,12 @@ class ReviewAuthority:
     def _dispatch(self, operation: str, payload: dict[str, object]) -> dict[str, object]:
         if operation == protocol.OP_HEALTH:
             _keys(payload, frozenset())
-            return {"status": "ok", "contract_version": BROKER_CONTRACT_VERSION, "key_id": self.key_id}
+            return {
+                "status": "ok",
+                "contract_version": BROKER_CONTRACT_VERSION,
+                "narrative_outbox_layout_version": NARRATIVE_OUTBOX_LAYOUT_VERSION,
+                "key_id": self.key_id,
+            }
         if operation == protocol.OP_REGISTER_DRAFT:
             return self._register(payload)
         if operation == protocol.OP_LATEST_STATE:
@@ -517,11 +694,11 @@ class ReviewAuthority:
             + b"\0" + contracts["source"].encode("utf-8")
         ).hexdigest()
         source_identity = _hex(value["source_identity"])
-        package_digest = _hex(value["package_digest"])
+        draft_package_digest = _hex(value["draft_package_digest"])
         expected_draft = _digest({
             "version": contracts["draft"],
             "source_identity": source_identity,
-            "package_digest": package_digest,
+            "package_digest": draft_package_digest,
         })
         if source_identity != expected_source or _hex(value["draft_identity"]) != expected_draft:
             _fail()
@@ -531,7 +708,7 @@ class ReviewAuthority:
             "source_ref": source_ref,
             "source_digest": source_digest,
             "draft_identity": expected_draft,
-            "package_digest": package_digest,
+            "draft_package_digest": draft_package_digest,
             "story_markdown_digest": _hex(value["story_markdown_digest"]),
             "draft_manifest_digest": _hex(value["draft_manifest_digest"]),
             "review_digest": _hex(value["review_digest"]),
@@ -549,7 +726,9 @@ class ReviewAuthority:
         when = _timestamp(value["timestamp"])
         event = state.build_review_event(
             self.__service, revision=1, previous_revision=0,
-            source_identity=source, draft_identity=draft, state=state.STATE_DRAFTED,
+            source_identity=source, draft_identity=draft,
+            draft_package_digest=str(binding["draft_package_digest"]),
+            state=state.STATE_DRAFTED,
             operator_request_id=operator, reason_codes=(), timestamp=when,
             previous_event_digest="", action_digest=_digest(binding),
         )
@@ -567,6 +746,13 @@ class ReviewAuthority:
         value = _keys(payload, _REVIEW_KEYS)
         source = _hex(value["source_identity"])
         draft = _hex(value["draft_identity"])
+        draft_package_digest = _hex(value["draft_package_digest"])
+        if draft != _digest({
+            "version": "normalizer-draft-identity-v1",
+            "source_identity": source,
+            "package_digest": draft_package_digest,
+        }):
+            _fail(AUTHORITY_STATE_CONFLICT)
         new_state = value["new_state"]
         if type(new_state) is not str or new_state not in {
             state.STATE_PASSED, state.STATE_REJECTED, state.STATE_SUPERSEDED,
@@ -582,7 +768,15 @@ class ReviewAuthority:
         ledger = self._store.read(source, draft)
         for old in ledger.events:
             if old.operator_request_id == operator:
-                action = _digest({"state": new_state, "operator_request_id": operator, "reason_codes": list(reasons)})
+                action = _digest({
+                    "version": "narrative-review-authority-review-action-v2",
+                    "source_identity": source,
+                    "draft_identity": draft,
+                    "draft_package_digest": draft_package_digest,
+                    "state": new_state,
+                    "operator_request_id": operator,
+                    "reason_codes": list(reasons),
+                })
                 if old.state == new_state and old.reason_codes == reasons and old.action_digest == action:
                     return self._event_result(ledger, True)
                 _fail(AUTHORITY_STATE_CONFLICT)
@@ -598,9 +792,17 @@ class ReviewAuthority:
         event = state.build_review_event(
             self.__service, revision=ledger.latest.revision + 1,
             previous_revision=ledger.latest.revision, source_identity=source,
-            draft_identity=draft, state=new_state, operator_request_id=operator,
-            reason_codes=reasons, timestamp=when,
-            previous_event_digest=ledger.latest.event_digest,
+            draft_identity=draft, draft_package_digest=draft_package_digest,
+            state=new_state, operator_request_id=operator,
+            reason_codes=reasons, action_digest=_digest({
+                "version": "narrative-review-authority-review-action-v2",
+                "source_identity": source,
+                "draft_identity": draft,
+                "draft_package_digest": draft_package_digest,
+                "state": new_state,
+                "operator_request_id": operator,
+                "reason_codes": list(reasons),
+            }), timestamp=when, previous_event_digest=ledger.latest.event_digest,
         )
         final, idem = self._store.append(event)
         return self._event_result(final, idem)
@@ -622,7 +824,7 @@ class ReviewAuthority:
             "source_ref": value["source_ref"],
             "source_digest": value["source_digest"],
             "draft_identity": value["draft_identity"],
-            "package_digest": value["package_digest"],
+            "draft_package_digest": value["draft_package_digest"],
             "story_markdown_digest": value["story_markdown_digest"],
             "draft_manifest_digest": value["draft_manifest_digest"],
             "review_digest": value["review_digest"],
@@ -630,27 +832,42 @@ class ReviewAuthority:
             "artifact_binding_digest": value["artifact_binding_digest"],
             "contract_versions": value["draft_contract_versions"],
         })
-        if ledger.events[0].action_digest != _digest(draft_binding):
+        if (
+            ledger.events[0].action_digest != _digest(draft_binding)
+            or _text(value["source_contract"])
+            != draft_binding["contract_versions"]["source"]
+        ):
             _fail(AUTHORITY_STATE_CONFLICT)
+        actual_narrative_package_digest = self._packages.digest(source, draft)
+        if (
+            _hex(value["narrative_package_digest"])
+            != actual_narrative_package_digest
+        ):
+            _fail(AUTHORITY_ATTESTATION_INVALID)
         operator = _safe(value["operator_request_id"])
         when = _timestamp(value["timestamp"])
         action = _digest({
-            "version": "narrative-review-authority-approval-action-v1",
+            "version": "narrative-review-authority-approval-action-v2",
             "source_identity": source, "draft_identity": draft,
-            "operator_request_id": operator, "package_digest": _hex(value["package_digest"]),
+            "operator_request_id": operator,
+            "draft_package_digest": _hex(value["draft_package_digest"]),
+            "narrative_package_digest": actual_narrative_package_digest,
             "artifact_binding_digest": _hex(value["artifact_binding_digest"]),
         })
         event = state.build_review_event(
             self.__service, revision=ledger.latest.revision + 1,
             previous_revision=ledger.latest.revision, source_identity=source,
-            draft_identity=draft, state=state.STATE_APPROVED,
+            draft_identity=draft,
+            draft_package_digest=_hex(value["draft_package_digest"]),
+            state=state.STATE_APPROVED,
             operator_request_id=operator, reason_codes=(), timestamp=when,
             previous_event_digest=ledger.latest.event_digest, action_digest=action,
         )
-        attestation = state.build_approval_attestation(
+        attestation = state.build_dual_digest_approval_attestation(
             self.__service, source_identity=source, source_ref=_text(value["source_ref"]),
             source_digest=_hex(value["source_digest"]), draft_identity=draft,
-            package_digest=_hex(value["package_digest"]),
+            draft_package_digest=_hex(value["draft_package_digest"]),
+            narrative_package_digest=actual_narrative_package_digest,
             ready_manifest_digest=_hex(value["narrative_ready_manifest_digest"]),
             story_markdown_digest=_hex(value["story_markdown_digest"]),
             draft_manifest_digest=_hex(value["draft_manifest_digest"]),
@@ -659,6 +876,7 @@ class ReviewAuthority:
             artifact_binding_digest=_hex(value["artifact_binding_digest"]),
             approved_event=event, ready_manifest_contract=_text(value["ready_manifest_contract"]),
             source_contract=_text(value["source_contract"]),
+            draft_contract=_text(value["draft_contract_versions"]["draft"]),
         )
         prepared = {
             "schema_version": PREPARED_APPROVAL_VERSION,
@@ -668,7 +886,9 @@ class ReviewAuthority:
         }
         return {"prepared": prepared, "attestation_digest": _digest(attestation.to_payload()), "mutated": False}
 
-    def _parse_prepared(self, value: object) -> tuple[state.ReviewEvent, state.ApprovalAttestation, dict[str, object]]:
+    def _parse_prepared(
+        self, value: object,
+    ) -> tuple[state.ReviewEvent, state.DualDigestApprovalAttestation, dict[str, object]]:
         if type(value) is not dict or frozenset(value) != {
             "schema_version", "event", "attestation", "prepared_identity"
         } or value["schema_version"] != PREPARED_APPROVAL_VERSION:
@@ -680,27 +900,74 @@ class ReviewAuthority:
         versions = raw_attestation.get("contract_versions")
         if type(versions) is not dict:
             _fail(AUTHORITY_ATTESTATION_INVALID)
-        attestation = state.approval_attestation_from_payload(
+        attestation = state.dual_digest_approval_attestation_from_payload(
             raw_attestation, self.__service,
             ready_manifest_contract=versions.get("ready_manifest"),
             source_contract=versions.get("source"),
+            draft_contract=versions.get("draft"),
         )
+        binding = self._draft_binding({
+            "source_identity": attestation.source_identity,
+            "source_ref": attestation.source_ref,
+            "source_digest": attestation.source_digest,
+            "draft_identity": attestation.draft_identity,
+            "draft_package_digest": attestation.draft_package_digest,
+            "story_markdown_digest": attestation.story_markdown_digest,
+            "draft_manifest_digest": attestation.draft_manifest_digest,
+            "review_digest": attestation.review_digest,
+            "completed_claim_digest": attestation.completed_claim_digest,
+            "artifact_binding_digest": attestation.artifact_binding_digest,
+            "contract_versions": {
+                "draft": versions["draft"], "source": versions["source"],
+            },
+        })
+        expected_action = _digest({
+            "version": "narrative-review-authority-approval-action-v2",
+            "source_identity": attestation.source_identity,
+            "draft_identity": attestation.draft_identity,
+            "operator_request_id": attestation.approval_request_id,
+            "draft_package_digest": attestation.draft_package_digest,
+            "narrative_package_digest": attestation.narrative_package_digest,
+            "artifact_binding_digest": attestation.artifact_binding_digest,
+        })
         identity = _digest({"event": event.to_payload(), "attestation": attestation.to_payload()})
-        if value["prepared_identity"] != identity or event.state != state.STATE_APPROVED:
+        if (
+            value["prepared_identity"] != identity
+            or event.state != state.STATE_APPROVED
+            or event.source_identity != binding["source_identity"]
+            or event.draft_identity != binding["draft_identity"]
+            or event.draft_package_digest != binding["draft_package_digest"]
+            or event.revision != attestation.review_revision
+            or event.event_digest != attestation.review_event_digest
+            or event.operator_request_id != attestation.approval_request_id
+            or event.action_digest != expected_action
+        ):
             _fail(AUTHORITY_ATTESTATION_INVALID)
         return event, attestation, value
 
     def _commit(self, payload: dict[str, object]) -> dict[str, object]:
         value = _keys(payload, _COMMIT_KEYS)
         event, attestation, prepared = self._parse_prepared(value["prepared"])
-        ready = value["ready_manifest"]
-        if type(ready) is not dict:
-            _fail(AUTHORITY_ATTESTATION_INVALID)
-        ready_digest = _digest(ready)
+        actual_narrative_package_digest = self._packages.digest(
+            attestation.source_identity, attestation.draft_identity,
+        )
+        ready = _ready_manifest(
+            value["ready_manifest"],
+            contract=dict(attestation.contract_versions)["ready_manifest"],
+        )
+        ready_digest = _canonical_file_digest(ready)
         if (
-            _hex(value["ready_manifest_digest"]) != ready_digest
+            _hex(value["draft_package_digest"]) != attestation.draft_package_digest
+            or _hex(value["narrative_package_digest"]) != attestation.narrative_package_digest
+            or actual_narrative_package_digest != attestation.narrative_package_digest
+            or _hex(value["ready_manifest_digest"]) != ready_digest
             or ready_digest != attestation.narrative_ready_manifest_digest
             or _hex(value["attestation_digest"]) != _digest(attestation.to_payload())
+            or ready.get("source_ref") != attestation.source_ref
+            or ready.get("source_digest") != attestation.source_digest
+            or ready.get("narrative_package_ref")
+            != f"{attestation.source_identity}/story.json"
+            or ready.get("narrative_package_digest") != attestation.narrative_package_digest
         ):
             _fail(AUTHORITY_ATTESTATION_INVALID)
         final, idem = self._store.append(event)
@@ -723,23 +990,57 @@ class ReviewAuthority:
         if type(versions) is not dict:
             _fail(AUTHORITY_NOT_READY)
         try:
-            attestation = state.approval_attestation_from_payload(
+            attestation = state.dual_digest_approval_attestation_from_payload(
                 attestation_raw, self.__service,
                 ready_manifest_contract=versions.get("ready_manifest"),
                 source_contract=versions.get("source"),
+                draft_contract=versions.get("draft"),
             )
             ledger = self._store.read(attestation.source_identity, attestation.draft_identity)
+            binding = self._draft_binding({
+                "source_identity": attestation.source_identity,
+                "source_ref": attestation.source_ref,
+                "source_digest": attestation.source_digest,
+                "draft_identity": attestation.draft_identity,
+                "draft_package_digest": attestation.draft_package_digest,
+                "story_markdown_digest": attestation.story_markdown_digest,
+                "draft_manifest_digest": attestation.draft_manifest_digest,
+                "review_digest": attestation.review_digest,
+                "completed_claim_digest": attestation.completed_claim_digest,
+                "artifact_binding_digest": attestation.artifact_binding_digest,
+                "contract_versions": {
+                    "draft": versions["draft"], "source": versions["source"],
+                },
+            })
+            actual_narrative_package_digest = self._packages.digest(
+                attestation.source_identity, attestation.draft_identity,
+            )
         except Exception:
             _fail(AUTHORITY_NOT_READY)
-        ready_digest = _digest(ready)
+        try:
+            ready = _ready_manifest(
+                ready,
+                contract=dict(attestation.contract_versions)["ready_manifest"],
+            )
+            ready_digest = _canonical_file_digest(ready)
+        except Exception:
+            _fail(AUTHORITY_NOT_READY)
         valid = (
             ledger.latest.state == state.STATE_APPROVED
+            and ledger.events[0].action_digest == _digest(binding)
+            and all(
+                event.draft_package_digest == attestation.draft_package_digest
+                for event in ledger.events
+            )
             and ledger.latest.revision == attestation.review_revision
             and ledger.latest.event_digest == attestation.review_event_digest
             and ready_digest == attestation.narrative_ready_manifest_digest
             and ready.get("source_ref") == attestation.source_ref
             and ready.get("source_digest") == attestation.source_digest
-            and ready.get("narrative_package_digest") == attestation.package_digest
+            and ready.get("narrative_package_ref")
+            == f"{attestation.source_identity}/story.json"
+            and ready.get("narrative_package_digest") == attestation.narrative_package_digest
+            and actual_narrative_package_digest == attestation.narrative_package_digest
         )
         if not valid:
             _fail(AUTHORITY_NOT_READY)
@@ -755,18 +1056,34 @@ class ReviewAuthority:
 
 def load_authority(
     *, authority_root: str | os.PathLike[str], key_file: str | os.PathLike[str],
+    narrative_outbox_root: str | os.PathLike[str],
     git_root: str | os.PathLike[str] | None = None,
     protected_roots: Iterable[str | os.PathLike[str]] = (),
 ) -> ReviewAuthority:
-    root = validate_authority_root(authority_root, git_root=git_root, protected_roots=protected_roots)
+    protected = tuple(protected_roots)
+    root = validate_authority_root(authority_root, git_root=git_root, protected_roots=protected)
+    outbox = validate_narrative_outbox_root(
+        narrative_outbox_root,
+        authority_root=root,
+        git_root=git_root,
+        protected_roots=protected,
+    )
     key_path = _validate_absolute_path(key_file, allow_missing=False)
-    if root == key_path or root in key_path.parents or key_path in root.parents:
+    if (
+        root == key_path or root in key_path.parents or key_path in root.parents
+        or outbox == key_path or outbox in key_path.parents or key_path in outbox.parents
+    ):
         _fail(AUTHORITY_PATH_INVALID)
     try:
         service = trust.load_trust_service({}, key_path)
     except trust.TrustError as error:
         raise AuthorityError(error.reason_code) from None
-    return ReviewAuthority(root, service)
+    return ReviewAuthority(
+        root, service,
+        narrative_outbox_root=outbox,
+        git_root=None if git_root is None else Path(git_root),
+        protected_roots=tuple(Path(item) for item in protected),
+    )
 
 
 def utc_now() -> str:
@@ -777,7 +1094,9 @@ __all__ = (
     "AUTHORITY_ATTESTATION_INVALID", "AUTHORITY_INTERNAL", "AUTHORITY_INVALID",
     "AUTHORITY_NOT_READY", "AUTHORITY_PATH_INVALID", "AUTHORITY_PERSISTENCE_INVALID",
     "AUTHORITY_STATE_CONFLICT", "AUTHORITY_STATE_MISSING", "AUTHORITY_TRANSITION_INVALID",
-    "AuthorityError", "BROKER_CONTRACT_VERSION", "PREPARED_APPROVAL_VERSION",
-    "ReviewAuthority", "ReviewStateAdapter", "STORAGE_ADAPTER_VERSION",
-    "VERIFY_READY_VERSION", "load_authority", "utc_now", "validate_authority_root",
+    "AuthorityError", "BROKER_CONTRACT_VERSION", "MAX_NARRATIVE_PACKAGE_BYTES",
+    "NARRATIVE_OUTBOX_LAYOUT_VERSION", "NarrativePackageReader",
+    "PREPARED_APPROVAL_VERSION", "ReviewAuthority", "ReviewStateAdapter",
+    "STORAGE_ADAPTER_VERSION", "VERIFY_READY_VERSION", "load_authority", "utc_now",
+    "validate_authority_root", "validate_narrative_outbox_root",
 )

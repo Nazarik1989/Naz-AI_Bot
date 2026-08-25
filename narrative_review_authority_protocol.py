@@ -10,7 +10,7 @@ from typing import BinaryIO, Mapping
 from narrative_normalizer_trust import canonical_payload
 
 
-IPC_SCHEMA_VERSION = "narrative-review-authority-ipc-v1"
+IPC_SCHEMA_VERSION = "narrative-review-authority-ipc-v2"
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 ROLE_NORMALIZER = "normalizer"

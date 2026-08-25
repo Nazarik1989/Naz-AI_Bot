@@ -30,6 +30,9 @@ H2 = "b" * 64
 H4 = "d" * 64
 H5 = "e" * 64
 H6 = "f" * 64
+STORY_PAYLOAD = {"schema_version": "normalizer-story-v1", "title": "Exact bytes"}
+STORY_BYTES = p.canonical(STORY_PAYLOAD) + b"\n"
+NARRATIVE_DIGEST = hashlib.sha256(STORY_BYTES).hexdigest()
 SOURCE_REF = "content/inbox/item.json"
 SOURCE_CONTRACT = "agent-content-source-v1"
 DRAFT_CONTRACT = "normalizer-draft-identity-v1"
@@ -114,6 +117,26 @@ def service() -> trust.NarrativeTrustService:
     return trust.NarrativeTrustService(b"authority-test-key-material-32!!")
 
 
+def narrative_outbox(root: Path, *, write_story: bool = True) -> Path:
+    outbox = root / "outbox"
+    outbox.mkdir(parents=True, exist_ok=True)
+    if write_story:
+        source_root = outbox / H
+        source_root.mkdir(parents=True, exist_ok=True)
+        story = source_root / "story.json"
+        if not os.path.lexists(story):
+            story.write_bytes(STORY_BYTES)
+    return outbox
+
+
+def make_broker(root: Path, *, write_story: bool = True) -> a.ReviewAuthority:
+    return a.ReviewAuthority(
+        root / "authority",
+        service(),
+        narrative_outbox_root=narrative_outbox(root, write_story=write_story),
+    )
+
+
 def transport_server(
     tmp_path: Path, broker: a.ReviewAuthority, monkeypatch: pytest.MonkeyPatch,
     *, timeout: float = 0.5,
@@ -162,15 +185,17 @@ def raw_connection(
 
 @pytest.fixture
 def broker(tmp_path: Path) -> a.ReviewAuthority:
-    return a.ReviewAuthority(tmp_path / "authority", service())
+    return make_broker(tmp_path)
 
 
 def request(request_id: str, operation: str, payload: dict[str, object]) -> p.Request:
     return p.Request(request_id, operation, payload)
 
 
-def _process_register(root: str, operator: str, output: object) -> None:
-    broker = a.ReviewAuthority(Path(root), service())
+def _process_register(root: str, outbox: str, operator: str, output: object) -> None:
+    broker = a.ReviewAuthority(
+        Path(root), service(), narrative_outbox_root=Path(outbox),
+    )
     payload = draft_payload(operator_request_id=operator)
     response = broker.handle(p.ROLE_NORMALIZER, request(f"process-{operator}", p.OP_REGISTER_DRAFT, payload))
     output.put((response.ok, response.error))
@@ -182,7 +207,7 @@ def draft_payload(**changes: object) -> dict[str, object]:
         "source_ref": SOURCE_REF,
         "source_digest": H2,
         "draft_identity": H3,
-        "package_digest": H4,
+        "draft_package_digest": H4,
         "story_markdown_digest": H5,
         "draft_manifest_digest": H6,
         "review_digest": H,
@@ -207,6 +232,7 @@ def review_payload(latest: dict[str, object], **changes: object) -> dict[str, ob
     value: dict[str, object] = {
         "source_identity": H,
         "draft_identity": H3,
+        "draft_package_digest": H4,
         "new_state": rs.STATE_PASSED,
         "operator_request_id": "review-001",
         "reason_codes": [],
@@ -232,14 +258,14 @@ def ready_manifest() -> dict[str, object]:
         "source_ref": SOURCE_REF,
         "source_digest": H2,
         "narrative_package_ref": f"{H}/story.json",
-        "narrative_package_digest": H4,
+        "narrative_package_digest": NARRATIVE_DIGEST,
         "status": "ready",
         "contract_versions": {"director": "review-only-v1", "narrative": "narrative-v1"},
     }
 
 
 def canonical_digest(value: object) -> str:
-    return hashlib.sha256(p.canonical(value)).hexdigest()
+    return hashlib.sha256(p.canonical(value) + b"\n").hexdigest()
 
 
 def prepare_payload(latest: dict[str, object], **changes: object) -> dict[str, object]:
@@ -249,7 +275,8 @@ def prepare_payload(latest: dict[str, object], **changes: object) -> dict[str, o
         "source_ref": SOURCE_REF,
         "source_digest": H2,
         "draft_identity": H3,
-        "package_digest": H4,
+        "draft_package_digest": H4,
+        "narrative_package_digest": NARRATIVE_DIGEST,
         "narrative_ready_manifest_digest": canonical_digest(ready),
         "story_markdown_digest": H5,
         "draft_manifest_digest": H6,
@@ -282,6 +309,8 @@ def commit_payload(prepared: dict[str, object], **changes: object) -> dict[str, 
         "ready_manifest": ready_manifest(),
         "ready_manifest_digest": canonical_digest(ready_manifest()),
         "attestation_digest": prepared["attestation_digest"],
+        "draft_package_digest": H4,
+        "narrative_package_digest": NARRATIVE_DIGEST,
     }
     value.update(changes)
     return value
@@ -313,6 +342,358 @@ def test_full_drafted_passed_prepared_approved_verified_workflow(broker: a.Revie
     assert verified.ok and verified.result["ready"] is True
 
 
+def test_register_draft_binds_logical_digest_and_recomputes_identity(broker: a.ReviewAuthority) -> None:
+    result = register(broker)
+    assert result["draft_package_digest"] == H4
+    assert result["draft_identity"] == hashlib.sha256(p.canonical({
+        "version": DRAFT_CONTRACT,
+        "source_identity": H,
+        "package_digest": H4,
+    })).hexdigest()
+    assert result["event"]["draft_package_digest"] == H4
+    assert result["event"]["schema_version"] == rs.REVIEW_EVENT_SCHEMA_VERSION
+    assert result["event"]["policy_version"] == rs.REVIEW_STATE_POLICY_VERSION
+
+
+def test_prepare_keeps_distinct_logical_and_story_file_digests(broker: a.ReviewAuthority) -> None:
+    prepared = prepare(broker)
+    attestation = prepared["prepared"]["attestation"]
+    assert H4 != NARRATIVE_DIGEST
+    assert attestation["draft_package_digest"] == H4
+    assert attestation["narrative_package_digest"] == NARRATIVE_DIGEST
+    assert "package_digest" not in attestation
+    assert attestation["schema_version"] == rs.DUAL_DIGEST_APPROVAL_ATTESTATION_SCHEMA_VERSION
+    assert attestation["contract_versions"]["attestation"] == rs.DUAL_DIGEST_APPROVAL_ATTESTATION_POLICY_VERSION
+
+
+def test_ready_manifest_digest_binds_exact_canonical_file_bytes_with_final_lf(
+    broker: a.ReviewAuthority,
+) -> None:
+    latest = pass_review(broker)
+    payload = prepare_payload(latest)
+    ready = ready_manifest()
+    assert payload["narrative_ready_manifest_digest"] == hashlib.sha256(
+        p.canonical(ready) + b"\n"
+    ).hexdigest()
+    assert payload["narrative_ready_manifest_digest"] != hashlib.sha256(
+        p.canonical(ready)
+    ).hexdigest()
+
+
+def test_prepare_rejects_story_digest_that_omits_persisted_final_lf(
+    broker: a.ReviewAuthority,
+) -> None:
+    latest = pass_review(broker)
+    without_lf = p.canonical(STORY_PAYLOAD)
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-story-digest-without-lf", p.OP_PREPARE_APPROVAL, prepare_payload(
+            latest,
+            narrative_package_digest=hashlib.sha256(without_lf).hexdigest(),
+        )),
+    )
+    assert (
+        not response.ok
+        and response.result is None
+        and response.error == a.AUTHORITY_ATTESTATION_INVALID
+    )
+    assert len(broker._store.read(H).events) == 2
+
+
+def test_prepare_accepts_digest_of_exact_persisted_story_bytes(
+    broker: a.ReviewAuthority,
+) -> None:
+    latest = pass_review(broker)
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-exact-story-bytes", p.OP_PREPARE_APPROVAL, prepare_payload(latest)),
+    )
+    assert response.ok
+    assert response.result["prepared"]["attestation"]["narrative_package_digest"] == hashlib.sha256(
+        STORY_BYTES
+    ).hexdigest()
+    assert len(broker._store.read(H).events) == 2
+
+
+def test_removing_story_final_lf_after_prepare_rejects_commit_without_approval(
+    broker: a.ReviewAuthority,
+) -> None:
+    prepared = prepare(broker)
+    (broker._packages.root / H / "story.json").write_bytes(STORY_BYTES[:-1])
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("commit-after-story-lf-removal", p.OP_COMMIT_APPROVAL, commit_payload(prepared)),
+    )
+    assert not response.ok and response.result is None
+    ledger = broker._store.read(H)
+    assert ledger.latest.state == rs.STATE_PASSED and len(ledger.events) == 2
+
+
+def test_changing_story_bytes_after_commit_rejects_verify_ready(
+    broker: a.ReviewAuthority,
+) -> None:
+    approved = commit(broker)
+    changed = p.canonical({"schema_version": "normalizer-story-v1", "title": "Changed"}) + b"\n"
+    (broker._packages.root / H / "story.json").write_bytes(changed)
+    response = broker.handle(
+        p.ROLE_CONSUMER,
+        request("verify-after-story-change", p.OP_VERIFY_READY, {
+            "ready_manifest": ready_manifest(),
+            "attestation": approved["attestation"],
+        }),
+    )
+    assert not response.ok and response.error == a.AUTHORITY_NOT_READY
+    assert broker._store.read(H).latest.state == rs.STATE_APPROVED
+
+
+def test_noncanonical_story_bytes_rejected_even_when_submitted_digest_matches(
+    broker: a.ReviewAuthority,
+) -> None:
+    latest = pass_review(broker)
+    noncanonical = b'{ "title": "Exact bytes", "schema_version": "normalizer-story-v1" }\n'
+    (broker._packages.root / H / "story.json").write_bytes(noncanonical)
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-noncanonical-story", p.OP_PREPARE_APPROVAL, prepare_payload(
+            latest,
+            narrative_package_digest=hashlib.sha256(noncanonical).hexdigest(),
+        )),
+    )
+    assert (
+        not response.ok
+        and response.result is None
+        and response.error == a.AUTHORITY_PERSISTENCE_INVALID
+    )
+    assert len(broker._store.read(H).events) == 2
+
+
+def test_missing_story_file_rejected_without_authority_mutation(
+    broker: a.ReviewAuthority,
+) -> None:
+    latest = pass_review(broker)
+    (broker._packages.root / H / "story.json").unlink()
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-missing-story", p.OP_PREPARE_APPROVAL, prepare_payload(latest)),
+    )
+    assert not response.ok and response.error == a.AUTHORITY_PERSISTENCE_INVALID
+    assert len(broker._store.read(H).events) == 2
+
+
+def test_symlink_story_file_rejected_without_authority_mutation(
+    broker: a.ReviewAuthority, tmp_path: Path,
+) -> None:
+    latest = pass_review(broker)
+    story = broker._packages.root / H / "story.json"
+    external = tmp_path / "external-story.json"
+    external.write_bytes(STORY_BYTES)
+    story.unlink()
+    try:
+        story.symlink_to(external)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-symlink-story", p.OP_PREPARE_APPROVAL, prepare_payload(latest)),
+    )
+    assert not response.ok and response.error == a.AUTHORITY_PERSISTENCE_INVALID
+    assert len(broker._store.read(H).events) == 2
+
+
+def test_outbox_source_identity_mismatch_rejected_without_authority_mutation(
+    broker: a.ReviewAuthority,
+) -> None:
+    latest = pass_review(broker)
+    source_root = broker._packages.root / H
+    source_root.rename(broker._packages.root / H2)
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-wrong-outbox-source", p.OP_PREPARE_APPROVAL, prepare_payload(latest)),
+    )
+    assert not response.ok and response.error == a.AUTHORITY_PERSISTENCE_INVALID
+    assert len(broker._store.read(H).events) == 2
+
+
+def test_caller_path_field_rejected_before_package_reader_access(
+    broker: a.ReviewAuthority, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    latest = pass_review(broker)
+    calls: list[tuple[str, str]] = []
+
+    def counted(self: a.NarrativePackageReader, source: str, draft: str) -> str:
+        calls.append((source, draft))
+        return NARRATIVE_DIGEST
+
+    monkeypatch.setattr(a.NarrativePackageReader, "digest", counted)
+    payload = prepare_payload(latest)
+    payload["story_path"] = "C:/arbitrary/story.json"
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-caller-path", p.OP_PREPARE_APPROVAL, payload),
+    )
+    assert not response.ok and response.error == a.AUTHORITY_INVALID
+    assert calls == [] and len(broker._store.read(H).events) == 2
+
+
+def test_equal_digest_values_remain_two_separate_fields(
+    broker: a.ReviewAuthority, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(a.NarrativePackageReader, "digest", lambda self, source, draft: H4)
+    latest = pass_review(broker)
+    ready = ready_manifest()
+    ready["narrative_package_digest"] = H4
+    payload = prepare_payload(
+        latest,
+        narrative_package_digest=H4,
+        narrative_ready_manifest_digest=canonical_digest(ready),
+    )
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-equal-digests", p.OP_PREPARE_APPROVAL, payload),
+    )
+    assert response.ok
+    prepared = response.result
+    attestation = prepared["prepared"]["attestation"]
+    assert attestation["draft_package_digest"] == H4
+    assert attestation["narrative_package_digest"] == H4
+    committed = broker.handle(
+        p.ROLE_REVIEWER,
+        request("commit-equal-digests", p.OP_COMMIT_APPROVAL, {
+            "prepared": prepared["prepared"],
+            "ready_manifest": ready,
+            "ready_manifest_digest": canonical_digest(ready),
+            "attestation_digest": prepared["attestation_digest"],
+            "draft_package_digest": H4,
+            "narrative_package_digest": H4,
+        }),
+    )
+    assert committed.ok
+
+
+def test_swapped_dual_digests_rejected_before_approval_append(broker: a.ReviewAuthority) -> None:
+    latest = pass_review(broker)
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-swapped-digests", p.OP_PREPARE_APPROVAL, prepare_payload(
+            latest,
+            draft_package_digest=NARRATIVE_DIGEST,
+            narrative_package_digest=H4,
+        )),
+    )
+    assert not response.ok
+    assert broker._store.read(H).latest.state == rs.STATE_PASSED
+
+
+@pytest.mark.parametrize("operation", [p.OP_REGISTER_DRAFT, p.OP_PREPARE_APPROVAL])
+def test_old_ambiguous_package_digest_is_rejected(broker: a.ReviewAuthority, operation: str) -> None:
+    if operation == p.OP_REGISTER_DRAFT:
+        payload = draft_payload()
+        payload["package_digest"] = payload.pop("draft_package_digest")
+        role = p.ROLE_NORMALIZER
+    else:
+        latest = pass_review(broker)
+        payload = prepare_payload(latest)
+        payload["package_digest"] = payload.pop("draft_package_digest")
+        role = p.ROLE_REVIEWER
+    response = broker.handle(role, request(f"old-ambiguous-{operation}", operation, payload))
+    assert not response.ok and response.error == a.AUTHORITY_INVALID
+
+
+@pytest.mark.parametrize("field", ["draft_package_digest", "narrative_package_digest"])
+def test_prepare_requires_each_dual_digest(broker: a.ReviewAuthority, field: str) -> None:
+    latest = pass_review(broker)
+    payload = prepare_payload(latest)
+    del payload[field]
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request(f"prepare-missing-explicit-{field}", p.OP_PREPARE_APPROVAL, payload),
+    )
+    assert not response.ok
+    assert broker._store.read(H).latest.state == rs.STATE_PASSED
+
+
+@pytest.mark.parametrize("field", ["draft_package_digest", "narrative_package_digest"])
+def test_dual_digest_str_subclasses_rejected_before_mutation(
+    broker: a.ReviewAuthority, field: str,
+) -> None:
+    latest = pass_review(broker)
+    with pytest.raises(p.ProtocolError):
+        request(
+            f"subclass-{field}", p.OP_PREPARE_APPROVAL,
+            prepare_payload(latest, **{field: Text(str(prepare_payload(latest)[field]))}),
+        )
+    assert broker._store.read(H).latest.state == rs.STATE_PASSED
+
+
+def test_changed_story_bytes_with_unchanged_logical_digest_rejected_at_commit(
+    broker: a.ReviewAuthority,
+) -> None:
+    prepared = prepare(broker)
+    changed_ready = ready_manifest()
+    changed_ready["narrative_package_digest"] = H2
+    payload = commit_payload(prepared)
+    payload["ready_manifest"] = changed_ready
+    payload["ready_manifest_digest"] = canonical_digest(changed_ready)
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("commit-changed-story-bytes", p.OP_COMMIT_APPROVAL, payload),
+    )
+    assert not response.ok
+    assert broker._store.read(H).latest.state == rs.STATE_PASSED
+
+
+def test_changed_logical_digest_with_unchanged_story_file_digest_rejected(
+    broker: a.ReviewAuthority,
+) -> None:
+    latest = pass_review(broker)
+    response = broker.handle(
+        p.ROLE_REVIEWER,
+        request("prepare-changed-logical", p.OP_PREPARE_APPROVAL, prepare_payload(
+            latest,
+            draft_package_digest=H2,
+            narrative_package_digest=NARRATIVE_DIGEST,
+        )),
+    )
+    assert not response.ok
+    assert broker._store.read(H).latest.state == rs.STATE_PASSED
+
+
+def test_exact_duplicate_approval_is_idempotent_and_divergent_retry_conflicts(
+    broker: a.ReviewAuthority,
+) -> None:
+    prepared = prepare(broker)
+    payload = commit_payload(prepared)
+    exact = request("commit-dual-digest-idempotent", p.OP_COMMIT_APPROVAL, payload)
+    first = broker.handle(p.ROLE_REVIEWER, exact)
+    second = broker.handle(p.ROLE_REVIEWER, exact)
+    assert first == second and first.ok
+    assert len(broker._store.read(H).events) == 3
+    divergent = copy.deepcopy(payload)
+    divergent["narrative_package_digest"] = H2
+    conflict = broker.handle(
+        p.ROLE_REVIEWER,
+        request("commit-dual-digest-idempotent", p.OP_COMMIT_APPROVAL, divergent),
+    )
+    assert not conflict.ok and conflict.error == p.REQUEST_CONFLICT
+    assert len(broker._store.read(H).events) == 3
+
+
+def test_attestation_copied_to_another_source_manifest_is_rejected(
+    broker: a.ReviewAuthority,
+) -> None:
+    approved = commit(broker)
+    other_ready = ready_manifest()
+    other_ready["source_ref"] = "content/inbox/other.json"
+    response = broker.handle(
+        p.ROLE_CONSUMER,
+        request("verify-copied-attestation", p.OP_VERIFY_READY, {
+            "ready_manifest": other_ready,
+            "attestation": approved["attestation"],
+        }),
+    )
+    assert not response.ok and response.error == a.AUTHORITY_NOT_READY
+
+
 @pytest.mark.parametrize("missing", sorted(draft_payload()))
 def test_register_draft_rejects_every_missing_field(broker: a.ReviewAuthority, missing: str) -> None:
     payload = draft_payload()
@@ -335,7 +716,7 @@ def test_register_draft_rejects_content_or_extra_fields(broker: a.ReviewAuthorit
     [
         ("source_identity", H2), ("source_identity", "A" * 64),
         ("source_digest", "x"), ("draft_identity", None),
-        ("package_digest", "0" * 63), ("story_markdown_digest", "0" * 65),
+        ("draft_package_digest", "0" * 63), ("story_markdown_digest", "0" * 65),
         ("draft_manifest_digest", 1), ("review_digest", True),
         ("completed_claim_digest", "../x"), ("artifact_binding_digest", ""),
         ("source_ref", " /absolute"), ("source_ref", ""),
@@ -441,7 +822,8 @@ def test_prepare_rejects_every_missing_field(broker: a.ReviewAuthority, missing:
     [
         ("expected_revision", 1), ("expected_event_digest", H2),
         ("source_identity", H2), ("draft_identity", H2),
-        ("source_digest", H), ("package_digest", "x"),
+        ("source_digest", H), ("draft_package_digest", "x"),
+        ("narrative_package_digest", "x"),
         ("story_markdown_digest", None),
         ("draft_manifest_digest", 1), ("review_digest", True),
         ("completed_claim_digest", ""), ("artifact_binding_digest", "f" * 63),
@@ -466,7 +848,7 @@ def test_only_reviewer_can_prepare_or_commit(broker: a.ReviewAuthority, role: st
     assert not response.ok and response.error == p.ACCESS_DENIED
 
 
-@pytest.mark.parametrize("field", ["prepared", "ready_manifest", "ready_manifest_digest", "attestation_digest"])
+@pytest.mark.parametrize("field", sorted(commit_payload({"prepared": {}, "attestation_digest": H})))
 def test_commit_rejects_every_missing_field(broker: a.ReviewAuthority, field: str) -> None:
     prepared = prepare(broker)
     payload = commit_payload(prepared)
@@ -478,6 +860,7 @@ def test_commit_rejects_every_missing_field(broker: a.ReviewAuthority, field: st
 @pytest.mark.parametrize(
     "mutation",
     [
+        ("draft_package_digest", H2), ("narrative_package_digest", H2),
         ("ready_manifest_digest", H), ("attestation_digest", H),
         ("ready_manifest", {"source_ref": "wrong"}),
         ("prepared.schema_version", "v2"),
@@ -489,7 +872,8 @@ def test_commit_rejects_every_missing_field(broker: a.ReviewAuthority, field: st
         ("prepared.attestation.source_identity", H2),
         ("prepared.attestation.source_digest", H),
         ("prepared.attestation.draft_identity", H2),
-        ("prepared.attestation.package_digest", H2),
+        ("prepared.attestation.draft_package_digest", H2),
+        ("prepared.attestation.narrative_package_digest", H2),
         ("prepared.attestation.review_event_digest", H),
         ("prepared.attestation.review_revision", 99),
         ("prepared.attestation.key_id", "0" * 24),
@@ -586,10 +970,17 @@ def test_concurrent_divergent_duplicates_append_at_most_one_event(broker: a.Revi
 @pytest.mark.parametrize("divergent", [False, True])
 def test_two_process_append_race_has_one_no_clobber_event(tmp_path: Path, divergent: bool) -> None:
     root = tmp_path / "authority"
+    outbox = narrative_outbox(tmp_path)
     context = multiprocessing.get_context("spawn")
     output = context.Queue()
     operators = ("register-process-a", "register-process-b" if divergent else "register-process-a")
-    processes = [context.Process(target=_process_register, args=(str(root), operator, output)) for operator in operators]
+    processes = [
+        context.Process(
+            target=_process_register,
+            args=(str(root), str(outbox), operator, output),
+        )
+        for operator in operators
+    ]
     for process in processes:
         process.start()
     for process in processes:
@@ -602,7 +993,9 @@ def test_two_process_append_race_has_one_no_clobber_event(tmp_path: Path, diverg
         assert {error for ok, error in results if not ok} == {a.AUTHORITY_STATE_CONFLICT}
     else:
         assert all(ok for ok, _ in results)
-    assert len(a.ReviewAuthority(root, service())._store.read(H).events) == 1
+    assert len(a.ReviewAuthority(
+        root, service(), narrative_outbox_root=outbox,
+    )._store.read(H).events) == 1
 
 
 def test_crash_before_event_promotion_leaves_previous_chain_current(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -613,11 +1006,11 @@ def test_crash_before_event_promotion_leaves_previous_chain_current(tmp_path: Pa
             raise OSError("simulated pre-promotion crash")
         return original(path, data)
 
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     monkeypatch.setattr(a, "_no_clobber", fail_before)
     response = broker.handle(p.ROLE_NORMALIZER, request("crash-before", p.OP_REGISTER_DRAFT, draft_payload()))
     assert not response.ok
-    restarted = a.ReviewAuthority(tmp_path / "authority", service())
+    restarted = make_broker(tmp_path)
     with pytest.raises(a.AuthorityError, match=a.AUTHORITY_STATE_MISSING):
         restarted._store.read(H)
 
@@ -631,11 +1024,11 @@ def test_crash_after_event_promotion_is_discovered_on_restart(tmp_path: Path, mo
             raise OSError("simulated post-promotion crash")
         return result
 
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     monkeypatch.setattr(a, "_no_clobber", fail_after)
     response = broker.handle(p.ROLE_NORMALIZER, request("crash-after", p.OP_REGISTER_DRAFT, draft_payload()))
     assert not response.ok
-    restarted = a.ReviewAuthority(tmp_path / "authority", service())
+    restarted = make_broker(tmp_path)
     assert restarted._store.read(H).latest.state == rs.STATE_DRAFTED
 
 
@@ -655,9 +1048,10 @@ def test_baseexception_from_dispatch_is_not_normalized_or_swallowed(
 
 def test_operator_identity_exact_duplicate_is_durable_across_restart(tmp_path: Path) -> None:
     root = tmp_path / "authority"
-    first = a.ReviewAuthority(root, service())
+    outbox = narrative_outbox(tmp_path)
+    first = a.ReviewAuthority(root, service(), narrative_outbox_root=outbox)
     register(first)
-    second = a.ReviewAuthority(root, service())
+    second = a.ReviewAuthority(root, service(), narrative_outbox_root=outbox)
     replay = second.handle(p.ROLE_NORMALIZER, request("new-ipc-id", p.OP_REGISTER_DRAFT, draft_payload()))
     assert replay.ok and replay.result["idempotent"] is True
     assert len(second._store.read(H).events) == 1
@@ -665,7 +1059,7 @@ def test_operator_identity_exact_duplicate_is_durable_across_restart(tmp_path: P
 
 @pytest.mark.parametrize("tamper", ["gap", "fork", "filename", "content", "signature", "previous", "draft", "source", "revision", "extra"])
 def test_event_chain_corruption_matrix_fails_closed(tmp_path: Path, tamper: str) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     pass_review(broker)
     events = sorted((tmp_path / "authority" / H / "events").iterdir())
     first, second = events
@@ -691,7 +1085,7 @@ def test_event_chain_corruption_matrix_fails_closed(tmp_path: Path, tamper: str)
 
 
 def test_stale_head_cache_cannot_roll_back_authority(tmp_path: Path) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     drafted = register(broker)
     head = tmp_path / "authority" / H / "head.json"
     stale = head.read_bytes()
@@ -735,6 +1129,64 @@ def test_authority_root_rejects_symlink_component(tmp_path: Path) -> None:
         a.validate_authority_root(link / "state")
 
 
+@pytest.mark.parametrize("relationship", ["same", "inside", "contains"])
+def test_narrative_outbox_root_cannot_overlap_authority(
+    tmp_path: Path, relationship: str,
+) -> None:
+    authority_root = tmp_path / "authority"
+    authority_root.mkdir()
+    outbox = {
+        "same": authority_root,
+        "inside": authority_root / "outbox",
+        "contains": tmp_path,
+    }[relationship]
+    outbox.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(a.AuthorityError, match=a.AUTHORITY_PATH_INVALID):
+        a.validate_narrative_outbox_root(outbox, authority_root=authority_root)
+
+
+def test_narrative_outbox_root_rejects_git_and_protected_overlap(tmp_path: Path) -> None:
+    git = tmp_path / "repo"
+    (git / ".git").mkdir(parents=True)
+    outbox = git / "outbox"
+    outbox.mkdir()
+    authority_root = tmp_path / "authority"
+    with pytest.raises(a.AuthorityError, match=a.AUTHORITY_PATH_INVALID):
+        a.validate_narrative_outbox_root(
+            outbox, authority_root=authority_root, git_root=git,
+        )
+    protected = tmp_path / "content-inbox"
+    protected.mkdir()
+    with pytest.raises(a.AuthorityError, match=a.AUTHORITY_PATH_INVALID):
+        a.validate_narrative_outbox_root(
+            protected, authority_root=authority_root, protected_roots=[protected],
+        )
+
+
+def test_review_authority_requires_explicit_existing_outbox_root(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        a.ReviewAuthority(tmp_path / "authority", service())
+    with pytest.raises(a.AuthorityError, match=a.AUTHORITY_PATH_INVALID):
+        a.ReviewAuthority(
+            tmp_path / "authority", service(),
+            narrative_outbox_root=tmp_path / "missing-outbox",
+        )
+
+
+def test_narrative_outbox_root_rejects_symlink_component(tmp_path: Path) -> None:
+    target = tmp_path / "real-outbox"
+    target.mkdir()
+    link = tmp_path / "outbox-link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    with pytest.raises(a.AuthorityError, match=a.AUTHORITY_PATH_INVALID):
+        a.validate_narrative_outbox_root(
+            link, authority_root=tmp_path / "authority",
+        )
+
+
 def write_key(path: Path, raw: bytes = b"k" * 32) -> None:
     path.write_text(base64.b64encode(raw).decode("ascii"), encoding="ascii")
     if os.name != "nt":
@@ -754,7 +1206,11 @@ def test_key_file_validation_fails_closed(tmp_path: Path, kind: str) -> None:
         try: path.symlink_to(target)
         except OSError: pytest.skip("symlink unavailable")
     with pytest.raises(a.AuthorityError):
-        a.load_authority(authority_root=tmp_path / "authority", key_file=path)
+        a.load_authority(
+            authority_root=tmp_path / "authority",
+            key_file=path,
+            narrative_outbox_root=narrative_outbox(tmp_path),
+        )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX key mode contract")
@@ -764,14 +1220,22 @@ def test_key_file_requires_posix_0600(tmp_path: Path, mode: int) -> None:
     write_key(key)
     key.chmod(mode)
     with pytest.raises(a.AuthorityError):
-        a.load_authority(authority_root=tmp_path / "authority", key_file=key)
+        a.load_authority(
+            authority_root=tmp_path / "authority",
+            key_file=key,
+            narrative_outbox_root=narrative_outbox(tmp_path),
+        )
 
 
 def test_key_never_appears_in_broker_repr_or_health(tmp_path: Path) -> None:
     key = tmp_path / "key"
     raw = b"secret-material-never-returned-1234"
     write_key(key, raw)
-    broker = a.load_authority(authority_root=tmp_path / "authority", key_file=key)
+    broker = a.load_authority(
+        authority_root=tmp_path / "authority",
+        key_file=key,
+        narrative_outbox_root=narrative_outbox(tmp_path),
+    )
     health = broker.handle(p.ROLE_CONSUMER, request("health", p.OP_HEALTH, {}))
     rendered = repr(broker) + json.dumps(health.to_payload())
     assert raw.decode("ascii") not in rendered
@@ -812,7 +1276,7 @@ def test_peer_role_policy_copies_mutable_input() -> None:
 @pytest.mark.skipif(os.name == "nt" or not hasattr(__import__("socket"), "SO_PEERCRED"), reason="Linux SO_PEERCRED contract")
 def test_unix_server_uses_real_peer_credentials(tmp_path: Path) -> None:
     import socket
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     policy = server.PeerRolePolicy({os.getuid(): p.ROLE_CONSUMER}, {})
     path = tmp_path / "broker.sock"
     value = server.ReviewAuthorityServer(
@@ -832,7 +1296,7 @@ def test_unix_server_uses_real_peer_credentials(tmp_path: Path) -> None:
 def test_two_concatenated_frames_are_rejected_before_broker_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     calls: list[str] = []
     original = a.ReviewAuthority.handle
 
@@ -852,7 +1316,7 @@ def test_two_concatenated_frames_are_rejected_before_broker_handle(
 def test_delayed_second_frame_is_rejected_before_broker_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     calls: list[str] = []
     original = a.ReviewAuthority.handle
 
@@ -877,7 +1341,7 @@ def test_delayed_second_frame_is_rejected_before_broker_handle(
 def test_single_frame_with_trailing_data_is_rejected_before_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trailing: bytes,
 ) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     calls: list[str] = []
     original = a.ReviewAuthority.handle
 
@@ -895,7 +1359,7 @@ def test_single_frame_with_trailing_data_is_rejected_before_handle(
 def test_fragmented_single_frame_is_dispatched_once_after_eof(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     calls: list[str] = []
     original = a.ReviewAuthority.handle
 
@@ -915,7 +1379,7 @@ def test_fragmented_single_frame_is_dispatched_once_after_eof(
 def test_missing_client_write_half_close_times_out_before_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     calls: list[str] = []
     original = a.ReviewAuthority.handle
 
@@ -937,7 +1401,7 @@ def test_missing_client_write_half_close_times_out_before_handle(
 def test_state_changing_first_frame_plus_second_request_executes_neither(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     latest = register(broker)
     before_registry = len(broker._requests)
     events_root = broker._store.root / H / "events"
@@ -964,7 +1428,7 @@ def test_state_changing_first_frame_plus_second_request_executes_neither(
 def test_exact_single_request_returns_exactly_one_closed_response_frame(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     frame = p.encode_frame(request("single-request", p.OP_HEALTH, {}).to_payload())
     running = transport_server(tmp_path, broker, monkeypatch)
     response = raw_connection(running, [frame])
@@ -1009,7 +1473,11 @@ def test_cli_help_is_inert_and_does_not_create_authority(tmp_path: Path) -> None
         cwd=Path(__file__).parents[1], env=env, capture_output=True, text=True,
         timeout=20, check=False,
     )
-    assert result.returncode == 0 and "--authority-root" in result.stdout
+    assert (
+        result.returncode == 0
+        and "--authority-root" in result.stdout
+        and "--narrative-outbox-root" in result.stdout
+    )
     assert not sentinel.exists()
 
 
@@ -1039,7 +1507,7 @@ def test_prepare_failure_is_cached_without_hidden_retry(broker: a.ReviewAuthorit
 
 
 def test_head_cache_failure_does_not_erase_durable_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    broker = a.ReviewAuthority(tmp_path / "authority", service())
+    broker = make_broker(tmp_path)
     original = os.replace
     monkeypatch.setattr(os, "replace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cache fault")))
     result = register(broker)

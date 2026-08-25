@@ -61,6 +61,13 @@ def test_request_roundtrip_for_each_closed_operation(operation: str) -> None:
     assert p.request_from_payload(request.to_payload()) == request
 
 
+def test_ambiguous_v1_ipc_envelope_is_rejected_by_v2_contract() -> None:
+    raw = dict(PLAIN_REQUEST)
+    raw["schema_version"] = "narrative-review-authority-ipc-v1"
+    with pytest.raises(p.ProtocolError, match=p.PROTOCOL_INVALID):
+        p.request_from_payload(raw)
+
+
 @pytest.mark.parametrize(
     ("role", "operation"),
     [(role, operation) for role in sorted(p.ROLES) for operation in sorted(p.OPERATIONS)],

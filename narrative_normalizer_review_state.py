@@ -22,10 +22,14 @@ import narrative_normalizer_trust as trust
 
 
 REVIEW_LEDGER_SCHEMA_VERSION = "normalizer-review-ledger-v1"
-REVIEW_EVENT_SCHEMA_VERSION = "normalizer-review-event-v1"
-REVIEW_STATE_POLICY_VERSION = "normalizer-review-state-policy-v1"
+REVIEW_EVENT_SCHEMA_VERSION_V1 = "normalizer-review-event-v1"
+REVIEW_EVENT_SCHEMA_VERSION = "normalizer-review-event-v2"
+REVIEW_STATE_POLICY_VERSION_V1 = "normalizer-review-state-policy-v1"
+REVIEW_STATE_POLICY_VERSION = "normalizer-review-state-policy-v2"
 APPROVAL_ATTESTATION_SCHEMA_VERSION = "normalizer-approval-attestation-v1"
 APPROVAL_ATTESTATION_POLICY_VERSION = "normalizer-approval-attestation-policy-v1"
+DUAL_DIGEST_APPROVAL_ATTESTATION_SCHEMA_VERSION = "normalizer-approval-attestation-v2"
+DUAL_DIGEST_APPROVAL_ATTESTATION_POLICY_VERSION = "normalizer-approval-attestation-policy-v2"
 
 STATE_DRAFTED = "drafted"
 STATE_PASSED = "passed"
@@ -52,12 +56,13 @@ _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _EVENT_FILE = re.compile(r"(?P<revision>[0-9]{8})-(?P<digest>[0-9a-f]{64})\.json\Z")
 _EVENT_STAGING = re.compile(r"\.event-staging-[0-9a-f]{16}\Z")
-_EVENT_KEYS = frozenset({
+_EVENT_KEYS_V1 = frozenset({
     "schema_version", "revision", "previous_revision", "source_identity",
     "draft_identity", "state", "operator_request_id", "reason_codes",
     "action_digest", "timestamp", "policy_version", "previous_event_digest", "event_digest",
     "trust_receipt",
 })
+_EVENT_KEYS = _EVENT_KEYS_V1 | {"draft_package_digest"}
 _LEDGER_KEYS = frozenset({
     "schema_version", "source_identity", "draft_identity", "latest_revision",
     "latest_state", "latest_event_digest", "events",
@@ -70,6 +75,9 @@ _ATTESTATION_KEYS = frozenset({
     "review_revision", "review_event_digest", "approval_request_id",
     "contract_versions", "key_id", "trust_receipt",
 })
+_DUAL_DIGEST_ATTESTATION_KEYS = (_ATTESTATION_KEYS - {"package_digest"}) | {
+    "draft_package_digest", "narrative_package_digest",
+}
 _ATTESTATION_CONTRACT_KEYS = frozenset({
     "attestation", "review_state", "ready_manifest", "source", "trust",
 })
@@ -166,6 +174,7 @@ def _event_core(
     previous_revision: int,
     source_identity: str,
     draft_identity: str,
+    draft_package_digest: str | None,
     state: str,
     operator_request_id: str,
     reason_codes: tuple[str, ...],
@@ -173,8 +182,12 @@ def _event_core(
     timestamp: str,
     previous_event_digest: str,
 ) -> dict[str, object]:
-    return {
-        "schema_version": REVIEW_EVENT_SCHEMA_VERSION,
+    result: dict[str, object] = {
+        "schema_version": (
+            REVIEW_EVENT_SCHEMA_VERSION
+            if draft_package_digest is not None
+            else REVIEW_EVENT_SCHEMA_VERSION_V1
+        ),
         "revision": revision,
         "previous_revision": previous_revision,
         "source_identity": source_identity,
@@ -184,9 +197,16 @@ def _event_core(
         "reason_codes": list(reason_codes),
         "action_digest": action_digest,
         "timestamp": timestamp,
-        "policy_version": REVIEW_STATE_POLICY_VERSION,
+        "policy_version": (
+            REVIEW_STATE_POLICY_VERSION
+            if draft_package_digest is not None
+            else REVIEW_STATE_POLICY_VERSION_V1
+        ),
         "previous_event_digest": previous_event_digest,
     }
+    if draft_package_digest is not None:
+        result["draft_package_digest"] = draft_package_digest
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +215,7 @@ class ReviewEvent:
     previous_revision: int
     source_identity: str
     draft_identity: str
+    draft_package_digest: str | None
     state: str
     operator_request_id: str
     reason_codes: tuple[str, ...]
@@ -211,6 +232,8 @@ class ReviewEvent:
             _raise(REVIEW_STATE_INVALID)
         _hex(self.source_identity)
         _hex(self.draft_identity)
+        if self.draft_package_digest is not None:
+            _hex(self.draft_package_digest)
         if self.state not in REVIEW_STATES:
             _raise(REVIEW_STATE_INVALID)
         _safe(self.operator_request_id)
@@ -233,6 +256,7 @@ class ReviewEvent:
             previous_revision=self.previous_revision,
             source_identity=self.source_identity,
             draft_identity=self.draft_identity,
+            draft_package_digest=self.draft_package_digest,
             state=self.state,
             operator_request_id=self.operator_request_id,
             reason_codes=self.reason_codes,
@@ -259,6 +283,7 @@ def build_review_event(
     previous_revision: int,
     source_identity: str,
     draft_identity: str,
+    draft_package_digest: str | None = None,
     state: str,
     operator_request_id: str,
     reason_codes: Iterable[str],
@@ -281,6 +306,9 @@ def build_review_event(
         previous_revision=previous_revision,
         source_identity=_hex(source_identity),
         draft_identity=_hex(draft_identity),
+        draft_package_digest=(
+            None if draft_package_digest is None else _hex(draft_package_digest)
+        ),
         state=state,
         operator_request_id=_safe(operator_request_id),
         reason_codes=reasons,
@@ -301,6 +329,7 @@ def build_review_event(
         previous_revision,
         source_identity,
         draft_identity,
+        draft_package_digest,
         state,
         operator_request_id,
         reasons,
@@ -314,12 +343,32 @@ def build_review_event(
 
 def review_event_from_payload(value: object, service: trust.NarrativeTrustService) -> ReviewEvent:
     try:
-        if type(value) is not dict or frozenset(value) != _EVENT_KEYS:
+        if type(value) is not dict or frozenset(value) not in {_EVENT_KEYS_V1, _EVENT_KEYS}:
+            _raise(REVIEW_STATE_INVALID)
+        schema_version = value["schema_version"]
+        if (
+            frozenset(value) == _EVENT_KEYS_V1
+            and (
+                type(schema_version) is not str
+                or schema_version != REVIEW_EVENT_SCHEMA_VERSION_V1
+                or type(value["policy_version"]) is not str
+                or value["policy_version"] != REVIEW_STATE_POLICY_VERSION_V1
+            )
+        ) or (
+            frozenset(value) == _EVENT_KEYS
+            and (
+                type(schema_version) is not str
+                or schema_version != REVIEW_EVENT_SCHEMA_VERSION
+                or type(value["policy_version"]) is not str
+                or value["policy_version"] != REVIEW_STATE_POLICY_VERSION
+            )
+        ):
             _raise(REVIEW_STATE_INVALID)
         receipt = trust.receipt_from_payload(value["trust_receipt"])
         event = ReviewEvent(
             value["revision"], value["previous_revision"], value["source_identity"],
-            value["draft_identity"], value["state"], value["operator_request_id"],
+            value["draft_identity"], value.get("draft_package_digest"),
+            value["state"], value["operator_request_id"],
             _reason_codes(value["reason_codes"]), value["action_digest"], value["timestamp"],
             value["previous_event_digest"], value["event_digest"], receipt,
         )
@@ -379,6 +428,8 @@ def review_ledger_from_payload(value: object, service: trust.NarrativeTrustServi
             _raise(REVIEW_STATE_INVALID)
         for index, event in enumerate(events):
             if event.source_identity != source_identity or event.draft_identity != draft_identity:
+                _raise(REVIEW_STATE_INVALID)
+            if event.draft_package_digest != events[0].draft_package_digest:
                 _raise(REVIEW_STATE_INVALID)
             if event.revision != index + 1 or event.previous_revision != index:
                 _raise(REVIEW_STATE_INVALID)
@@ -960,14 +1011,230 @@ class ApprovalAttestation:
         return dict(self.core_payload(), trust_receipt=trust.receipt_to_payload(self.trust_receipt))
 
 
+@dataclass(frozen=True, slots=True)
+class DualDigestApprovalAttestation:
+    """Version-2 authority attestation with distinct logical and file digests."""
+
+    source_identity: str
+    source_ref: str
+    source_digest: str
+    draft_identity: str
+    draft_package_digest: str
+    narrative_package_digest: str
+    narrative_ready_manifest_digest: str
+    story_markdown_digest: str
+    draft_manifest_digest: str
+    review_digest: str
+    completed_claim_digest: str
+    artifact_binding_digest: str
+    review_revision: int
+    review_event_digest: str
+    approval_request_id: str
+    contract_versions: tuple[tuple[str, str], ...]
+    key_id: str
+    trust_receipt: trust.TrustReceipt
+
+    def __post_init__(self) -> None:
+        _hex(self.source_identity)
+        _plain(self.source_ref)
+        _hex(self.source_digest)
+        _hex(self.draft_identity)
+        _hex(self.draft_package_digest)
+        _hex(self.narrative_package_digest)
+        _hex(self.narrative_ready_manifest_digest)
+        _hex(self.story_markdown_digest)
+        _hex(self.draft_manifest_digest)
+        _hex(self.review_digest)
+        _hex(self.completed_claim_digest)
+        _hex(self.artifact_binding_digest)
+        if type(self.review_revision) is not int or self.review_revision < 3:
+            _raise(APPROVAL_ATTESTATION_INVALID)
+        _hex(self.review_event_digest)
+        _safe(self.approval_request_id)
+        if type(self.contract_versions) is not tuple:
+            _raise(APPROVAL_ATTESTATION_INVALID)
+        try:
+            versions_valid = (
+                tuple(sorted(self.contract_versions)) == self.contract_versions
+                and frozenset(key for key, _ in self.contract_versions)
+                == {"attestation", "draft", "review_state", "ready_manifest", "source", "trust"}
+                and all(
+                    type(key) is str and type(value) is str and bool(value)
+                    for key, value in self.contract_versions
+                )
+            )
+        except (TypeError, ValueError):
+            versions_valid = False
+        if not versions_valid:
+            _raise(APPROVAL_ATTESTATION_INVALID)
+        _hex(self.key_id, short=True)
+        if type(self.trust_receipt) is not trust.TrustReceipt:
+            _raise(APPROVAL_ATTESTATION_INVALID)
+
+    def core_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": DUAL_DIGEST_APPROVAL_ATTESTATION_SCHEMA_VERSION,
+            "source_identity": self.source_identity,
+            "source_ref": self.source_ref,
+            "source_digest": self.source_digest,
+            "draft_identity": self.draft_identity,
+            "draft_package_digest": self.draft_package_digest,
+            "narrative_package_digest": self.narrative_package_digest,
+            "narrative_ready_manifest_digest": self.narrative_ready_manifest_digest,
+            "story_markdown_digest": self.story_markdown_digest,
+            "draft_manifest_digest": self.draft_manifest_digest,
+            "review_digest": self.review_digest,
+            "completed_claim_digest": self.completed_claim_digest,
+            "artifact_binding_digest": self.artifact_binding_digest,
+            "review_revision": self.review_revision,
+            "review_event_digest": self.review_event_digest,
+            "approval_request_id": self.approval_request_id,
+            "contract_versions": dict(self.contract_versions),
+            "key_id": self.key_id,
+        }
+
+    def to_payload(self) -> dict[str, object]:
+        return dict(self.core_payload(), trust_receipt=trust.receipt_to_payload(self.trust_receipt))
+
+
 def approval_contract_versions(*, ready_manifest: str, source: str) -> tuple[tuple[str, str], ...]:
     return tuple(sorted({
         "attestation": APPROVAL_ATTESTATION_POLICY_VERSION,
+        "review_state": REVIEW_STATE_POLICY_VERSION_V1,
+        "ready_manifest": _plain(ready_manifest),
+        "source": _plain(source),
+        "trust": trust.TRUST_RECEIPT_SCHEMA_VERSION,
+    }.items()))
+
+
+def dual_digest_approval_contract_versions(
+    *, ready_manifest: str, source: str, draft: str,
+) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted({
+        "attestation": DUAL_DIGEST_APPROVAL_ATTESTATION_POLICY_VERSION,
+        "draft": _plain(draft),
         "review_state": REVIEW_STATE_POLICY_VERSION,
         "ready_manifest": _plain(ready_manifest),
         "source": _plain(source),
         "trust": trust.TRUST_RECEIPT_SCHEMA_VERSION,
     }.items()))
+
+
+def build_dual_digest_approval_attestation(
+    service: trust.NarrativeTrustService,
+    *,
+    source_identity: str,
+    source_ref: str,
+    source_digest: str,
+    draft_identity: str,
+    draft_package_digest: str,
+    narrative_package_digest: str,
+    ready_manifest_digest: str,
+    story_markdown_digest: str,
+    draft_manifest_digest: str,
+    review_digest: str,
+    completed_claim_digest: str,
+    artifact_binding_digest: str,
+    approved_event: ReviewEvent,
+    ready_manifest_contract: str,
+    source_contract: str,
+    draft_contract: str,
+) -> DualDigestApprovalAttestation:
+    if (
+        type(service) is not trust.NarrativeTrustService
+        or type(approved_event) is not ReviewEvent
+        or approved_event.state != STATE_APPROVED
+        or approved_event.draft_package_digest != draft_package_digest
+    ):
+        _raise(APPROVAL_ATTESTATION_INVALID)
+    versions = dual_digest_approval_contract_versions(
+        ready_manifest=ready_manifest_contract,
+        source=source_contract,
+        draft=draft_contract,
+    )
+    placeholder = DualDigestApprovalAttestation(
+        _hex(source_identity), _plain(source_ref), _hex(source_digest), _hex(draft_identity),
+        _hex(draft_package_digest), _hex(narrative_package_digest),
+        _hex(ready_manifest_digest), _hex(story_markdown_digest),
+        _hex(draft_manifest_digest), _hex(review_digest), _hex(completed_claim_digest),
+        _hex(artifact_binding_digest), approved_event.revision,
+        _hex(approved_event.event_digest), _safe(approved_event.operator_request_id),
+        versions, service.key_id,
+        service.sign(trust.TRUST_DOMAIN_APPROVAL_ATTESTATION, {}),
+    )
+    try:
+        receipt = service.sign(trust.TRUST_DOMAIN_APPROVAL_ATTESTATION, placeholder.core_payload())
+    except trust.TrustError:
+        _raise(APPROVAL_ATTESTATION_INVALID)
+    return DualDigestApprovalAttestation(
+        placeholder.source_identity, placeholder.source_ref, placeholder.source_digest,
+        placeholder.draft_identity, placeholder.draft_package_digest,
+        placeholder.narrative_package_digest, placeholder.narrative_ready_manifest_digest,
+        placeholder.story_markdown_digest, placeholder.draft_manifest_digest,
+        placeholder.review_digest, placeholder.completed_claim_digest,
+        placeholder.artifact_binding_digest, placeholder.review_revision,
+        placeholder.review_event_digest, placeholder.approval_request_id,
+        placeholder.contract_versions, placeholder.key_id, receipt,
+    )
+
+
+def dual_digest_approval_attestation_from_payload(
+    value: object,
+    service: trust.NarrativeTrustService,
+    *,
+    ready_manifest_contract: str,
+    source_contract: str,
+    draft_contract: str,
+) -> DualDigestApprovalAttestation:
+    try:
+        if type(value) is not dict or frozenset(value) != _DUAL_DIGEST_ATTESTATION_KEYS:
+            _raise(APPROVAL_ATTESTATION_INVALID)
+        if (
+            type(value["schema_version"]) is not str
+            or value["schema_version"] != DUAL_DIGEST_APPROVAL_ATTESTATION_SCHEMA_VERSION
+        ):
+            _raise(APPROVAL_ATTESTATION_INVALID)
+        versions = value["contract_versions"]
+        expected_versions = dual_digest_approval_contract_versions(
+            ready_manifest=ready_manifest_contract,
+            source=source_contract,
+            draft=draft_contract,
+        )
+        if (
+            type(versions) is not dict
+            or frozenset(versions) != {"attestation", "draft", "review_state", "ready_manifest", "source", "trust"}
+            or tuple(sorted(versions.items())) != expected_versions
+            or any(type(key) is not str or type(item) is not str for key, item in versions.items())
+        ):
+            _raise(APPROVAL_ATTESTATION_INVALID)
+        receipt = trust.receipt_from_payload(value["trust_receipt"])
+        attestation = DualDigestApprovalAttestation(
+            _hex(value["source_identity"]), _plain(value["source_ref"]),
+            _hex(value["source_digest"]), _hex(value["draft_identity"]),
+            _hex(value["draft_package_digest"]), _hex(value["narrative_package_digest"]),
+            _hex(value["narrative_ready_manifest_digest"]),
+            _hex(value["story_markdown_digest"]), _hex(value["draft_manifest_digest"]),
+            _hex(value["review_digest"]), _hex(value["completed_claim_digest"]),
+            _hex(value["artifact_binding_digest"]), value["review_revision"],
+            _hex(value["review_event_digest"]), _safe(value["approval_request_id"]),
+            expected_versions, _hex(value["key_id"], short=True), receipt,
+        )
+        if type(attestation.review_revision) is not int or attestation.review_revision < 3:
+            _raise(APPROVAL_ATTESTATION_INVALID)
+        if attestation.key_id != service.key_id or attestation.trust_receipt.key_id != service.key_id:
+            _raise(APPROVAL_ATTESTATION_INVALID)
+        service.require_valid(
+            trust.TRUST_DOMAIN_APPROVAL_ATTESTATION,
+            attestation.core_payload(),
+            attestation.trust_receipt,
+        )
+        return attestation
+    except ReviewStateError as error:
+        if error.reason_code == APPROVAL_ATTESTATION_INVALID:
+            raise
+        raise ReviewStateError(APPROVAL_ATTESTATION_INVALID) from None
+    except (KeyError, TypeError, ValueError, trust.TrustError):
+        raise ReviewStateError(APPROVAL_ATTESTATION_INVALID) from None
 
 
 def build_approval_attestation(
@@ -1072,13 +1339,18 @@ __all__ = (
     "APPROVAL_ATTESTATION_POLICY_VERSION",
     "APPROVAL_ATTESTATION_SCHEMA_VERSION",
     "ApprovalAttestation",
+    "DUAL_DIGEST_APPROVAL_ATTESTATION_POLICY_VERSION",
+    "DUAL_DIGEST_APPROVAL_ATTESTATION_SCHEMA_VERSION",
+    "DualDigestApprovalAttestation",
     "REVIEW_EVENT_SCHEMA_VERSION",
+    "REVIEW_EVENT_SCHEMA_VERSION_V1",
     "REVIEW_LEDGER_SCHEMA_VERSION",
     "REVIEW_STATE_CONFLICT",
     "REVIEW_STATE_INVALID",
     "REVIEW_STATE_MISSING",
     "REVIEW_STATE_PERSISTENCE_INVALID",
     "REVIEW_STATE_POLICY_VERSION",
+    "REVIEW_STATE_POLICY_VERSION_V1",
     "REVIEW_STATE_TRANSITION_INVALID",
     "REVIEW_STATES",
     "ReviewEvent",
@@ -1093,7 +1365,10 @@ __all__ = (
     "approval_attestation_from_payload",
     "approval_contract_versions",
     "build_approval_attestation",
+    "build_dual_digest_approval_attestation",
     "build_review_event",
+    "dual_digest_approval_attestation_from_payload",
+    "dual_digest_approval_contract_versions",
     "review_event_from_payload",
     "review_ledger_from_payload",
 )

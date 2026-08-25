@@ -763,3 +763,133 @@ def test_approval_attestation_rejects_scalar_subclasses(tmp_path: Path, field: s
             ready_manifest_contract="naz-narrative-ready-v1",
             source_contract="agent-content-source-v1",
         )
+
+
+def dual_digest_approved_event() -> tuple[trust.NarrativeTrustService, rs.ReviewEvent]:
+    signer = service()
+    event = rs.build_review_event(
+        signer,
+        revision=3,
+        previous_revision=2,
+        source_identity=SOURCE_IDENTITY,
+        draft_identity=DRAFT_IDENTITY,
+        draft_package_digest=PACKAGE_DIGEST,
+        state=rs.STATE_APPROVED,
+        operator_request_id="approval-v2-001",
+        reason_codes=(),
+        action_digest="b" * 64,
+        timestamp=T2,
+        previous_event_digest="c" * 64,
+    )
+    return signer, event
+
+
+def test_dual_digest_attestation_v2_roundtrip_has_no_ambiguous_field() -> None:
+    signer, event = dual_digest_approved_event()
+    value = rs.build_dual_digest_approval_attestation(
+        signer,
+        source_identity=SOURCE_IDENTITY,
+        source_ref="Project/2026-08-17",
+        source_digest=SOURCE_DIGEST,
+        draft_identity=DRAFT_IDENTITY,
+        draft_package_digest=PACKAGE_DIGEST,
+        narrative_package_digest="d" * 64,
+        ready_manifest_digest=READY_DIGEST,
+        story_markdown_digest="6" * 64,
+        draft_manifest_digest="7" * 64,
+        review_digest="8" * 64,
+        completed_claim_digest="9" * 64,
+        artifact_binding_digest="a" * 64,
+        approved_event=event,
+        ready_manifest_contract="naz-narrative-ready-v1",
+        source_contract="agent-content-source-v1",
+        draft_contract="normalizer-draft-identity-v1",
+    )
+    payload = value.to_payload()
+    assert payload["schema_version"] == rs.DUAL_DIGEST_APPROVAL_ATTESTATION_SCHEMA_VERSION
+    assert payload["draft_package_digest"] == PACKAGE_DIGEST
+    assert payload["narrative_package_digest"] == "d" * 64
+    assert "package_digest" not in payload
+    parsed = rs.dual_digest_approval_attestation_from_payload(
+        payload,
+        signer,
+        ready_manifest_contract="naz-narrative-ready-v1",
+        source_contract="agent-content-source-v1",
+        draft_contract="normalizer-draft-identity-v1",
+    )
+    assert parsed == value
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["draft_package_digest", "narrative_package_digest", "schema_version", "extra"],
+)
+def test_dual_digest_attestation_rejects_missing_old_or_extra_contract_fields(field: str) -> None:
+    signer, event = dual_digest_approved_event()
+    payload = rs.build_dual_digest_approval_attestation(
+        signer,
+        source_identity=SOURCE_IDENTITY,
+        source_ref="Project/2026-08-17",
+        source_digest=SOURCE_DIGEST,
+        draft_identity=DRAFT_IDENTITY,
+        draft_package_digest=PACKAGE_DIGEST,
+        narrative_package_digest="d" * 64,
+        ready_manifest_digest=READY_DIGEST,
+        story_markdown_digest="6" * 64,
+        draft_manifest_digest="7" * 64,
+        review_digest="8" * 64,
+        completed_claim_digest="9" * 64,
+        artifact_binding_digest="a" * 64,
+        approved_event=event,
+        ready_manifest_contract="naz-narrative-ready-v1",
+        source_contract="agent-content-source-v1",
+        draft_contract="normalizer-draft-identity-v1",
+    ).to_payload()
+    if field == "extra":
+        payload["package_digest"] = PACKAGE_DIGEST
+    else:
+        payload.pop(field)
+    with pytest.raises(rs.ReviewStateError, match=rs.APPROVAL_ATTESTATION_INVALID):
+        rs.dual_digest_approval_attestation_from_payload(
+            payload,
+            signer,
+            ready_manifest_contract="naz-narrative-ready-v1",
+            source_contract="agent-content-source-v1",
+            draft_contract="normalizer-draft-identity-v1",
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["schema_version", "draft_package_digest", "narrative_package_digest"],
+)
+def test_dual_digest_attestation_rejects_string_subclasses(field: str) -> None:
+    signer, event = dual_digest_approved_event()
+    payload = rs.build_dual_digest_approval_attestation(
+        signer,
+        source_identity=SOURCE_IDENTITY,
+        source_ref="Project/2026-08-17",
+        source_digest=SOURCE_DIGEST,
+        draft_identity=DRAFT_IDENTITY,
+        draft_package_digest=PACKAGE_DIGEST,
+        narrative_package_digest="d" * 64,
+        ready_manifest_digest=READY_DIGEST,
+        story_markdown_digest="6" * 64,
+        draft_manifest_digest="7" * 64,
+        review_digest="8" * 64,
+        completed_claim_digest="9" * 64,
+        artifact_binding_digest="a" * 64,
+        approved_event=event,
+        ready_manifest_contract="naz-narrative-ready-v1",
+        source_contract="agent-content-source-v1",
+        draft_contract="normalizer-draft-identity-v1",
+    ).to_payload()
+    payload[field] = StringSubclass(payload[field])
+    with pytest.raises(rs.ReviewStateError, match=rs.APPROVAL_ATTESTATION_INVALID):
+        rs.dual_digest_approval_attestation_from_payload(
+            payload,
+            signer,
+            ready_manifest_contract="naz-narrative-ready-v1",
+            source_contract="agent-content-source-v1",
+            draft_contract="normalizer-draft-identity-v1",
+        )

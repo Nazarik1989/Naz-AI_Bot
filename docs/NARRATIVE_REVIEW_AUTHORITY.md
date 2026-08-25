@@ -14,6 +14,19 @@ The authority root is explicit and must be outside the Git checkout and outside
 all configured content inbox, narrative outbox, quarantine registry, and other
 protected roots. Symlink path components and overlapping roots fail closed.
 
+The Broker also requires an explicit read-only `--narrative-outbox-root`.
+`normalizer-outbox-source-identity-v1` is the code-owned layout:
+
+```text
+<narrative-outbox-root>/<source-identity>/story.json
+```
+
+The layout does not place `draft_identity` in the filesystem path; the Broker
+validates it separately against `source_identity` and `draft_package_digest`.
+Clients submit neither paths nor filenames. The outbox root must already exist,
+must not overlap the authority root, Git checkout, inbox, registry, or any other
+configured protected root, and may not contain symlink path components.
+
 ## Roles and capabilities
 
 Roles come exclusively from kernel Unix peer credentials (`SO_PEERCRED`) and an
@@ -36,7 +49,7 @@ owner, group, and mode. Messages are length-prefixed canonical UTF-8 JSON with a
 1 MiB maximum frame. The closed request envelope is:
 
 ```json
-{"schema_version":"narrative-review-authority-ipc-v1","request_id":"...","operation":"...","payload":{}}
+{"schema_version":"narrative-review-authority-ipc-v2","request_id":"...","operation":"...","payload":{}}
 ```
 
 Exact keys and exact JSON scalar/container types are required before encoding
@@ -82,6 +95,46 @@ ready-manifest digest, and attestation digest before the no-clobber append.
 Consumer verification is read-only and returns only a safe verdict and detached
 identities/digests.
 
+## Version-2 dual-digest contract
+
+Broker contract `narrative-review-authority-v2`, review events
+`normalizer-review-event-v2`, and approval attestations
+`normalizer-approval-attestation-v2` keep two mandatory digests with different
+meanings:
+
+- `draft_package_digest` is the logical canonical package digest. It alone is
+  used with `source_identity` and `normalizer-draft-identity-v1` to recompute
+  `draft_identity`.
+- `narrative_package_digest` is the SHA-256 digest of the exact persisted
+  `story.json` bytes referenced by `NarrativeReadyManifest`.
+
+`register_draft` requires only `draft_package_digest`. Every drafted, review,
+and approved event carries that logical digest. `append_review` verifies it
+against `draft_identity`. `prepare_approval` requires both digests, proves the
+registration binding again, and signs both into the V2 attestation.
+`commit_approval` requires both values again and checks them against the
+prepared event, attestation, and ready manifest before appending the approved
+event. `verify_ready` recomputes the draft identity using only the logical
+digest and compares only `narrative_package_digest` with the ready manifest.
+The `narrative_ready_manifest_digest` is SHA-256 of the canonical persisted
+manifest bytes including the required final LF, matching the existing file
+verification contract.
+
+At prepare, commit, and verify, the Broker derives the story path itself and
+opens that exact regular non-symlink file with a bounded read. It checks the
+opened-file identity and size before and after reading, requires exact canonical
+UTF-8 JSON bytes with the final LF, and hashes the raw bytes without
+parse/reserialize digesting. Prepare compares this computed digest with the
+submitted value and signs only the computed value. Commit rereads to detect
+changes after prepare; verify rereads to detect changes after commit.
+
+The V2 payloads never contain the ambiguous bare field `package_digest`.
+Missing, extra, swapped, stale, coerced, or aliased digest fields fail closed.
+The values remain separate fields even when a synthetic test supplies equal
+strings. V1 ambiguous Broker requests cannot mutate V2 authority state and are
+not silently upgraded. There is no production migration because A1 authority
+history has not been deployed.
+
 ## Threat model and residual limits
 
 The boundary is designed to resist forged JSON roles, replayed request IDs,
@@ -102,6 +155,7 @@ authority data; those require a separately reviewed integration checkpoint.
 ```text
 python tools/run_narrative_review_authority.py \
   --authority-root /var/lib/naz-ai-bot/review-authority \
+  --narrative-outbox-root /var/lib/naz-ai-bot/narrative-outbox \
   --key-file /etc/naz-ai-bot/review-authority.key \
   --socket /run/naz-ai-bot/review-authority.sock \
   --git-root /opt/naz-ai-bot \
