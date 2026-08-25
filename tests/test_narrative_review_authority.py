@@ -259,7 +259,7 @@ def ready_manifest() -> dict[str, object]:
         "source_digest": H2,
         "narrative_package_ref": f"{H}/story.json",
         "narrative_package_digest": NARRATIVE_DIGEST,
-        "status": "ready",
+        "status": "narrative_ready",
         "contract_versions": {"director": "review-only-v1", "narrative": "narrative-v1"},
     }
 

@@ -35,6 +35,7 @@ import reels_failure_quarantine as quarantine
 import narrative_normalizer_evidence as evidence
 import narrative_normalizer_review_state as review_state
 import narrative_normalizer_trust as trust
+import narrative_review_authority_client as review_authority_client
 
 
 SOURCE_CONTRACT_VERSION = "agent-content-source-v1"
@@ -125,6 +126,12 @@ REASON_CODES = frozenset({
     "narrative_normalizer_cli_invalid",
     "narrative_normalizer_internal_error",
 })
+
+BROKER_DRAFT_CONTRACT_VERSION = "normalizer-draft-identity-v1"
+BROKER_REGISTER_BINDING_VERSION = "narrative-review-authority-draft-binding-v1"
+BROKER_PREPARED_APPROVAL_VERSION = "narrative-review-authority-prepared-approval-v2"
+BROKER_READY_VERDICT_VERSION = "narrative-review-authority-ready-verdict-v2"
+BROKER_STORAGE_ADAPTER_VERSION = "narrative-review-authority-state-adapter-v2"
 
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -921,6 +928,16 @@ class ApprovalResult:
     manifest_digest: str
     status: str
     idempotent: bool
+
+
+class ReviewAuthorityTransport(Protocol):
+    """State-free Broker proxy used by production-capable review operations."""
+
+    def register_draft(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
+    def latest_state(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
+    def append_review(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
+    def prepare_approval(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
+    def commit_approval(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
 
 
 class NarrativeContextProvider(Protocol):
@@ -4231,7 +4248,7 @@ def validate_draft_directory(
             ready.source_ref != story["source_ref"]
             or ready.source_digest != story["source_digest"]
             or ready.narrative_package_ref != f"{expected_source_identity}/story.json"
-            or ready.narrative_package_digest != quarantine.narrative_package_digest(path / "story.json")
+            or ready.narrative_package_digest != _file_digest(path / "story.json")
             or ready.status != quarantine.CLASS_READY
         ):
             _raise("narrative_normalizer_draft_invalid")
@@ -4368,6 +4385,7 @@ class NarrativeOutboxStore:
         policy: quarantine.QuarantinePathPolicy,
         *,
         trust_service: trust.NarrativeTrustService | None = None,
+        review_authority: ReviewAuthorityTransport | None = None,
     ):
         if type(policy) is not quarantine.QuarantinePathPolicy:
             raise TypeError("policy")
@@ -4377,6 +4395,7 @@ class NarrativeOutboxStore:
         self._locks = self._state / "locks"
         self._claims = self._state / "claims"
         self.trust_service = trust_service
+        self.review_authority = review_authority
 
     def _require_trust(self) -> trust.NarrativeTrustService:
         service = _require_trust_service(self.trust_service)
@@ -4389,6 +4408,10 @@ class NarrativeOutboxStore:
             _raise("narrative_normalizer_review_authority_unavailable")
         return review_state.ReviewStateStore(authority_root, self._require_trust())
 
+    @property
+    def broker_mode(self) -> bool:
+        return self.review_authority is not None
+
     @staticmethod
     def _review_state_error(error: review_state.ReviewStateError) -> None:
         mapping = {
@@ -4398,6 +4421,104 @@ class NarrativeOutboxStore:
             review_state.REVIEW_STATE_PERSISTENCE_INVALID: "narrative_normalizer_persistence_invalid",
         }
         _raise(mapping.get(error.reason_code, "narrative_normalizer_trust_invalid"))
+
+    @staticmethod
+    def _broker_error(error: BaseException) -> None:
+        reason = getattr(error, "reason_code", "")
+        if reason in {
+            "review_authority_request_conflict",
+            "review_authority_state_conflict",
+        }:
+            _raise("narrative_normalizer_review_identity_conflict")
+        if reason in {
+            "review_authority_transition_invalid",
+            "review_authority_not_ready",
+        }:
+            _raise("narrative_normalizer_review_not_passed")
+        _raise("narrative_normalizer_review_authority_unavailable")
+
+    def _broker_call(
+        self,
+        method: str,
+        request_id: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        authority = self.review_authority
+        if authority is None:
+            _raise("narrative_normalizer_review_authority_unavailable")
+        try:
+            operation = getattr(authority, method)
+            result = operation(request_id, payload)
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            self._broker_error(error)
+        if type(result) is not dict:
+            _raise("narrative_normalizer_review_authority_unavailable")
+        return result
+
+    @staticmethod
+    def _validate_broker_event_result(
+        result: object,
+        *,
+        source_identity_value: str,
+        draft_identity_value: str,
+        draft_package_digest: str,
+        expected_state: str | None = None,
+        allow_extra: frozenset[str] = frozenset(),
+    ) -> dict[str, object]:
+        base = frozenset({
+            "source_identity", "draft_identity", "draft_package_digest",
+            "revision", "state", "event_digest", "event", "idempotent",
+            "storage_adapter_version",
+        })
+        if type(result) is not dict or frozenset(result) != base | allow_extra:
+            _raise("narrative_normalizer_review_authority_unavailable")
+        state_value = result.get("state")
+        if (
+            result.get("source_identity") != source_identity_value
+            or result.get("draft_identity") != draft_identity_value
+            or result.get("draft_package_digest") != draft_package_digest
+            or type(result.get("revision")) is not int
+            or int(result["revision"]) < 1
+            or type(state_value) is not str
+            or state_value not in {
+                review_state.STATE_DRAFTED, review_state.STATE_PASSED,
+                review_state.STATE_REJECTED, review_state.STATE_SUPERSEDED,
+                review_state.STATE_APPROVED,
+            }
+            or (expected_state is not None and state_value != expected_state)
+            or type(result.get("event_digest")) is not str
+            or _HEX64.fullmatch(str(result["event_digest"])) is None
+            or type(result.get("event")) is not dict
+            or type(result.get("idempotent")) is not bool
+            or result.get("storage_adapter_version") != BROKER_STORAGE_ADAPTER_VERSION
+        ):
+            _raise("narrative_normalizer_review_authority_unavailable")
+        return result
+
+    def _broker_latest(
+        self,
+        source_identity_value: str,
+        draft_identity_value: str,
+        draft_package_digest: str,
+    ) -> dict[str, object]:
+        result = self._broker_call(
+            "latest_state",
+            f"latest-{secrets.token_hex(16)}",
+            {
+                "source_identity": source_identity_value,
+                "draft_identity": draft_identity_value,
+            },
+        )
+        return self._validate_broker_event_result(
+            result,
+            source_identity_value=source_identity_value,
+            draft_identity_value=draft_identity_value,
+            draft_package_digest=draft_package_digest,
+        )
 
     def _ensure_write_layout(self) -> None:
         for path in (self.root, self._state, self._locks, self._claims):
@@ -4712,17 +4833,18 @@ class NarrativeOutboxStore:
                 and current["manifest"] == artifact.draft_manifest
                 and current["review"] == artifact.review_payload
             ):
-                try:
-                    self._review_store().initialize(
-                        source_identity=identity,
-                        draft_identity=str(artifact.draft_manifest["draft_identity"]),
-                        initial_state=str(artifact.review_payload["status"]),
-                        reason_codes=tuple(artifact.review_payload["reason_codes"]),
-                        drafted_at=str(artifact.draft_manifest["created_at"]),
-                        reviewed_at=str(artifact.review_payload["reviewed_at"]),
-                    )
-                except review_state.ReviewStateError as error:
-                    self._review_state_error(error)
+                if not self.broker_mode:
+                    try:
+                        self._review_store().initialize(
+                            source_identity=identity,
+                            draft_identity=str(artifact.draft_manifest["draft_identity"]),
+                            initial_state=str(artifact.review_payload["status"]),
+                            reason_codes=tuple(artifact.review_payload["reason_codes"]),
+                            drafted_at=str(artifact.draft_manifest["created_at"]),
+                            reviewed_at=str(artifact.review_payload["reviewed_at"]),
+                        )
+                    except review_state.ReviewStateError as error:
+                        self._review_state_error(error)
                 return final, True
             _raise("narrative_normalizer_persistence_conflict")
         self._ensure_write_layout()
@@ -4755,17 +4877,18 @@ class NarrativeOutboxStore:
                     _cleanup_owned_path(staging)
                     if os.path.lexists(staging):
                         _raise("narrative_normalizer_persistence_invalid")
-                    try:
-                        self._review_store().initialize(
-                            source_identity=identity,
-                            draft_identity=str(artifact.draft_manifest["draft_identity"]),
-                            initial_state=str(artifact.review_payload["status"]),
-                            reason_codes=tuple(artifact.review_payload["reason_codes"]),
-                            drafted_at=str(artifact.draft_manifest["created_at"]),
-                            reviewed_at=str(artifact.review_payload["reviewed_at"]),
-                        )
-                    except review_state.ReviewStateError as error:
-                        self._review_state_error(error)
+                    if not self.broker_mode:
+                        try:
+                            self._review_store().initialize(
+                                source_identity=identity,
+                                draft_identity=str(artifact.draft_manifest["draft_identity"]),
+                                initial_state=str(artifact.review_payload["status"]),
+                                reason_codes=tuple(artifact.review_payload["reason_codes"]),
+                                drafted_at=str(artifact.draft_manifest["created_at"]),
+                                reviewed_at=str(artifact.review_payload["reviewed_at"]),
+                            )
+                        except review_state.ReviewStateError as error:
+                            self._review_state_error(error)
                     return final, True
                 _raise("narrative_normalizer_persistence_conflict")
             _fsync_directory(self.root)
@@ -4774,23 +4897,85 @@ class NarrativeOutboxStore:
                 review_authority_root=self.policy.narrative_review_authority_root,
                 require_trust=True
             )
-            try:
-                self._review_store().initialize(
-                    source_identity=identity,
-                    draft_identity=str(artifact.draft_manifest["draft_identity"]),
-                    initial_state=str(artifact.review_payload["status"]),
-                    reason_codes=tuple(artifact.review_payload["reason_codes"]),
-                    drafted_at=str(artifact.draft_manifest["created_at"]),
-                    reviewed_at=str(artifact.review_payload["reviewed_at"]),
-                )
-            except review_state.ReviewStateError as error:
-                self._review_state_error(error)
+            if not self.broker_mode:
+                try:
+                    self._review_store().initialize(
+                        source_identity=identity,
+                        draft_identity=str(artifact.draft_manifest["draft_identity"]),
+                        initial_state=str(artifact.review_payload["status"]),
+                        reason_codes=tuple(artifact.review_payload["reason_codes"]),
+                        drafted_at=str(artifact.draft_manifest["created_at"]),
+                        reviewed_at=str(artifact.review_payload["reviewed_at"]),
+                    )
+                except review_state.ReviewStateError as error:
+                    self._review_state_error(error)
             return final, False
         finally:
             if os.path.lexists(staging):
                 _cleanup_owned_path(staging)
                 if os.path.lexists(staging):
                     _raise("narrative_normalizer_persistence_invalid")
+
+    def register_draft_with_authority(
+        self,
+        source_ref: str,
+        source_digest_value: str,
+    ) -> dict[str, object]:
+        """Register an exact, fully persisted draft without exposing its content."""
+
+        if not self.broker_mode:
+            _raise("narrative_normalizer_review_authority_unavailable")
+        identity = self._identity(source_ref, source_digest_value)
+        path = self.root / identity
+        value = validate_draft_directory(
+            path,
+            expected_identity=identity,
+            trust_service=self._require_trust(),
+            review_authority_root=self.policy.narrative_review_authority_root,
+            require_trust=True,
+            validate_ready=False,
+        )
+        story = value["story"]
+        manifest = value["manifest"]
+        claim = self.read_claim(source_ref, source_digest_value)
+        if claim is None or not self._claim_matches_draft(claim, value):
+            _raise("narrative_normalizer_claim_uncertain")
+        operator_request_id = f"register-{claim['attempt_id']}"
+        payload = {
+            "source_identity": identity,
+            "source_ref": source_ref,
+            "source_digest": source_digest_value,
+            "draft_identity": manifest["draft_identity"],
+            "draft_package_digest": story["package_digest"],
+            "story_markdown_digest": _file_digest(path / "story.md"),
+            "draft_manifest_digest": _file_digest(path / "draft-manifest.json"),
+            "review_digest": _file_digest(path / "review.json"),
+            "completed_claim_digest": _file_digest(
+                self.claim_path(source_ref, source_digest_value)
+            ),
+            "artifact_binding_digest": value["artifact_binding_digest"],
+            "contract_versions": {
+                "draft": BROKER_DRAFT_CONTRACT_VERSION,
+                "source": SOURCE_CONTRACT_VERSION,
+            },
+            "operator_request_id": operator_request_id,
+            "timestamp": claim["updated_at"],
+        }
+        result = self._broker_call("register_draft", operator_request_id, payload)
+        checked = self._validate_broker_event_result(
+            result,
+            source_identity_value=identity,
+            draft_identity_value=str(manifest["draft_identity"]),
+            draft_package_digest=str(story["package_digest"]),
+            expected_state=review_state.STATE_DRAFTED,
+            allow_extra=frozenset({"draft_binding_digest"}),
+        )
+        if (
+            type(checked.get("draft_binding_digest")) is not str
+            or _HEX64.fullmatch(str(checked["draft_binding_digest"])) is None
+        ):
+            _raise("narrative_normalizer_review_authority_unavailable")
+        return checked
 
     def list_drafts(self) -> tuple[dict[str, object], ...]:
         if not self.root.exists():
@@ -4804,12 +4989,13 @@ class NarrativeOutboxStore:
             value = validate_draft_directory(
                 path,
                 expected_identity=path.name,
+                validate_ready=not self.broker_mode,
                 trust_service=self.trust_service,
                 review_authority_root=self.policy.narrative_review_authority_root,
                 require_trust=self.trust_service is not None,
             )
             authoritative_state = "unverified"
-            if self.trust_service is not None:
+            if self.trust_service is not None and not self.broker_mode:
                 try:
                     authoritative_state = self._review_store().read(
                         path.name,
@@ -4859,13 +5045,13 @@ class NarrativeOutboxStore:
         value = validate_draft_directory(
             self.root / identity,
             expected_identity=identity,
-            validate_ready=self.trust_service is not None,
+            validate_ready=self.trust_service is not None and not self.broker_mode,
             trust_service=self.trust_service,
             review_authority_root=self.policy.narrative_review_authority_root,
             require_trust=self.trust_service is not None,
         )
         authoritative_state = "unverified"
-        if self.trust_service is not None:
+        if self.trust_service is not None and not self.broker_mode:
             try:
                 authoritative_state = self._review_store().read(
                     identity,
@@ -5073,6 +5259,41 @@ class NarrativeOutboxStore:
             "supersede_binding": None if supersede_binding is None else dict(supersede_binding),
         }
         action_digest = _sha(action)
+        if self.broker_mode:
+            latest = self._broker_latest(
+                identity,
+                expected_draft_identity,
+                str(current["story"]["package_digest"]),
+            )
+            result = self._broker_call(
+                "append_review",
+                operator_request_id,
+                {
+                    "source_identity": identity,
+                    "draft_identity": expected_draft_identity,
+                    "draft_package_digest": current["story"]["package_digest"],
+                    "new_state": status,
+                    "operator_request_id": operator_request_id,
+                    "reason_codes": list(safe_reasons),
+                    "timestamp": reviewed_at,
+                    "expected_revision": latest["revision"],
+                    "expected_event_digest": latest["event_digest"],
+                },
+            )
+            checked = self._validate_broker_event_result(
+                result,
+                source_identity_value=identity,
+                draft_identity_value=expected_draft_identity,
+                draft_package_digest=str(current["story"]["package_digest"]),
+                expected_state=status,
+            )
+            return ReviewUpdateResult(
+                identity,
+                expected_draft_identity,
+                str(checked["state"]),
+                operator_request_id,
+                bool(checked["idempotent"]),
+            )
         try:
             ledger, idempotent = self._review_store().transition(
                 source_identity=identity,
@@ -5095,6 +5316,28 @@ class NarrativeOutboxStore:
             operator_request_id,
             idempotent,
         )
+
+    @_privacy_boundary("narrative_normalizer_internal_error")
+    def pass_review(
+        self,
+        source_ref: str,
+        source_digest_value: str,
+        *,
+        operator_request_id: str,
+        expected_draft_identity: str,
+        reviewed_at: str,
+    ) -> ReviewUpdateResult:
+        with self.lock_for(source_ref, source_digest_value, blocking=True):
+            return self._transition_review(
+                source_ref=source_ref,
+                source_digest_value=source_digest_value,
+                expected_draft_identity=expected_draft_identity,
+                status=REVIEW_PASSED,
+                reason_codes=(),
+                operator_request_id=operator_request_id,
+                reviewed_at=reviewed_at,
+                supersede_binding=None,
+            )
 
     @_privacy_boundary("narrative_normalizer_internal_error")
     def reject(
@@ -5173,25 +5416,26 @@ class NarrativeOutboxStore:
                 "operator_request_id": operator_request_id,
                 "supersede_binding": binding,
             }
-            try:
-                ledger = self._review_store().read(
-                    old_source_identity,
-                    expected_draft_identity=old_draft_identity,
-                )
-            except review_state.ReviewStateError as error:
-                self._review_state_error(error)
-            for event in ledger.events:
-                if event.operator_request_id != operator_request_id:
-                    continue
-                if event.state != review_state.STATE_SUPERSEDED or event.action_digest != _sha(action):
-                    _raise("narrative_normalizer_review_identity_conflict")
-                return ReviewUpdateResult(
-                    old_source_identity,
-                    old_draft_identity,
-                    REVIEW_SUPERSEDED,
-                    operator_request_id,
-                    True,
-                )
+            if not self.broker_mode:
+                try:
+                    ledger = self._review_store().read(
+                        old_source_identity,
+                        expected_draft_identity=old_draft_identity,
+                    )
+                except review_state.ReviewStateError as error:
+                    self._review_state_error(error)
+                for event in ledger.events:
+                    if event.operator_request_id != operator_request_id:
+                        continue
+                    if event.state != review_state.STATE_SUPERSEDED or event.action_digest != _sha(action):
+                        _raise("narrative_normalizer_review_identity_conflict")
+                    return ReviewUpdateResult(
+                        old_source_identity,
+                        old_draft_identity,
+                        REVIEW_SUPERSEDED,
+                        operator_request_id,
+                        True,
+                    )
             new_value = validate_draft_directory(
                 self.root / new_source_identity,
                 expected_identity=new_source_identity,
@@ -5215,6 +5459,316 @@ class NarrativeOutboxStore:
                 supersede_binding=binding,
             )
 
+    def _approve_with_broker(
+        self,
+        source_ref: str,
+        source_digest_value: str,
+        *,
+        expected_draft_identity: str,
+        operator_request_id: str,
+    ) -> ApprovalResult:
+        trust_service = self._require_trust()
+        identity = self._identity(source_ref, source_digest_value)
+        raw_source = read_source_unit(
+            self.policy,
+            source_ref,
+            expected_digest=source_digest_value,
+            allow_insufficient=True,
+        )
+        source_documents = read_source_documents(
+            self.policy,
+            source_ref,
+            expected_digest=source_digest_value,
+        )
+        path = self.root / identity
+        value = validate_draft_directory(
+            path,
+            expected_identity=identity,
+            validate_ready=False,
+            trust_service=trust_service,
+            review_authority_root=self.policy.narrative_review_authority_root,
+            require_trust=True,
+        )
+        raw_source = _replay_source_for_story(raw_source, source_documents, value["story"])
+        value = validate_draft_directory(
+            path,
+            expected_identity=identity,
+            expected_source=raw_source,
+            validate_ready=False,
+            trust_service=trust_service,
+            review_authority_root=self.policy.narrative_review_authority_root,
+            require_trust=True,
+        )
+        story = value["story"]
+        review = value["review"]
+        manifest = value["manifest"]
+        completed_claim = self.read_claim(source_ref, source_digest_value)
+        if completed_claim is None or not self._claim_matches_draft(completed_claim, value):
+            _raise("narrative_normalizer_approval_conflict")
+        if manifest["draft_identity"] != expected_draft_identity:
+            _raise("narrative_normalizer_review_identity_conflict")
+        if (
+            review["status"] != REVIEW_PASSED
+            or value["factuality"].unsupported_claim_count != 0
+            or not value["factuality"].passed
+            or not value["meaning"].passed
+            or not value["plain_language"].passed
+        ):
+            _raise("narrative_normalizer_review_not_passed")
+
+        story_path = path / "story.json"
+        narrative_package_digest = _file_digest(story_path)
+        ready_payload = {
+            "schema_version": quarantine.MANIFEST_SCHEMA_VERSION,
+            "source_ref": source_ref,
+            "source_digest": source_digest_value,
+            "narrative_package_ref": f"{identity}/story.json",
+            "narrative_package_digest": narrative_package_digest,
+            "status": quarantine.CLASS_READY,
+            "contract_versions": {
+                "director": "review-only-normalizer-v1",
+                "narrative": generation.GENERATION_CONTRACT_VERSION,
+            },
+        }
+        try:
+            quarantine.validate_narrative_ready_payload(self.policy, source_ref, ready_payload)
+        except quarantine.QuarantineError:
+            _raise("narrative_normalizer_manifest_invalid")
+        ready_encoded = _canonical(ready_payload) + b"\n"
+        ready_digest = hashlib.sha256(ready_encoded).hexdigest()
+        draft_package_digest = str(story["package_digest"])
+        latest = self._broker_latest(
+            identity,
+            expected_draft_identity,
+            draft_package_digest,
+        )
+        ready_target = path / "narrative_ready.json"
+        attestation_target = path / "approval-attestation.json"
+
+        def validate_attestation(raw: object) -> review_state.DualDigestApprovalAttestation:
+            if type(raw) is not dict:
+                _raise("narrative_normalizer_manifest_invalid")
+            try:
+                parsed = review_state.dual_digest_approval_attestation_from_payload(
+                    raw,
+                    trust_service,
+                    ready_manifest_contract=quarantine.MANIFEST_SCHEMA_VERSION,
+                    source_contract=SOURCE_CONTRACT_VERSION,
+                    draft_contract=BROKER_DRAFT_CONTRACT_VERSION,
+                )
+            except review_state.ReviewStateError:
+                _raise("narrative_normalizer_manifest_invalid")
+            claim_path = self.claim_path(source_ref, source_digest_value)
+            if (
+                parsed.source_identity != identity
+                or parsed.source_ref != source_ref
+                or parsed.source_digest != source_digest_value
+                or parsed.draft_identity != expected_draft_identity
+                or parsed.draft_package_digest != draft_package_digest
+                or parsed.narrative_package_digest != narrative_package_digest
+                or parsed.narrative_ready_manifest_digest != ready_digest
+                or parsed.story_markdown_digest != _file_digest(path / "story.md")
+                or parsed.draft_manifest_digest != _file_digest(path / "draft-manifest.json")
+                or parsed.review_digest != _file_digest(path / "review.json")
+                or parsed.completed_claim_digest != _file_digest(claim_path)
+                or parsed.artifact_binding_digest != value["artifact_binding_digest"]
+                or parsed.approval_request_id != operator_request_id
+            ):
+                _raise("narrative_normalizer_manifest_invalid")
+            return parsed
+
+        if latest["state"] == review_state.STATE_APPROVED:
+            if (
+                not os.path.lexists(attestation_target)
+                or not os.path.lexists(ready_target)
+                or attestation_target.is_symlink()
+                or ready_target.is_symlink()
+                or not attestation_target.is_file()
+                or not ready_target.is_file()
+                or ready_target.read_bytes() != ready_encoded
+            ):
+                _raise("narrative_normalizer_approval_conflict")
+            attestation_raw = _json_read(
+                attestation_target,
+                frozenset(json.loads(attestation_target.read_text(encoding="utf-8"))),
+                "narrative_normalizer_manifest_invalid",
+            )
+            parsed = validate_attestation(attestation_raw)
+            if (
+                latest["revision"] != parsed.review_revision
+                or latest["event_digest"] != parsed.review_event_digest
+            ):
+                _raise("narrative_normalizer_approval_conflict")
+            return ApprovalResult(source_digest_value, _sha(ready_payload), quarantine.CLASS_READY, True)
+        if latest["state"] != review_state.STATE_PASSED:
+            _raise("narrative_normalizer_review_not_passed")
+
+        prepare_payload = {
+            "source_identity": identity,
+            "source_ref": source_ref,
+            "source_digest": source_digest_value,
+            "draft_identity": expected_draft_identity,
+            "draft_package_digest": draft_package_digest,
+            "narrative_package_digest": narrative_package_digest,
+            "narrative_ready_manifest_digest": ready_digest,
+            "story_markdown_digest": _file_digest(path / "story.md"),
+            "draft_manifest_digest": _file_digest(path / "draft-manifest.json"),
+            "review_digest": _file_digest(path / "review.json"),
+            "completed_claim_digest": _file_digest(
+                self.claim_path(source_ref, source_digest_value)
+            ),
+            "artifact_binding_digest": value["artifact_binding_digest"],
+            "ready_manifest_contract": quarantine.MANIFEST_SCHEMA_VERSION,
+            "source_contract": SOURCE_CONTRACT_VERSION,
+            "draft_contract_versions": {
+                "draft": BROKER_DRAFT_CONTRACT_VERSION,
+                "source": SOURCE_CONTRACT_VERSION,
+            },
+            "operator_request_id": operator_request_id,
+            # A stable persisted timestamp makes a failed commit exactly
+            # replayable under the same operator request identity.
+            "timestamp": completed_claim["updated_at"],
+            "expected_revision": latest["revision"],
+            "expected_event_digest": latest["event_digest"],
+        }
+        prepared_result = self._broker_call(
+            "prepare_approval",
+            f"prepare-{operator_request_id}",
+            prepare_payload,
+        )
+        if (
+            frozenset(prepared_result) != {"prepared", "attestation_digest", "mutated"}
+            or prepared_result.get("mutated") is not False
+            or type(prepared_result.get("prepared")) is not dict
+        ):
+            _raise("narrative_normalizer_review_authority_unavailable")
+        prepared = prepared_result["prepared"]
+        assert type(prepared) is dict
+        if (
+            frozenset(prepared) != {"schema_version", "event", "attestation", "prepared_identity"}
+            or prepared.get("schema_version") != BROKER_PREPARED_APPROVAL_VERSION
+            or type(prepared.get("event")) is not dict
+            or type(prepared.get("attestation")) is not dict
+            or prepared.get("prepared_identity") != _sha({
+                "event": prepared["event"],
+                "attestation": prepared["attestation"],
+            })
+            or prepared_result.get("attestation_digest") != _sha(prepared["attestation"])
+        ):
+            _raise("narrative_normalizer_review_authority_unavailable")
+        parsed_attestation = validate_attestation(prepared["attestation"])
+        attestation_encoded = _canonical(prepared["attestation"]) + b"\n"
+
+        if os.path.lexists(ready_target) != os.path.lexists(attestation_target):
+            _raise("narrative_normalizer_approval_conflict")
+        if os.path.lexists(ready_target):
+            if (
+                ready_target.is_symlink()
+                or attestation_target.is_symlink()
+                or not ready_target.is_file()
+                or not attestation_target.is_file()
+                or ready_target.read_bytes() != ready_encoded
+                or attestation_target.read_bytes() != attestation_encoded
+            ):
+                _raise("narrative_normalizer_approval_conflict")
+        else:
+            token = secrets.token_hex(8)
+            attestation_staging = path / f".attestation-staging-{token}"
+            ready_staging = path / f".ready-staging-{token}"
+            owned_targets: list[tuple[Path, tuple[int, int]]] = []
+            pair_promoted = False
+            try:
+                _write_exclusive_file(attestation_staging, attestation_encoded)
+                if attestation_staging.read_bytes() != attestation_encoded:
+                    _raise("narrative_normalizer_manifest_invalid")
+                validate_attestation(json.loads(attestation_staging.read_text(encoding="utf-8")))
+                _write_exclusive_file(ready_staging, ready_encoded)
+                if ready_staging.read_bytes() != ready_encoded:
+                    _raise("narrative_normalizer_manifest_invalid")
+                quarantine.validate_narrative_ready_payload(
+                    self.policy,
+                    source_ref,
+                    json.loads(ready_staging.read_text(encoding="utf-8")),
+                )
+                for staging, target, encoded in (
+                    (attestation_staging, attestation_target, attestation_encoded),
+                    (ready_staging, ready_target, ready_encoded),
+                ):
+                    signature_stat = os.stat(staging, follow_symlinks=False)
+                    signature = (signature_stat.st_dev, signature_stat.st_ino)
+                    os.link(staging, target)
+                    owned_targets.append((target, signature))
+                    _fsync_directory(path)
+                    if target.is_symlink() or not target.is_file() or target.read_bytes() != encoded:
+                        _raise("narrative_normalizer_manifest_invalid")
+                pair_promoted = True
+            except BaseException:
+                if not pair_promoted:
+                    for target, signature in reversed(owned_targets):
+                        if os.path.lexists(target) and not target.is_symlink() and target.is_file():
+                            target_stat = os.stat(target, follow_symlinks=False)
+                            if (target_stat.st_dev, target_stat.st_ino) == signature:
+                                _cleanup_owned_path(target)
+                                _fsync_directory(path)
+                raise
+            finally:
+                for staging in (attestation_staging, ready_staging):
+                    if os.path.lexists(staging):
+                        _cleanup_owned_path(staging)
+                        _fsync_directory(path)
+
+        # Recompute immediately before commit; the Broker independently reads
+        # the same persisted bytes and rejects any prepare/commit race.
+        if _file_digest(story_path) != narrative_package_digest:
+            _raise("narrative_normalizer_approval_conflict")
+        commit_payload = {
+            "prepared": prepared,
+            "ready_manifest": ready_payload,
+            "ready_manifest_digest": ready_digest,
+            "attestation_digest": str(prepared_result["attestation_digest"]),
+            "draft_package_digest": draft_package_digest,
+            "narrative_package_digest": narrative_package_digest,
+        }
+        committed = self._broker_call(
+            "commit_approval",
+            f"commit-{operator_request_id}",
+            commit_payload,
+        )
+        checked = self._validate_broker_event_result(
+            committed,
+            source_identity_value=identity,
+            draft_identity_value=expected_draft_identity,
+            draft_package_digest=draft_package_digest,
+            expected_state=review_state.STATE_APPROVED,
+            allow_extra=frozenset({"attestation", "attestation_digest", "prepared_identity"}),
+        )
+        if (
+            checked.get("attestation") != prepared["attestation"]
+            or checked.get("attestation_digest") != prepared_result["attestation_digest"]
+            or checked.get("prepared_identity") != prepared["prepared_identity"]
+            or ready_target.read_bytes() != ready_encoded
+            or attestation_target.read_bytes() != attestation_encoded
+            or _file_digest(story_path) != narrative_package_digest
+        ):
+            _raise("narrative_normalizer_approval_conflict")
+        final_latest = self._broker_latest(
+            identity,
+            expected_draft_identity,
+            draft_package_digest,
+        )
+        if (
+            final_latest["state"] != review_state.STATE_APPROVED
+            or final_latest["revision"] != parsed_attestation.review_revision
+            or final_latest["event_digest"] != parsed_attestation.review_event_digest
+        ):
+            _raise("narrative_normalizer_approval_conflict")
+        return ApprovalResult(
+            source_digest_value,
+            _sha(ready_payload),
+            quarantine.CLASS_READY,
+            bool(checked["idempotent"]),
+        )
+
     @_privacy_boundary("narrative_normalizer_internal_error")
     def approve(
         self,
@@ -5232,6 +5786,13 @@ class NarrativeOutboxStore:
         if type(operator_request_id) is not str or _SAFE_COMPONENT.fullmatch(operator_request_id) is None:
             _raise("narrative_normalizer_review_identity_conflict")
         with self.lock_for(source_ref, source_digest_value, blocking=True):
+            if self.broker_mode:
+                return self._approve_with_broker(
+                    source_ref,
+                    source_digest_value,
+                    expected_draft_identity=expected_draft_identity,
+                    operator_request_id=operator_request_id,
+                )
             raw_source = read_source_unit(
                 self.policy,
                 source_ref,
@@ -5297,7 +5858,7 @@ class NarrativeOutboxStore:
                 )
             except review_state.ReviewStateError as error:
                 self._review_state_error(error)
-            actual_story_digest = quarantine.narrative_package_digest(path / "story.json")
+            actual_story_digest = _file_digest(path / "story.json")
             manifest_payload = {
                 "schema_version": quarantine.MANIFEST_SCHEMA_VERSION,
                 "source_ref": source_ref,
@@ -5692,6 +6253,7 @@ class NarrativeNormalizerService:
         generation_service: generation.NarrativeGenerationService,
         evidence_service: evidence.GenericEvidenceService | None = None,
         trust_service: trust.NarrativeTrustService | None = None,
+        review_authority: ReviewAuthorityTransport | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         claim_lease_seconds: int = DEFAULT_CLAIM_LEASE_SECONDS,
     ):
@@ -5710,7 +6272,11 @@ class NarrativeNormalizerService:
         self.trust_service = trust_service
         self.clock = clock
         self.claim_lease_seconds = claim_lease_seconds
-        self.store = NarrativeOutboxStore(policy, trust_service=trust_service)
+        self.store = NarrativeOutboxStore(
+            policy,
+            trust_service=trust_service,
+            review_authority=review_authority,
+        )
 
     def _source_id(self, source_ref: str) -> str:
         return hashlib.sha256(source_ref.encode("utf-8")).hexdigest()[:12]
@@ -5872,7 +6438,10 @@ class NarrativeNormalizerService:
                 calls=0,
                 evidence_path="deterministic_fast_path",
             )
-        if self.policy.narrative_review_authority_root is None:
+        if (
+            self.policy.narrative_review_authority_root is None
+            and not self.store.broker_mode
+        ):
             return self._outcome(
                 source,
                 OUTCOME_MANUAL_ATTENTION,
@@ -5933,11 +6502,18 @@ class NarrativeNormalizerService:
                         review=value["review"]["status"],
                     )
                 try:
-                    authoritative_review = self.store._review_store().read(
-                        identity,
-                        expected_draft_identity=str(value["manifest"]["draft_identity"]),
-                    ).latest.state
-                except review_state.ReviewStateError:
+                    if self.store.broker_mode:
+                        authoritative_review = str(self.store._broker_latest(
+                            identity,
+                            str(value["manifest"]["draft_identity"]),
+                            str(value["story"]["package_digest"]),
+                        )["state"])
+                    else:
+                        authoritative_review = self.store._review_store().read(
+                            identity,
+                            expected_draft_identity=str(value["manifest"]["draft_identity"]),
+                        ).latest.state
+                except (review_state.ReviewStateError, NarrativeNormalizerError):
                     return self._outcome(
                         source,
                         OUTCOME_UNCERTAIN,
@@ -5951,7 +6527,11 @@ class NarrativeNormalizerService:
                         OUTCOME_MANUAL_ATTENTION,
                         reasons=tuple(value["review"]["reason_codes"]),
                         digest=value["story"]["package_digest"],
-                        review=authoritative_review,
+                        review=(
+                            authoritative_review
+                            if authoritative_review in REVIEW_STATES
+                            else str(value["review"]["status"])
+                        ),
                     )
                 return self._outcome(
                     source, OUTCOME_EXISTING, digest=value["story"]["package_digest"], review=authoritative_review
@@ -6122,6 +6702,24 @@ class NarrativeNormalizerService:
                 artifact_binding_digest=artifact.artifact_binding_digest,
             )
             self.store._write_claim_locked(completed)
+            if self.store.broker_mode:
+                try:
+                    self.store.register_draft_with_authority(
+                        source.source_ref,
+                        source.source_digest,
+                    )
+                except NarrativeNormalizerError as error:
+                    # The immutable local draft remains available for manual
+                    # review, but it is not authority-registered and can never
+                    # create a ready pair through an automatic local fallback.
+                    return self._outcome(
+                        source,
+                        OUTCOME_MANUAL_ATTENTION,
+                        reasons=(error.reason_code,),
+                        calls=artifact.model_call_count,
+                        digest=artifact.package_digest,
+                        review=artifact.review_status,
+                    )
             if artifact.review_status != REVIEW_PASSED:
                 return self._outcome(
                     source,

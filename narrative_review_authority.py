@@ -170,7 +170,7 @@ def _ready_manifest(value: object, *, contract: str) -> dict[str, object]:
         or _source_ref(ready["narrative_package_ref"]) != ready["narrative_package_ref"]
         or _hex(ready["narrative_package_digest"]) != ready["narrative_package_digest"]
         or type(ready["status"]) is not str
-        or ready["status"] != "ready"
+        or ready["status"] != "narrative_ready"
     ):
         _fail(AUTHORITY_ATTESTATION_INVALID)
     contracts = _contracts(ready["contract_versions"])

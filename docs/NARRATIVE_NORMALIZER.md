@@ -303,8 +303,12 @@ independently scans the authority chain, verifies the HMAC, and requires the
 attestation revision/event digest to equal its latest `approved` event. A
 missing/wrong key or authority root,
 ready without attestation, attestation without ready, stale event, or any
-coherently recomputed open SHA digest remains `needs_narrative`. Legacy source-side
-and unambiguous digest-only ready manifests retain their previous contract.
+coherently recomputed open SHA digest remains `needs_narrative`. The quarantine
+consumer classifies the code-owned discovery location before checking any package
+digest. Identity-layout V2 uses SHA-256 of the exact persisted `story.json` bytes;
+legacy source-side and unambiguous digest-only manifests use the frozen historical
+tree-envelope digest. There is no cross-layout retry or fallback. Coexisting
+legacy/V2 artifacts and a manifest placed in the wrong layout fail closed.
 
 Threat model: this local design blocks rollback by replacing the draft bundle,
 legacy ledger, or mutable head cache while newer immutable events remain. It
@@ -446,15 +450,27 @@ python tools/run_narrative_normalizer.py `
   scan
 ```
 
-Executable `normalize`/`resume`, `approve`, `reject`, `supersede`, and `verify`
-also require `--review-authority-root <external-authority>` (or
-`NARRATIVE_NORMALIZER_REVIEW_AUTHORITY_ROOT`) plus the trust key. Read-only
+Executable `normalize`/`resume`, `pass`, `approve`, `reject`, `supersede`, and
+`verify` require an explicit `--review-authority-socket` with exact socket owner
+UID/GID, mode, and timeout configuration. The local review-authority root adapter
+remains available only through an internal unit-test seam and is not selected by
+the production CLI. Read-only
 `scan`, `coverage-snapshot`, `list`, `show`, `status`, and every dry-run neither
 read nor create the authority root. A missing authority on a mutating command
 fails before adapter/model loading, locks, or filesystem writes.
 
 Команды: `scan`, `coverage-snapshot`, `normalize`, `resume`, `list`, `show`,
-`approve`, `reject`, `supersede`, `status`, `verify`.
+`pass`, `approve`, `reject`, `supersede`, `status`, `verify`.
+
+In Broker mode, normalization registers the fully persisted and revalidated
+draft with `register_draft`. Human review state and approval are owned only by
+the Broker; transport, protocol, role, stale-state, or request-conflict failures
+never fall back to the local ledger. Approval binds the logical
+`draft_package_digest` independently from the SHA-256 of the exact persisted
+`story.json` bytes (including its final LF). The attestation and
+`narrative_ready.json` are promoted as a no-clobber pair before Broker commit,
+and quarantine subsequently requires both latest `approved` and
+`verify_ready=true`.
 
 Privacy-safe batch output различает `evidence_fast_path`,
 `evidence_generic_path`, `source_insufficient`, `manual_attention` и

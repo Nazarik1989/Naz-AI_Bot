@@ -493,6 +493,114 @@ def test_valid_manifest_is_discovered_ready(tmp_path: Path) -> None:
     assert discovered[0].source_ref == "Naz/2026-08-09"
 
 
+def test_legacy_source_side_frozen_tree_envelope_digest_is_accepted(tmp_path: Path) -> None:
+    policy = make_policy(tmp_path)
+    source, package, payload = ready_payload(policy)
+    package.write_bytes(b'{"story":"legacy"}\n')
+    frozen_tree_digest = "a60ea7f40b962b224fad0651c7e994b315cf68546b4af09bcb66fbc7dd419d6a"
+    raw_story_digest = hashlib.sha256(package.read_bytes()).hexdigest()
+    assert raw_story_digest == "ef1ab233e0c592d8023eb3eb65530eeed117a501f523b244f6b9fa0813340ed7"
+    assert frozen_tree_digest != raw_story_digest
+    payload["narrative_package_digest"] = frozen_tree_digest
+    (source / "narrative_ready.json").write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    validated = rq.validate_narrative_ready_manifest(policy, "Naz/2026-08-09")
+
+    assert validated.narrative_package_digest == frozen_tree_digest
+    assert rq.narrative_package_digest(package) == frozen_tree_digest
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("package-tree", "manifest-digest"),
+    ids=("legacy-tree-changed", "legacy-manifest-digest-changed"),
+)
+def test_legacy_source_side_digest_mutation_is_rejected(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    policy = make_policy(tmp_path)
+    source, package, payload = ready_payload(policy)
+    if mutation == "package-tree":
+        package.write_text("changed after manifest", encoding="utf-8")
+    else:
+        payload["narrative_package_digest"] = "0" * 64
+        (source / "narrative_ready.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(rq.EligibilityError, match="narrative_manifest_package_digest_mismatch"):
+        rq.validate_narrative_ready_manifest(policy, "Naz/2026-08-09")
+
+
+def test_legacy_source_side_never_calls_broker_even_when_unavailable(tmp_path: Path) -> None:
+    class ForbiddenBroker:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def latest_state(self, *args: object, **kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("latest_state")
+
+        def verify_ready(self, *args: object, **kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("verify_ready")
+
+    original = make_policy(tmp_path)
+    ready_payload(original)
+    broker = ForbiddenBroker()
+    policy = replace(original, review_authority_client=broker)
+
+    assert rq.validate_narrative_ready_manifest(policy, "Naz/2026-08-09").status == rq.CLASS_READY
+    assert broker.calls == 0
+
+
+@pytest.mark.parametrize(
+    "confusion",
+    (
+        "legacy-in-v2-directory",
+        "v2-source-side",
+        "legacy-with-v2-attestation",
+        "legacy-and-v2-artifacts",
+    ),
+    ids=(
+        "legacy-manifest-in-v2-identity-directory",
+        "v2-manifest-placed-source-side",
+        "legacy-manifest-with-v2-attestation",
+        "legacy-plus-v2-artifacts",
+    ),
+)
+def test_manifest_layout_confusion_fails_closed(tmp_path: Path, confusion: str) -> None:
+    policy = make_policy(tmp_path)
+    source, _, payload = ready_payload(policy)
+    identity = rq.narrative_source_identity(
+        payload["source_ref"],
+        payload["source_digest"],
+    )
+    identity_dir = policy.narrative_outbox_root / identity
+    identity_dir.mkdir(parents=True, exist_ok=True)
+    if confusion == "legacy-in-v2-directory":
+        (source / "narrative_ready.json").unlink()
+        (identity_dir / "narrative_ready.json").write_text(json.dumps(payload), encoding="utf-8")
+    elif confusion == "v2-source-side":
+        story = identity_dir / "story.json"
+        story.write_bytes(b"{}\n")
+        payload["narrative_package_ref"] = f"{identity}/story.json"
+        payload["narrative_package_digest"] = hashlib.sha256(story.read_bytes()).hexdigest()
+        (source / "narrative_ready.json").write_text(json.dumps(payload), encoding="utf-8")
+    elif confusion == "legacy-with-v2-attestation":
+        (source / "approval-attestation.json").write_bytes(b"{}\n")
+    else:
+        (identity_dir / "story.json").write_bytes(b"{}\n")
+
+    with pytest.raises(
+        rq.EligibilityError,
+        match="narrative_manifest_(?:layout_mismatch|ambiguous)",
+    ):
+        rq.validate_narrative_ready_manifest(policy, "Naz/2026-08-09")
+
+
 def test_symlink_source_fails_closed(tmp_path: Path) -> None:
     policy = make_policy(tmp_path)
     outside = tmp_path / "outside"

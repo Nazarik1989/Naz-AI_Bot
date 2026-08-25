@@ -847,7 +847,7 @@ def test_cli_exact_five_opaque_targets_prints_preflight_before_factory(tmp_path,
     ]
     for identity in identities:
         args.extend(("--source-identity", identity))
-    assert cli.run(args) == 0
+    assert cli.run(args, _allow_local_review_authority_for_tests=True) == 0
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert output[0]["live_provider_preflight"]["selected_source_count"] == 5
     assert output[0]["live_provider_preflight"]["calculated_maximum_calls"] == 25

@@ -412,6 +412,11 @@ def _cli_base(policy: rq.QuarantinePathPolicy) -> list[str]:
     ]
 
 
+def _cli_run_with_local_test_authority(argv: list[str]) -> int:
+    """Exercise the legacy adapter through the non-CLI test-only seam."""
+    return cli.run(argv, _allow_local_review_authority_for_tests=True)
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 
@@ -427,7 +432,7 @@ def write_identity_ready(policy, record):
         "source_ref": record.source_ref,
         "source_digest": record.source_digest,
         "narrative_package_ref": f"{identity}/story.json",
-        "narrative_package_digest": rq.narrative_package_digest(package),
+        "narrative_package_digest": hashlib.sha256(package.read_bytes()).hexdigest(),
         "status": rq.CLASS_READY,
         "contract_versions": {"director": "director-v1", "narrative": "narrative-v1"},
     }
@@ -1825,7 +1830,9 @@ def test_consumer_attestation_tamper_matrix_never_makes_source_ready(tmp_path, m
         story["title"] = story["title"] + " altered"
         write_json(draft / "story.json", story)
         ready = json.loads(ready_path.read_text(encoding="utf-8"))
-        ready["narrative_package_digest"] = rq.narrative_package_digest(draft / "story.json")
+        ready["narrative_package_digest"] = hashlib.sha256(
+            (draft / "story.json").read_bytes()
+        ).hexdigest()
         write_json(ready_path, ready)
     elif mutation in {"story-markdown", "review", "draft-manifest"}:
         name = {
@@ -3189,7 +3196,7 @@ def test_cli_scan_list_status_verify_are_safe_json(tmp_path, capsys):
     spec, policy, source_path, record = write_source(tmp_path)
     base = _cli_base(policy)
     for command in ("scan", "list", "status", "verify"):
-        assert cli.run([*base, command]) == 0
+        assert _cli_run_with_local_test_authority([*base, command]) == 0
         output = capsys.readouterr().out
         payload = json.loads(output)
         assert str(tmp_path) not in output
@@ -3200,7 +3207,7 @@ def test_cli_verify_requires_matching_sealed_terminal_claim(tmp_path, capsys):
     *values, _, _ = create_draft(tmp_path)
     policy, record, service = values[1], values[3], values[-1]
     base = _cli_base(policy)
-    assert cli.run([*base, "verify"]) == 0
+    assert _cli_run_with_local_test_authority([*base, "verify"]) == 0
     assert json.loads(capsys.readouterr().out) == {"passed": True, "verified": 1}
     claim = service.store.read_claim(record.source_ref, record.source_digest)
     assert claim is not None and claim["state"] == nn.CLAIM_COMPLETED
@@ -3234,7 +3241,7 @@ def test_cli_verify_fails_closed_for_missing_tampered_or_mismatched_claim(
         changed = dict(claim, package_digest="f" * 64)
         write_json(path, service.store._seal_claim_payload(changed))
     base = _cli_base(policy)
-    assert cli.run([*base, "verify"]) == 2
+    assert _cli_run_with_local_test_authority([*base, "verify"]) == 2
     assert json.loads(capsys.readouterr().out) == {
         "ok": False,
         "reason_code": expected_reason,
@@ -3251,7 +3258,7 @@ def test_cli_verify_fails_closed_for_orphan_completed_claim(tmp_path, capsys):
     draft.rmdir()
     assert claim_path.is_file()
     base = _cli_base(policy)
-    assert cli.run([*base, "verify"]) == 2
+    assert _cli_run_with_local_test_authority([*base, "verify"]) == 2
     assert json.loads(capsys.readouterr().out) == {
         "ok": False,
         "reason_code": "narrative_normalizer_claim_uncertain",
@@ -3272,7 +3279,7 @@ def test_cli_verify_accepts_explicit_trust_key_file_without_environment_key(
     )
     monkeypatch.delenv("NARRATIVE_NORMALIZER_TRUST_KEY", raising=False)
     base = [*_cli_base(policy), "--trust-key-file", str(key_file)]
-    assert cli.run([*base, "verify"]) == 0
+    assert _cli_run_with_local_test_authority([*base, "verify"]) == 0
     assert json.loads(capsys.readouterr().out) == {"passed": True, "verified": 1}
 
 
@@ -3288,7 +3295,7 @@ def test_cli_verify_rejects_ambiguous_environment_and_file_key_sources(
         encoding="ascii",
     )
     base = [*_cli_base(policy), "--trust-key-file", str(key_file)]
-    assert cli.run([*base, "verify"]) == 2
+    assert _cli_run_with_local_test_authority([*base, "verify"]) == 2
     assert json.loads(capsys.readouterr().out) == {
         "ok": False,
         "reason_code": "narrative_normalizer_trust_invalid",
@@ -3327,7 +3334,7 @@ def test_cli_executable_normalize_requires_trust_before_loading_adapter(
         "--enable-local-execution",
         "--adapter",
         "private:factory",
-    ])
+    ], _allow_local_review_authority_for_tests=True)
     assert code == 2
     assert adapter_calls == 0
     assert json.loads(capsys.readouterr().out) == {
@@ -3379,7 +3386,7 @@ def test_cli_executable_normalize_requires_external_authority_before_key_or_adap
     assert not outbox.exists()
 
 
-def test_cli_verify_accepts_review_authority_from_environment(tmp_path, monkeypatch, capsys):
+def test_cli_verify_does_not_select_local_authority_from_environment(tmp_path, monkeypatch, capsys):
     *values, _, _ = create_draft(tmp_path)
     policy = values[1]
     authority = policy.narrative_review_authority_root
@@ -3391,8 +3398,11 @@ def test_cli_verify_accepts_review_authority_from_environment(tmp_path, monkeypa
         "--outbox-root", str(policy.narrative_outbox_root),
         "verify",
     ])
-    assert code == 0
-    assert json.loads(capsys.readouterr().out) == {"passed": True, "verified": 1}
+    assert code == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": False,
+        "reason_code": "narrative_normalizer_review_authority_unavailable",
+    }
 
 
 @pytest.mark.parametrize("location", ("inbox", "outbox", "registry", "git"))
@@ -4169,7 +4179,9 @@ def test_final_claim_read_precedes_coherent_final_draft_revalidation(tmp_path, m
             write_json(draft / "story.json", story)
             write_json(draft / "draft-manifest.json", manifest)
             write_json(draft / "review.json", review)
-            ready["narrative_package_digest"] = rq.narrative_package_digest(draft / "story.json")
+            ready["narrative_package_digest"] = hashlib.sha256(
+                (draft / "story.json").read_bytes()
+            ).hexdigest()
             write_json(draft / "narrative_ready.json", ready)
         return original_read(source_ref, source_digest)
 

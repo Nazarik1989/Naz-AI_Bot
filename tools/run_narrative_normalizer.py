@@ -12,6 +12,7 @@ from pathlib import Path
 
 import narrative_normalizer as normalizer
 import narrative_normalizer_trust as trust
+import narrative_review_authority_client as authority_client
 import reels_failure_quarantine as quarantine
 
 
@@ -22,6 +23,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--outbox-root", "--narrative-outbox", dest="outbox_root", required=True)
     parser.add_argument("--trust-key-file")
     parser.add_argument("--review-authority-root")
+    parser.add_argument("--review-authority-socket")
+    parser.add_argument("--review-authority-owner-uid", type=int)
+    parser.add_argument("--review-authority-owner-gid", type=int)
+    parser.add_argument(
+        "--review-authority-socket-mode",
+        type=lambda value: int(value, 8),
+        default=0o660,
+    )
+    parser.add_argument("--review-authority-timeout", type=float, default=10.0)
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("scan")
@@ -56,6 +66,11 @@ def _parser() -> argparse.ArgumentParser:
     reject.add_argument("expected_draft_identity")
     reject.add_argument("operator_request_id")
     reject.add_argument("--reason-code", action="append", required=True)
+    passed = sub.add_parser("pass")
+    passed.add_argument("source_ref")
+    passed.add_argument("source_digest")
+    passed.add_argument("expected_draft_identity")
+    passed.add_argument("operator_request_id")
     supersede = sub.add_parser("supersede")
     for name in (
         "old_source_ref", "old_source_digest", "old_source_identity", "old_draft_identity",
@@ -85,11 +100,46 @@ def _policy(args: argparse.Namespace) -> quarantine.QuarantinePathPolicy:
     )
 
 
-def _require_review_authority(policy: quarantine.QuarantinePathPolicy) -> None:
-    if policy.narrative_review_authority_root is None:
+def _require_review_authority(
+    policy: quarantine.QuarantinePathPolicy,
+    broker: normalizer.ReviewAuthorityTransport | None = None,
+    *,
+    allow_local_test_adapter: bool = False,
+) -> None:
+    if broker is None and not (
+        allow_local_test_adapter
+        and policy.narrative_review_authority_root is not None
+    ):
         raise normalizer.NarrativeNormalizerError(
             "narrative_normalizer_review_authority_unavailable"
         )
+
+
+def _load_broker_client(
+    args: argparse.Namespace,
+) -> normalizer.ReviewAuthorityTransport | None:
+    socket_path = args.review_authority_socket
+    if socket_path is None:
+        return None
+    try:
+        if (
+            args.review_authority_owner_uid is None
+            or args.review_authority_owner_gid is None
+            or args.review_authority_owner_uid < 0
+            or args.review_authority_owner_gid < 0
+        ):
+            raise ValueError
+        return authority_client.ReviewAuthorityClient(
+            socket_path,
+            owner_uid=args.review_authority_owner_uid,
+            owner_gid=args.review_authority_owner_gid,
+            mode=args.review_authority_socket_mode,
+            timeout=args.review_authority_timeout,
+        )
+    except (TypeError, ValueError, authority_client.ClientError):
+        raise normalizer.NarrativeNormalizerError(
+            "narrative_normalizer_review_authority_unavailable"
+        ) from None
 
 
 def _emit(value: object) -> None:
@@ -235,7 +285,11 @@ def _coverage_snapshot(
     }
 
 
-def run(argv: list[str] | None = None) -> int:
+def run(
+    argv: list[str] | None = None,
+    *,
+    _allow_local_review_authority_for_tests: bool = False,
+) -> int:
     args = _parser().parse_args(argv)
     try:
         policy = _policy(args)
@@ -260,14 +314,22 @@ def run(argv: list[str] | None = None) -> int:
 
         store: normalizer.NarrativeOutboxStore | None = None
         trust_service: trust.NarrativeTrustService | None = None
+        broker_client = _load_broker_client(args)
+        if broker_client is not None:
+            policy = replace(policy, review_authority_client=broker_client)
         if command not in {"normalize", "resume"}:
-            if command in {"approve", "reject", "supersede", "verify"}:
-                _require_review_authority(policy)
+            if command in {"approve", "pass", "reject", "supersede", "verify"}:
+                _require_review_authority(
+                    policy,
+                    broker_client,
+                    allow_local_test_adapter=_allow_local_review_authority_for_tests,
+                )
                 trust_service = _load_trust_service(args)
                 policy = replace(policy, narrative_trust_service=trust_service)
                 store = normalizer.NarrativeOutboxStore(
                     policy,
                     trust_service=trust_service,
+                    review_authority=broker_client,
                 )
             else:
                 store = normalizer.NarrativeOutboxStore(policy)
@@ -302,6 +364,17 @@ def run(argv: list[str] | None = None) -> int:
             )
             _emit(asdict(result))
             return 0
+        if command == "pass":
+            assert store is not None
+            result = store.pass_review(
+                args.source_ref,
+                args.source_digest,
+                expected_draft_identity=args.expected_draft_identity,
+                operator_request_id=args.operator_request_id,
+                reviewed_at=now,
+            )
+            _emit(asdict(result))
+            return 0
         if command == "supersede":
             assert store is not None
             result = store.supersede(
@@ -331,6 +404,7 @@ def run(argv: list[str] | None = None) -> int:
                 value = normalizer.validate_draft_directory(
                     store.root / str(item["source_identity"]),
                     expected_identity=str(item["source_identity"]),
+                    validate_ready=broker_client is None,
                     trust_service=trust_service,
                     review_authority_root=policy.narrative_review_authority_root,
                     require_trust=True,
@@ -345,7 +419,14 @@ def run(argv: list[str] | None = None) -> int:
                         "narrative_normalizer_claim_uncertain"
                     )
                 verified_drafts[str(item["source_identity"])] = value
-                if item["approved"]:
+                ready_path = (
+                    store.root
+                    / str(item["source_identity"])
+                    / "narrative_ready.json"
+                )
+                if item["approved"] or (
+                    broker_client is not None and ready_path.is_file()
+                ):
                     quarantine.validate_narrative_ready_manifest(
                         policy,
                         str(value["story"]["source_ref"]),
@@ -467,7 +548,19 @@ def run(argv: list[str] | None = None) -> int:
             live_summary: dict[str, object] | None = None
             dependencies: object
             if args.adapter == production_adapter_spec:
-                _require_review_authority(policy)
+                _require_review_authority(
+                    policy,
+                    broker_client,
+                    allow_local_test_adapter=_allow_local_review_authority_for_tests,
+                )
+                if (
+                    args.enable_live_provider
+                    and broker_client is None
+                    and not _allow_local_review_authority_for_tests
+                ):
+                    raise normalizer.NarrativeNormalizerError(
+                        "narrative_normalizer_review_authority_unavailable"
+                    )
                 trust_service = _load_trust_service(args)
                 policy = replace(policy, narrative_trust_service=trust_service)
                 try:
@@ -503,7 +596,11 @@ def run(argv: list[str] | None = None) -> int:
             else:
                 if args.enable_live_provider or not args.enable_local_execution:
                     raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
-                _require_review_authority(policy)
+                _require_review_authority(
+                    policy,
+                    broker_client,
+                    allow_local_test_adapter=_allow_local_review_authority_for_tests,
+                )
                 trust_service = _load_trust_service(args)
                 policy = replace(policy, narrative_trust_service=trust_service)
                 dependencies = normalizer.load_adapter(args.adapter)
@@ -520,6 +617,7 @@ def run(argv: list[str] | None = None) -> int:
                 generation_service=generation_service,
                 evidence_service=evidence_service,
                 trust_service=trust_service,
+                review_authority=broker_client,
             )
             result = service.normalize_batch(
                 rows,

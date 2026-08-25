@@ -1,7 +1,8 @@
 # Narrative Review Authority Broker
 
-This checkpoint adds a standalone authority boundary. It is not wired into the
-Normalizer, quarantine consumer, `main.py`, a service unit, or production.
+This checkpoint adds a standalone authority boundary. The local CP6B-A2 client
+integration wires it into the Normalizer reviewer flow and quarantine consumer;
+`main.py`, service units, and production remain unchanged and dormant.
 
 ## Ownership boundary
 
@@ -147,8 +148,35 @@ and configured UID/GID policy are trusted. An administrator with root access can
 replace process memory or files. HMAC provides integrity and authenticity, not
 confidentiality or non-repudiation against the key owner. This A1 checkpoint does
 not implement deployment, service hardening, key rotation, production role IDs,
-Normalizer integration, consumer integration, or migration of existing review
-authority data; those require a separately reviewed integration checkpoint.
+deployment, service hardening, production role IDs, or migration of existing
+review authority data. The integrated client path is dormant until an explicit
+Broker socket is supplied.
+
+## CP6B-A2 client integration
+
+The Normalizer persists and re-reads a completed draft before sending only its
+canonical identities, digests, contract versions, timestamp, and request ID to
+`register_draft`. Review `pass`, `reject`, and `supersede` operations are Broker
+mutations. Approval is a two-phase Broker transaction: `prepare_approval`, local
+no-clobber promotion of `approval-attestation.json` followed by
+`narrative_ready.json`, then `commit_approval`. The ready manifest uses the
+production status value `narrative_ready`.
+
+The quarantine consumer does not load the Broker trust key. For an identity
+layout V2 pair it recomputes both digest roles, requires Broker latest state
+`approved`, and calls `verify_ready`. Broker unavailability, denial, protocol
+failure, stale state, or digest mismatch fails closed as `needs_narrative` with
+no provider, Director, Renderer, or publication path. Existing unambiguous
+legacy manifests keep their pre-Broker tree-envelope digest contract and never
+call the Broker. Layout selection comes from the exact discovered location and
+source-identity contract, not a caller field; mixed, misplaced, or ambiguous
+artifacts fail closed before authority access.
+
+The CLI selects this path only through explicit `--review-authority-socket`,
+socket owner UID/GID, mode, and timeout options. A configured local authority
+root is not a production CLI fallback. Imports, help, scan, coverage snapshot,
+dry-run, and non-authoritative list/show paths construct no Broker client and
+make no socket connection.
 
 ## Explicit startup example
 
