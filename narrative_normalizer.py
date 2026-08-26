@@ -35,6 +35,7 @@ import reels_failure_quarantine as quarantine
 import narrative_normalizer_evidence as evidence
 import narrative_normalizer_review_state as review_state
 import narrative_normalizer_trust as trust
+import narrative_outbox_permissions as outbox_permissions
 import narrative_review_authority_client as review_authority_client
 
 
@@ -534,16 +535,59 @@ def _atomic_write(path: Path, data: bytes, *, mode: int = 0o600) -> None:
 class _FileLock:
     """Small cross-platform advisory lock; lock files contain no source data."""
 
-    def __init__(self, path: Path, *, blocking: bool):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        blocking: bool,
+        mode: int = 0o600,
+        expected_gid: int | None = None,
+    ):
         self.path = path
         self.blocking = blocking
+        self.mode = mode
+        self.expected_gid = expected_gid
         self._stream = None
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        stream = self.path.open("a+b")
-        if os.name != "nt":
-            os.chmod(self.path, 0o600)
+        descriptor = -1
+        created = False
+        try:
+            if os.name == "nt":
+                stream = self.path.open("a+b")
+            else:
+                flags = os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    descriptor = os.open(
+                        self.path,
+                        flags | os.O_CREAT | os.O_EXCL,
+                        self.mode,
+                    )
+                    created = True
+                except FileExistsError:
+                    descriptor = os.open(self.path, flags)
+                stream = os.fdopen(descriptor, "a+b", closefd=True)
+                descriptor = -1
+                if created:
+                    if self.expected_gid is not None:
+                        os.fchown(stream.fileno(), -1, self.expected_gid)
+                    os.fchmod(stream.fileno(), self.mode)
+                metadata = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != self.mode
+                    or (
+                        self.expected_gid is not None
+                        and metadata.st_gid != self.expected_gid
+                    )
+                ):
+                    stream.close()
+                    return False
+        except OSError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            return False
         if stream.tell() == 0:
             stream.write(b"0")
             stream.flush()
@@ -4386,9 +4430,14 @@ class NarrativeOutboxStore:
         *,
         trust_service: trust.NarrativeTrustService | None = None,
         review_authority: ReviewAuthorityTransport | None = None,
+        permission_policy: outbox_permissions.NarrativeOutboxPermissionPolicy = (
+            outbox_permissions.PRIVATE_POLICY
+        ),
     ):
         if type(policy) is not quarantine.QuarantinePathPolicy:
             raise TypeError("policy")
+        if type(permission_policy) is not outbox_permissions.NarrativeOutboxPermissionPolicy:
+            raise TypeError("permission_policy")
         self.policy = policy
         self.root = policy.narrative_outbox_root
         self._state = self.root / ".normalizer-state"
@@ -4396,6 +4445,7 @@ class NarrativeOutboxStore:
         self._claims = self._state / "claims"
         self.trust_service = trust_service
         self.review_authority = review_authority
+        self.permission_policy = permission_policy
 
     def _require_trust(self) -> trust.NarrativeTrustService:
         service = _require_trust_service(self.trust_service)
@@ -4521,12 +4571,63 @@ class NarrativeOutboxStore:
         )
 
     def _ensure_write_layout(self) -> None:
-        for path in (self.root, self._state, self._locks, self._claims):
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not self.permission_policy.shared:
+            for path in (self.root, self._state, self._locks, self._claims):
+                path.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if path.is_symlink() or not path.is_dir():
+                    _raise("narrative_normalizer_persistence_invalid")
+                if os.name != "nt":
+                    os.chmod(path, 0o700)
+            return
+        for path, mode in (
+            (self.root, outbox_permissions.SHARED_ROOT_MODE),
+            (self._state, outbox_permissions.SHARED_STATE_MODE),
+            (self._locks, outbox_permissions.SHARED_LOCK_DIRECTORY_MODE),
+            (self._claims, outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+        ):
+            path.mkdir(parents=True, exist_ok=True, mode=mode)
             if path.is_symlink() or not path.is_dir():
                 _raise("narrative_normalizer_persistence_invalid")
-            if os.name != "nt":
-                os.chmod(path, 0o700)
+        outbox_permissions.finalize_shared_internal_layout(
+            self.permission_policy,
+            self.root,
+            self._state,
+            self._locks,
+            self._claims,
+        )
+
+    def _verify_draft_permissions(self, path: Path) -> None:
+        if self.permission_policy.shared:
+            outbox_permissions.verify_shared_draft(
+                self.permission_policy,
+                self.root,
+                path,
+            )
+
+    def _finalize_approval_file(self, path: Path) -> None:
+        if self.permission_policy.shared:
+            outbox_permissions.finalize_shared_approval_file(
+                self.permission_policy,
+                path,
+            )
+
+    def _verify_approval_file(self, path: Path) -> None:
+        if self.permission_policy.shared:
+            outbox_permissions.verify_shared_approval_file(
+                self.permission_policy,
+                path,
+            )
+
+    def _verify_approval_pair_if_present(self, draft: Path) -> None:
+        if not self.permission_policy.shared:
+            return
+        attestation = draft / "approval-attestation.json"
+        ready = draft / "narrative_ready.json"
+        if os.path.lexists(attestation) != os.path.lexists(ready):
+            _raise("narrative_normalizer_approval_conflict")
+        if os.path.lexists(attestation):
+            self._verify_approval_file(attestation)
+            self._verify_approval_file(ready)
 
     def _identity(self, source_ref: str, source_digest: str) -> str:
         return source_identity(source_ref, source_digest, SOURCE_CONTRACT_VERSION)
@@ -4570,7 +4671,16 @@ class NarrativeOutboxStore:
 
     def lock_for(self, source_ref: str, source_digest_value: str, *, blocking: bool = False) -> _FileLock:
         identity = self._identity(source_ref, source_digest_value)
-        return _FileLock(self._locks / f"{identity}.lock", blocking=blocking)
+        return _FileLock(
+            self._locks / f"{identity}.lock",
+            blocking=blocking,
+            mode=self.permission_policy.lock_file_mode,
+            expected_gid=(
+                self.permission_policy.shared_gid
+                if self.permission_policy.shared
+                else None
+            ),
+        )
 
     def claim_path(self, source_ref: str, source_digest_value: str) -> Path:
         return self._claims / f"{self._identity(source_ref, source_digest_value)}.json"
@@ -4784,7 +4894,13 @@ class NarrativeOutboxStore:
             )
             if not self._claim_matches_draft(candidate, value):
                 _raise("narrative_normalizer_claim_invalid")
-        _atomic_write(path, encoded)
+        _atomic_write(path, encoded, mode=self.permission_policy.claim_file_mode)
+        if self.permission_policy.shared:
+            outbox_permissions.finalize_shared_claim(
+                self.permission_policy,
+                self.root,
+                path,
+            )
         final = self.read_claim(str(source_ref), source_digest_value)
         if final != candidate:
             _raise("narrative_normalizer_claim_invalid")
@@ -4823,6 +4939,7 @@ class NarrativeOutboxStore:
         if final.name != identity:
             _raise("narrative_normalizer_persistence_invalid")
         if final.exists():
+            self._verify_draft_permissions(final)
             current = validate_draft_directory(
                 final, expected_identity=identity, trust_service=trust_service,
                 review_authority_root=self.policy.narrative_review_authority_root,
@@ -4866,8 +4983,11 @@ class NarrativeOutboxStore:
                 require_trust=True
             )
             try:
+                staging_stat = os.stat(staging, follow_symlinks=False)
+                staging_signature = (staging_stat.st_dev, staging_stat.st_ino)
                 os.rename(staging, final)
             except FileExistsError:
+                self._verify_draft_permissions(final)
                 current = validate_draft_directory(
                     final, expected_identity=identity, trust_service=trust_service,
                     review_authority_root=self.policy.narrative_review_authority_root,
@@ -4891,7 +5011,22 @@ class NarrativeOutboxStore:
                             self._review_state_error(error)
                     return final, True
                 _raise("narrative_normalizer_persistence_conflict")
+            try:
+                if self.permission_policy.shared:
+                    outbox_permissions.finalize_shared_draft(
+                        self.permission_policy,
+                        self.root,
+                        final,
+                    )
+            except BaseException:
+                if os.path.lexists(final) and not final.is_symlink() and final.is_dir():
+                    final_stat = os.stat(final, follow_symlinks=False)
+                    if (final_stat.st_dev, final_stat.st_ino) == staging_signature:
+                        _cleanup_owned_path(final)
+                        _fsync_directory(self.root)
+                raise
             _fsync_directory(self.root)
+            self._verify_draft_permissions(final)
             validate_draft_directory(
                 final, expected_identity=identity, trust_service=trust_service,
                 review_authority_root=self.policy.narrative_review_authority_root,
@@ -4927,6 +5062,7 @@ class NarrativeOutboxStore:
             _raise("narrative_normalizer_review_authority_unavailable")
         identity = self._identity(source_ref, source_digest_value)
         path = self.root / identity
+        self._verify_draft_permissions(path)
         value = validate_draft_directory(
             path,
             expected_identity=identity,
@@ -4982,10 +5118,17 @@ class NarrativeOutboxStore:
             return ()
         if self.root.is_symlink() or not self.root.is_dir():
             _raise("narrative_normalizer_persistence_invalid")
+        if self.permission_policy.shared:
+            outbox_permissions.verify_shared_root(
+                self.permission_policy,
+                self.root,
+            )
         rows = []
         for path in sorted(self.root.iterdir(), key=lambda item: item.name):
             if not path.is_dir() or _HEX64.fullmatch(path.name) is None:
                 continue
+            self._verify_draft_permissions(path)
+            self._verify_approval_pair_if_present(path)
             value = validate_draft_directory(
                 path,
                 expected_identity=path.name,
@@ -5042,8 +5185,11 @@ class NarrativeOutboxStore:
 
     def show(self, source_ref: str, source_digest_value: str) -> dict[str, object]:
         identity = self._identity(source_ref, source_digest_value)
+        path = self.root / identity
+        self._verify_draft_permissions(path)
+        self._verify_approval_pair_if_present(path)
         value = validate_draft_directory(
-            self.root / identity,
+            path,
             expected_identity=identity,
             validate_ready=self.trust_service is not None and not self.broker_mode,
             trust_service=self.trust_service,
@@ -5235,6 +5381,7 @@ class NarrativeOutboxStore:
         trust_service = self._require_trust()
         identity = self._identity(source_ref, source_digest_value)
         path = self.root / identity
+        self._verify_draft_permissions(path)
         current = validate_draft_directory(
             path, expected_identity=identity, trust_service=trust_service,
             review_authority_root=self.policy.narrative_review_authority_root,
@@ -5398,6 +5545,7 @@ class NarrativeOutboxStore:
         expected_relation = dict(binding)
         expected_relation.pop("operator_request_id")
         with self.lock_for(old_source_ref, old_source_digest, blocking=True):
+            self._verify_draft_permissions(self.root / old_source_identity)
             old_value = validate_draft_directory(
                 self.root / old_source_identity,
                 expected_identity=old_source_identity,
@@ -5436,8 +5584,10 @@ class NarrativeOutboxStore:
                         operator_request_id,
                         True,
                     )
+            new_path = self.root / new_source_identity
+            self._verify_draft_permissions(new_path)
             new_value = validate_draft_directory(
-                self.root / new_source_identity,
+                new_path,
                 expected_identity=new_source_identity,
                 trust_service=trust_service,
                 review_authority_root=self.policy.narrative_review_authority_root,
@@ -5481,6 +5631,7 @@ class NarrativeOutboxStore:
             expected_digest=source_digest_value,
         )
         path = self.root / identity
+        self._verify_draft_permissions(path)
         value = validate_draft_directory(
             path,
             expected_identity=identity,
@@ -5588,6 +5739,8 @@ class NarrativeOutboxStore:
                 or ready_target.read_bytes() != ready_encoded
             ):
                 _raise("narrative_normalizer_approval_conflict")
+            self._verify_approval_file(attestation_target)
+            self._verify_approval_file(ready_target)
             attestation_raw = _json_read(
                 attestation_target,
                 frozenset(json.loads(attestation_target.read_text(encoding="utf-8"))),
@@ -5671,6 +5824,8 @@ class NarrativeOutboxStore:
                 or attestation_target.read_bytes() != attestation_encoded
             ):
                 _raise("narrative_normalizer_approval_conflict")
+            self._verify_approval_file(attestation_target)
+            self._verify_approval_file(ready_target)
         else:
             token = secrets.token_hex(8)
             attestation_staging = path / f".attestation-staging-{token}"
@@ -5699,6 +5854,7 @@ class NarrativeOutboxStore:
                     os.link(staging, target)
                     owned_targets.append((target, signature))
                     _fsync_directory(path)
+                    self._finalize_approval_file(target)
                     if target.is_symlink() or not target.is_file() or target.read_bytes() != encoded:
                         _raise("narrative_normalizer_manifest_invalid")
                 pair_promoted = True
@@ -5805,6 +5961,7 @@ class NarrativeOutboxStore:
                 expected_digest=source_digest_value,
             )
             path = self.root / identity
+            self._verify_draft_permissions(path)
             value = validate_draft_directory(
                 path,
                 expected_identity=identity,
@@ -5900,6 +6057,8 @@ class NarrativeOutboxStore:
             attestation_encoded = _canonical(attestation_payload) + b"\n"
 
             def existing_ready_result() -> ApprovalResult:
+                self._verify_approval_file(attestation_target)
+                self._verify_approval_file(ready_target)
                 if (
                     ready_target.is_symlink()
                     or not ready_target.is_file()
@@ -5978,6 +6137,7 @@ class NarrativeOutboxStore:
                 ):
                     if os.path.lexists(target):
                         if target.is_file() and not target.is_symlink() and target.read_bytes() == encoded:
+                            self._verify_approval_file(target)
                             continue
                         _raise("narrative_normalizer_approval_conflict")
                     staging_stat = os.stat(staging, follow_symlinks=False)
@@ -5995,6 +6155,7 @@ class NarrativeOutboxStore:
                     else:
                         owned_targets.append((target, signature))
                     _fsync_directory(path)
+                    self._finalize_approval_file(target)
                     if target.is_symlink() or not target.is_file() or target.read_bytes() != encoded:
                         _raise("narrative_normalizer_manifest_invalid")
 
@@ -6254,6 +6415,9 @@ class NarrativeNormalizerService:
         evidence_service: evidence.GenericEvidenceService | None = None,
         trust_service: trust.NarrativeTrustService | None = None,
         review_authority: ReviewAuthorityTransport | None = None,
+        permission_policy: outbox_permissions.NarrativeOutboxPermissionPolicy = (
+            outbox_permissions.PRIVATE_POLICY
+        ),
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         claim_lease_seconds: int = DEFAULT_CLAIM_LEASE_SECONDS,
     ):
@@ -6276,6 +6440,7 @@ class NarrativeNormalizerService:
             policy,
             trust_service=trust_service,
             review_authority=review_authority,
+            permission_policy=permission_policy,
         )
 
     def _source_id(self, source_ref: str) -> str:
@@ -6459,6 +6624,7 @@ class NarrativeNormalizerService:
             )
         self.trust_service = trust_service
         self.store.trust_service = trust_service
+        self.store._ensure_write_layout()
         lock = self.store.lock_for(source.source_ref, source.source_digest, blocking=False)
         if not lock.acquire():
             return self._outcome(source, OUTCOME_PROCESSING)
@@ -6473,6 +6639,7 @@ class NarrativeNormalizerService:
             identity = source_identity(source.source_ref, source.source_digest, source.receipt.source_contract_version)
             final = self.store.draft_path(source.source_digest, source_ref=source.source_ref)
             if os.path.lexists(final):
+                self.store._verify_draft_permissions(final)
                 value = validate_draft_directory(
                     final,
                     expected_identity=identity,

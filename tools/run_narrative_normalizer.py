@@ -12,6 +12,7 @@ from pathlib import Path
 
 import narrative_normalizer as normalizer
 import narrative_normalizer_trust as trust
+import narrative_outbox_permissions as outbox_permissions
 import narrative_review_authority_client as authority_client
 import reels_failure_quarantine as quarantine
 
@@ -21,6 +22,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--inbox-root", required=True)
     parser.add_argument("--registry-path", "--registry", dest="registry_path", required=True)
     parser.add_argument("--outbox-root", "--narrative-outbox", dest="outbox_root", required=True)
+    parser.add_argument(
+        "--outbox-permission-policy",
+        choices=tuple(sorted(outbox_permissions.POLICY_VERSIONS)),
+        default=outbox_permissions.PRIVATE_POLICY_VERSION,
+    )
+    parser.add_argument("--outbox-shared-group")
     parser.add_argument("--trust-key-file")
     parser.add_argument("--review-authority-root")
     parser.add_argument("--review-authority-socket")
@@ -293,6 +300,10 @@ def run(
     args = _parser().parse_args(argv)
     try:
         policy = _policy(args)
+        permission_policy = outbox_permissions.resolve_permission_policy(
+            args.outbox_permission_policy,
+            args.outbox_shared_group,
+        )
         command = args.command
         if command == "scan":
             rows = normalizer.scan_needs_narrative(policy)
@@ -330,9 +341,13 @@ def run(
                     policy,
                     trust_service=trust_service,
                     review_authority=broker_client,
+                    permission_policy=permission_policy,
                 )
             else:
-                store = normalizer.NarrativeOutboxStore(policy)
+                store = normalizer.NarrativeOutboxStore(
+                    policy,
+                    permission_policy=permission_policy,
+                )
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         if command == "list":
             assert store is not None
@@ -618,6 +633,7 @@ def run(
                 evidence_service=evidence_service,
                 trust_service=trust_service,
                 review_authority=broker_client,
+                permission_policy=permission_policy,
             )
             result = service.normalize_batch(
                 rows,
@@ -639,7 +655,13 @@ def run(
             normalizer.NarrativeNormalizerError("narrative_normalizer_trust_invalid")
         ))
         return 2
-    except (quarantine.QuarantineError, TypeError, ValueError, OSError):
+    except (
+        quarantine.QuarantineError,
+        outbox_permissions.OutboxPermissionError,
+        TypeError,
+        ValueError,
+        OSError,
+    ):
         _emit(normalizer.safe_error(normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")))
         return 2
 

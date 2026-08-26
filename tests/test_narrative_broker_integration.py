@@ -14,6 +14,7 @@ import pytest
 import narrative_normalizer as nn
 import narrative_normalizer_review_state as review_state
 import narrative_normalizer_trust as trust
+import narrative_outbox_permissions as outbox_permissions
 import narrative_review_authority as authority
 import narrative_review_authority_client as authority_client
 import narrative_review_authority_protocol as protocol
@@ -156,6 +157,90 @@ def _event_count(env: dict[str, object]) -> int:
         value["story"]["source_identity"],
         value["manifest"]["draft_identity"],
     ).events)
+
+
+@pytest.mark.skipif(
+    __import__("os").name != "posix",
+    reason="real shared UID/GID/mode semantics require POSIX",
+)
+def test_shared_review_policy_preserves_broker_approval_and_consumer_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import os
+    import stat
+
+    monkeypatch.setenv(
+        "NARRATIVE_NORMALIZER_TRUST_KEY",
+        base64.b64encode(normalizer_tests.TEST_TRUST_KEY).decode("ascii"),
+    )
+    values = normalizer_tests.runtime(tmp_path)
+    policy = values[1]
+    record = values[3]
+    service = values[-1]
+    broker = authority.ReviewAuthority(
+        tmp_path / "broker-authority",
+        trust.NarrativeTrustService(normalizer_tests.TEST_TRUST_KEY),
+        narrative_outbox_root=policy.narrative_outbox_root,
+    )
+    client = CoreBrokerClient(broker)
+    shared = outbox_permissions.NarrativeOutboxPermissionPolicy(
+        outbox_permissions.SHARED_REVIEW_POLICY_VERSION,
+        os.getegid(),
+    )
+    service.store = nn.NarrativeOutboxStore(
+        policy,
+        trust_service=policy.narrative_trust_service,
+        review_authority=client,
+        permission_policy=shared,
+    )
+
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+    assert outcome.status == nn.OUTCOME_DRAFT_READY_FOR_REVIEW
+    draft = service.store.draft_path(
+        record.source_digest,
+        source_ref=record.source_ref,
+    )
+    value = nn.validate_draft_directory(
+        draft,
+        validate_ready=False,
+        trust_service=service.store.trust_service,
+        require_trust=True,
+    )
+    service.store.pass_review(
+        record.source_ref,
+        record.source_digest,
+        expected_draft_identity=value["manifest"]["draft_identity"],
+        operator_request_id="shared-human-pass-001",
+        reviewed_at="2026-08-24T12:00:00Z",
+    )
+    service.store.approve(
+        record.source_ref,
+        record.source_digest,
+        expected_draft_identity=value["manifest"]["draft_identity"],
+        operator_request_id="shared-human-approval-001",
+        reviewed_at="2026-08-24T12:01:00Z",
+    )
+
+    verified = client.verify_ready(
+        "shared-consumer-verify-001",
+        {
+            "ready_manifest": json.loads(
+                (draft / "narrative_ready.json").read_text(encoding="utf-8")
+            ),
+            "attestation": json.loads(
+                (draft / "approval-attestation.json").read_text(encoding="utf-8")
+            ),
+        },
+    )
+    assert verified["ready"] is True
+    assert stat.S_IMODE(draft.lstat().st_mode) == 0o3770
+    for name in outbox_permissions.DRAFT_FILE_NAMES:
+        assert stat.S_IMODE((draft / name).lstat().st_mode) == 0o640
+    for name in outbox_permissions.APPROVAL_FILE_NAMES:
+        target = draft / name
+        assert stat.S_IMODE(target.lstat().st_mode) == 0o640
+        assert target.lstat().st_gid == shared.shared_gid
 
 
 def test_successful_normalize_registers_only_canonical_binding(integrated):

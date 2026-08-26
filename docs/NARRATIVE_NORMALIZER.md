@@ -492,6 +492,36 @@ Import модуля сам ничего не запускает.
 неопределённой попытки; обычный `normalize` не делает скрытых retry.
 Scheduler, Telegram command, auto-approval и auto-Reels в CP6B отсутствуют.
 
+## Versioned outbox permissions
+
+The versioned `private-v1` policy remains the default and preserves the existing
+`0700` directory / `0600` file behavior. A shared Normalizer/Reviewer/Broker
+deployment must opt in explicitly:
+
+```text
+--outbox-permission-policy shared-review-v1 \
+--outbox-shared-group naz-narrative-content
+```
+
+`shared-review-v1` is POSIX-only and resolves the named group before any live
+write. The outbox root is `02750`; every promoted draft directory is `03770`;
+`story.md`, `story.json`, `draft-manifest.json`, and `review.json` are `0640`
+and remain owned by the Normalizer UID. Reviewer-created
+`approval-attestation.json` and `narrative_ready.json` are `0640`, owned by the
+Reviewer UID, and use the same configured GID. Internal claims are group
+readable and coordination locks are group writable, without granting the
+Reviewer access to the trust key or Review Authority storage. World
+permission bits are always zero.
+
+The sticky bit on a final draft directory allows a group Reviewer to create the
+approval pair but prevents it from deleting or replacing Normalizer-owned draft
+files. Staging directories/files remain private (`0700`/`0600`) until the exact
+validated promotion boundary. Every owner, group, and mode is applied and read
+back before Broker registration or approval commit. A missing group, a
+non-POSIX host, a symlink, or any ownership/mode mismatch fails closed; there is
+no fallback to private or ambient ACL behavior. Help, coverage, and dry-run
+commands never create outbox state.
+
 ## Test isolation
 
 Каждая test group запускается отдельным процессом с новым внешним `DB_PATH`, внешним
