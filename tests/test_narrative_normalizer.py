@@ -3103,6 +3103,14 @@ def test_generic_resolution_maps_to_exact_honest_normalizer_outcome(
     assert outcome.model_call_count == expected_calls
     assert len(evidence_client.requests) == expected_calls
     assert generation_client.requests == []
+    if case == "bad-schema":
+        assert type(outcome.evidence_diagnostic) is nn.evidence.EvidenceValidationDiagnostic
+        assert outcome.evidence_diagnostic.validation_stage == "top_level_schema"
+        summary_item = nn.BatchResult(1, (outcome,)).safe_summary()["items"][0]
+        assert summary_item["evidence_diagnostic"]["stable_subreason"] == "top_level_key_set_invalid"
+        assert "material.md" not in json.dumps(summary_item, ensure_ascii=False)
+    else:
+        assert outcome.evidence_diagnostic is None
     assert not service.store.draft_path(
         record.source_digest,
         source_ref=record.source_ref,

@@ -1238,6 +1238,124 @@ def test_contract_errors_expose_only_stable_reason_code() -> None:
     assert error.__context__ is None
 
 
+def _diagnostic_case(
+    bundle: evidence.SourceDocumentBundle,
+    case_id: str,
+) -> object:
+    raw: object = deepcopy(_base_extraction_payload(bundle))
+    assert type(raw) is dict
+    if case_id == "response-type":
+        return []
+    if case_id == "json-parse":
+        return "{"
+    if case_id == "top-level-schema":
+        raw.pop("run_id")
+    elif case_id == "contract-version":
+        raw["schema_version"] = "normalizer-evidence-extraction-v999"
+    elif case_id == "source-binding":
+        raw["source_identity"] = "0" * 64
+    elif case_id == "nested-schema":
+        raw["evidence"] = {}
+    elif case_id == "segment-binding":
+        raw["segment_dispositions"][0]["segment_id"] = "missing-segment"
+    elif case_id == "quote-binding":
+        raw["evidence"][0]["exact_quotes"][0]["character_end"] -= 1
+    elif case_id == "proposition-binding":
+        raw["evidence"][0]["proposition"] = "Unsupported synthesized proposition."
+    elif case_id == "value-binding":
+        raw["evidence"][0]["numbers"] = [{
+            "atom_id": "number-1",
+            "atom_kind": "number",
+            "quote_id": "quote-1",
+            "exact_lexeme": "999",
+        }]
+    elif case_id == "relation-binding":
+        raw["evidence"][0]["evidence_kind"] = "explicit_cause"
+    elif case_id == "semantic-validation":
+        raw["evidence"][0]["polarity"] = "negated"
+    return raw
+
+
+@pytest.mark.parametrize(
+    "case_id,expected_stage",
+    [
+        ("response-type", "response_type"),
+        ("json-parse", "json_parse"),
+        ("top-level-schema", "top_level_schema"),
+        ("contract-version", "contract_version"),
+        ("source-binding", "source_binding"),
+        ("nested-schema", "nested_schema"),
+        ("segment-binding", "segment_binding"),
+        ("quote-binding", "quote_binding"),
+        ("proposition-binding", "proposition_binding"),
+        ("value-binding", "value_binding"),
+        ("relation-binding", "relation_binding"),
+        ("semantic-validation", "semantic_validation"),
+    ],
+    ids=lambda value: value,
+)
+def test_extraction_rejection_emits_closed_privacy_safe_diagnostic_stage(
+    tmp_path: Path,
+    case_id: str,
+    expected_stage: str,
+) -> None:
+    bundle = _write_bundle(tmp_path)
+    raw = _diagnostic_case(bundle, case_id)
+    with pytest.raises(evidence.EvidenceContractError) as captured:
+        evidence.parse_extraction_response(raw, bundle)
+    diagnostic = captured.value.diagnostic
+    assert type(diagnostic) is evidence.EvidenceValidationDiagnostic
+    assert diagnostic.validation_stage == expected_stage
+    payload = diagnostic.safe_payload()
+    encoded = evidence.json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert set(payload) == {
+        "validation_stage", "stable_subreason", "field_path",
+        "response_top_level_exact_type", "top_level_key_set", "missing_keys",
+        "extra_keys", "nested_field_types", "list_item_counts",
+        "schema_contract_version", "span_quote_validation_category",
+        "source_identity_binding_result", "response_byte_size",
+        "response_character_size",
+    }
+    assert "Naz opened the blue notebook" not in encoded
+    assert "Unsupported synthesized proposition" not in encoded
+    assert captured.value.reason_code != "evidence_verified"
+
+
+def test_extraction_diagnostic_propagates_without_retry_or_raw_values(tmp_path: Path) -> None:
+    bundle = _write_bundle(tmp_path)
+    bad = _base_extraction_payload(bundle)
+    bad["evidence"][0]["exact_quotes"][0]["byte_end"] -= 1
+    client = FakeEvidenceClient([bad])
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="extract-model-v1",
+        adjudication_model="judge-model-v1",
+    ).resolve(bundle)
+    assert result.status == "failed"
+    assert result.model_call_count == 1
+    assert len(client.requests) == 1
+    assert type(result.diagnostic) is evidence.EvidenceValidationDiagnostic
+    assert result.diagnostic.validation_stage == "quote_binding"
+    assert "blue notebook" not in evidence.json.dumps(result.diagnostic.safe_payload())
+
+
+def test_nested_diagnostic_reports_only_safe_shape_metadata(tmp_path: Path) -> None:
+    bundle = _write_bundle(tmp_path)
+    bad = _base_extraction_payload(bundle)
+    bad["evidence"][0]["exact_quotes"][0].pop("byte_end")
+    bad["evidence"][0]["exact_quotes"][0]["unexpected_field"] = "private value must not escape"
+    with pytest.raises(evidence.EvidenceContractError) as captured:
+        evidence.parse_extraction_response(bad, bundle)
+    payload = captured.value.diagnostic.safe_payload()
+    assert payload["field_path"] == "$.evidence[].exact_quotes[]"
+    assert payload["missing_keys"] == ["byte_end"]
+    assert payload["extra_keys"] == ["unexpected_field"]
+    assert {item["field_path"] for item in payload["list_item_counts"]} >= {
+        "$.evidence", "$.evidence[].exact_quotes", "$.segment_dispositions",
+    }
+    assert "private value must not escape" not in evidence.json.dumps(payload)
+
+
 def test_module_has_no_normalizer_cp_or_network_dependency() -> None:
     source = Path(evidence.__file__).read_text(encoding="utf-8")
     assert "import narrative_normalizer" not in source
@@ -1263,6 +1381,6 @@ def test_requested_integration_api_is_exported_exactly() -> None:
     }
     assert required <= set(evidence.__all__)
     assert tuple(evidence.EvidenceResolution.__dataclass_fields__) == (
-        "status", "verified_bundle", "model_call_count", "reason_code"
+        "status", "verified_bundle", "model_call_count", "reason_code", "diagnostic"
     )
     assert isinstance(evidence.GenericEvidenceService, type)

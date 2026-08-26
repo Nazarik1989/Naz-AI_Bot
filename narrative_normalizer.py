@@ -885,6 +885,7 @@ class NormalizationOutcome:
     package_digest: str | None
     review_status: str | None
     evidence_path: str | None = None
+    evidence_diagnostic: evidence.EvidenceValidationDiagnostic | None = None
 
     def __post_init__(self) -> None:
         if type(self.source_id) is not str or re.fullmatch(r"[0-9a-f]{12}", self.source_id) is None:
@@ -909,6 +910,10 @@ class NormalizationOutcome:
             raise ValueError("review_status")
         if self.evidence_path not in {None, "deterministic_fast_path", "generic"}:
             raise ValueError("evidence_path")
+        if self.evidence_diagnostic is not None and type(self.evidence_diagnostic) is not evidence.EvidenceValidationDiagnostic:
+            raise TypeError("evidence_diagnostic")
+        if self.evidence_diagnostic is not None and self.status != OUTCOME_FAILED:
+            raise ValueError("evidence_diagnostic")
 
 
 @dataclass(frozen=True, slots=True)
@@ -960,6 +965,11 @@ class BatchResult:
                     "package_digest": item.package_digest,
                     "review_status": item.review_status,
                     "evidence_path": item.evidence_path,
+                    "evidence_diagnostic": (
+                        None
+                        if item.evidence_diagnostic is None
+                        else item.evidence_diagnostic.safe_payload()
+                    ),
                 }
                 for item in self.outcomes
             ],
@@ -6456,6 +6466,7 @@ class NarrativeNormalizerService:
         digest=None,
         review=None,
         evidence_path: str | None = None,
+        evidence_diagnostic: evidence.EvidenceValidationDiagnostic | None = None,
     ) -> NormalizationOutcome:
         return NormalizationOutcome(
             self._source_id(source.source_ref),
@@ -6466,6 +6477,7 @@ class NarrativeNormalizerService:
             digest,
             review,
             source.evidence_mode if evidence_path is None else evidence_path,
+            evidence_diagnostic,
         )
 
     def _record_failed_claim_locked(self, source: SourceUnit, *, attempt_id: str, started_at: str, reason_code: str) -> None:
@@ -6750,7 +6762,7 @@ class NarrativeNormalizerService:
                 try:
                     with _provider_source_scope(self.generation_service, identity):
                         resolution = self.evidence_service.resolve(documents)
-                except evidence.EvidenceContractError:
+                except evidence.EvidenceContractError as error:
                     reason = "narrative_normalizer_evidence_invalid"
                     self._record_failed_claim_locked(
                         source,
@@ -6764,6 +6776,7 @@ class NarrativeNormalizerService:
                         reasons=(reason,),
                         calls=model_calls,
                         evidence_path="generic",
+                        evidence_diagnostic=error.diagnostic,
                     )
                 evidence_model_calls = resolution.model_call_count
                 model_calls += evidence_model_calls
@@ -6796,6 +6809,7 @@ class NarrativeNormalizerService:
                         reasons=(reason,),
                         calls=model_calls,
                         evidence_path="generic",
+                        evidence_diagnostic=resolution.diagnostic,
                     )
                 if resolution.verified_bundle is None:
                     _raise("narrative_normalizer_evidence_invalid")

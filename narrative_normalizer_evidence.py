@@ -185,13 +185,146 @@ _PROPOSITION_STOPWORDS = frozenset({
 })
 
 
+_DIAGNOSTIC_STAGES = frozenset({
+    "response_type",
+    "json_parse",
+    "top_level_schema",
+    "contract_version",
+    "source_binding",
+    "nested_schema",
+    "segment_binding",
+    "quote_binding",
+    "proposition_binding",
+    "value_binding",
+    "relation_binding",
+    "semantic_validation",
+    "provider_boundary",
+})
+_DIAGNOSTIC_TYPE_LABELS = frozenset({
+    "dict", "list", "str", "int", "float", "bool", "null", "other",
+})
+_DIAGNOSTIC_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
+_DIAGNOSTIC_PATH = re.compile(r"\$(?:\.[A-Za-z][A-Za-z0-9_-]{0,79}|\[\]){0,8}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceValidationDiagnostic:
+    """Closed privacy-safe description of one rejected model response."""
+
+    validation_stage: str
+    stable_subreason: str
+    field_path: str
+    response_top_level_exact_type: str
+    top_level_key_set: tuple[str, ...]
+    missing_keys: tuple[str, ...]
+    extra_keys: tuple[str, ...]
+    nested_field_types: tuple[tuple[str, str], ...]
+    list_item_counts: tuple[tuple[str, int], ...]
+    schema_contract_version: str
+    span_quote_validation_category: str
+    source_identity_binding_result: str
+    response_byte_size: int
+    response_character_size: int
+
+    def __post_init__(self) -> None:
+        if self.validation_stage not in _DIAGNOSTIC_STAGES:
+            raise ValueError("validation_stage")
+        for value, name in (
+            (self.stable_subreason, "stable_subreason"),
+            (self.schema_contract_version, "schema_contract_version"),
+            (self.span_quote_validation_category, "span_quote_validation_category"),
+            (self.source_identity_binding_result, "source_identity_binding_result"),
+        ):
+            if type(value) is not str or _DIAGNOSTIC_KEY.fullmatch(value) is None:
+                raise TypeError(name)
+        if type(self.field_path) is not str or _DIAGNOSTIC_PATH.fullmatch(self.field_path) is None:
+            raise TypeError("field_path")
+        if self.response_top_level_exact_type not in _DIAGNOSTIC_TYPE_LABELS:
+            raise ValueError("response_top_level_exact_type")
+        for values, name in (
+            (self.top_level_key_set, "top_level_key_set"),
+            (self.missing_keys, "missing_keys"),
+            (self.extra_keys, "extra_keys"),
+        ):
+            if (
+                type(values) is not tuple
+                or any(type(item) is not str or _DIAGNOSTIC_KEY.fullmatch(item) is None for item in values)
+                or tuple(sorted(values)) != values
+                or len(values) != len(set(values))
+            ):
+                raise TypeError(name)
+        if (
+            type(self.nested_field_types) is not tuple
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                or _DIAGNOSTIC_PATH.fullmatch(item[0]) is None
+                or item[1] not in _DIAGNOSTIC_TYPE_LABELS
+                for item in self.nested_field_types
+            )
+        ):
+            raise TypeError("nested_field_types")
+        if (
+            type(self.list_item_counts) is not tuple
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                or _DIAGNOSTIC_PATH.fullmatch(item[0]) is None
+                or type(item[1]) is not int
+                or isinstance(item[1], bool)
+                or item[1] < 0
+                for item in self.list_item_counts
+            )
+        ):
+            raise TypeError("list_item_counts")
+        for value, name in (
+            (self.response_byte_size, "response_byte_size"),
+            (self.response_character_size, "response_character_size"),
+        ):
+            if type(value) is not int or isinstance(value, bool) or value < 0:
+                raise TypeError(name)
+        if self.source_identity_binding_result not in {"matched", "mismatched", "unavailable"}:
+            raise ValueError("source_identity_binding_result")
+
+    def safe_payload(self) -> dict[str, object]:
+        return {
+            "validation_stage": self.validation_stage,
+            "stable_subreason": self.stable_subreason,
+            "field_path": self.field_path,
+            "response_top_level_exact_type": self.response_top_level_exact_type,
+            "top_level_key_set": list(self.top_level_key_set),
+            "missing_keys": list(self.missing_keys),
+            "extra_keys": list(self.extra_keys),
+            "nested_field_types": [
+                {"field_path": path, "exact_type": exact_type}
+                for path, exact_type in self.nested_field_types
+            ],
+            "list_item_counts": [
+                {"field_path": path, "item_count": count}
+                for path, count in self.list_item_counts
+            ],
+            "schema_contract_version": self.schema_contract_version,
+            "span_quote_validation_category": self.span_quote_validation_category,
+            "source_identity_binding_result": self.source_identity_binding_result,
+            "response_byte_size": self.response_byte_size,
+            "response_character_size": self.response_character_size,
+        }
+
+
 class EvidenceContractError(ValueError):
     """Privacy-safe public failure for the evidence boundary."""
 
-    def __init__(self, reason_code: str):
+    def __init__(
+        self,
+        reason_code: str,
+        diagnostic: EvidenceValidationDiagnostic | None = None,
+    ):
         code = reason_code if reason_code in REASON_CODES else "evidence_schema_invalid"
         super().__init__(code)
         self.reason_code = code
+        self.diagnostic = diagnostic if type(diagnostic) is EvidenceValidationDiagnostic else None
         self.__cause__ = None
         self.__context__ = None
 
@@ -1179,6 +1312,7 @@ class EvidenceResolution:
     verified_bundle: VerifiedEvidenceBundle | None
     model_call_count: int
     reason_code: str
+    diagnostic: EvidenceValidationDiagnostic | None = None
 
     def __post_init__(self) -> None:
         _enum(self.status, RESOLUTION_STATUSES, "status")
@@ -1197,6 +1331,10 @@ class EvidenceResolution:
         }.get(self.status)
         if expected_reason is not None and self.reason_code != expected_reason:
             raise ValueError("reason_code")
+        if self.diagnostic is not None and type(self.diagnostic) is not EvidenceValidationDiagnostic:
+            raise TypeError("diagnostic")
+        if self.status != "failed" and self.diagnostic is not None:
+            raise ValueError("diagnostic")
 
 
 _QUOTE_KEYS = frozenset({
@@ -1221,6 +1359,313 @@ _DECISION_KEYS = frozenset({"evidence_id", "evidence_digest", "decision", "reaso
 _ADJUDICATION_RESPONSE_KEYS = frozenset({
     "schema_version", "source_identity", "extraction_bundle_digest", "run_id", "decisions",
 })
+
+
+def _diagnostic_type(value: object) -> str:
+    return {
+        dict: "dict",
+        list: "list",
+        str: "str",
+        int: "int",
+        float: "float",
+        bool: "bool",
+        type(None): "null",
+    }.get(type(value), "other")
+
+
+def _diagnostic_key(value: object) -> str:
+    if type(value) is str and _DIAGNOSTIC_KEY.fullmatch(value) is not None:
+        return value
+    return "unsafe-key"
+
+
+def _diagnostic_dimensions(response: object) -> tuple[int, int]:
+    if type(response) is str:
+        return len(response.encode("utf-8")), len(response)
+    try:
+        encoded = json.dumps(
+            response,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return 0, 0
+    return len(encoded.encode("utf-8")), len(encoded)
+
+
+def _safe_contract_version(value: object, expected: str) -> str:
+    if type(value) is str and _DIAGNOSTIC_KEY.fullmatch(value) is not None:
+        return value
+    if value is None:
+        return "missing"
+    return f"invalid-{_diagnostic_type(value)}"
+
+
+def _first_extraction_shape_issue(raw: object) -> tuple[str, str, str]:
+    if type(raw) is not dict:
+        return "response_type", "top_level_exact_type_invalid", "$"
+    if frozenset(raw) != _EXTRACTION_RESPONSE_KEYS:
+        return "top_level_schema", "top_level_key_set_invalid", "$"
+    scalar_fields = (
+        "schema_version", "source_identity", "document_bundle_digest", "run_id",
+    )
+    for name in scalar_fields:
+        if type(raw[name]) is not str:
+            return "nested_schema", "exact_scalar_type_invalid", f"$.{name}"
+    for name in ("evidence", "segment_dispositions"):
+        if type(raw[name]) is not list:
+            return "nested_schema", "exact_list_type_invalid", f"$.{name}"
+    for item in raw["evidence"]:
+        if type(item) is not dict:
+            return "nested_schema", "list_item_exact_type_invalid", "$.evidence[]"
+        if frozenset(item) != _EVIDENCE_KEYS:
+            return "nested_schema", "nested_key_set_invalid", "$.evidence[]"
+        for name in (
+            "evidence_id", "proposition", "evidence_kind", "polarity",
+            "uncertainty", "public_safety",
+        ):
+            if type(item[name]) is not str:
+                return "nested_schema", "exact_scalar_type_invalid", f"$.evidence[].{name}"
+        for name in ("ordered_segment_refs", "exact_quotes", "entities", "numbers", "dates"):
+            if type(item[name]) is not list:
+                return "nested_schema", "exact_list_type_invalid", f"$.evidence[].{name}"
+        for quote in item["exact_quotes"]:
+            if type(quote) is not dict:
+                return "nested_schema", "list_item_exact_type_invalid", "$.evidence[].exact_quotes[]"
+            if frozenset(quote) != _QUOTE_KEYS:
+                return "nested_schema", "nested_key_set_invalid", "$.evidence[].exact_quotes[]"
+            for name in ("quote_id", "document_id", "segment_id", "exact_text"):
+                if type(quote[name]) is not str:
+                    return "nested_schema", "exact_scalar_type_invalid", f"$.evidence[].exact_quotes[].{name}"
+            for name in ("byte_start", "byte_end", "character_start", "character_end"):
+                if type(quote[name]) is not int:
+                    return "nested_schema", "exact_scalar_type_invalid", f"$.evidence[].exact_quotes[].{name}"
+        for name in ("entities", "numbers", "dates"):
+            for atom in item[name]:
+                if type(atom) is not dict:
+                    return "nested_schema", "list_item_exact_type_invalid", f"$.evidence[].{name}[]"
+                if frozenset(atom) != _ATOM_KEYS:
+                    return "nested_schema", "nested_key_set_invalid", f"$.evidence[].{name}[]"
+                for field in _ATOM_KEYS:
+                    if type(atom[field]) is not str:
+                        return "nested_schema", "exact_scalar_type_invalid", f"$.evidence[].{name}[].{field}"
+        for name in ("temporal_relation", "causal_relation"):
+            relation = item[name]
+            if relation is None:
+                continue
+            if type(relation) is not dict:
+                return "nested_schema", "exact_mapping_type_invalid", f"$.evidence[].{name}"
+            if frozenset(relation) != _RELATION_KEYS:
+                return "nested_schema", "nested_key_set_invalid", f"$.evidence[].{name}"
+            for field in ("relation_kind", "marker_quote_id"):
+                if type(relation[field]) is not str:
+                    return "nested_schema", "exact_scalar_type_invalid", f"$.evidence[].{name}.{field}"
+            for field in ("left_operand_quote_ids", "right_operand_quote_ids"):
+                if type(relation[field]) is not list:
+                    return "nested_schema", "exact_list_type_invalid", f"$.evidence[].{name}.{field}"
+    for item in raw["segment_dispositions"]:
+        if type(item) is not dict:
+            return "nested_schema", "list_item_exact_type_invalid", "$.segment_dispositions[]"
+        if frozenset(item) != _DISPOSITION_KEYS:
+            return "nested_schema", "nested_key_set_invalid", "$.segment_dispositions[]"
+        for name in ("segment_id", "disposition"):
+            if type(item[name]) is not str:
+                return "nested_schema", "exact_scalar_type_invalid", f"$.segment_dispositions[].{name}"
+        if type(item["ordered_evidence_ids"]) is not list:
+            return "nested_schema", "exact_list_type_invalid", "$.segment_dispositions[].ordered_evidence_ids"
+    return "semantic_validation", "code_owned_validation_rejected", "$"
+
+
+def _nested_key_delta(raw: object) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if type(raw) is not dict or type(raw.get("evidence")) is not list:
+        return (), ()
+    candidates: list[tuple[object, frozenset[str]]] = []
+    for item in raw["evidence"]:
+        candidates.append((item, _EVIDENCE_KEYS))
+        if type(item) is not dict:
+            continue
+        for quote in item.get("exact_quotes", ()) if type(item.get("exact_quotes")) is list else ():
+            candidates.append((quote, _QUOTE_KEYS))
+        for name in ("entities", "numbers", "dates"):
+            for atom in item.get(name, ()) if type(item.get(name)) is list else ():
+                candidates.append((atom, _ATOM_KEYS))
+        for name in ("temporal_relation", "causal_relation"):
+            relation = item.get(name)
+            if relation is not None:
+                candidates.append((relation, _RELATION_KEYS))
+    if type(raw.get("segment_dispositions")) is list:
+        candidates.extend((item, _DISPOSITION_KEYS) for item in raw["segment_dispositions"])
+    for value, expected in candidates:
+        if type(value) is not dict:
+            continue
+        actual = frozenset(item for item in value if type(item) is str)
+        if frozenset(value) != expected:
+            return (
+                tuple(sorted(expected - actual)),
+                tuple(sorted({_diagnostic_key(item) for item in value if item not in expected})),
+            )
+    return (), ()
+
+
+def _nested_shape_inventory(
+    raw: object,
+) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, int], ...]]:
+    if type(raw) is not dict:
+        return (), ()
+    types: list[tuple[str, str]] = []
+    counts: list[tuple[str, int]] = []
+
+    def add(path: str, value: object) -> None:
+        if len(types) < 96:
+            types.append((path, _diagnostic_type(value)))
+        if type(value) is list and len(counts) < 48:
+            counts.append((path, len(value)))
+
+    for name in sorted(_EXTRACTION_RESPONSE_KEYS):
+        if name in raw:
+            add(f"$.{name}", raw[name])
+    evidence_items = raw.get("evidence")
+    if type(evidence_items) is list:
+        for item in evidence_items:
+            add("$.evidence[]", item)
+            if type(item) is not dict:
+                continue
+            for name in sorted(_EVIDENCE_KEYS):
+                if name in item:
+                    add(f"$.evidence[].{name}", item[name])
+            quote_items = item.get("exact_quotes")
+            if type(quote_items) is list:
+                for quote in quote_items:
+                    add("$.evidence[].exact_quotes[]", quote)
+                    if type(quote) is dict:
+                        for name in sorted(_QUOTE_KEYS):
+                            if name in quote:
+                                add(f"$.evidence[].exact_quotes[].{name}", quote[name])
+            for name in ("entities", "numbers", "dates"):
+                atom_items = item.get(name)
+                if type(atom_items) is list:
+                    for atom in atom_items:
+                        add(f"$.evidence[].{name}[]", atom)
+                        if type(atom) is dict:
+                            for field in sorted(_ATOM_KEYS):
+                                if field in atom:
+                                    add(f"$.evidence[].{name}[].{field}", atom[field])
+    dispositions = raw.get("segment_dispositions")
+    if type(dispositions) is list:
+        for item in dispositions:
+            add("$.segment_dispositions[]", item)
+            if type(item) is dict:
+                for name in sorted(_DISPOSITION_KEYS):
+                    if name in item:
+                        add(f"$.segment_dispositions[].{name}", item[name])
+    return tuple(types), tuple(counts)
+
+
+def _semantic_diagnostic(reason_code: str) -> tuple[str, str, str, str]:
+    return {
+        "evidence_source_binding_invalid": (
+            "source_binding", "source_or_document_binding_mismatch", "$.source_identity", "not_applicable",
+        ),
+        "evidence_segment_binding_invalid": (
+            "segment_binding", "segment_coverage_or_order_invalid", "$.segment_dispositions", "not_applicable",
+        ),
+        "evidence_quote_binding_invalid": (
+            "quote_binding", "exact_byte_or_character_span_invalid", "$.evidence[].exact_quotes[]", "exact_span_invalid",
+        ),
+        "evidence_proposition_binding_invalid": (
+            "proposition_binding", "proposition_not_exact_quote", "$.evidence[].proposition", "exact_quote_missing",
+        ),
+        "evidence_value_binding_invalid": (
+            "value_binding", "entity_number_or_date_binding_invalid", "$.evidence[]", "not_applicable",
+        ),
+        "evidence_relation_binding_invalid": (
+            "relation_binding", "relation_operand_or_marker_invalid", "$.evidence[]", "not_applicable",
+        ),
+        "evidence_polarity_invalid": (
+            "semantic_validation", "polarity_conflict", "$.evidence[].polarity", "not_applicable",
+        ),
+        "evidence_uncertainty_invalid": (
+            "semantic_validation", "uncertainty_conflict", "$.evidence[].uncertainty", "not_applicable",
+        ),
+        "evidence_sensitive": (
+            "semantic_validation", "privacy_classification_rejected", "$.evidence[]", "not_applicable",
+        ),
+    }.get(reason_code, (
+        "semantic_validation", "code_owned_validation_rejected", "$", "not_applicable",
+    ))
+
+
+def _extraction_diagnostic(
+    response: object,
+    source_bundle: SourceDocumentBundle,
+    reason_code: str,
+) -> EvidenceValidationDiagnostic:
+    byte_size, character_size = _diagnostic_dimensions(response)
+    decoded: object = response
+    json_invalid = False
+    if type(response) is str:
+        try:
+            decoded = json.loads(response)
+        except (json.JSONDecodeError, RecursionError):
+            json_invalid = True
+    if type(decoded) is dict:
+        safe_keys = tuple(sorted({_diagnostic_key(item) for item in decoded}))
+        actual_keys = frozenset(item for item in decoded if type(item) is str)
+        missing = tuple(sorted(_EXTRACTION_RESPONSE_KEYS - actual_keys))
+        extra = tuple(sorted({_diagnostic_key(item) for item in decoded if item not in _EXTRACTION_RESPONSE_KEYS}))
+        nested, counts = _nested_shape_inventory(decoded)
+        version = _safe_contract_version(decoded.get("schema_version"), EVIDENCE_EXTRACTION_CONTRACT_VERSION)
+        binding = (
+            "matched"
+            if type(decoded.get("source_identity")) is str
+            and decoded.get("source_identity") == source_bundle.source_identity
+            else "mismatched"
+            if type(decoded.get("source_identity")) is str
+            else "unavailable"
+        )
+    else:
+        safe_keys = ()
+        missing = tuple(sorted(_EXTRACTION_RESPONSE_KEYS))
+        extra = ()
+        nested = ()
+        counts = ()
+        version = "missing"
+        binding = "unavailable"
+    if json_invalid:
+        stage, subreason, field_path, span_category = (
+            "json_parse", "json_document_invalid", "$", "not_applicable",
+        )
+    else:
+        stage, subreason, field_path = _first_extraction_shape_issue(decoded)
+        span_category = "not_applicable"
+        if stage == "nested_schema" and subreason == "nested_key_set_invalid":
+            missing, extra = _nested_key_delta(decoded)
+        if stage == "semantic_validation":
+            stage, subreason, field_path, span_category = _semantic_diagnostic(reason_code)
+        if (
+            type(decoded) is dict
+            and frozenset(decoded) == _EXTRACTION_RESPONSE_KEYS
+            and type(decoded.get("schema_version")) is str
+            and decoded.get("schema_version") != EVIDENCE_EXTRACTION_CONTRACT_VERSION
+        ):
+            stage, subreason, field_path = "contract_version", "contract_version_mismatch", "$.schema_version"
+    return EvidenceValidationDiagnostic(
+        validation_stage=stage,
+        stable_subreason=subreason,
+        field_path=field_path,
+        response_top_level_exact_type=_diagnostic_type(response),
+        top_level_key_set=safe_keys,
+        missing_keys=missing,
+        extra_keys=extra,
+        nested_field_types=nested,
+        list_item_counts=counts,
+        schema_contract_version=version,
+        span_quote_validation_category=span_category,
+        source_identity_binding_result=binding,
+        response_byte_size=byte_size,
+        response_character_size=character_size,
+    )
 
 
 def _quote_from(value: object) -> EvidenceQuote:
@@ -1311,14 +1756,14 @@ def parse_extraction_response(
     response: Mapping[str, object] | str,
     source_bundle: SourceDocumentBundle,
 ) -> EvidenceExtractionBundle:
-    raw = _exact_mapping(_mapping_response(response), _EXTRACTION_RESPONSE_KEYS)
-    if (
-        raw["schema_version"] != EVIDENCE_EXTRACTION_CONTRACT_VERSION
-        or raw["source_identity"] != source_bundle.source_identity
-        or raw["document_bundle_digest"] != source_bundle.bundle_digest
-    ):
-        _raise("evidence_source_binding_invalid")
     try:
+        raw = _exact_mapping(_mapping_response(response), _EXTRACTION_RESPONSE_KEYS)
+        if (
+            raw["schema_version"] != EVIDENCE_EXTRACTION_CONTRACT_VERSION
+            or raw["source_identity"] != source_bundle.source_identity
+            or raw["document_bundle_digest"] != source_bundle.bundle_digest
+        ):
+            _raise("evidence_source_binding_invalid")
         evidence = tuple(_evidence_from(item) for item in _exact_list(raw["evidence"]))
         dispositions = tuple(_disposition_from(item) for item in _exact_list(raw["segment_dispositions"]))
         payload = {
@@ -1330,12 +1775,15 @@ def parse_extraction_response(
             "ordered_segment_dispositions": dispositions,
         }
         result = EvidenceExtractionBundle(**payload, bundle_digest=_sha(payload))
-    except EvidenceContractError:
-        raise
+        validate_extraction(source_bundle, result)
+        return result
+    except EvidenceContractError as error:
+        if error.diagnostic is None:
+            error.diagnostic = _extraction_diagnostic(response, source_bundle, error.reason_code)
+        raise error from None
     except (TypeError, ValueError):
-        _raise("evidence_schema_invalid")
-    validate_extraction(source_bundle, result)
-    return result
+        diagnostic = _extraction_diagnostic(response, source_bundle, "evidence_schema_invalid")
+        raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
 
 
 def evidence_digest(evidence: SourceEvidence) -> str:
@@ -1683,7 +2131,7 @@ class GenericEvidenceService:
             adjudication_raw = self._client.generate_json(adjudication_request)
             adjudication = parse_adjudication_response(adjudication_raw, extraction)
         except EvidenceContractError as error:
-            return EvidenceResolution("failed", None, calls, error.reason_code)
+            return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic)
         except Exception:
             return EvidenceResolution("failed", None, calls, "evidence_provider_failed")
         dispositions = {item.disposition for item in extraction.ordered_segment_dispositions}
@@ -1711,7 +2159,7 @@ class GenericEvidenceService:
         try:
             verified = _make_verified(bundle, extraction, adjudication)
         except EvidenceContractError as error:
-            return EvidenceResolution("failed", None, calls, error.reason_code)
+            return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic)
         return EvidenceResolution("verified", verified, calls, "evidence_verified")
 
 
@@ -2006,6 +2454,7 @@ __all__ = [
     "EvidenceQuote",
     "EvidenceRelation",
     "EvidenceResolution",
+    "EvidenceValidationDiagnostic",
     "GenericEvidenceService",
     "PUBLIC_SAFETY",
     "REASON_CODES",
