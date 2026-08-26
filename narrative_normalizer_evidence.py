@@ -235,8 +235,14 @@ _SEMANTIC_REJECTIONS = {
     "temporal_relation_mismatch": (
         "relation_binding", "temporal_relation_mismatch", "$.evidence[].temporal_relation", "not_applicable",
     ),
+    "temporal_relation_operands_incomplete": (
+        "relation_binding", "temporal_relation_operands_incomplete", "$.evidence[].temporal_relation", "not_applicable",
+    ),
     "causal_relation_mismatch": (
         "relation_binding", "causal_relation_mismatch", "$.evidence[].causal_relation", "not_applicable",
+    ),
+    "causal_relation_operands_incomplete": (
+        "relation_binding", "causal_relation_operands_incomplete", "$.evidence[].causal_relation", "not_applicable",
     ),
     "duplicate_or_conflicting_evidence": (
         "semantic_validation", "duplicate_or_conflicting_evidence", "$.evidence", "not_applicable",
@@ -1463,14 +1469,19 @@ def evidence_model_response_schema(
             "quote_id": dict(safe_id),
             "exact_lexeme": {"type": "string"},
         })
+        relation_operands = {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        }
         relation = _closed_object_schema({
             "relation_kind": {
                 "type": "string",
                 "enum": sorted(TEMPORAL_RELATIONS | CAUSAL_RELATIONS),
             },
             "marker_quote_id": dict(safe_id),
-            "left_operand_quote_ids": dict(string_array),
-            "right_operand_quote_ids": dict(string_array),
+            "left_operand_quote_ids": dict(relation_operands),
+            "right_operand_quote_ids": dict(relation_operands),
         })
         evidence_item = _closed_object_schema({
             "evidence_id": dict(safe_id),
@@ -1865,12 +1876,21 @@ def _relation_from(
     if value is None:
         return None
     raw = _exact_mapping(value, _RELATION_KEYS)
+    left_operands = _exact_list(raw["left_operand_quote_ids"])
+    right_operands = _exact_list(raw["right_operand_quote_ids"])
+    if not left_operands or not right_operands:
+        incomplete_rejection = (
+            "temporal_relation_operands_incomplete"
+            if semantic_rejection == "temporal_relation_mismatch"
+            else "causal_relation_operands_incomplete"
+        )
+        _raise("evidence_schema_invalid", semantic_rejection=incomplete_rejection)
     try:
         relation = EvidenceRelation(
             relation_kind=raw["relation_kind"],
             marker_quote_id=raw["marker_quote_id"],
-            left_operand_quote_ids=tuple(_exact_list(raw["left_operand_quote_ids"])),
-            right_operand_quote_ids=tuple(_exact_list(raw["right_operand_quote_ids"])),
+            left_operand_quote_ids=tuple(left_operands),
+            right_operand_quote_ids=tuple(right_operands),
         )
     except (TypeError, ValueError):
         _raise("evidence_schema_invalid", semantic_rejection=semantic_rejection)

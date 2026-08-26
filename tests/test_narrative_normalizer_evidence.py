@@ -1474,6 +1474,52 @@ def test_provider_evidence_schema_is_closed_versioned_and_fresh(operation: str, 
     assert "caller_mutation" not in second["properties"]
 
 
+@pytest.mark.parametrize(
+    "relation_field",
+    ("temporal_relation", "causal_relation"),
+)
+def test_provider_extraction_schema_requires_both_relation_operand_sides(
+    relation_field: str,
+) -> None:
+    schema = evidence.evidence_model_response_schema(
+        "evidence_extraction",
+        evidence.EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+    )
+    relation = schema["properties"]["evidence"]["items"]["properties"][relation_field]["anyOf"][0]
+    assert relation["properties"]["left_operand_quote_ids"]["minItems"] == 1
+    assert relation["properties"]["right_operand_quote_ids"]["minItems"] == 1
+
+
+@pytest.mark.parametrize(
+    ("relation_field", "relation_kind", "subreason"),
+    (
+        ("temporal_relation", "sequence", "temporal_relation_operands_incomplete"),
+        ("causal_relation", "because", "causal_relation_operands_incomplete"),
+    ),
+)
+def test_empty_relation_operand_side_has_exact_safe_diagnostic(
+    tmp_path: Path,
+    relation_field: str,
+    relation_kind: str,
+    subreason: str,
+) -> None:
+    bundle = _write_bundle(tmp_path)
+    raw = _base_extraction_payload(bundle)
+    raw["evidence"][0][relation_field] = {
+        "relation_kind": relation_kind,
+        "marker_quote_id": "quote-1",
+        "left_operand_quote_ids": ["quote-1"],
+        "right_operand_quote_ids": [],
+    }
+    with pytest.raises(evidence.EvidenceContractError) as captured:
+        evidence.parse_extraction_response(raw, bundle)
+    diagnostic = captured.value.diagnostic
+    assert type(diagnostic) is evidence.EvidenceValidationDiagnostic
+    assert diagnostic.stable_subreason == subreason
+    assert diagnostic.field_path == f"$.evidence[].{relation_field}"
+    assert captured.value.reason_code == "evidence_schema_invalid"
+
+
 def test_module_has_no_normalizer_cp_or_network_dependency() -> None:
     source = Path(evidence.__file__).read_text(encoding="utf-8")
     assert "import narrative_normalizer" not in source
