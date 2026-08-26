@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 import narrative_generation as generation
 import narrative_normalizer as normalizer
 import narrative_normalizer_evidence as evidence
+import model_boundary_privacy as privacy
 import narrative_normalizer_review_state as review_state
 import narrative_normalizer_trust as trust
 import narrative_translator as contract
@@ -85,19 +86,10 @@ _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 _OPERATION = re.compile(r"(?:evidence_extraction|evidence_adjudication|generation|adjudication|repair)\Z")
 _HEX24 = re.compile(r"[0-9a-f]{24}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
-_CREDENTIAL_MARKER = re.compile(
-    r"(?i)(?:api[_-]?key|authorization|bearer\s|password|credential|"
-    r"narrative_normalizer_trust_key|naz_ai_bot\.sqlite3|"
-    r"review-authority|registry\.json|sk-[A-Za-z0-9_-]{8,})"
-)
-_CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?im)^\s*(?:[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\s*[:=]\s*\S+"
-)
-_ENV_ASSIGNMENT = re.compile(r"(?m)(?:^|\n)\s*[A-Z][A-Z0-9_]{1,63}\s*=\s*[^\n]+(?:\n|$)")
-_ABSOLUTE_PATH = re.compile(
-    r"(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\s]+|file:///(?:[^\s]+)|"
-    r"(?<![A-Za-z0-9_:/])/(?!/)[^\s\"'<>\]\)]+|(?<![A-Za-z0-9_])~[\\/])"
-)
+_CREDENTIAL_MARKER = privacy.CREDENTIAL_MARKER
+_CREDENTIAL_ASSIGNMENT = privacy.CREDENTIAL_ASSIGNMENT
+_ENV_ASSIGNMENT = privacy.ENV_ASSIGNMENT
+_ABSOLUTE_PATH = privacy.ABSOLUTE_PATH
 _LOG = logging.getLogger(__name__)
 
 

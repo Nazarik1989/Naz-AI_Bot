@@ -20,6 +20,8 @@ from typing import Mapping, Protocol, Sequence
 import json
 import re
 
+import model_boundary_privacy as privacy
+
 
 SOURCE_DOCUMENT_CONTRACT_VERSION = "normalizer-source-document-v1"
 EVIDENCE_EXTRACTION_CONTRACT_VERSION = "normalizer-evidence-extraction-v1"
@@ -148,14 +150,6 @@ _UNCERTAINTY = re.compile(
     r"\b(?:may|might|possibly|perhaps|unclear|uncertain|unknown|apparently|"
     r"возможно|вероятно|неясно|неизвестно|предположительно)\b",
     re.IGNORECASE,
-)
-_SECRET = re.compile(
-    r"(?:api[_-]?key|token|secret|password|authorization|credential)\s*[:=]\s*\S+|"
-    r"(?:sk|ghp|xox[baprs])[-_A-Za-z0-9]{12,}",
-    re.IGNORECASE,
-)
-_ABSOLUTE_PATH = re.compile(
-    r"(?:[A-Za-z]:[\\/]|(?<![A-Za-z0-9._-])/(?!/)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)"
 )
 _TEMPORAL_MARKERS = {
     "before": re.compile(r"\b(?:before|prior\s+to|до|раньше)\b", re.IGNORECASE),
@@ -306,7 +300,7 @@ def source_identity(source_ref: str, source_digest: str, source_contract_version
 
 
 def _is_sensitive(text: str) -> bool:
-    return bool(_SECRET.search(text) or _ABSOLUTE_PATH.search(text))
+    return privacy.contains_forbidden_outbound_text(text)
 
 
 def _proposition_anchor_labels(proposition: str) -> tuple[str, ...]:

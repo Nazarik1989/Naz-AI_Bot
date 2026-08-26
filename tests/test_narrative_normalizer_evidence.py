@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import narrative_normalizer_evidence as evidence
+import narrative_normalizer_provider as provider
 
 
 SOURCE_REF = "Project/2026-08-17"
@@ -967,6 +968,54 @@ def test_sensitive_segments_are_never_sent_to_model(tmp_path: Path, secret: str)
     ).resolve(bundle)
     assert result.status == "verified"
     assert all(secret not in item.payload_json for item in client.requests)
+
+
+@pytest.mark.parametrize(
+    "private_text",
+    [
+        "The operator discussed credential handling without publishing a value.",
+        r"A document referenced \\internal-host\private-share\item.txt.",
+        "A document referenced file:///private/location/item.txt.",
+        "The review mentioned ~/private/item.txt.",
+    ],
+    ids=("credential-marker", "unc-path", "file-uri", "home-path"),
+)
+def test_evidence_projection_uses_exact_provider_privacy_vocabulary(
+    tmp_path: Path,
+    private_text: str,
+) -> None:
+    bundle = _write_bundle(
+        tmp_path,
+        {"source.txt": f"A safe public observation.\n{private_text}\n"},
+    )
+
+    projection = evidence._source_projection(bundle)
+    projected_segments = [
+        segment
+        for document in projection["documents"]
+        for segment in document["segments"]
+    ]
+    withheld = [segment for segment in projected_segments if segment["withheld"]]
+
+    assert len(withheld) == 1
+    assert frozenset(withheld[0]) == {"segment_id", "withheld", "segment_digest"}
+    assert private_text not in evidence._canonical(projection).decode("utf-8")
+    provider._assert_private_payload(
+        {"messages": [{"content": evidence._canonical(projection).decode("utf-8")}]},
+        secret_values=("test-secret-not-present",),
+    )
+
+
+def test_direct_provider_payload_remains_fail_closed_for_shared_private_text() -> None:
+    private_text = "The operator discussed credential handling."
+
+    with pytest.raises(provider.NormalizerProviderError) as caught:
+        provider._assert_private_payload(
+            {"messages": [{"content": private_text}]},
+            secret_values=("test-secret-not-present",),
+        )
+
+    assert caught.value.reason_code == provider.PROVIDER_CONFIGURATION_INVALID
 
 
 @pytest.mark.parametrize(
