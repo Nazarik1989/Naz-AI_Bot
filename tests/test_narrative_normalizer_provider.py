@@ -288,7 +288,63 @@ def narrative_request(operation: str, model: str):
 
 
 def evidence_request(operation: str, model: str):
-    return evidence.EvidenceModelRequest(operation, model, '{"safe":"payload"}', "schema-v1")
+    version = (
+        evidence.EVIDENCE_EXTRACTION_CONTRACT_VERSION
+        if operation == "evidence_extraction"
+        else evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION
+    )
+    return evidence.EvidenceModelRequest(operation, model, '{"safe":"payload"}', version)
+
+
+@pytest.mark.parametrize(
+    ("operation", "model", "required"),
+    (
+        (
+            "evidence_extraction",
+            CONTENT_MODEL,
+            {"schema_version", "source_identity", "document_bundle_digest", "run_id", "evidence", "segment_dispositions"},
+        ),
+        (
+            "evidence_adjudication",
+            REVIEW_MODEL,
+            {"schema_version", "source_identity", "extraction_bundle_digest", "run_id", "decisions"},
+        ),
+    ),
+    ids=("extraction", "adjudication"),
+)
+def test_evidence_transport_uses_code_owned_strict_closed_schema(operation, model, required):
+    _dependencies, client, transport = adapter()
+    request = evidence_request(operation, model)
+    response_format = provider._request_payload(request)[3]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == required
+    assert set(schema["properties"]) == required
+    assert "withheld_segments" not in schema["properties"]
+    invoke(client, request)
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "version"),
+    (
+        ("evidence_extraction", evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION),
+        ("evidence_adjudication", evidence.EVIDENCE_EXTRACTION_CONTRACT_VERSION),
+        ("evidence_extraction", "unknown-version"),
+    ),
+    ids=("extraction-wrong-version", "adjudication-wrong-version", "unknown-version"),
+)
+def test_evidence_schema_version_mismatch_rejects_before_transport(operation, version):
+    _dependencies, client, transport = adapter()
+    model = CONTENT_MODEL if operation == "evidence_extraction" else REVIEW_MODEL
+    request = evidence.EvidenceModelRequest(operation, model, '{"safe":"payload"}', version)
+    with pytest.raises(provider.NormalizerProviderError) as caught:
+        invoke(client, request)
+    assert caught.value.reason_code == provider.PROVIDER_CONFIGURATION_INVALID
+    assert transport.calls == []
 
 
 @pytest.mark.parametrize(

@@ -853,16 +853,38 @@ def _request_payload(request: object) -> tuple[str, str, tuple[dict[str, str], .
         return operation, request.model, messages, response_format, digest_payload
     if type(request) is evidence.EvidenceModelRequest:
         operation = request.request_kind
+        try:
+            schema = evidence.evidence_model_response_schema(
+                operation,
+                request.response_schema_version,
+            )
+        except (TypeError, ValueError):
+            _raise(PROVIDER_CONFIGURATION_INVALID)
         messages = (
-            {"role": "system", "content": f"Return strict JSON for {operation} under {request.response_schema_version}."},
+            {
+                "role": "system",
+                "content": (
+                    f"Return exactly one JSON object for {operation} under "
+                    f"{request.response_schema_version}. Follow the supplied strict schema; "
+                    "do not add wrapper keys. Copy source bindings and exact span offsets."
+                ),
+            },
             {"role": "user", "content": request.payload_json},
         )
-        response_format = {"type": "json_object"}
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": f"normalizer_{operation}_response",
+                "strict": True,
+                "schema": schema,
+            },
+        }
         digest_payload = {
             "operation": operation,
             "model": request.model,
             "payload_json": request.payload_json,
             "response_schema_version": request.response_schema_version,
+            "response_schema": schema,
         }
         return operation, request.model, messages, response_format, digest_payload
     _raise(PROVIDER_CONFIGURATION_INVALID)

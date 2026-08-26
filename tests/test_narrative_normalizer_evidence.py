@@ -1356,6 +1356,25 @@ def test_nested_diagnostic_reports_only_safe_shape_metadata(tmp_path: Path) -> N
     assert "private value must not escape" not in evidence.json.dumps(payload)
 
 
+@pytest.mark.parametrize(
+    ("operation", "version"),
+    (
+        ("evidence_extraction", evidence.EVIDENCE_EXTRACTION_CONTRACT_VERSION),
+        ("evidence_adjudication", evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION),
+    ),
+    ids=("extraction", "adjudication"),
+)
+def test_provider_evidence_schema_is_closed_versioned_and_fresh(operation: str, version: str) -> None:
+    first = evidence.evidence_model_response_schema(operation, version)
+    second = evidence.evidence_model_response_schema(operation, version)
+    assert first == second and first is not second
+    assert first["type"] == "object"
+    assert first["additionalProperties"] is False
+    assert set(first["required"]) == set(first["properties"])
+    first["properties"]["caller_mutation"] = {"type": "string"}
+    assert "caller_mutation" not in second["properties"]
+
+
 def test_module_has_no_normalizer_cp_or_network_dependency() -> None:
     source = Path(evidence.__file__).read_text(encoding="utf-8")
     assert "import narrative_normalizer" not in source

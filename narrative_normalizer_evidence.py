@@ -1361,6 +1361,104 @@ _ADJUDICATION_RESPONSE_KEYS = frozenset({
 })
 
 
+def _closed_object_schema(properties: dict[str, object]) -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def evidence_model_response_schema(
+    request_kind: str,
+    response_schema_version: str,
+) -> dict[str, object]:
+    """Return the code-owned strict provider schema for one evidence operation."""
+
+    if type(request_kind) is not str or type(response_schema_version) is not str:
+        raise TypeError("evidence response schema")
+    safe_id = {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"}
+    hex64 = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    string_array = {"type": "array", "items": {"type": "string"}}
+    if request_kind == "evidence_extraction":
+        if response_schema_version != EVIDENCE_EXTRACTION_CONTRACT_VERSION:
+            raise ValueError("evidence response schema")
+        quote = _closed_object_schema({
+            "quote_id": dict(safe_id),
+            "document_id": dict(safe_id),
+            "segment_id": dict(safe_id),
+            "byte_start": {"type": "integer", "minimum": 0},
+            "byte_end": {"type": "integer", "minimum": 0},
+            "character_start": {"type": "integer", "minimum": 0},
+            "character_end": {"type": "integer", "minimum": 0},
+            "exact_text": {"type": "string"},
+        })
+        atom = _closed_object_schema({
+            "atom_id": dict(safe_id),
+            "atom_kind": {"type": "string", "enum": sorted(ATOM_KINDS)},
+            "quote_id": dict(safe_id),
+            "exact_lexeme": {"type": "string"},
+        })
+        relation = _closed_object_schema({
+            "relation_kind": {
+                "type": "string",
+                "enum": sorted(TEMPORAL_RELATIONS | CAUSAL_RELATIONS),
+            },
+            "marker_quote_id": dict(safe_id),
+            "left_operand_quote_ids": dict(string_array),
+            "right_operand_quote_ids": dict(string_array),
+        })
+        evidence_item = _closed_object_schema({
+            "evidence_id": dict(safe_id),
+            "proposition": {"type": "string"},
+            "evidence_kind": {"type": "string", "enum": sorted(EVIDENCE_KINDS)},
+            "ordered_segment_refs": dict(string_array),
+            "exact_quotes": {"type": "array", "items": quote},
+            "entities": {"type": "array", "items": atom},
+            "numbers": {"type": "array", "items": atom},
+            "dates": {"type": "array", "items": atom},
+            "polarity": {"type": "string", "enum": sorted(POLARITIES)},
+            "temporal_relation": {"anyOf": [relation, {"type": "null"}]},
+            "causal_relation": {"anyOf": [relation, {"type": "null"}]},
+            "uncertainty": {"type": "string", "enum": sorted(UNCERTAINTIES)},
+            "public_safety": {"type": "string", "enum": sorted(PUBLIC_SAFETY)},
+        })
+        disposition = _closed_object_schema({
+            "segment_id": dict(safe_id),
+            "disposition": {"type": "string", "enum": sorted(SEGMENT_DISPOSITIONS)},
+            "ordered_evidence_ids": dict(string_array),
+        })
+        return _closed_object_schema({
+            "schema_version": {"type": "string", "const": EVIDENCE_EXTRACTION_CONTRACT_VERSION},
+            "source_identity": dict(hex64),
+            "document_bundle_digest": dict(hex64),
+            "run_id": dict(safe_id),
+            "evidence": {"type": "array", "items": evidence_item},
+            "segment_dispositions": {"type": "array", "items": disposition},
+        })
+    if request_kind == "evidence_adjudication":
+        if response_schema_version != EVIDENCE_ADJUDICATION_CONTRACT_VERSION:
+            raise ValueError("evidence response schema")
+        decision = _closed_object_schema({
+            "evidence_id": dict(safe_id),
+            "evidence_digest": dict(hex64),
+            "decision": {"type": "string", "enum": sorted(EVIDENCE_DECISIONS)},
+            "reason_codes": {
+                "type": "array",
+                "items": {"type": "string", "enum": sorted(ADJUDICATION_REASON_CODES)},
+            },
+        })
+        return _closed_object_schema({
+            "schema_version": {"type": "string", "const": EVIDENCE_ADJUDICATION_CONTRACT_VERSION},
+            "source_identity": dict(hex64),
+            "extraction_bundle_digest": dict(hex64),
+            "run_id": dict(safe_id),
+            "decisions": {"type": "array", "items": decision},
+        })
+    raise ValueError("evidence response schema")
+
+
 def _diagnostic_type(value: object) -> str:
     return {
         dict: "dict",
@@ -2475,6 +2573,7 @@ __all__ = [
     "build_verified_fact_bindings",
     "classify_source_bundle",
     "evidence_digest",
+    "evidence_model_response_schema",
     "parse_adjudication_response",
     "parse_extraction_response",
     "revalidate_verified_bundle",
