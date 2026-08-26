@@ -1339,6 +1339,105 @@ def test_extraction_diagnostic_propagates_without_retry_or_raw_values(tmp_path: 
     assert "blue notebook" not in evidence.json.dumps(result.diagnostic.safe_payload())
 
 
+def _semantic_diagnostic_probe(
+    tmp_path: Path,
+    case_id: str,
+) -> tuple[evidence.EvidenceValidationDiagnostic, str]:
+    if case_id == "withheld-segment":
+        bundle = _write_bundle(
+            tmp_path,
+            {"story.txt": "Public evidence line.\napi_key=sk-super-sensitive-value\n"},
+        )
+    elif case_id == "unbound-segment":
+        bundle = _write_bundle(tmp_path, {"story.txt": "First public line.\nSecond public line.\n"})
+    else:
+        bundle = _write_bundle(tmp_path)
+    raw = _base_extraction_payload(bundle)
+    item = raw["evidence"][0]
+    dispositions = raw["segment_dispositions"]
+    if case_id == "disposition-partition":
+        dispositions[0]["ordered_evidence_ids"] = ["unknown-evidence"]
+    elif case_id == "duplicate-disposition":
+        dispositions.append(deepcopy(dispositions[0]))
+    elif case_id == "unbound-segment":
+        item["ordered_segment_refs"].append(dispositions[1]["segment_id"])
+    elif case_id == "withheld-segment":
+        item["ordered_segment_refs"].append(dispositions[1]["segment_id"])
+    elif case_id == "entity-ownership":
+        item["entities"] = [{
+            "atom_id": "entity-1", "atom_kind": "entity",
+            "quote_id": "quote-1", "exact_lexeme": "AbsentEntity",
+        }]
+    elif case_id == "number-ownership":
+        item["numbers"] = [{
+            "atom_id": "number-1", "atom_kind": "number",
+            "quote_id": "quote-1", "exact_lexeme": "999",
+        }]
+    elif case_id == "date-ownership":
+        item["dates"] = [{
+            "atom_id": "date-1", "atom_kind": "date",
+            "quote_id": "quote-1", "exact_lexeme": "2026-99-99",
+        }]
+    elif case_id == "polarity":
+        item["polarity"] = "negated"
+    elif case_id == "temporal":
+        item["evidence_kind"] = "explicit_sequence"
+    elif case_id == "causal":
+        item["evidence_kind"] = "explicit_cause"
+    elif case_id == "duplicate-evidence":
+        raw["evidence"].append(deepcopy(item))
+    elif case_id == "coverage":
+        item["exact_quotes"] = []
+    elif case_id == "unsupported-ambiguous":
+        item["evidence_kind"] = "insufficient_or_ambiguous"
+    elif case_id == "meaning-anchor":
+        item["proposition"] = "Unsupported synthesized proposition."
+    else:
+        raise AssertionError(case_id)
+    with pytest.raises(evidence.EvidenceContractError) as captured:
+        evidence.parse_extraction_response(raw, bundle)
+    assert type(captured.value.diagnostic) is evidence.EvidenceValidationDiagnostic
+    return captured.value.diagnostic, evidence.json.dumps(
+        captured.value.diagnostic.safe_payload(), ensure_ascii=False, sort_keys=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "subreason", "field_path"),
+    (
+        ("disposition-partition", "disposition_partition_mismatch", "$.segment_dispositions"),
+        ("duplicate-disposition", "duplicate_or_missing_segment_disposition", "$.segment_dispositions"),
+        ("unbound-segment", "evidence_item_not_bound_to_source_segment", "$.evidence[].ordered_segment_refs"),
+        ("withheld-segment", "evidence_references_withheld_segment", "$.evidence[].ordered_segment_refs"),
+        ("entity-ownership", "entity_ownership_invalid", "$.evidence[].entities[]"),
+        ("number-ownership", "number_ownership_invalid", "$.evidence[].numbers[]"),
+        ("date-ownership", "date_ownership_invalid", "$.evidence[].dates[]"),
+        ("polarity", "polarity_mismatch", "$.evidence[].polarity"),
+        ("temporal", "temporal_relation_mismatch", "$.evidence[].temporal_relation"),
+        ("causal", "causal_relation_mismatch", "$.evidence[].causal_relation"),
+        ("duplicate-evidence", "duplicate_or_conflicting_evidence", "$.evidence"),
+        ("coverage", "evidence_count_or_coverage_policy_invalid", "$.evidence"),
+        ("unsupported-ambiguous", "unsupported_or_ambiguous_proposition", "$.evidence[].proposition"),
+        ("meaning-anchor", "generic_or_meaning_anchor_rejection", "$.evidence[]"),
+    ),
+    ids=lambda value: value,
+)
+def test_semantic_rejection_branches_emit_closed_safe_reason_and_path(
+    tmp_path: Path,
+    case_id: str,
+    subreason: str,
+    field_path: str,
+) -> None:
+    diagnostic, encoded = _semantic_diagnostic_probe(tmp_path, case_id)
+    assert diagnostic.stable_subreason == subreason
+    assert diagnostic.field_path == field_path
+    assert diagnostic.response_top_level_exact_type == "dict"
+    assert "Naz opened the blue notebook" not in encoded
+    assert "Public evidence line" not in encoded
+    assert "sk-super-sensitive-value" not in encoded
+    assert "Unsupported synthesized proposition" not in encoded
+
+
 def test_nested_diagnostic_reports_only_safe_shape_metadata(tmp_path: Path) -> None:
     bundle = _write_bundle(tmp_path)
     bad = _base_extraction_payload(bundle)

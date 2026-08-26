@@ -207,6 +207,64 @@ _DIAGNOSTIC_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
 _DIAGNOSTIC_PATH = re.compile(r"\$(?:\.[A-Za-z][A-Za-z0-9_-]{0,79}|\[\]){0,8}\Z")
 
 
+_SEMANTIC_REJECTIONS = {
+    "disposition_partition_mismatch": (
+        "segment_binding", "disposition_partition_mismatch", "$.segment_dispositions", "not_applicable",
+    ),
+    "duplicate_or_missing_segment_disposition": (
+        "segment_binding", "duplicate_or_missing_segment_disposition", "$.segment_dispositions", "not_applicable",
+    ),
+    "evidence_item_not_bound_to_source_segment": (
+        "segment_binding", "evidence_item_not_bound_to_source_segment", "$.evidence[].ordered_segment_refs", "not_applicable",
+    ),
+    "evidence_references_withheld_segment": (
+        "segment_binding", "evidence_references_withheld_segment", "$.evidence[].ordered_segment_refs", "not_applicable",
+    ),
+    "entity_ownership_invalid": (
+        "value_binding", "entity_ownership_invalid", "$.evidence[].entities[]", "not_applicable",
+    ),
+    "number_ownership_invalid": (
+        "value_binding", "number_ownership_invalid", "$.evidence[].numbers[]", "not_applicable",
+    ),
+    "date_ownership_invalid": (
+        "value_binding", "date_ownership_invalid", "$.evidence[].dates[]", "not_applicable",
+    ),
+    "polarity_mismatch": (
+        "semantic_validation", "polarity_mismatch", "$.evidence[].polarity", "not_applicable",
+    ),
+    "temporal_relation_mismatch": (
+        "relation_binding", "temporal_relation_mismatch", "$.evidence[].temporal_relation", "not_applicable",
+    ),
+    "causal_relation_mismatch": (
+        "relation_binding", "causal_relation_mismatch", "$.evidence[].causal_relation", "not_applicable",
+    ),
+    "duplicate_or_conflicting_evidence": (
+        "semantic_validation", "duplicate_or_conflicting_evidence", "$.evidence", "not_applicable",
+    ),
+    "evidence_count_or_coverage_policy_invalid": (
+        "semantic_validation", "evidence_count_or_coverage_policy_invalid", "$.evidence", "not_applicable",
+    ),
+    "unsupported_or_ambiguous_proposition": (
+        "proposition_binding", "unsupported_or_ambiguous_proposition", "$.evidence[].proposition", "not_applicable",
+    ),
+    "generic_or_meaning_anchor_rejection": (
+        "proposition_binding", "generic_or_meaning_anchor_rejection", "$.evidence[]", "not_applicable",
+    ),
+    "quote_span_or_ownership_invalid": (
+        "quote_binding", "quote_span_or_ownership_invalid", "$.evidence[].exact_quotes[]", "exact_span_invalid",
+    ),
+    "duplicate_quote_or_conflicting_evidence": (
+        "semantic_validation", "duplicate_or_conflicting_evidence", "$.evidence[].exact_quotes[]", "not_applicable",
+    ),
+    "uncertainty_mismatch": (
+        "semantic_validation", "uncertainty_mismatch", "$.evidence[].uncertainty", "not_applicable",
+    ),
+    "privacy_classification_rejected": (
+        "semantic_validation", "privacy_classification_rejected", "$.evidence[]", "not_applicable",
+    ),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceValidationDiagnostic:
     """Closed privacy-safe description of one rejected model response."""
@@ -320,17 +378,22 @@ class EvidenceContractError(ValueError):
         self,
         reason_code: str,
         diagnostic: EvidenceValidationDiagnostic | None = None,
+        *,
+        semantic_rejection: str | None = None,
     ):
         code = reason_code if reason_code in REASON_CODES else "evidence_schema_invalid"
         super().__init__(code)
         self.reason_code = code
         self.diagnostic = diagnostic if type(diagnostic) is EvidenceValidationDiagnostic else None
+        self._semantic_rejection = (
+            semantic_rejection if semantic_rejection in _SEMANTIC_REJECTIONS else None
+        )
         self.__cause__ = None
         self.__context__ = None
 
 
-def _raise(reason_code: str) -> None:
-    raise EvidenceContractError(reason_code) from None
+def _raise(reason_code: str, *, semantic_rejection: str | None = None) -> None:
+    raise EvidenceContractError(reason_code, semantic_rejection=semantic_rejection) from None
 
 
 def _plain(value: object, name: str, *, allow_empty: bool = False) -> str:
@@ -1660,7 +1723,12 @@ def _nested_shape_inventory(
     return tuple(types), tuple(counts)
 
 
-def _semantic_diagnostic(reason_code: str) -> tuple[str, str, str, str]:
+def _semantic_diagnostic(
+    reason_code: str,
+    semantic_rejection: str | None,
+) -> tuple[str, str, str, str]:
+    if semantic_rejection in _SEMANTIC_REJECTIONS:
+        return _SEMANTIC_REJECTIONS[semantic_rejection]
     return {
         "evidence_source_binding_invalid": (
             "source_binding", "source_or_document_binding_mismatch", "$.source_identity", "not_applicable",
@@ -1698,6 +1766,7 @@ def _extraction_diagnostic(
     response: object,
     source_bundle: SourceDocumentBundle,
     reason_code: str,
+    semantic_rejection: str | None = None,
 ) -> EvidenceValidationDiagnostic:
     byte_size, character_size = _diagnostic_dimensions(response)
     decoded: object = response
@@ -1740,7 +1809,10 @@ def _extraction_diagnostic(
         if stage == "nested_schema" and subreason == "nested_key_set_invalid":
             missing, extra = _nested_key_delta(decoded)
         if stage == "semantic_validation":
-            stage, subreason, field_path, span_category = _semantic_diagnostic(reason_code)
+            stage, subreason, field_path, span_category = _semantic_diagnostic(
+                reason_code,
+                semantic_rejection,
+            )
         if (
             type(decoded) is dict
             and frozenset(decoded) == _EXTRACTION_RESPONSE_KEYS
@@ -1771,7 +1843,7 @@ def _quote_from(value: object) -> EvidenceQuote:
     try:
         return EvidenceQuote(**raw)
     except (TypeError, ValueError):
-        _raise("evidence_schema_invalid")
+        _raise("evidence_schema_invalid", semantic_rejection="quote_span_or_ownership_invalid")
 
 
 def _atom_from(value: object, expected_kind: str) -> EvidenceAtom:
@@ -1779,13 +1851,17 @@ def _atom_from(value: object, expected_kind: str) -> EvidenceAtom:
     try:
         atom = EvidenceAtom(**raw)
     except (TypeError, ValueError):
-        _raise("evidence_schema_invalid")
+        _raise("evidence_schema_invalid", semantic_rejection=f"{expected_kind}_ownership_invalid")
     if atom.atom_kind != expected_kind:
-        _raise("evidence_schema_invalid")
+        _raise("evidence_schema_invalid", semantic_rejection=f"{expected_kind}_ownership_invalid")
     return atom
 
 
-def _relation_from(value: object, allowed: frozenset[str]) -> EvidenceRelation | None:
+def _relation_from(
+    value: object,
+    allowed: frozenset[str],
+    semantic_rejection: str,
+) -> EvidenceRelation | None:
     if value is None:
         return None
     raw = _exact_mapping(value, _RELATION_KEYS)
@@ -1797,9 +1873,9 @@ def _relation_from(value: object, allowed: frozenset[str]) -> EvidenceRelation |
             right_operand_quote_ids=tuple(_exact_list(raw["right_operand_quote_ids"])),
         )
     except (TypeError, ValueError):
-        _raise("evidence_schema_invalid")
+        _raise("evidence_schema_invalid", semantic_rejection=semantic_rejection)
     if relation.relation_kind not in allowed:
-        _raise("evidence_schema_invalid")
+        _raise("evidence_schema_invalid", semantic_rejection=semantic_rejection)
     return relation
 
 
@@ -1816,15 +1892,31 @@ def _evidence_from(value: object) -> SourceEvidence:
             numbers=tuple(_atom_from(item, "number") for item in _exact_list(raw["numbers"])),
             dates=tuple(_atom_from(item, "date") for item in _exact_list(raw["dates"])),
             polarity=raw["polarity"],
-            temporal_relation=_relation_from(raw["temporal_relation"], TEMPORAL_RELATIONS),
-            causal_relation=_relation_from(raw["causal_relation"], CAUSAL_RELATIONS),
+            temporal_relation=_relation_from(
+                raw["temporal_relation"], TEMPORAL_RELATIONS, "temporal_relation_mismatch",
+            ),
+            causal_relation=_relation_from(
+                raw["causal_relation"], CAUSAL_RELATIONS, "causal_relation_mismatch",
+            ),
             uncertainty=raw["uncertainty"],
             public_safety=raw["public_safety"],
         )
     except EvidenceContractError:
         raise
-    except (TypeError, ValueError):
-        _raise("evidence_schema_invalid")
+    except (TypeError, ValueError) as error:
+        rejection = {
+            "evidence_kind": "unsupported_or_ambiguous_proposition",
+            "insufficient evidence": "unsupported_or_ambiguous_proposition",
+            "ordered_segment_refs": "evidence_count_or_coverage_policy_invalid",
+            "exact_quotes": "evidence_count_or_coverage_policy_invalid",
+            "evidence quotes": "evidence_count_or_coverage_policy_invalid",
+            "polarity": "polarity_mismatch",
+            "temporal_relation": "temporal_relation_mismatch",
+            "causal_relation": "causal_relation_mismatch",
+            "uncertainty": "uncertainty_mismatch",
+            "public_safety": "privacy_classification_rejected",
+        }.get(str(error), "generic_or_meaning_anchor_rejection")
+        _raise("evidence_schema_invalid", semantic_rejection=rejection)
 
 
 def _disposition_from(value: object) -> SegmentDisposition:
@@ -1835,8 +1927,13 @@ def _disposition_from(value: object) -> SegmentDisposition:
             raw["disposition"],
             tuple(_exact_list(raw["ordered_evidence_ids"])),
         )
-    except (TypeError, ValueError):
-        _raise("evidence_schema_invalid")
+    except (TypeError, ValueError) as error:
+        rejection = (
+            "duplicate_or_missing_segment_disposition"
+            if str(error) in {"segment_id", "ordered_evidence_ids"}
+            else "disposition_partition_mismatch"
+        )
+        _raise("evidence_schema_invalid", semantic_rejection=rejection)
 
 
 def _mapping_response(value: Mapping[str, object] | str) -> dict[str, object]:
@@ -1877,7 +1974,12 @@ def parse_extraction_response(
         return result
     except EvidenceContractError as error:
         if error.diagnostic is None:
-            error.diagnostic = _extraction_diagnostic(response, source_bundle, error.reason_code)
+            error.diagnostic = _extraction_diagnostic(
+                response,
+                source_bundle,
+                error.reason_code,
+                error._semantic_rejection,
+            )
         raise error from None
     except (TypeError, ValueError):
         diagnostic = _extraction_diagnostic(response, source_bundle, "evidence_schema_invalid")
@@ -1894,16 +1996,20 @@ def _quote_order_key(quote: EvidenceQuote, *, end: bool = False) -> tuple[str, i
     return (quote.document_id, quote.character_end if end else quote.character_start)
 
 
-def _validate_relation(relation: EvidenceRelation, quotes: Mapping[str, EvidenceQuote]) -> None:
+def _validate_relation(
+    relation: EvidenceRelation,
+    quotes: Mapping[str, EvidenceQuote],
+    semantic_rejection: str,
+) -> None:
     all_ids = {relation.marker_quote_id, *relation.left_operand_quote_ids, *relation.right_operand_quote_ids}
     if any(item not in quotes for item in all_ids):
-        _raise("evidence_relation_binding_invalid")
+        _raise("evidence_relation_binding_invalid", semantic_rejection=semantic_rejection)
     if relation.marker_quote_id in relation.left_operand_quote_ids or relation.marker_quote_id in relation.right_operand_quote_ids:
-        _raise("evidence_relation_binding_invalid")
+        _raise("evidence_relation_binding_invalid", semantic_rejection=semantic_rejection)
     marker = quotes[relation.marker_quote_id].exact_text
     rules = _TEMPORAL_MARKERS if relation.relation_kind in TEMPORAL_RELATIONS else _CAUSAL_MARKERS
     if rules[relation.relation_kind].search(marker) is None:
-        _raise("evidence_relation_binding_invalid")
+        _raise("evidence_relation_binding_invalid", semantic_rejection=semantic_rejection)
     marker_quote = quotes[relation.marker_quote_id]
     left_quotes = tuple(quotes[item] for item in relation.left_operand_quote_ids)
     right_quotes = tuple(quotes[item] for item in relation.right_operand_quote_ids)
@@ -1911,7 +2017,7 @@ def _validate_relation(relation: EvidenceRelation, quotes: Mapping[str, Evidence
         max((_quote_order_key(item, end=True) for item in left_quotes)) > _quote_order_key(marker_quote)
         or _quote_order_key(marker_quote, end=True) > min((_quote_order_key(item) for item in right_quotes))
     ):
-        _raise("evidence_relation_binding_invalid")
+        _raise("evidence_relation_binding_invalid", semantic_rejection=semantic_rejection)
 
 
 def _contains_bound_lexeme(text: str, lexeme: str, atom_kind: str) -> bool:
@@ -1957,10 +2063,10 @@ def validate_extraction(source_bundle: SourceDocumentBundle, extraction: Evidenc
     segment_order = {item.segment_id: index for index, item in enumerate(segments)}
     evidence_ids = tuple(item.evidence_id for item in extraction.ordered_evidence)
     if len(evidence_ids) != len(set(evidence_ids)):
-        _raise("evidence_schema_invalid")
+        _raise("evidence_schema_invalid", semantic_rejection="duplicate_or_conflicting_evidence")
     disposition_ids = tuple(item.segment_id for item in extraction.ordered_segment_dispositions)
     if disposition_ids != tuple(item.segment_id for item in segments) or len(disposition_ids) != len(set(disposition_ids)):
-        _raise("evidence_segment_binding_invalid")
+        _raise("evidence_segment_binding_invalid", semantic_rejection="duplicate_or_missing_segment_disposition")
     disposition_by_id = {item.segment_id: item for item in extraction.ordered_segment_dispositions}
     known_evidence = set(evidence_ids)
     refs_by_evidence = {
@@ -1970,30 +2076,35 @@ def validate_extraction(source_bundle: SourceDocumentBundle, extraction: Evidenc
     for disposition in extraction.ordered_segment_dispositions:
         segment = segment_by_id[disposition.segment_id]
         if any(item not in known_evidence for item in disposition.ordered_evidence_ids):
-            _raise("evidence_segment_binding_invalid")
+            _raise("evidence_segment_binding_invalid", semantic_rejection="disposition_partition_mismatch")
         if any(disposition.segment_id not in refs_by_evidence[item] for item in disposition.ordered_evidence_ids):
-            _raise("evidence_segment_binding_invalid")
+            _raise("evidence_segment_binding_invalid", semantic_rejection="evidence_item_not_bound_to_source_segment")
         if _is_sensitive(segment.exact_text) and disposition.disposition != "sensitive":
-            _raise("evidence_sensitive")
+            _raise("evidence_sensitive", semantic_rejection="evidence_references_withheld_segment")
     global_quotes: set[str] = set()
     for evidence in extraction.ordered_evidence:
         if _is_sensitive(evidence.proposition):
-            _raise("evidence_sensitive")
+            _raise("evidence_sensitive", semantic_rejection="privacy_classification_rejected")
         if evidence.ordered_segment_refs:
             try:
                 positions = tuple(segment_order[item] for item in evidence.ordered_segment_refs)
             except KeyError:
-                _raise("evidence_segment_binding_invalid")
+                _raise("evidence_segment_binding_invalid", semantic_rejection="evidence_item_not_bound_to_source_segment")
             if positions != tuple(sorted(positions)):
-                _raise("evidence_segment_binding_invalid")
+                _raise("evidence_segment_binding_invalid", semantic_rejection="disposition_partition_mismatch")
         for segment_id in evidence.ordered_segment_refs:
             disposition = disposition_by_id[segment_id]
             if disposition.disposition != "evidence" or evidence.evidence_id not in disposition.ordered_evidence_ids:
-                _raise("evidence_segment_binding_invalid")
+                rejection = (
+                    "evidence_references_withheld_segment"
+                    if disposition.disposition == "sensitive"
+                    else "evidence_item_not_bound_to_source_segment"
+                )
+                _raise("evidence_segment_binding_invalid", semantic_rejection=rejection)
         quotes: dict[str, EvidenceQuote] = {}
         for quote in evidence.exact_quotes:
             if quote.quote_id in global_quotes or quote.quote_id in quotes:
-                _raise("evidence_quote_binding_invalid")
+                _raise("evidence_quote_binding_invalid", semantic_rejection="duplicate_quote_or_conflicting_evidence")
             global_quotes.add(quote.quote_id)
             quotes[quote.quote_id] = quote
             segment = segment_by_id.get(quote.segment_id)
@@ -2009,14 +2120,14 @@ def validate_extraction(source_bundle: SourceDocumentBundle, extraction: Evidenc
                 or quote.byte_end > segment.byte_end
                 or _is_sensitive(quote.exact_text)
             ):
-                _raise("evidence_quote_binding_invalid")
+                _raise("evidence_quote_binding_invalid", semantic_rejection="quote_span_or_ownership_invalid")
             raw = document.exact_text.encode("utf-8")
             try:
                 byte_text = raw[quote.byte_start:quote.byte_end].decode("utf-8", errors="strict")
             except UnicodeDecodeError:
-                _raise("evidence_quote_binding_invalid")
+                _raise("evidence_quote_binding_invalid", semantic_rejection="quote_span_or_ownership_invalid")
             if document.exact_text[quote.character_start:quote.character_end] != quote.exact_text or byte_text != quote.exact_text:
-                _raise("evidence_quote_binding_invalid")
+                _raise("evidence_quote_binding_invalid", semantic_rejection="quote_span_or_ownership_invalid")
         # The extractor's prose is not evidence.  A public proposition must
         # be an exact, independently replayable source span; adjudication may
         # accept or reject that span but cannot authorize invented wording.
@@ -2026,42 +2137,43 @@ def validate_extraction(source_bundle: SourceDocumentBundle, extraction: Evidenc
             evidence.evidence_kind != "insufficient_or_ambiguous"
             and evidence.proposition not in {item.exact_text for item in quotes.values()}
         ):
-            _raise("evidence_proposition_binding_invalid")
+            _raise("evidence_proposition_binding_invalid", semantic_rejection="generic_or_meaning_anchor_rejection")
         all_atoms = (*evidence.entities, *evidence.numbers, *evidence.dates)
         atom_ids = tuple(item.atom_id for item in all_atoms)
         if len(atom_ids) != len(set(atom_ids)):
-            _raise("evidence_value_binding_invalid")
+            _raise("evidence_value_binding_invalid", semantic_rejection="duplicate_or_conflicting_evidence")
         for atom in all_atoms:
+            rejection = f"{atom.atom_kind}_ownership_invalid"
             quote = quotes.get(atom.quote_id)
             if quote is None or not _contains_bound_lexeme(quote.exact_text, atom.exact_lexeme, atom.atom_kind):
-                _raise("evidence_value_binding_invalid")
+                _raise("evidence_value_binding_invalid", semantic_rejection=rejection)
             if atom.atom_kind == "number" and _NUMBER.fullmatch(atom.exact_lexeme) is None:
-                _raise("evidence_value_binding_invalid")
+                _raise("evidence_value_binding_invalid", semantic_rejection="number_ownership_invalid")
             if atom.atom_kind == "date" and not _valid_date_lexeme(atom.exact_lexeme):
-                _raise("evidence_value_binding_invalid")
+                _raise("evidence_value_binding_invalid", semantic_rejection="date_ownership_invalid")
         if evidence.temporal_relation is not None:
-            _validate_relation(evidence.temporal_relation, quotes)
+            _validate_relation(evidence.temporal_relation, quotes, "temporal_relation_mismatch")
         if evidence.causal_relation is not None:
-            _validate_relation(evidence.causal_relation, quotes)
+            _validate_relation(evidence.causal_relation, quotes, "causal_relation_mismatch")
         if evidence.temporal_relation is not None and evidence.causal_relation is not None:
-            _raise("evidence_relation_binding_invalid")
+            _raise("evidence_relation_binding_invalid", semantic_rejection="duplicate_or_conflicting_evidence")
         if evidence.evidence_kind == "explicit_sequence" and (
             evidence.temporal_relation is None or evidence.temporal_relation.relation_kind != "sequence"
         ):
-            _raise("evidence_relation_binding_invalid")
+            _raise("evidence_relation_binding_invalid", semantic_rejection="temporal_relation_mismatch")
         if evidence.evidence_kind == "explicit_cause" and evidence.causal_relation is None:
-            _raise("evidence_relation_binding_invalid")
+            _raise("evidence_relation_binding_invalid", semantic_rejection="causal_relation_mismatch")
         quote_text = "\n".join(item.exact_text for item in evidence.exact_quotes)
         negated = _NEGATION.search(quote_text) is not None
         if (evidence.polarity == "negated") != negated and evidence.polarity != "quoted":
-            _raise("evidence_polarity_invalid")
+            _raise("evidence_polarity_invalid", semantic_rejection="polarity_mismatch")
         uncertain = _UNCERTAINTY.search(quote_text) is not None
         if evidence.uncertainty == "certain" and uncertain:
-            _raise("evidence_uncertainty_invalid")
+            _raise("evidence_uncertainty_invalid", semantic_rejection="uncertainty_mismatch")
         if evidence.uncertainty == "uncertain" and not uncertain:
-            _raise("evidence_uncertainty_invalid")
+            _raise("evidence_uncertainty_invalid", semantic_rejection="uncertainty_mismatch")
         if evidence.public_safety == "safe" and any(_is_sensitive(item.exact_text) for item in evidence.exact_quotes):
-            _raise("evidence_sensitive")
+            _raise("evidence_sensitive", semantic_rejection="privacy_classification_rejected")
 
 
 def _decision_from(value: object) -> EvidenceDecision:
