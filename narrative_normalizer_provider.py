@@ -83,7 +83,7 @@ PROVIDER_REASON_CODES = frozenset({
 })
 
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
-_OPERATION = re.compile(r"(?:evidence_extraction|evidence_adjudication|generation|adjudication|repair)\Z")
+_OPERATION = re.compile(r"(?:evidence_coverage|evidence_extraction|evidence_adjudication|generation|adjudication|repair)\Z")
 _HEX24 = re.compile(r"[0-9a-f]{24}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _CREDENTIAL_MARKER = privacy.CREDENTIAL_MARKER
@@ -178,6 +178,7 @@ class ProviderConfiguration:
         return {
             "adapter_version": self.adapter_version,
             "models": {
+                "evidence_coverage": self.generation_model,
                 "evidence_extraction": self.generation_model,
                 "story_generation": self.generation_model,
                 "story_repair": self.generation_model,
@@ -334,6 +335,7 @@ class LiveProviderRunAuthorization:
         return {
             "adapter_version": self.adapter_version,
             "models": {
+                "evidence_coverage": self.content_model,
                 "evidence_extraction": self.content_model,
                 "story_generation": self.content_model,
                 "story_repair": self.content_model,
@@ -857,6 +859,7 @@ def _request_payload(request: object) -> tuple[str, str, tuple[dict[str, str], .
             schema = evidence.evidence_model_response_schema(
                 operation,
                 request.response_schema_version,
+                request.required_block_ids,
             )
         except (TypeError, ValueError):
             _raise(PROVIDER_CONFIGURATION_INVALID)
@@ -884,6 +887,7 @@ def _request_payload(request: object) -> tuple[str, str, tuple[dict[str, str], .
             "model": request.model,
             "payload_json": request.payload_json,
             "response_schema_version": request.response_schema_version,
+            "required_block_ids": list(request.required_block_ids),
             "response_schema": schema,
         }
         return operation, request.model, messages, response_format, digest_payload
@@ -998,6 +1002,7 @@ def _ipc_request_payload(request: object) -> dict[str, object]:
                 "model": request.model,
                 "payload_json": request.payload_json,
                 "response_schema_version": request.response_schema_version,
+                "required_block_ids": _ipc_value(request.required_block_ids),
             },
         }
     _raise(PROVIDER_CONFIGURATION_INVALID)
@@ -1556,6 +1561,7 @@ def _build_authorized_adapter(
         client,
         extraction_model=config.generation_model,
         adjudication_model=config.adjudication_model,
+        coverage_v2=True,
     )
     result = (provider, generation_service, evidence_service)
     if (

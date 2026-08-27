@@ -33,6 +33,10 @@ DRAFT_FILE_NAMES: Final = (
     "draft-manifest.json",
     "review.json",
 )
+MANUAL_ATTENTION_FILE_NAMES: Final = (
+    "manual-attention.json",
+    "manual-attention.md",
+)
 APPROVAL_FILE_NAMES: Final = (
     "approval-attestation.json",
     "narrative_ready.json",
@@ -255,6 +259,30 @@ def verify_shared_draft(
             gid=policy.shared_gid,
             mode=SHARED_DRAFT_FILE_MODE,
         )
+
+
+def finalize_shared_manual_attention(
+    policy: NarrativeOutboxPermissionPolicy,
+    root: Path,
+    package: Path,
+) -> None:
+    uid = verify_shared_root(policy, root)
+    assert policy.shared_gid is not None
+    for name in MANUAL_ATTENTION_FILE_NAMES:
+        _apply(package / name, directory=False, uid=uid, gid=policy.shared_gid, mode=SHARED_DRAFT_FILE_MODE)
+    _apply(package, directory=True, uid=uid, gid=policy.shared_gid, mode=SHARED_DRAFT_DIRECTORY_MODE)
+
+
+def verify_shared_manual_attention(
+    policy: NarrativeOutboxPermissionPolicy,
+    root: Path,
+    package: Path,
+) -> None:
+    uid = verify_shared_root(policy, root)
+    assert policy.shared_gid is not None
+    _verify(package, directory=True, uid=uid, gid=policy.shared_gid, mode=SHARED_DRAFT_DIRECTORY_MODE)
+    for name in MANUAL_ATTENTION_FILE_NAMES:
+        _verify(package / name, directory=False, uid=uid, gid=policy.shared_gid, mode=SHARED_DRAFT_FILE_MODE)
 
 
 def finalize_shared_claim(

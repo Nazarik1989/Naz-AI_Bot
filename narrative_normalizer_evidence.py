@@ -25,6 +25,8 @@ import model_boundary_privacy as privacy
 
 SOURCE_DOCUMENT_CONTRACT_VERSION = "normalizer-source-document-v1"
 EVIDENCE_EXTRACTION_CONTRACT_VERSION = "normalizer-evidence-extraction-v1"
+EVIDENCE_COVERAGE_CONTRACT_VERSION = "normalizer-evidence-coverage-v2"
+EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION = "normalizer-evidence-extraction-v2"
 EVIDENCE_ADJUDICATION_CONTRACT_VERSION = "normalizer-evidence-adjudication-v1"
 VERIFIED_EVIDENCE_CONTRACT_VERSION = "normalizer-verified-evidence-v1"
 VERIFIED_FACT_BINDING_VERSION = "normalizer-verified-fact-binding-v1"
@@ -33,6 +35,8 @@ MAX_DOCUMENT_BYTES = 2_000_000
 MAX_SOURCE_BYTES = 8_000_000
 MAX_DOCUMENTS = 128
 MAX_SEGMENTS = 20_000
+MAX_BLOCK_SEGMENTS = 16
+MAX_BLOCK_CHARACTERS = 4_096
 
 MEDIA_TYPES = frozenset({
     "plain_text",
@@ -86,6 +90,9 @@ POLARITIES = frozenset({"affirmed", "negated", "quoted"})
 UNCERTAINTIES = frozenset({"certain", "uncertain", "ambiguous"})
 PUBLIC_SAFETY = frozenset({"safe", "sensitive", "mixed", "unknown"})
 SEGMENT_DISPOSITIONS = frozenset({"evidence", "irrelevant", "sensitive", "ambiguous"})
+BLOCK_DISPOSITIONS = frozenset({
+    "evidence_candidate", "context_only", "structural", "sensitive_withheld", "ambiguous",
+})
 EVIDENCE_DECISIONS = frozenset({"supported", "rejected", "ambiguous"})
 RESOLUTION_STATUSES = frozenset({
     "verified",
@@ -117,6 +124,8 @@ REASON_CODES = frozenset({
     "evidence_manual_attention",
     "evidence_provider_failed",
     "evidence_verified_bundle_invalid",
+    "evidence_coverage_incomplete",
+    "evidence_coverage_conflict",
 })
 ADJUDICATION_REASON_CODES = frozenset({
     "unsupported_proposition",
@@ -651,6 +660,136 @@ class CoverageClassification:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class SourceBlock:
+    """Immutable, deterministic group of adjacent source segments."""
+
+    block_id: str
+    source_identity: str
+    document_id: str
+    ordered_segment_ids: tuple[str, ...]
+    character_start: int
+    character_end: int
+    byte_start: int
+    byte_end: int
+    block_kind: str
+    sensitivity_status: str
+    block_digest: str
+
+    def __post_init__(self) -> None:
+        _safe_id(self.block_id, "block_id")
+        _hex64(self.source_identity, "source_identity")
+        _safe_id(self.document_id, "document_id")
+        _strings(self.ordered_segment_ids, "ordered_segment_ids", allow_empty=False)
+        for name in ("character_start", "byte_start"):
+            _plain_int(getattr(self, name), name)
+        for name in ("character_end", "byte_end"):
+            _plain_int(getattr(self, name), name, minimum=1)
+        if self.character_end <= self.character_start or self.byte_end <= self.byte_start:
+            raise ValueError("block span")
+        _enum(self.block_kind, SEGMENT_KINDS, "block_kind")
+        _enum(self.sensitivity_status, {"public", "sensitive_withheld"}, "sensitivity_status")
+        _hex64(self.block_digest, "block_digest")
+        if len(self.ordered_segment_ids) > MAX_BLOCK_SEGMENTS:
+            raise ValueError("block segment bound")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceBlockInventory:
+    contract_version: str
+    source_identity: str
+    document_bundle_digest: str
+    ordered_blocks: tuple[SourceBlock, ...]
+    inventory_digest: str
+
+    def __post_init__(self) -> None:
+        if self.contract_version != EVIDENCE_COVERAGE_CONTRACT_VERSION:
+            raise ValueError("contract_version")
+        _hex64(self.source_identity, "source_identity")
+        _hex64(self.document_bundle_digest, "document_bundle_digest")
+        _typed_tuple(self.ordered_blocks, SourceBlock, "ordered_blocks")
+        _hex64(self.inventory_digest, "inventory_digest")
+        ids = tuple(item.block_id for item in self.ordered_blocks)
+        if len(ids) != len(set(ids)):
+            raise ValueError("block ids")
+        payload = {
+            "contract_version": self.contract_version,
+            "source_identity": self.source_identity,
+            "document_bundle_digest": self.document_bundle_digest,
+            "ordered_blocks": self.ordered_blocks,
+        }
+        if self.inventory_digest != _sha(payload):
+            raise ValueError("inventory_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class BlockCoverageDecision:
+    block_id: str
+    disposition: str
+
+    def __post_init__(self) -> None:
+        _safe_id(self.block_id, "block_id")
+        _enum(self.disposition, BLOCK_DISPOSITIONS, "disposition")
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceCoveragePlan:
+    contract_version: str
+    source_identity: str
+    document_bundle_digest: str
+    inventory_digest: str
+    run_id: str
+    ordered_decisions: tuple[BlockCoverageDecision, ...]
+    plan_digest: str
+
+    def __post_init__(self) -> None:
+        if self.contract_version != EVIDENCE_COVERAGE_CONTRACT_VERSION:
+            raise ValueError("contract_version")
+        for value, name in (
+            (self.source_identity, "source_identity"),
+            (self.document_bundle_digest, "document_bundle_digest"),
+            (self.inventory_digest, "inventory_digest"),
+            (self.plan_digest, "plan_digest"),
+        ):
+            _hex64(value, name)
+        _safe_id(self.run_id, "run_id")
+        _typed_tuple(self.ordered_decisions, BlockCoverageDecision, "ordered_decisions")
+        ids = tuple(item.block_id for item in self.ordered_decisions)
+        if len(ids) != len(set(ids)):
+            raise ValueError("block decisions")
+        payload = {
+            "contract_version": self.contract_version,
+            "source_identity": self.source_identity,
+            "document_bundle_digest": self.document_bundle_digest,
+            "inventory_digest": self.inventory_digest,
+            "run_id": self.run_id,
+            "ordered_decisions": self.ordered_decisions,
+        }
+        if self.plan_digest != _sha(payload):
+            raise ValueError("plan_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceCoverageSummary:
+    block_count: int
+    segment_count: int
+    evidence_candidate_count: int
+    context_only_count: int
+    structural_count: int
+    sensitive_count: int
+    ambiguous_count: int
+    omitted_count: int
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if field.name == "reason_code":
+                _enum(value, {"coverage_complete", "coverage_incomplete", "coverage_conflict", "coverage_ambiguous"}, field.name)
+            else:
+                _plain_int(value, field.name)
+
+
 def _char_to_byte_offsets(text: str) -> tuple[int, ...]:
     offsets = [0]
     current = 0
@@ -1084,6 +1223,79 @@ def classify_source_bundle(
     )
 
 
+def build_source_block_inventory(bundle: SourceDocumentBundle) -> SourceBlockInventory:
+    """Build stable bounded blocks without model judgement or filesystem state."""
+
+    if type(bundle) is not SourceDocumentBundle:
+        raise TypeError("bundle")
+    blocks: list[SourceBlock] = []
+    for document in bundle.ordered_documents:
+        pending: list[SourceSegment] = []
+
+        def flush() -> None:
+            if not pending:
+                return
+            index = len(blocks) + 1
+            sensitive = _is_sensitive(pending[0].exact_text)
+            content_binding = {
+                "source_identity": bundle.source_identity,
+                "document_id": document.document_id,
+                "ordered_segments": tuple(
+                    (item.segment_id, item.exact_text, item.byte_start, item.byte_end)
+                    for item in pending
+                ),
+                "block_kind": pending[0].segment_kind,
+                "sensitivity_status": "sensitive_withheld" if sensitive else "public",
+            }
+            digest = _sha(content_binding)
+            blocks.append(SourceBlock(
+                block_id=f"block-{index:05d}-{digest[:16]}",
+                source_identity=bundle.source_identity,
+                document_id=document.document_id,
+                ordered_segment_ids=tuple(item.segment_id for item in pending),
+                character_start=pending[0].character_start,
+                character_end=pending[-1].character_end,
+                byte_start=pending[0].byte_start,
+                byte_end=pending[-1].byte_end,
+                block_kind=pending[0].segment_kind,
+                sensitivity_status="sensitive_withheld" if sensitive else "public",
+                block_digest=digest,
+            ))
+            pending.clear()
+
+        for segment in document.ordered_segments:
+            if pending:
+                previous = pending[-1]
+                gap = document.exact_text[previous.character_end:segment.character_start]
+                projected_characters = segment.character_end - pending[0].character_start
+                boundary = (
+                    segment.segment_kind != pending[0].segment_kind
+                    or segment.container_path != pending[0].container_path
+                    or _is_sensitive(segment.exact_text) != _is_sensitive(pending[0].exact_text)
+                    or segment.segment_kind in {"heading", "list_item"}
+                    or "\n\n" in gap.replace("\r\n", "\n")
+                    or len(pending) >= MAX_BLOCK_SEGMENTS
+                    or projected_characters > MAX_BLOCK_CHARACTERS
+                )
+                if boundary:
+                    flush()
+            pending.append(segment)
+        flush()
+    payload = {
+        "contract_version": EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "ordered_blocks": tuple(blocks),
+    }
+    return SourceBlockInventory(
+        contract_version=EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        source_identity=bundle.source_identity,
+        document_bundle_digest=bundle.bundle_digest,
+        ordered_blocks=tuple(blocks),
+        inventory_digest=_sha(payload),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceQuote:
     quote_id: str
@@ -1361,13 +1573,25 @@ class EvidenceModelRequest:
     model: str
     payload_json: str
     response_schema_version: str
+    required_block_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.request_kind not in {"evidence_extraction", "evidence_adjudication"}:
+        if self.request_kind not in {"evidence_coverage", "evidence_extraction", "evidence_adjudication"}:
             raise ValueError("request_kind")
         _plain(self.model, "model")
         _plain(self.payload_json, "payload_json")
         _plain(self.response_schema_version, "response_schema_version")
+        _strings(self.required_block_ids, "required_block_ids")
+        if len(self.required_block_ids) != len(set(self.required_block_ids)):
+            raise ValueError("required_block_ids")
+        if self.request_kind == "evidence_coverage":
+            if (
+                self.response_schema_version != EVIDENCE_COVERAGE_CONTRACT_VERSION
+                or not self.required_block_ids
+            ):
+                raise ValueError("required_block_ids")
+        elif self.request_kind != "evidence_extraction" and self.required_block_ids:
+            raise ValueError("required_block_ids")
 
 
 class EvidenceModelClient(Protocol):
@@ -1382,11 +1606,12 @@ class EvidenceResolution:
     model_call_count: int
     reason_code: str
     diagnostic: EvidenceValidationDiagnostic | None = None
+    coverage_summary: EvidenceCoverageSummary | None = None
 
     def __post_init__(self) -> None:
         _enum(self.status, RESOLUTION_STATUSES, "status")
         _plain_int(self.model_call_count, "model_call_count")
-        if self.model_call_count > 2:
+        if self.model_call_count > 3:
             raise ValueError("model_call_count")
         if type(self.reason_code) is not str or self.reason_code not in REASON_CODES:
             raise ValueError("reason_code")
@@ -1404,6 +1629,8 @@ class EvidenceResolution:
             raise TypeError("diagnostic")
         if self.status != "failed" and self.diagnostic is not None:
             raise ValueError("diagnostic")
+        if self.coverage_summary is not None and type(self.coverage_summary) is not EvidenceCoverageSummary:
+            raise TypeError("coverage_summary")
 
 
 _QUOTE_KEYS = frozenset({
@@ -1424,6 +1651,14 @@ _EXTRACTION_RESPONSE_KEYS = frozenset({
     "schema_version", "source_identity", "document_bundle_digest", "run_id", "evidence",
     "segment_dispositions",
 })
+_COVERAGE_RESPONSE_KEYS = frozenset({
+    "schema_version", "source_identity", "document_bundle_digest", "inventory_digest",
+    "run_id", "block_dispositions",
+})
+_EXTRACTION_V2_RESPONSE_KEYS = frozenset({
+    "schema_version", "source_identity", "document_bundle_digest", "coverage_plan_digest",
+    "run_id", "evidence",
+})
 _DECISION_KEYS = frozenset({"evidence_id", "evidence_digest", "decision", "reason_codes"})
 _ADJUDICATION_RESPONSE_KEYS = frozenset({
     "schema_version", "source_identity", "extraction_bundle_digest", "run_id", "decisions",
@@ -1442,6 +1677,7 @@ def _closed_object_schema(properties: dict[str, object]) -> dict[str, object]:
 def evidence_model_response_schema(
     request_kind: str,
     response_schema_version: str,
+    required_block_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Return the code-owned strict provider schema for one evidence operation."""
 
@@ -1450,8 +1686,37 @@ def evidence_model_response_schema(
     safe_id = {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"}
     hex64 = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
     string_array = {"type": "array", "items": {"type": "string"}}
+    if request_kind == "evidence_coverage":
+        if (
+            response_schema_version != EVIDENCE_COVERAGE_CONTRACT_VERSION
+            or type(required_block_ids) is not tuple
+            or not required_block_ids
+            or len(required_block_ids) != len(set(required_block_ids))
+            or any(type(item) is not str or _SAFE_ID.fullmatch(item) is None for item in required_block_ids)
+        ):
+            raise ValueError("evidence response schema")
+        disposition_map = {
+            "type": "object",
+            "properties": {
+                item: {"type": "string", "enum": sorted(BLOCK_DISPOSITIONS)}
+                for item in required_block_ids
+            },
+            "required": list(required_block_ids),
+            "additionalProperties": False,
+        }
+        return _closed_object_schema({
+            "schema_version": {"type": "string", "const": EVIDENCE_COVERAGE_CONTRACT_VERSION},
+            "source_identity": dict(hex64),
+            "document_bundle_digest": dict(hex64),
+            "inventory_digest": dict(hex64),
+            "run_id": dict(safe_id),
+            "block_dispositions": disposition_map,
+        })
     if request_kind == "evidence_extraction":
-        if response_schema_version != EVIDENCE_EXTRACTION_CONTRACT_VERSION:
+        if response_schema_version not in {
+            EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+            EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+        }:
             raise ValueError("evidence response schema")
         quote = _closed_object_schema({
             "quote_id": dict(safe_id),
@@ -1498,6 +1763,27 @@ def evidence_model_response_schema(
             "uncertainty": {"type": "string", "enum": sorted(UNCERTAINTIES)},
             "public_safety": {"type": "string", "enum": sorted(PUBLIC_SAFETY)},
         })
+        if response_schema_version == EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION:
+            if (
+                type(required_block_ids) is not tuple
+                or not required_block_ids
+                or len(required_block_ids) != len(set(required_block_ids))
+            ):
+                raise ValueError("evidence response schema")
+            evidence_item["properties"]["ordered_block_refs"] = {
+                "type": "array",
+                "items": {"type": "string", "enum": list(required_block_ids)},
+                "minItems": 1,
+            }
+            evidence_item["required"].append("ordered_block_refs")
+            return _closed_object_schema({
+                "schema_version": {"type": "string", "const": EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION},
+                "source_identity": dict(hex64),
+                "document_bundle_digest": dict(hex64),
+                "coverage_plan_digest": dict(hex64),
+                "run_id": dict(safe_id),
+                "evidence": {"type": "array", "items": evidence_item},
+            })
         disposition = _closed_object_schema({
             "segment_id": dict(safe_id),
             "disposition": {"type": "string", "enum": sorted(SEGMENT_DISPOSITIONS)},
@@ -2309,8 +2595,226 @@ def _source_projection(bundle: SourceDocumentBundle) -> dict[str, object]:
     }
 
 
+def _block_projection(
+    bundle: SourceDocumentBundle,
+    inventory: SourceBlockInventory,
+    *,
+    selected_block_ids: frozenset[str] | None = None,
+) -> dict[str, object]:
+    segments = {item.segment_id: item for item in _segments(bundle)}
+    projected: list[dict[str, object]] = []
+    for block in inventory.ordered_blocks:
+        if selected_block_ids is not None and block.block_id not in selected_block_ids:
+            continue
+        item: dict[str, object] = {
+            "block_id": block.block_id,
+            "block_digest": block.block_digest,
+            "document_id": block.document_id,
+            "ordered_segment_ids": list(block.ordered_segment_ids),
+            "block_kind": block.block_kind,
+            "sensitivity_status": block.sensitivity_status,
+        }
+        if block.sensitivity_status == "public":
+            item["segments"] = [
+                {
+                    "segment_id": segment_id,
+                    "exact_text": segments[segment_id].exact_text,
+                    "byte_start": segments[segment_id].byte_start,
+                    "byte_end": segments[segment_id].byte_end,
+                    "character_start": segments[segment_id].character_start,
+                    "character_end": segments[segment_id].character_end,
+                }
+                for segment_id in block.ordered_segment_ids
+            ]
+        projected.append(item)
+    return {
+        "schema_version": EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "blocks": projected,
+    }
+
+
+def _unique_json_object(value: Mapping[str, object] | str) -> dict[str, object]:
+    if type(value) is str:
+        duplicate = False
+
+        def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            nonlocal duplicate
+            result: dict[str, object] = {}
+            for key, item in pairs:
+                if key in result:
+                    duplicate = True
+                result[key] = item
+            return result
+
+        try:
+            value = json.loads(value, object_pairs_hook=object_pairs)
+        except json.JSONDecodeError:
+            _raise("evidence_coverage_incomplete")
+        if duplicate:
+            _raise("evidence_coverage_conflict")
+    if type(value) is not dict:
+        _raise("evidence_coverage_incomplete")
+    return value
+
+
+def parse_coverage_response(
+    response: Mapping[str, object] | str,
+    bundle: SourceDocumentBundle,
+    inventory: SourceBlockInventory,
+) -> EvidenceCoveragePlan:
+    raw = _exact_mapping(_unique_json_object(response), _COVERAGE_RESPONSE_KEYS)
+    if (
+        raw["schema_version"] != EVIDENCE_COVERAGE_CONTRACT_VERSION
+        or raw["source_identity"] != bundle.source_identity
+        or raw["document_bundle_digest"] != bundle.bundle_digest
+        or raw["inventory_digest"] != inventory.inventory_digest
+    ):
+        _raise("evidence_coverage_conflict")
+    decisions_raw = raw["block_dispositions"]
+    if type(decisions_raw) is not dict:
+        _raise("evidence_coverage_incomplete")
+    expected_ids = tuple(item.block_id for item in inventory.ordered_blocks)
+    if frozenset(decisions_raw) != frozenset(expected_ids):
+        _raise("evidence_coverage_incomplete")
+    try:
+        decisions = tuple(
+            BlockCoverageDecision(block_id, decisions_raw[block_id])
+            for block_id in expected_ids
+        )
+    except (TypeError, ValueError):
+        _raise("evidence_coverage_conflict")
+    block_by_id = {item.block_id: item for item in inventory.ordered_blocks}
+    for decision in decisions:
+        sensitive = block_by_id[decision.block_id].sensitivity_status == "sensitive_withheld"
+        if sensitive != (decision.disposition == "sensitive_withheld"):
+            _raise("evidence_coverage_conflict")
+    payload = {
+        "contract_version": EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "run_id": raw["run_id"],
+        "ordered_decisions": decisions,
+    }
+    try:
+        return EvidenceCoveragePlan(**payload, plan_digest=_sha(payload))
+    except (TypeError, ValueError):
+        _raise("evidence_coverage_conflict")
+
+
+def _coverage_summary(
+    inventory: SourceBlockInventory,
+    plan: EvidenceCoveragePlan | None,
+    reason_code: str,
+) -> EvidenceCoverageSummary:
+    counts = {item: 0 for item in BLOCK_DISPOSITIONS}
+    if plan is not None:
+        for decision in plan.ordered_decisions:
+            counts[decision.disposition] += 1
+    decided = sum(counts.values())
+    return EvidenceCoverageSummary(
+        block_count=len(inventory.ordered_blocks),
+        segment_count=sum(len(item.ordered_segment_ids) for item in inventory.ordered_blocks),
+        evidence_candidate_count=counts["evidence_candidate"],
+        context_only_count=counts["context_only"],
+        structural_count=counts["structural"],
+        sensitive_count=counts["sensitive_withheld"],
+        ambiguous_count=counts["ambiguous"],
+        omitted_count=max(0, len(inventory.ordered_blocks) - decided),
+        reason_code=reason_code,
+    )
+
+
+def parse_extraction_v2_response(
+    response: Mapping[str, object] | str,
+    bundle: SourceDocumentBundle,
+    inventory: SourceBlockInventory,
+    plan: EvidenceCoveragePlan,
+) -> EvidenceExtractionBundle:
+    raw = _exact_mapping(_mapping_response(response), _EXTRACTION_V2_RESPONSE_KEYS)
+    if (
+        raw["schema_version"] != EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION
+        or raw["source_identity"] != bundle.source_identity
+        or raw["document_bundle_digest"] != bundle.bundle_digest
+        or raw["coverage_plan_digest"] != plan.plan_digest
+    ):
+        _raise("evidence_source_binding_invalid")
+    block_by_id = {item.block_id: item for item in inventory.ordered_blocks}
+    selected = tuple(
+        item.block_id for item in plan.ordered_decisions
+        if item.disposition == "evidence_candidate"
+    )
+    selected_set = frozenset(selected)
+    evidence_items: list[SourceEvidence] = []
+    refs_by_evidence: dict[str, tuple[str, ...]] = {}
+    for value in _exact_list(raw["evidence"]):
+        if type(value) is not dict or frozenset(value) != _EVIDENCE_KEYS | {"ordered_block_refs"}:
+            _raise("evidence_schema_invalid")
+        block_refs = value["ordered_block_refs"]
+        if (
+            type(block_refs) is not list
+            or not block_refs
+            or any(type(item) is not str for item in block_refs)
+            or len(block_refs) != len(set(block_refs))
+            or any(item not in selected_set for item in block_refs)
+        ):
+            _raise("evidence_segment_binding_invalid")
+        reduced = {key: item for key, item in value.items() if key != "ordered_block_refs"}
+        evidence_item = _evidence_from(reduced)
+        allowed_segments = {
+            segment_id
+            for block_id in block_refs
+            for segment_id in block_by_id[block_id].ordered_segment_ids
+        }
+        if not set(evidence_item.ordered_segment_refs) <= allowed_segments:
+            _raise("evidence_segment_binding_invalid")
+        evidence_items.append(evidence_item)
+        refs_by_evidence[evidence_item.evidence_id] = evidence_item.ordered_segment_refs
+    evidence_by_segment: dict[str, list[str]] = {}
+    for evidence_id, refs in refs_by_evidence.items():
+        for segment_id in refs:
+            evidence_by_segment.setdefault(segment_id, []).append(evidence_id)
+    disposition_by_block = {item.block_id: item.disposition for item in plan.ordered_decisions}
+    block_for_segment = {
+        segment_id: block
+        for block in inventory.ordered_blocks
+        for segment_id in block.ordered_segment_ids
+    }
+    dispositions: list[SegmentDisposition] = []
+    for segment in _segments(bundle):
+        block = block_for_segment[segment.segment_id]
+        evidence_ids = tuple(evidence_by_segment.get(segment.segment_id, ()))
+        planned = disposition_by_block[block.block_id]
+        disposition = (
+            "sensitive" if planned == "sensitive_withheld"
+            else "ambiguous" if planned == "ambiguous"
+            else "evidence" if evidence_ids
+            else "irrelevant"
+        )
+        dispositions.append(SegmentDisposition(segment.segment_id, disposition, evidence_ids))
+    payload = {
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "contract_version": EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+        "run_id": raw["run_id"],
+        "ordered_evidence": tuple(evidence_items),
+        "ordered_segment_dispositions": tuple(dispositions),
+    }
+    try:
+        result = EvidenceExtractionBundle(**payload, bundle_digest=_sha(payload))
+        validate_extraction(bundle, result)
+        return result
+    except EvidenceContractError:
+        raise
+    except (TypeError, ValueError):
+        _raise("evidence_schema_invalid")
+
+
 class GenericEvidenceService:
-    """Exactly one extraction and one adjudication call on a valid generic path."""
+    """Legacy evidence flow plus an explicitly enabled coverage-v2 flow."""
 
     def __init__(
         self,
@@ -2318,16 +2822,22 @@ class GenericEvidenceService:
         *,
         extraction_model: str,
         adjudication_model: str,
+        coverage_v2: bool = False,
     ):
         if not callable(getattr(client, "generate_json", None)):
             raise TypeError("client")
         self._client = client
         self.extraction_model = _plain(extraction_model, "extraction_model")
         self.adjudication_model = _plain(adjudication_model, "adjudication_model")
+        if type(coverage_v2) is not bool:
+            raise TypeError("coverage_v2")
+        self.coverage_v2 = coverage_v2
 
     def resolve(self, bundle: SourceDocumentBundle) -> EvidenceResolution:
         if type(bundle) is not SourceDocumentBundle:
             raise TypeError("bundle")
+        if self.coverage_v2:
+            return self._resolve_v2(bundle)
         classification = classify_source_bundle(bundle)
         if classification.classification == "insufficient":
             return EvidenceResolution("source_insufficient", None, 0, "evidence_source_insufficient")
@@ -2391,6 +2901,115 @@ class GenericEvidenceService:
         except EvidenceContractError as error:
             return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic)
         return EvidenceResolution("verified", verified, calls, "evidence_verified")
+
+    def _resolve_v2(self, bundle: SourceDocumentBundle) -> EvidenceResolution:
+        classification = classify_source_bundle(bundle)
+        if classification.classification == "insufficient":
+            return EvidenceResolution("source_insufficient", None, 0, "evidence_source_insufficient")
+        if classification.classification == "sensitive":
+            return EvidenceResolution("sensitive_rejected", None, 0, "evidence_sensitive")
+        if classification.classification in {"parse_error", "unsupported_binary_container"}:
+            return EvidenceResolution("manual_attention", None, 0, "evidence_manual_attention")
+        inventory = build_source_block_inventory(bundle)
+        calls = 0
+        plan: EvidenceCoveragePlan | None = None
+        try:
+            coverage_payload = _block_projection(bundle, inventory)
+            coverage_request = EvidenceModelRequest(
+                "evidence_coverage",
+                self.extraction_model,
+                _canonical(coverage_payload).decode("utf-8"),
+                EVIDENCE_COVERAGE_CONTRACT_VERSION,
+                tuple(item.block_id for item in inventory.ordered_blocks),
+            )
+            calls += 1
+            plan = parse_coverage_response(
+                self._client.generate_json(coverage_request), bundle, inventory
+            )
+        except EvidenceContractError as error:
+            reason = "coverage_conflict" if error.reason_code == "evidence_coverage_conflict" else "coverage_incomplete"
+            return EvidenceResolution(
+                "manual_attention", None, calls, "evidence_manual_attention", None,
+                _coverage_summary(inventory, None, reason),
+            )
+        except Exception:
+            return EvidenceResolution("failed", None, calls, "evidence_provider_failed")
+        summary = _coverage_summary(inventory, plan, "coverage_complete")
+        if summary.ambiguous_count or not summary.evidence_candidate_count:
+            return EvidenceResolution(
+                "manual_attention", None, calls, "evidence_manual_attention", None,
+                _coverage_summary(inventory, plan, "coverage_ambiguous"),
+            )
+        selected = frozenset(
+            item.block_id for item in plan.ordered_decisions
+            if item.disposition == "evidence_candidate"
+        )
+        try:
+            extraction_payload = _block_projection(
+                bundle, inventory, selected_block_ids=selected
+            )
+            extraction_payload.update({
+                "schema_version": EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+                "coverage_plan_digest": plan.plan_digest,
+            })
+            extraction_request = EvidenceModelRequest(
+                "evidence_extraction",
+                self.extraction_model,
+                _canonical(extraction_payload).decode("utf-8"),
+                EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+                tuple(item for item in (block.block_id for block in inventory.ordered_blocks) if item in selected),
+            )
+            calls += 1
+            extraction = parse_extraction_v2_response(
+                self._client.generate_json(extraction_request), bundle, inventory, plan
+            )
+            adjudication_payload = {
+                "source": _source_projection(bundle),
+                "coverage_plan_digest": plan.plan_digest,
+                "extraction": _to_data(extraction),
+            }
+            adjudication_request = EvidenceModelRequest(
+                "evidence_adjudication",
+                self.adjudication_model,
+                _canonical(adjudication_payload).decode("utf-8"),
+                EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
+            )
+            calls += 1
+            adjudication = parse_adjudication_response(
+                self._client.generate_json(adjudication_request), extraction
+            )
+        except EvidenceContractError as error:
+            return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic, summary)
+        except Exception:
+            return EvidenceResolution("failed", None, calls, "evidence_provider_failed", None, summary)
+        decisions = {item.decision for item in adjudication.ordered_decisions}
+        if not extraction.ordered_evidence or "supported" not in decisions:
+            return EvidenceResolution(
+                "manual_attention", None, calls, "evidence_manual_attention", None, summary
+            )
+        if "ambiguous" in decisions or any(
+            item.evidence_kind == "insufficient_or_ambiguous" or item.uncertainty == "ambiguous"
+            for item in extraction.ordered_evidence
+        ):
+            return EvidenceResolution(
+                "manual_attention", None, calls, "evidence_manual_attention", None,
+                _coverage_summary(inventory, plan, "coverage_ambiguous"),
+            )
+        if "rejected" in decisions:
+            sensitive = any("sensitive_content" in item.reason_codes for item in adjudication.ordered_decisions)
+            return EvidenceResolution(
+                "sensitive_rejected" if sensitive else "source_insufficient",
+                None,
+                calls,
+                "evidence_sensitive" if sensitive else "evidence_source_insufficient",
+                None,
+                summary,
+            )
+        try:
+            verified = _make_verified(bundle, extraction, adjudication)
+        except EvidenceContractError as error:
+            return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic, summary)
+        return EvidenceResolution("verified", verified, calls, "evidence_verified", None, summary)
 
 
 def _extraction_payload(extraction: EvidenceExtractionBundle) -> dict[str, object]:
@@ -2671,10 +3290,15 @@ __all__ = [
     "ADJUDICATION_REASON_CODES",
     "CAUSAL_RELATIONS",
     "COVERAGE_CLASSIFICATIONS",
+    "BLOCK_DISPOSITIONS",
+    "EVIDENCE_COVERAGE_CONTRACT_VERSION",
     "EVIDENCE_ADJUDICATION_CONTRACT_VERSION",
     "EVIDENCE_EXTRACTION_CONTRACT_VERSION",
+    "EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION",
     "EVIDENCE_KINDS",
     "EvidenceAdjudicationBundle",
+    "EvidenceCoveragePlan",
+    "EvidenceCoverageSummary",
     "EvidenceAtom",
     "EvidenceContractError",
     "EvidenceDecision",
@@ -2695,6 +3319,9 @@ __all__ = [
     "SourceDocumentBundle",
     "SourceEvidence",
     "SourceSegment",
+    "SourceBlock",
+    "SourceBlockInventory",
+    "BlockCoverageDecision",
     "SegmentDisposition",
     "TEMPORAL_RELATIONS",
     "VERIFIED_EVIDENCE_CONTRACT_VERSION",
@@ -2702,12 +3329,15 @@ __all__ = [
     "VerifiedEvidenceBundle",
     "VerifiedFactBinding",
     "build_source_document_bundle",
+    "build_source_block_inventory",
     "build_verified_fact_bindings",
     "classify_source_bundle",
     "evidence_digest",
     "evidence_model_response_schema",
     "parse_adjudication_response",
     "parse_extraction_response",
+    "parse_coverage_response",
+    "parse_extraction_v2_response",
     "revalidate_verified_bundle",
     "source_identity",
     "validate_extraction",

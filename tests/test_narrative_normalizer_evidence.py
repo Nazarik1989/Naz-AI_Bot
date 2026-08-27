@@ -1545,6 +1545,147 @@ def test_requested_integration_api_is_exported_exactly() -> None:
     }
     assert required <= set(evidence.__all__)
     assert tuple(evidence.EvidenceResolution.__dataclass_fields__) == (
-        "status", "verified_bundle", "model_call_count", "reason_code", "diagnostic"
+        "status", "verified_bundle", "model_call_count", "reason_code", "diagnostic",
+        "coverage_summary",
     )
     assert isinstance(evidence.GenericEvidenceService, type)
+
+
+def _coverage_payload(bundle, inventory, *, disposition="evidence_candidate"):
+    return {
+        "schema_version": evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "run_id": "coverage-test-run",
+        "block_dispositions": {
+            block.block_id: (
+                "sensitive_withheld"
+                if block.sensitivity_status == "sensitive_withheld"
+                else disposition
+            )
+            for block in inventory.ordered_blocks
+        },
+    }
+
+
+def _v2_extraction(bundle, inventory, plan):
+    legacy = _base_extraction_payload(bundle)
+    segment_id = legacy["evidence"][0]["ordered_segment_refs"][0]
+    block_id = next(
+        block.block_id for block in inventory.ordered_blocks
+        if segment_id in block.ordered_segment_ids
+    )
+    return {
+        "schema_version": evidence.EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "coverage_plan_digest": plan.plan_digest,
+        "run_id": "extract-test-run",
+        "evidence": [dict(legacy["evidence"][0], ordered_block_refs=[block_id])],
+    }
+
+
+def test_coverage_v2_twenty_one_segments_have_deterministic_bounded_blocks(tmp_path):
+    text = "\n".join(f"Fact {index} is supported." for index in range(1, 22))
+    first = _write_bundle(tmp_path, {"facts.txt": text})
+    second = evidence.build_source_document_bundle(
+        tmp_path / "inbox", SOURCE_REF, SOURCE_DIGEST, SOURCE_CONTRACT_VERSION
+    )
+    left = evidence.build_source_block_inventory(first)
+    right = evidence.build_source_block_inventory(second)
+    assert left == right
+    assert sum(len(item.ordered_segment_ids) for item in left.ordered_blocks) == 21
+    assert all(len(item.ordered_segment_ids) <= evidence.MAX_BLOCK_SEGMENTS for item in left.ordered_blocks)
+
+
+def test_coverage_v2_six_hundred_thirteen_segments_remain_bounded(tmp_path):
+    bundle = _write_bundle(
+        tmp_path, {"facts.txt": "\n".join(f"Fact {index}." for index in range(613))}
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    assert sum(len(item.ordered_segment_ids) for item in inventory.ordered_blocks) == 613
+    assert len(inventory.ordered_blocks) == 39
+    assert all(len(item.ordered_segment_ids) <= 16 for item in inventory.ordered_blocks)
+
+
+def test_coverage_v2_dynamic_schema_requires_every_exact_block_id(tmp_path):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "One.\nTwo.\nThree."})
+    inventory = evidence.build_source_block_inventory(bundle)
+    ids = tuple(item.block_id for item in inventory.ordered_blocks)
+    schema = evidence.evidence_model_response_schema(
+        "evidence_coverage", evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION, ids
+    )
+    disposition = schema["properties"]["block_dispositions"]
+    assert tuple(disposition["required"]) == ids
+    assert disposition["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra"))
+def test_coverage_v2_incomplete_or_extra_block_is_rejected(tmp_path, mutation):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "One.\nTwo."})
+    inventory = evidence.build_source_block_inventory(bundle)
+    payload = _coverage_payload(bundle, inventory)
+    if mutation == "missing":
+        payload["block_dispositions"].pop(next(iter(payload["block_dispositions"])))
+    else:
+        payload["block_dispositions"]["block-unknown"] = "context_only"
+    with pytest.raises(evidence.EvidenceContractError) as caught:
+        evidence.parse_coverage_response(payload, bundle, inventory)
+    assert caught.value.reason_code == "evidence_coverage_incomplete"
+
+
+def test_coverage_v2_duplicate_json_block_is_conflict(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+    payload = _coverage_payload(bundle, inventory)
+    block_id = inventory.ordered_blocks[0].block_id
+    raw = __import__("json").dumps(payload, separators=(",", ":"))
+    raw = raw.replace(
+        f'"{block_id}":"evidence_candidate"',
+        f'"{block_id}":"evidence_candidate","{block_id}":"context_only"',
+    )
+    with pytest.raises(evidence.EvidenceContractError) as caught:
+        evidence.parse_coverage_response(raw, bundle, inventory)
+    assert caught.value.reason_code == "evidence_coverage_conflict"
+
+
+def test_coverage_v2_expands_every_segment_exactly_once(tmp_path):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "First fact.\nSecond context.\nThird context."})
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(_coverage_payload(bundle, inventory), bundle, inventory)
+    parsed = evidence.parse_extraction_v2_response(
+        _v2_extraction(bundle, inventory, plan), bundle, inventory, plan
+    )
+    expected = tuple(item.segment_id for item in _all_segments(bundle))
+    actual = tuple(item.segment_id for item in parsed.ordered_segment_dispositions)
+    assert actual == expected
+    assert len(actual) == len(set(actual))
+
+
+def test_coverage_v2_sensitive_block_text_never_enters_provider_projection(tmp_path):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "Public fact.\nAPI_KEY=sk-secret-value"})
+    inventory = evidence.build_source_block_inventory(bundle)
+    projection = evidence._block_projection(bundle, inventory)
+    sensitive = [item for item in projection["blocks"] if item["sensitivity_status"] == "sensitive_withheld"]
+    assert sensitive
+    assert all("segments" not in item for item in sensitive)
+    assert "sk-secret-value" not in __import__("json").dumps(projection)
+
+
+def test_coverage_v2_ambiguous_plan_returns_useful_manual_summary(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+    response = _coverage_payload(bundle, inventory, disposition="ambiguous")
+    client = FakeEvidenceClient([response])
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle)
+    assert result.status == "manual_attention"
+    assert result.model_call_count == 1
+    assert result.coverage_summary is not None
+    assert result.coverage_summary.ambiguous_count == len(inventory.ordered_blocks)
+    assert [item.request_kind for item in client.requests] == ["evidence_coverage"]

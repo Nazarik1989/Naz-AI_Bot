@@ -69,6 +69,7 @@ REVIEW_STATES = frozenset({REVIEW_PASSED, REVIEW_REJECTED, REVIEW_SUPERSEDED})
 OUTCOME_DRAFT_READY_FOR_REVIEW = "draft_ready_for_review"
 OUTCOME_SOURCE_INSUFFICIENT = "source_insufficient"
 OUTCOME_MANUAL_ATTENTION = "manual_attention"
+OUTCOME_MANUAL_ATTENTION_PACKAGE_READY = "manual_attention_package_ready"
 OUTCOME_SENSITIVE_REJECTED = "sensitive_rejected"
 OUTCOME_EXISTING_DRAFT = "existing_draft"
 OUTCOME_PROCESSING = "processing"
@@ -82,6 +83,7 @@ PUBLIC_OUTCOMES = frozenset({
     OUTCOME_DRAFT_READY_FOR_REVIEW,
     OUTCOME_SOURCE_INSUFFICIENT,
     OUTCOME_MANUAL_ATTENTION,
+    OUTCOME_MANUAL_ATTENTION_PACKAGE_READY,
     OUTCOME_SENSITIVE_REJECTED,
     OUTCOME_EXISTING_DRAFT,
     OUTCOME_PROCESSING,
@@ -121,6 +123,7 @@ REASON_CODES = frozenset({
     "narrative_normalizer_evidence_invalid",
     "narrative_normalizer_evidence_incomplete",
     "narrative_normalizer_evidence_ambiguous",
+    "narrative_normalizer_manual_attention_package_ready",
     "narrative_normalizer_review_authority_unavailable",
     "narrative_normalizer_trust_unavailable",
     "narrative_normalizer_trust_invalid",
@@ -876,6 +879,19 @@ class DraftArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualAttentionArtifact:
+    source_identity: str
+    payload: Mapping[str, object]
+    markdown: str
+
+    def __post_init__(self) -> None:
+        if type(self.source_identity) is not str or _HEX64.fullmatch(self.source_identity) is None:
+            raise TypeError("source_identity")
+        if type(self.payload) is not dict or type(self.markdown) is not str or not self.markdown:
+            raise TypeError("manual attention artifact")
+
+
+@dataclass(frozen=True, slots=True)
 class NormalizationOutcome:
     source_id: str
     source_digest: str
@@ -950,6 +966,7 @@ class BatchResult:
             OUTCOME_DRAFT_READY_FOR_REVIEW: counts.get(OUTCOME_DRAFT_READY_FOR_REVIEW, 0),
             "source_insufficient": counts.get(OUTCOME_SOURCE_INSUFFICIENT, 0),
             "manual_attention": counts.get(OUTCOME_MANUAL_ATTENTION, 0),
+            OUTCOME_MANUAL_ATTENTION_PACKAGE_READY: counts.get(OUTCOME_MANUAL_ATTENTION_PACKAGE_READY, 0),
             "sensitive_rejected": counts.get(OUTCOME_SENSITIVE_REJECTED, 0),
             OUTCOME_EXISTING_DRAFT: counts.get(OUTCOME_EXISTING_DRAFT, 0),
             OUTCOME_PROCESSING: counts.get(OUTCOME_PROCESSING, 0),
@@ -2925,7 +2942,11 @@ def assemble_draft_artifact(
     evidence_model_call_count: int = 0,
     supersedes: Mapping[str, object] | None = None,
 ) -> DraftArtifact:
-    if result.model_call_count not in {2, 3} or evidence_model_call_count not in {0, 2}:
+    if (
+        result.model_call_count not in {2, 3}
+        or evidence_model_call_count not in {0, 2, 3}
+        or result.model_call_count + evidence_model_call_count > 5
+    ):
         _raise("narrative_normalizer_model_budget_exceeded")
     candidate = _selected(result)
     package = candidate.package
@@ -4431,6 +4452,95 @@ def _write_exclusive_file(path: Path, payload: bytes, *, mode: int = 0o600) -> N
         os.chmod(path, mode)
 
 
+MANUAL_ATTENTION_CONTRACT_VERSION = "normalizer-manual-attention-v1"
+_MANUAL_ATTENTION_KEYS = frozenset({
+    "schema_version", "source_identity", "reason_code", "coverage_counts",
+    "verified_candidate_fact_summaries", "why_no_complete_story", "human_actions",
+    "narrative_ready", "package_digest",
+})
+
+
+def _manual_attention_artifact(
+    source_identity_value: str,
+    summary: evidence.EvidenceCoverageSummary,
+) -> ManualAttentionArtifact:
+    counts = {
+        "blocks": summary.block_count,
+        "segments": summary.segment_count,
+        "evidence_candidates": summary.evidence_candidate_count,
+        "context_only": summary.context_only_count,
+        "structural": summary.structural_count,
+        "sensitive_withheld": summary.sensitive_count,
+        "ambiguous": summary.ambiguous_count,
+        "omitted": summary.omitted_count,
+    }
+    core = {
+        "schema_version": MANUAL_ATTENTION_CONTRACT_VERSION,
+        "source_identity": source_identity_value,
+        "reason_code": summary.reason_code,
+        "coverage_counts": counts,
+        "verified_candidate_fact_summaries": [],
+        "why_no_complete_story": (
+            "Coverage could not safely authorize a complete public story without human judgement."
+        ),
+        "human_actions": ["use_selected_facts", "skip", "discuss"],
+        "narrative_ready": False,
+    }
+    payload = dict(core, package_digest=_sha(core))
+    markdown = (
+        "# Manual attention required\n\n"
+        f"Reason: {summary.reason_code}.\n\n"
+        f"Coverage: {summary.block_count} blocks and {summary.segment_count} segments; "
+        f"{summary.ambiguous_count} ambiguous, {summary.omitted_count} omitted, "
+        f"{summary.sensitive_count} sensitive withheld.\n\n"
+        "No complete story or approval was produced. Human actions: use selected facts, skip, or discuss.\n"
+    )
+    return ManualAttentionArtifact(source_identity_value, payload, markdown)
+
+
+def _validate_manual_attention_directory(path: Path, expected_identity: str) -> dict[str, object]:
+    if (
+        not path.is_dir()
+        or path.is_symlink()
+        or frozenset(item.name for item in path.iterdir())
+        != frozenset(outbox_permissions.MANUAL_ATTENTION_FILE_NAMES)
+    ):
+        _raise("narrative_normalizer_persistence_invalid")
+    payload = _json_read(
+        path / "manual-attention.json", _MANUAL_ATTENTION_KEYS,
+        "narrative_normalizer_persistence_invalid",
+    )
+    core = dict(payload)
+    digest = core.pop("package_digest", None)
+    counts = core.get("coverage_counts")
+    if (
+        core.get("schema_version") != MANUAL_ATTENTION_CONTRACT_VERSION
+        or core.get("source_identity") != expected_identity
+        or core.get("reason_code") not in {
+            "coverage_incomplete", "coverage_conflict", "coverage_ambiguous"
+        }
+        or type(counts) is not dict
+        or frozenset(counts) != frozenset({
+            "blocks", "segments", "evidence_candidates", "context_only", "structural",
+            "sensitive_withheld", "ambiguous", "omitted",
+        })
+        or any(type(value) is not int or value < 0 for value in counts.values())
+        or core.get("verified_candidate_fact_summaries") != []
+        or core.get("human_actions") != ["use_selected_facts", "skip", "discuss"]
+        or core.get("narrative_ready") is not False
+        or type(digest) is not str
+        or digest != _sha(core)
+    ):
+        _raise("narrative_normalizer_persistence_invalid")
+    try:
+        markdown = (path / "manual-attention.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        _raise("narrative_normalizer_persistence_invalid")
+    if not markdown or evidence._is_sensitive(markdown):
+        _raise("narrative_normalizer_persistence_invalid")
+    return payload
+
+
 class NarrativeOutboxStore:
     """Lazy, source-identity keyed persistence for review-only drafts."""
 
@@ -4939,6 +5049,50 @@ class NarrativeOutboxStore:
                 if existing is None or existing != candidate:
                     _raise("narrative_normalizer_claim_invalid")
             return self._write_claim_locked(candidate)
+
+    @_privacy_boundary("narrative_normalizer_persistence_invalid")
+    def persist_manual_attention(
+        self,
+        artifact: ManualAttentionArtifact,
+    ) -> tuple[Path, bool]:
+        if type(artifact) is not ManualAttentionArtifact:
+            raise TypeError("artifact")
+        final = self.root / artifact.source_identity
+        if os.path.lexists(final):
+            if self.permission_policy.shared:
+                outbox_permissions.verify_shared_manual_attention(
+                    self.permission_policy, self.root, final
+                )
+            existing = _validate_manual_attention_directory(final, artifact.source_identity)
+            if existing == artifact.payload:
+                return final, True
+            _raise("narrative_normalizer_persistence_conflict")
+        self._ensure_write_layout()
+        staging = self.root / f".staging-{artifact.source_identity}-{secrets.token_hex(8)}"
+        try:
+            staging.mkdir(mode=0o700)
+            _write_exclusive_file(
+                staging / "manual-attention.json",
+                _canonical(artifact.payload) + b"\n",
+            )
+            _write_exclusive_file(
+                staging / "manual-attention.md", artifact.markdown.encode("utf-8")
+            )
+            _fsync_directory(staging)
+            _validate_manual_attention_directory(staging, artifact.source_identity)
+            os.rename(staging, final)
+            if self.permission_policy.shared:
+                outbox_permissions.finalize_shared_manual_attention(
+                    self.permission_policy, self.root, final
+                )
+            _fsync_directory(self.root)
+            _validate_manual_attention_directory(final, artifact.source_identity)
+            return final, False
+        except FileExistsError:
+            _raise("narrative_normalizer_persistence_conflict")
+        finally:
+            if os.path.lexists(staging):
+                _cleanup_owned_path(staging)
 
     @_privacy_boundary("narrative_normalizer_persistence_invalid")
     def persist(self, artifact: DraftArtifact) -> tuple[Path, bool]:
@@ -6363,6 +6517,9 @@ class _EvidenceCapturingGenerationService(generation.NarrativeGenerationService)
             f"normalizer_cp2_evidence_{id(self)}",
             default=None,
         )
+        self._repair_allowed: ContextVar[bool] = ContextVar(
+            f"normalizer_cp2_repair_allowed_{id(self)}", default=True
+        )
 
     def _call_parse(
         self,
@@ -6371,7 +6528,11 @@ class _EvidenceCapturingGenerationService(generation.NarrativeGenerationService)
         calls: list[str],
         repair_used: list[bool],
     ) -> object:
-        parsed = super()._call_parse(request, parser, calls, repair_used)
+        if self._repair_allowed.get():
+            parsed = super()._call_parse(request, parser, calls, repair_used)
+        else:
+            calls.append(request.request_kind)
+            parsed = parser(self._client.generate_json(request))
         capture = self._evidence_capture.get()
         if capture is not None and request.request_kind in {"generation", "adjudication"}:
             self._evidence_capture.set((*capture, (request.request_kind, parsed)))
@@ -6380,12 +6541,18 @@ class _EvidenceCapturingGenerationService(generation.NarrativeGenerationService)
     def generate_with_evidence(
         self,
         context: generation.NarrativeGenerationInput,
+        *,
+        allow_repair: bool = True,
     ) -> tuple[generation.NarrativeGenerationResult, _CapturedCP2Evidence]:
+        if type(allow_repair) is not bool:
+            raise TypeError("allow_repair")
         token = self._evidence_capture.set(())
+        repair_token = self._repair_allowed.set(allow_repair)
         try:
             result = super().generate(context)
             records = self._evidence_capture.get()
         finally:
+            self._repair_allowed.reset(repair_token)
             self._evidence_capture.reset(token)
         if records is None or tuple(item[0] for item in records) != ("generation", "adjudication"):
             _raise("narrative_normalizer_generation_failed")
@@ -6651,6 +6818,21 @@ class NarrativeNormalizerService:
             identity = source_identity(source.source_ref, source.source_digest, source.receipt.source_contract_version)
             final = self.store.draft_path(source.source_digest, source_ref=source.source_ref)
             if os.path.lexists(final):
+                if final.is_dir() and not final.is_symlink() and (
+                    frozenset(item.name for item in final.iterdir())
+                    == frozenset(outbox_permissions.MANUAL_ATTENTION_FILE_NAMES)
+                ):
+                    if self.store.permission_policy.shared:
+                        outbox_permissions.verify_shared_manual_attention(
+                            self.store.permission_policy, self.store.root, final
+                        )
+                    _validate_manual_attention_directory(final, identity)
+                    return self._outcome(
+                        source,
+                        OUTCOME_MANUAL_ATTENTION_PACKAGE_READY,
+                        reasons=("narrative_normalizer_manual_attention_package_ready",),
+                        evidence_path="generic",
+                    )
                 self.store._verify_draft_permissions(final)
                 value = validate_draft_directory(
                     final,
@@ -6749,6 +6931,7 @@ class NarrativeNormalizerService:
                         else OUTCOME_MANUAL_ATTENTION
                         if reason in {
                             "narrative_normalizer_evidence_ambiguous",
+                            "narrative_normalizer_manual_attention_package_ready",
                             "narrative_normalizer_trust_unavailable",
                         }
                         else OUTCOME_FAILED
@@ -6788,6 +6971,28 @@ class NarrativeNormalizerService:
                 }
                 if resolution.status != "verified":
                     status = outcome_by_resolution.get(resolution.status, OUTCOME_FAILED)
+                    if (
+                        resolution.status == "manual_attention"
+                        and resolution.coverage_summary is not None
+                    ):
+                        artifact = _manual_attention_artifact(
+                            identity, resolution.coverage_summary
+                        )
+                        self.store.persist_manual_attention(artifact)
+                        reason = "narrative_normalizer_manual_attention_package_ready"
+                        self._record_failed_claim_locked(
+                            source,
+                            attempt_id=attempt_id,
+                            started_at=started_at,
+                            reason_code=reason,
+                        )
+                        return self._outcome(
+                            source,
+                            OUTCOME_MANUAL_ATTENTION_PACKAGE_READY,
+                            reasons=(reason,),
+                            calls=model_calls,
+                            evidence_path="generic",
+                        )
                     reason = (
                         "narrative_normalizer_source_insufficient"
                         if status == OUTCOME_SOURCE_INSUFFICIENT
@@ -6821,10 +7026,20 @@ class NarrativeNormalizerService:
             )
             with _provider_source_scope(self.generation_service, identity):
                 result, captured_evidence = self.generation_service.generate_with_evidence(
-                    normalization_input.generation_input
+                    normalization_input.generation_input,
+                    allow_repair=(
+                        fast_path
+                        or self.evidence_service is None
+                        or not self.evidence_service.coverage_v2
+                    ),
                 )
             model_calls += result.model_call_count
-            if result.model_call_count not in {2, 3}:
+            coverage_v2_path = bool(
+                not fast_path
+                and self.evidence_service is not None
+                and self.evidence_service.coverage_v2
+            )
+            if result.model_call_count not in ({2} if coverage_v2_path else {2, 3}):
                 _raise("narrative_normalizer_model_budget_exceeded")
             model_identity = _sha({
                 "generation_model": self.generation_service.generation_model,

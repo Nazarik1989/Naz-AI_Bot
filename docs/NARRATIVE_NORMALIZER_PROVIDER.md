@@ -229,3 +229,27 @@ in development: all execution tests use fake transports and network
 tripwires. The adapter remains dormant and the Review Authority Broker still
 blocks production rollout; separate deployment and first-five execution
 authorization are required.
+
+## Coverage-planned generic evidence
+
+The production factory enables `normalizer-evidence-coverage-v2`. Code first
+groups source segments into immutable, source-bound blocks. The coverage call
+must return one closed disposition for every dynamic block ID; unknown,
+duplicate, missing, conflicting, or source-mismatched decisions fail closed.
+Sensitive blocks contain only opaque identifiers and digests at the provider
+boundary.
+
+Only blocks classified as `evidence_candidate` enter the extraction request.
+Code then expands the block plan back to every original segment exactly once
+and applies the existing quote, span, entity, number, date, polarity, temporal,
+causal, source-binding, and adjudication validators. The generic path owns five
+non-retryable operation slots: coverage, extraction, evidence adjudication,
+story generation, and story adjudication. Story repair is not available on this
+path.
+
+An incomplete or ambiguous coverage plan creates a safe
+`normalizer-manual-attention-v1` package containing only opaque identity,
+counts, a stable reason, and the closed human actions `use_selected_facts`,
+`skip`, and `discuss`. It contains no source text, quotes, prompts, paths, or
+credentials; it is not a draft, cannot be approved, does not create Broker
+state, and cannot become `narrative_ready`.

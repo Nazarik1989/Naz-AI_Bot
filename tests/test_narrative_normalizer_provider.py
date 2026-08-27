@@ -206,6 +206,71 @@ def _bind_story_payload_to_review_context(payload, context):
     return value
 
 
+def _generic_v2_responses(documents, propositions):
+    core = _core_normalizer_test_helpers()
+    legacy_extraction, _legacy_adjudication = core.generic_evidence_responses(
+        documents, propositions
+    )
+    inventory = evidence.build_source_block_inventory(documents)
+    coverage = {
+        "schema_version": evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "run_id": "coverage-run-v2",
+        "block_dispositions": {
+            block.block_id: (
+                "sensitive_withheld"
+                if block.sensitivity_status == "sensitive_withheld"
+                else "evidence_candidate"
+            )
+            for block in inventory.ordered_blocks
+        },
+    }
+    plan = evidence.parse_coverage_response(coverage, documents, inventory)
+    block_for_segment = {
+        segment_id: block.block_id
+        for block in inventory.ordered_blocks
+        for segment_id in block.ordered_segment_ids
+    }
+    extraction = {
+        "schema_version": evidence.EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "coverage_plan_digest": plan.plan_digest,
+        "run_id": "extraction-run-v2",
+        "evidence": [
+            dict(
+                item,
+                ordered_block_refs=list(dict.fromkeys(
+                    block_for_segment[segment_id]
+                    for segment_id in item["ordered_segment_refs"]
+                )),
+            )
+            for item in legacy_extraction["evidence"]
+        ],
+    }
+    parsed = evidence.parse_extraction_v2_response(
+        extraction, documents, inventory, plan
+    )
+    adjudication = {
+        "schema_version": evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "extraction_bundle_digest": parsed.bundle_digest,
+        "run_id": "adjudication-run-v2",
+        "decisions": [
+            {
+                "evidence_id": item.evidence_id,
+                "evidence_digest": evidence.evidence_digest(item),
+                "decision": "supported",
+                "reason_codes": [],
+            }
+            for item in parsed.ordered_evidence
+        ],
+    }
+    return coverage, extraction, adjudication
+
+
 def _generic_provider_batch(
     tmp_path, *, source_count: int, repair: bool, fail_index: int | None = None
 ):
@@ -238,6 +303,9 @@ def _generic_provider_batch(
         extraction, evidence_adjudication = core.generic_evidence_responses(
             documents, propositions
         )
+        coverage_v2, extraction_v2, adjudication_v2 = _generic_v2_responses(
+            documents, propositions
+        )
         if fail_index is not None and index == fail_index:
             replies.append(RuntimeError("private provider detail must not escape"))
             continue
@@ -261,9 +329,7 @@ def _generic_provider_batch(
             core.generic_story_response(load_fixture("quiet_object"), propositions), context
         )
         story_adjudication = fake_adjudication_payload(story, context)
-        replies.extend((extraction, evidence_adjudication))
-        if repair:
-            replies.append({"unexpected": "schema"})
+        replies.extend((coverage_v2, extraction_v2, adjudication_v2))
         replies.extend((story, story_adjudication))
     transport.replies.extend(replies)
     service = normalizer.NarrativeNormalizerService(
@@ -987,10 +1053,8 @@ def test_fake_production_adapter_fast_path_uses_two_calls_then_resume_and_approv
     assert len(transport.calls) == call_count
 
 
-@pytest.mark.parametrize("repair", (False, True), ids=("four-call", "five-call-repair"))
 def test_fake_production_adapter_generic_path_obeys_exact_budget_and_model_free_approval(
     tmp_path,
-    repair,
 ):
     core = _core_normalizer_test_helpers()
     _shape, filename, body, propositions = core._GENERIC_E2E_SHAPES[0]
@@ -1019,6 +1083,9 @@ def test_fake_production_adapter_generic_path_obeys_exact_budget_and_model_free_
     extraction, evidence_adjudication = core.generic_evidence_responses(
         documents, propositions
     )
+    coverage_v2, extraction_v2, adjudication_v2 = _generic_v2_responses(
+        documents, propositions
+    )
     preparation = evidence.GenericEvidenceService(
         core.QueueClient((copy.deepcopy(extraction), copy.deepcopy(evidence_adjudication))),
         extraction_model=CONTENT_MODEL,
@@ -1038,11 +1105,7 @@ def test_fake_production_adapter_generic_path_obeys_exact_budget_and_model_free_
         core.generic_story_response(load_fixture("quiet_object"), propositions), context
     )
     story_adjudication = fake_adjudication_payload(story, context)
-    transport.replies.extend((extraction, evidence_adjudication))
-    if repair:
-        transport.replies.extend(({"unexpected": "schema"}, story, story_adjudication))
-    else:
-        transport.replies.extend((story, story_adjudication))
+    transport.replies.extend((coverage_v2, extraction_v2, adjudication_v2, story, story_adjudication))
     service = normalizer.NarrativeNormalizerService(
         policy=policy,
         context_provider=dependencies[0],
@@ -1059,20 +1122,19 @@ def test_fake_production_adapter_generic_path_obeys_exact_budget_and_model_free_
             f"{error.reason_code}; transport_calls={len(transport.calls)}; "
             f"ledger={client.ledger.snapshot()}"
         )
-    expected_calls = 5 if repair else 4
-    assert outcome.status == normalizer.OUTCOME_DRAFT_READY_FOR_REVIEW
+    expected_calls = 5
+    assert outcome.status == normalizer.OUTCOME_DRAFT_READY_FOR_REVIEW, (
+        outcome, client.ledger.snapshot(), transport.calls
+    )
     assert outcome.evidence_path == "generic"
     assert outcome.model_call_count == expected_calls
-    assert [item.operation for item in client.ledger.snapshot()] == (
-        ["evidence_extraction", "evidence_adjudication", "generation", "repair", "adjudication"]
-        if repair
-        else ["evidence_extraction", "evidence_adjudication", "generation", "adjudication"]
-    )
-    assert [item.model_id for item in client.ledger.snapshot()] == (
-        [CONTENT_MODEL, REVIEW_MODEL, CONTENT_MODEL, CONTENT_MODEL, REVIEW_MODEL]
-        if repair
-        else [CONTENT_MODEL, REVIEW_MODEL, CONTENT_MODEL, REVIEW_MODEL]
-    )
+    assert [item.operation for item in client.ledger.snapshot()] == [
+        "evidence_coverage", "evidence_extraction", "evidence_adjudication",
+        "generation", "adjudication",
+    ]
+    assert [item.model_id for item in client.ledger.snapshot()] == [
+        CONTENT_MODEL, CONTENT_MODEL, REVIEW_MODEL, CONTENT_MODEL, REVIEW_MODEL,
+    ]
 
     draft = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
     value = normalizer.validate_draft_directory(
@@ -1106,13 +1168,13 @@ def test_fake_production_adapter_source_three_failure_has_no_retry_and_batch_con
         normalizer.OUTCOME_DRAFT_READY_FOR_REVIEW,
         normalizer.OUTCOME_DRAFT_READY_FOR_REVIEW,
     ]
-    assert [item.model_call_count for item in result.outcomes] == [4, 4, 1, 4, 4]
-    assert len(transport.calls) == 17
+    assert [item.model_call_count for item in result.outcomes] == [5, 5, 1, 5, 5]
+    assert len(transport.calls) == 21
     ledger = client.ledger.snapshot()
-    assert ledger[8].source_identity == normalizer.source_identity(
+    assert ledger[10].source_identity == normalizer.source_identity(
         records[2].source_ref, records[2].source_digest
     )
-    assert ledger[8].safe_outcome == provider.PROVIDER_TRANSPORT_FAILED
+    assert ledger[10].safe_outcome == provider.PROVIDER_TRANSPORT_FAILED
     assert all(item.attempt_number == 1 for item in ledger)
     before = len(transport.calls)
     ledger_before = len(ledger)
@@ -1122,19 +1184,17 @@ def test_fake_production_adapter_source_three_failure_has_no_retry_and_batch_con
     assert len(client.ledger.snapshot()) == ledger_before
 
 
-@pytest.mark.parametrize("repair", (False, True), ids=("twenty-calls", "twenty-five-calls"))
 def test_fake_production_adapter_exact_five_generic_sources_never_begin_a_sixth(
     tmp_path,
-    repair,
 ):
     records, service, client, transport = _generic_provider_batch(
-        tmp_path, source_count=6, repair=repair
+        tmp_path, source_count=6, repair=False
     )
     selected = records[:5]
     result = service.normalize_batch(
         tuple((item.source_ref, item.source_digest) for item in selected)
     )
-    expected_calls = 25 if repair else 20
+    expected_calls = 25
     assert len(result.outcomes) == 5
     assert all(item.status == normalizer.OUTCOME_DRAFT_READY_FOR_REVIEW for item in result.outcomes)
     assert sum(item.model_call_count for item in result.outcomes) == expected_calls

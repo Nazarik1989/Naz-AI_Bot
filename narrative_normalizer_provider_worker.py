@@ -96,11 +96,17 @@ def _decode_request(value: object) -> object:
     if request_type == "evidence":
         fields = _exact_mapping(
             fields,
-            frozenset({"request_kind", "model", "payload_json", "response_schema_version"}),
+            frozenset({
+                "request_kind", "model", "payload_json", "response_schema_version",
+                "required_block_ids",
+            }),
         )
+        block_ids = _decode_value(fields["required_block_ids"])
+        if type(block_ids) is not tuple:
+            raise provider.NormalizerProviderError(provider.PROVIDER_CONFIGURATION_INVALID)
         return evidence.EvidenceModelRequest(
             fields["request_kind"], fields["model"], fields["payload_json"],
-            fields["response_schema_version"],
+            fields["response_schema_version"], block_ids,
         )
     raise provider.NormalizerProviderError(provider.PROVIDER_CONFIGURATION_INVALID)
 
@@ -213,7 +219,7 @@ def _bootstrap(value: object):
 
 
 def _expected_model(config: provider.ProviderConfiguration, operation: str) -> str:
-    if operation in {"generation", "repair", "evidence_extraction"}:
+    if operation in {"generation", "repair", "evidence_coverage", "evidence_extraction"}:
         return config.generation_model
     if operation in {"adjudication", "evidence_adjudication"}:
         return config.adjudication_model

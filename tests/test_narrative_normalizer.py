@@ -2882,6 +2882,83 @@ def test_generic_path_schema_repair_uses_exact_five_call_budget_and_model_free_a
     )
 
 
+def test_coverage_v2_incomplete_source_persists_safe_manual_attention_package(tmp_path):
+    _, filename, body, _propositions = _GENERIC_E2E_SHAPES[0]
+    inbox = tmp_path / "inbox"
+    outbox = tmp_path / "outbox"
+    registry = tmp_path / "state" / "registry.json"
+    source_path = inbox / "Manual-Coverage" / "2026-08-20"
+    source_path.mkdir(parents=True)
+    registry.parent.mkdir(parents=True)
+    (source_path / filename).write_text(body, encoding="utf-8")
+    trust_service = nn.trust.NarrativeTrustService(TEST_TRUST_KEY)
+    policy = rq.QuarantinePathPolicy(
+        inbox, registry, outbox, trust_service, tmp_path / "review-authority"
+    )
+    rq.reconcile_complete_backlog(policy, now=NOW)
+    record = rq.read_registry(registry).records[0]
+    documents = nn.read_source_documents(
+        policy, record.source_ref, expected_digest=record.source_digest
+    )
+    inventory = nn.evidence.build_source_block_inventory(documents)
+    coverage = {
+        "schema_version": nn.evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "run_id": "manual-coverage-run",
+        "block_dispositions": {
+            block.block_id: "ambiguous" for block in inventory.ordered_blocks
+        },
+    }
+    evidence_client = QueueClient([coverage])
+    generation_client = QueueClient([])
+    service = nn.NarrativeNormalizerService(
+        policy=policy,
+        context_provider=nn.TemplateNarrativeContextProvider(fixture_to_input(load_fixture("quiet_object"))),
+        generation_service=ng.NarrativeGenerationService(
+            generation_client,
+            generation_model="content-model",
+            adjudication_model="review-model",
+        ),
+        evidence_service=nn.evidence.GenericEvidenceService(
+            evidence_client,
+            extraction_model="content-model",
+            adjudication_model="review-model",
+            coverage_v2=True,
+        ),
+        trust_service=trust_service,
+        clock=lambda: NOW,
+    )
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+    assert outcome.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY, outcome
+    assert outcome.model_call_count == 1
+    package = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
+    assert {item.name for item in package.iterdir()} == {
+        "manual-attention.json", "manual-attention.md"
+    }
+    payload = json.loads((package / "manual-attention.json").read_text(encoding="utf-8"))
+    assert payload["narrative_ready"] is False
+    assert payload["verified_candidate_fact_summaries"] == []
+    assert payload["human_actions"] == ["use_selected_facts", "skip", "discuss"]
+    assert not (package / "story.json").exists()
+    assert generation_client.requests == []
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+    with pytest.raises(nn.NarrativeNormalizerError):
+        nn.validate_draft_directory(package, trust_service=trust_service, require_trust=True)
+    with pytest.raises(nn.NarrativeNormalizerError):
+        service.store.approve(
+            record.source_ref,
+            record.source_digest,
+            expected_draft_identity="not-a-draft",
+            reviewed_at=NOW.isoformat(),
+        )
+    replay = service.normalize_source(record.source_ref, record.source_digest)
+    assert replay.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert replay.model_call_count == 0
+    assert len(evidence_client.requests) == 1
+
+
 @pytest.mark.parametrize(
     "retained_token_indexes",
     ((0,), (0, 1), (0, 2), (2, 1, 0)),
