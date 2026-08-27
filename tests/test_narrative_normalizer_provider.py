@@ -4,6 +4,7 @@ import asyncio
 import ast
 import copy
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import os
@@ -94,11 +95,17 @@ class FakeTransport:
         self._channel = channel
 
 
-def authorization(*, env=None, sources=AUTHORIZED_SOURCES):
+def authorization(
+    *,
+    env=None,
+    sources=AUTHORIZED_SOURCES,
+    run_profile=provider.FIRST_FIVE_RUN_PROFILE,
+):
     return provider.authorize_live_provider_run(
         adapter_spec=provider.PRODUCTION_ADAPTER_SPEC,
         local_execution_enabled=True,
         live_provider_enabled=True,
+        run_profile=run_profile,
         source_identities=tuple(sources),
         env=live_env() if env is None else env,
         trust_service=TEST_TRUST_SERVICE,
@@ -106,9 +113,15 @@ def authorization(*, env=None, sources=AUTHORIZED_SOURCES):
     )
 
 
-def adapter(transport: FakeTransport | None = None, *, env=None, sources=AUTHORIZED_SOURCES):
+def adapter(
+    transport: FakeTransport | None = None,
+    *,
+    env=None,
+    sources=AUTHORIZED_SOURCES,
+    run_profile=provider.FIRST_FIVE_RUN_PROFILE,
+):
     fake = transport or FakeTransport()
-    approved = authorization(env=env, sources=sources)
+    approved = authorization(env=env, sources=sources, run_profile=run_profile)
     return adapter_from_authorization(approved, fake)
 
 
@@ -272,7 +285,12 @@ def _generic_v2_responses(documents, propositions):
 
 
 def _generic_provider_batch(
-    tmp_path, *, source_count: int, repair: bool, fail_index: int | None = None
+    tmp_path,
+    *,
+    source_count: int,
+    repair: bool,
+    fail_index: int | None = None,
+    run_profile: str = provider.FIRST_FIVE_RUN_PROFILE,
 ):
     core = _core_normalizer_test_helpers()
     _shape, filename, body, propositions = core._GENERIC_E2E_SHAPES[0]
@@ -292,8 +310,21 @@ def _generic_provider_batch(
     records = quarantine.read_registry(registry).records
     assert len(records) == source_count
     transport = FakeTransport()
+    selected_count = (
+        provider.CANARY_SOURCE_COUNT
+        if run_profile == provider.CANARY_RUN_PROFILE
+        else provider.FIRST_FIVE_SOURCE_COUNT
+    )
+    selected_sources = tuple(
+        normalizer.source_identity(item.source_ref, item.source_digest)
+        for item in records[:selected_count]
+    )
+    if run_profile == provider.FIRST_FIVE_RUN_PROFILE:
+        selected_sources = authorized_sources_for_records(records[:selected_count])
     dependencies, client, _ = adapter(
-        transport, sources=authorized_sources_for_records(records[:5])
+        transport,
+        sources=selected_sources,
+        run_profile=run_profile,
     )
     replies = []
     for index, record in enumerate(records):
@@ -355,11 +386,19 @@ def narrative_request(operation: str, model: str):
 
 def evidence_request(operation: str, model: str):
     version = (
-        evidence.EVIDENCE_EXTRACTION_CONTRACT_VERSION
+        evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION
+        if operation == "evidence_coverage"
+        else evidence.EVIDENCE_EXTRACTION_CONTRACT_VERSION
         if operation == "evidence_extraction"
         else evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION
     )
-    return evidence.EvidenceModelRequest(operation, model, '{"safe":"payload"}', version)
+    return evidence.EvidenceModelRequest(
+        operation,
+        model,
+        '{"safe":"payload"}',
+        version,
+        ("block-0001",) if operation == "evidence_coverage" else (),
+    )
 
 
 @pytest.mark.parametrize(
@@ -415,17 +454,17 @@ def test_evidence_schema_version_mismatch_rejects_before_transport(operation, ve
 
 @pytest.mark.parametrize(
     ("operation", "request_factory", "model"),
-    (
-        ("evidence_extraction", evidence_request, CONTENT_MODEL),
-        ("generation", narrative_request, CONTENT_MODEL),
-        ("repair", narrative_request, CONTENT_MODEL),
-        ("evidence_adjudication", evidence_request, REVIEW_MODEL),
+        (
+            ("evidence_extraction", evidence_request, CONTENT_MODEL),
+            ("evidence_coverage", evidence_request, CONTENT_MODEL),
+            ("generation", narrative_request, CONTENT_MODEL),
+            ("evidence_adjudication", evidence_request, REVIEW_MODEL),
         ("adjudication", narrative_request, REVIEW_MODEL),
     ),
     ids=(
-        "correct-extraction-model",
-        "correct-generation-model",
-        "correct-repair-model",
+            "correct-extraction-model",
+            "correct-coverage-model",
+            "correct-generation-model",
         "correct-evidence-adjudication-model",
         "correct-story-adjudication-model",
     ),
@@ -640,15 +679,18 @@ def test_hard_call_budget_blocks_call_twenty_six_before_transport():
     transport = FakeTransport()
     _dependencies, client, _ = adapter(transport)
     operations = (
-        "evidence_extraction", "evidence_adjudication", "generation", "repair", "adjudication"
+        "evidence_coverage", "evidence_extraction", "evidence_adjudication",
+        "generation", "adjudication",
     )
     for source_identity in AUTHORIZED_SOURCES:
         for operation in operations:
             if operation.startswith("evidence_"):
-                model = CONTENT_MODEL if operation == "evidence_extraction" else REVIEW_MODEL
+                model = CONTENT_MODEL if operation in {
+                    "evidence_coverage", "evidence_extraction",
+                } else REVIEW_MODEL
                 request = evidence_request(operation, model)
             else:
-                model = CONTENT_MODEL if operation in {"generation", "repair"} else REVIEW_MODEL
+                model = CONTENT_MODEL if operation == "generation" else REVIEW_MODEL
                 request = narrative_request(operation, model)
             invoke(client, request, source_identity)
     with pytest.raises(provider.NormalizerProviderError) as caught:
@@ -663,18 +705,20 @@ def test_hard_call_budget_blocks_call_twenty_six_before_transport():
     (
         (("generation", "adjudication"), 2),
         (("evidence_extraction", "evidence_adjudication", "generation", "adjudication"), 4),
-        (("evidence_extraction", "evidence_adjudication", "generation", "repair", "adjudication"), 5),
+        (("evidence_coverage", "evidence_extraction", "evidence_adjudication", "generation", "adjudication"), 5),
     ),
-    ids=("fast-path-two", "generic-four", "generic-repair-five"),
+    ids=("fast-path-two", "generic-four", "generic-coverage-five"),
 )
 def test_exact_normalizer_operation_budgets(operations, expected):
     _dependencies, client, transport = adapter()
     for operation in operations:
         if operation.startswith("evidence_"):
-            model = CONTENT_MODEL if operation == "evidence_extraction" else REVIEW_MODEL
+            model = CONTENT_MODEL if operation in {
+                "evidence_coverage", "evidence_extraction",
+            } else REVIEW_MODEL
             request = evidence_request(operation, model)
         else:
-            model = CONTENT_MODEL if operation in {"generation", "repair"} else REVIEW_MODEL
+            model = CONTENT_MODEL if operation == "generation" else REVIEW_MODEL
             request = narrative_request(operation, model)
         invoke(client, request)
     assert len(transport.calls) == expected
@@ -808,6 +852,111 @@ def test_configuration_inspection_never_constructs_transport():
     summary = provider.inspect_live_configuration(live_env(), selected_source_count=5)
     assert summary["calculated_maximum_calls"] == 25
     assert summary["retry_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("profile", "count", "accepted"),
+    (
+        (provider.CANARY_RUN_PROFILE, 0, False),
+        (provider.CANARY_RUN_PROFILE, 1, True),
+        (provider.CANARY_RUN_PROFILE, 2, False),
+        (provider.CANARY_RUN_PROFILE, 5, False),
+        (provider.FIRST_FIVE_RUN_PROFILE, 1, False),
+        (provider.FIRST_FIVE_RUN_PROFILE, 4, False),
+        (provider.FIRST_FIVE_RUN_PROFILE, 5, True),
+        (provider.FIRST_FIVE_RUN_PROFILE, 6, False),
+    ),
+    ids=(
+        "canary-zero-rejected", "canary-one-accepted", "canary-two-rejected",
+        "canary-five-rejected", "first-five-one-rejected", "first-five-four-rejected",
+        "first-five-five-accepted", "first-five-six-rejected",
+    ),
+)
+def test_closed_live_run_profile_source_counts(profile, count, accepted):
+    sources = tuple(f"{index + 20:064x}" for index in range(count))
+    if accepted:
+        approved = authorization(sources=sources, run_profile=profile)
+        assert approved.run_profile == profile
+        assert approved.global_call_budget == count * 5
+    else:
+        with pytest.raises(provider.NormalizerProviderError) as caught:
+            authorization(sources=sources, run_profile=profile)
+        assert caught.value.reason_code == provider.PROVIDER_CONFIGURATION_INVALID
+
+
+def test_live_run_profile_rules_are_immutable_code_owned_values():
+    rules = normalizer.run_profiles.LIVE_RUN_PROFILE_RULES
+    assert type(rules) is tuple
+    assert tuple(rule.profile for rule in rules) == provider.LIVE_RUN_PROFILES
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        rules[0].call_budget = 25
+
+
+@pytest.mark.parametrize(
+    "profile",
+    (None, "canary-v1", "unknown-profile", StringSubclass(provider.CANARY_RUN_PROFILE)),
+    ids=("missing", "alias", "unknown", "str-subclass"),
+)
+def test_unknown_or_nonexact_live_run_profile_rejected_before_worker(profile, monkeypatch):
+    constructions = []
+    monkeypatch.setattr(provider, "_start_worker_channel", lambda *_a, **_k: constructions.append(True))
+    with pytest.raises(provider.NormalizerProviderError):
+        authorization(
+            sources=(AUTHORIZED_SOURCES[0],),
+            run_profile=profile,
+        )
+    assert constructions == []
+
+
+def test_caller_budget_override_is_rejected_before_worker(monkeypatch):
+    constructions = []
+    monkeypatch.setattr(provider, "_start_worker_channel", lambda *_a, **_k: constructions.append(True))
+    with pytest.raises(provider.NormalizerProviderError) as caught:
+        provider.authorize_live_provider_run(
+            adapter_spec=provider.PRODUCTION_ADAPTER_SPEC,
+            local_execution_enabled=True,
+            live_provider_enabled=True,
+            run_profile=provider.CANARY_RUN_PROFILE,
+            source_identities=(AUTHORIZED_SOURCES[0],),
+            env=live_env(),
+            trust_service=TEST_TRUST_SERVICE,
+            review_authority_root=TEST_AUTHORITY_ROOT,
+            global_call_budget=25,
+        )
+    assert caught.value.reason_code == provider.PROVIDER_CONFIGURATION_INVALID
+    assert constructions == []
+
+
+def test_canary_profile_enforces_one_source_five_operations_and_no_repair():
+    transport = FakeTransport()
+    _dependencies, client, _ = adapter(
+        transport,
+        sources=(AUTHORIZED_SOURCES[0],),
+        run_profile=provider.CANARY_RUN_PROFILE,
+    )
+    operations = (
+        "evidence_coverage", "evidence_extraction", "evidence_adjudication",
+        "generation", "adjudication",
+    )
+    for operation in operations:
+        model = CONTENT_MODEL if operation in {
+            "evidence_coverage", "evidence_extraction", "generation",
+        } else REVIEW_MODEL
+        request = (
+            evidence_request(operation, model)
+            if operation.startswith("evidence_")
+            else narrative_request(operation, model)
+        )
+        invoke(client, request, AUTHORIZED_SOURCES[0])
+    assert len(transport.calls) == provider.CANARY_MAX_PROVIDER_CALLS
+    assert client.ledger.max_calls == provider.CANARY_MAX_PROVIDER_CALLS
+    with pytest.raises(provider.NormalizerProviderError):
+        invoke(client, narrative_request("generation", CONTENT_MODEL), AUTHORIZED_SOURCES[0])
+    with pytest.raises(provider.NormalizerProviderError):
+        invoke(client, narrative_request("repair", CONTENT_MODEL), AUTHORIZED_SOURCES[0])
+    with pytest.raises(provider.NormalizerProviderError):
+        invoke(client, narrative_request("generation", CONTENT_MODEL), AUTHORIZED_SOURCES[1])
+    assert len(transport.calls) == provider.CANARY_MAX_PROVIDER_CALLS
 
 
 def _cli_paths(tmp_path: Path) -> list[str]:
@@ -965,6 +1114,7 @@ def test_cli_exact_five_opaque_targets_prints_preflight_before_factory(tmp_path,
         *_cli_paths(tmp_path),
         "--review-authority-root", str(tmp_path / "authority"),
         "normalize", "--enable-local-execution", "--enable-live-provider",
+        "--live-run-profile", provider.FIRST_FIVE_RUN_PROFILE,
         "--adapter", provider.PRODUCTION_ADAPTER_SPEC,
     ]
     for identity in identities:
@@ -977,6 +1127,7 @@ def test_cli_exact_five_opaque_targets_prints_preflight_before_factory(tmp_path,
     assert captured_authorization["adapter_spec"] == provider.PRODUCTION_ADAPTER_SPEC
     assert captured_authorization["local_execution_enabled"] is True
     assert captured_authorization["live_provider_enabled"] is True
+    assert captured_authorization["run_profile"] == provider.FIRST_FIVE_RUN_PROFILE
     assert captured_authorization["source_identities"] == identities
 
 
@@ -992,6 +1143,108 @@ def test_cli_rejects_sixth_target_before_factory(tmp_path, monkeypatch):
     for identity in identities:
         args.extend(("--source-identity", identity))
     assert cli.run(args) == 2
+
+
+def test_cli_one_source_canary_requires_profile_and_builds_non_destructive_retry(
+    tmp_path, monkeypatch, capsys
+):
+    row = ("source/one", "a" * 64)
+    identity = normalizer.source_identity(*row)
+    monkeypatch.setattr(normalizer, "scan_needs_narrative", lambda _policy: (row,))
+    monkeypatch.setattr(
+        cli,
+        "_load_trust_service",
+        lambda _args: trust.NarrativeTrustService(b"x" * 32),
+    )
+
+    class FakeAuthorization:
+        def safe_summary(self):
+            return {
+                "adapter_version": provider.NORMALIZER_PRODUCTION_ADAPTER_VERSION,
+                "run_profile": provider.CANARY_RUN_PROFILE,
+                "selected_source_count": 1,
+                "calculated_maximum_calls": 5,
+                "retry_count": 0,
+            }
+
+    class Result:
+        def safe_summary(self):
+            return {"status_counts": {}, "total": 1}
+
+    captured = {}
+
+    class Service:
+        def __init__(self, **kwargs):
+            captured["service"] = kwargs
+
+        def normalize_batch(self, selected, **kwargs):
+            captured["selected"] = tuple(selected)
+            captured["batch"] = kwargs
+            return Result()
+
+    fake_dependencies, _client, _transport = adapter(
+        sources=(identity,), run_profile=provider.CANARY_RUN_PROFILE
+    )
+    fake_authorization = FakeAuthorization()
+    def authorize(**kwargs):
+        captured["authorization"] = kwargs
+        return fake_authorization
+
+    monkeypatch.setattr(provider, "authorize_live_provider_run", authorize)
+    monkeypatch.setattr(
+        provider,
+        "production_adapter_factory",
+        lambda value: fake_dependencies if value is fake_authorization else None,
+    )
+    monkeypatch.setattr(normalizer, "NarrativeNormalizerService", Service)
+    args = [
+        *_cli_paths(tmp_path),
+        "--review-authority-root", str(tmp_path / "authority"),
+        "normalize",
+        "--enable-local-execution",
+        "--enable-live-provider",
+        "--live-run-profile", provider.CANARY_RUN_PROFILE,
+        "--adapter", provider.PRODUCTION_ADAPTER_SPEC,
+        "--source-identity", identity,
+        "--manual-retry-request-id", "manual-canary-retry-0001",
+        "--expected-failed-attempt-id", "b" * 32,
+        "--expected-failed-claim-digest", "c" * 64,
+    ]
+
+    assert cli.run(args, _allow_local_review_authority_for_tests=True) == 0
+    retry = captured["batch"]["manual_retry"]
+    assert type(retry) is normalizer.ManualRetryRequest
+    assert retry.source_identity == identity
+    assert retry.run_profile == provider.CANARY_RUN_PROFILE
+    assert captured["authorization"]["source_identities"] == (identity,)
+    assert captured["authorization"]["run_profile"] == provider.CANARY_RUN_PROFILE
+    assert captured["selected"] == (row,)
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[0]["live_provider_preflight"]["calculated_maximum_calls"] == 5
+
+
+def test_cli_live_construction_without_explicit_profile_is_rejected_before_authorization(
+    tmp_path, monkeypatch
+):
+    row = ("source/one", "a" * 64)
+    identity = normalizer.source_identity(*row)
+    monkeypatch.setattr(normalizer, "scan_needs_narrative", lambda _policy: (row,))
+    calls = []
+    monkeypatch.setattr(
+        provider,
+        "authorize_live_provider_run",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    rc = cli.run([
+        *_cli_paths(tmp_path),
+        "normalize",
+        "--enable-local-execution",
+        "--enable-live-provider",
+        "--adapter", provider.PRODUCTION_ADAPTER_SPEC,
+        "--source-identity", identity,
+    ])
+    assert rc == 2
+    assert calls == []
 
 
 def test_fake_production_adapter_fast_path_uses_two_calls_then_resume_and_approval_use_zero(
@@ -1154,6 +1407,68 @@ def test_fake_production_adapter_generic_path_obeys_exact_budget_and_model_free_
     assert len(transport.calls) == before_approval
 
 
+def test_fake_production_canary_manual_retry_uses_one_source_and_exact_five_calls(tmp_path):
+    core = _core_normalizer_test_helpers()
+    records, service, client, transport = _generic_provider_batch(
+        tmp_path,
+        source_count=1,
+        repair=False,
+        run_profile=provider.CANARY_RUN_PROFILE,
+    )
+    record = records[0]
+    source = normalizer.read_source_unit(
+        service.policy,
+        record.source_ref,
+        expected_digest=record.source_digest,
+        allow_insufficient=True,
+    )
+    timestamp = core.NOW.isoformat().replace("+00:00", "Z")
+    processing = normalizer._claim_payload(
+        source,
+        attempt_id="a" * 32,
+        state=normalizer.CLAIM_PROCESSING,
+        started_at=timestamp,
+        updated_at=timestamp,
+    )
+    service.store.write_claim(processing)
+    service.store.write_claim(dict(
+        processing,
+        state=normalizer.CLAIM_FAILED,
+        reason_code="narrative_normalizer_evidence_invalid",
+    ))
+    old_path = service.store.claim_path(record.source_ref, record.source_digest)
+    old_bytes = old_path.read_bytes()
+    old_digest = hashlib.sha256(old_bytes).hexdigest()
+    retry = normalizer.ManualRetryRequest(
+        normalizer.source_identity(record.source_ref, record.source_digest),
+        record.source_digest,
+        "a" * 32,
+        old_digest,
+        "production-shape-canary-retry-0001",
+        provider.CANARY_RUN_PROFILE,
+    )
+
+    outcome = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=retry,
+    )
+
+    assert outcome.status == normalizer.OUTCOME_DRAFT_READY_FOR_REVIEW
+    assert outcome.model_call_count == provider.CANARY_MAX_PROVIDER_CALLS
+    assert len(transport.calls) == provider.CANARY_MAX_PROVIDER_CALLS
+    assert len(client.ledger.snapshot()) == provider.CANARY_MAX_PROVIDER_CALLS
+    assert service.store.archived_attempt_bytes(
+        retry.source_identity, retry.previous_failed_attempt_id
+    ) == old_bytes
+    current = service.store.read_claim(record.source_ref, record.source_digest)
+    assert current is not None and current["state"] == normalizer.CLAIM_COMPLETED
+    assert current["attempt_id"] != retry.previous_failed_attempt_id
+    with pytest.raises(provider.NormalizerProviderError):
+        invoke(client, narrative_request("generation", CONTENT_MODEL), AUTHORIZED_SOURCES[0])
+    assert len(transport.calls) == provider.CANARY_MAX_PROVIDER_CALLS
+
+
 def test_fake_production_adapter_source_three_failure_has_no_retry_and_batch_continues(tmp_path):
     records, service, client, transport = _generic_provider_batch(
         tmp_path, source_count=6, repair=False, fail_index=2
@@ -1275,6 +1590,7 @@ def test_authorization_boundary_rejects_each_missing_or_forged_gate(field, value
         "adapter_spec": provider.PRODUCTION_ADAPTER_SPEC,
         "local_execution_enabled": True,
         "live_provider_enabled": True,
+        "run_profile": provider.FIRST_FIVE_RUN_PROFILE,
         "source_identities": AUTHORIZED_SOURCES,
         "env": live_env(),
         "trust_service": TEST_TRUST_SERVICE,
@@ -1667,7 +1983,8 @@ def test_exact_duplicate_after_safe_transport_failure_never_retries(failure, rea
 def test_exact_duplicate_does_not_consume_twenty_sixth_budget_slot():
     _dependencies, client, transport = adapter()
     operations = (
-        "evidence_extraction", "evidence_adjudication", "generation", "repair", "adjudication"
+        "evidence_coverage", "evidence_extraction", "evidence_adjudication",
+        "generation", "adjudication",
     )
     first = ipc_message(client, "3" * 24, narrative_request("generation", CONTENT_MODEL))
     assert exchange_ipc(client, first)["status"] == "ok"
@@ -1678,7 +1995,7 @@ def test_exact_duplicate_does_not_consume_twenty_sixth_budget_slot():
             if source_identity == AUTHORIZED_SOURCES[0] and operation == "generation":
                 continue
             model = CONTENT_MODEL if operation in {
-                "evidence_extraction", "generation", "repair"
+                "evidence_coverage", "evidence_extraction", "generation"
             } else REVIEW_MODEL
             request = (
                 evidence_request(operation, model)
@@ -1833,17 +2150,20 @@ def test_concurrent_call_twenty_six_is_rejected_before_transport():
     transport = FakeTransport()
     _dependencies, client, _ = adapter(transport)
     operations = (
-        "evidence_extraction", "evidence_adjudication", "generation", "repair", "adjudication"
+        "evidence_coverage", "evidence_extraction", "evidence_adjudication",
+        "generation", "adjudication",
     )
     for source_index, source_identity in enumerate(AUTHORIZED_SOURCES):
         for operation in operations:
             if source_index == 4 and operation == "adjudication":
                 continue
             if operation.startswith("evidence_"):
-                model = CONTENT_MODEL if operation == "evidence_extraction" else REVIEW_MODEL
+                model = CONTENT_MODEL if operation in {
+                    "evidence_coverage", "evidence_extraction",
+                } else REVIEW_MODEL
                 request = evidence_request(operation, model)
             else:
-                model = CONTENT_MODEL if operation in {"generation", "repair"} else REVIEW_MODEL
+                model = CONTENT_MODEL if operation == "generation" else REVIEW_MODEL
                 request = narrative_request(operation, model)
             invoke(client, request, source_identity)
     barrier = threading.Barrier(2)
@@ -2032,7 +2352,9 @@ def test_provider_documentation_matches_sealed_contract():
     )
     required = (
         "LiveProviderRunAuthorization",
-        "exactly five",
+        provider.CANARY_RUN_PROFILE,
+        provider.FIRST_FIVE_RUN_PROFILE,
+        "byte-identical",
         "one-shot",
         "shared private",
         "recursive",

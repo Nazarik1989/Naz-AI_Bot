@@ -1523,6 +1523,197 @@ def test_explicit_uncertain_retry_uses_exact_single_pair(tmp_path):
     assert service.store.read_claim(record.source_ref, record.source_digest)["attempt_id"] == "c" * 32
 
 
+def _seed_failed_claim(service, source, *, attempt_id="d" * 32):
+    timestamp = NOW.isoformat().replace("+00:00", "Z")
+    processing = nn._claim_payload(
+        source,
+        attempt_id=attempt_id,
+        state=nn.CLAIM_PROCESSING,
+        started_at=timestamp,
+        updated_at=timestamp,
+    )
+    service.store.write_claim(processing)
+    failed = dict(
+        processing,
+        state=nn.CLAIM_FAILED,
+        reason_code="narrative_normalizer_evidence_invalid",
+    )
+    service.store.write_claim(failed)
+    path = service.store.claim_path(source.source_ref, source.source_digest)
+    payload = path.read_bytes()
+    return path, payload, hashlib.sha256(payload).hexdigest()
+
+
+def _manual_retry_request(source, previous_digest, *, request_id="manual-retry-request-0001", **updates):
+    values = {
+        "source_identity": nn.source_identity(source.source_ref, source.source_digest),
+        "source_digest": source.source_digest,
+        "previous_failed_attempt_id": "d" * 32,
+        "previous_failed_claim_digest": previous_digest,
+        "operator_request_id": request_id,
+        "run_profile": nn.run_profiles.CANARY_RUN_PROFILE,
+    }
+    values.update(updates)
+    return nn.ManualRetryRequest(**values)
+
+
+def test_manual_retry_archives_old_failed_bytes_and_completes_new_attempt(tmp_path):
+    values = runtime(tmp_path)
+    record, source, client, service = values[3], values[4], values[7], values[8]
+    claim_path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(source, old_digest)
+
+    outcome = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=request,
+    )
+
+    assert outcome.status == nn.OUTCOME_DRAFT_READY_FOR_REVIEW
+    current = service.store.read_claim(record.source_ref, record.source_digest)
+    assert current is not None and current["state"] == nn.CLAIM_COMPLETED
+    assert current["attempt_id"] != "d" * 32
+    assert claim_path.read_bytes() != old_bytes
+    assert service.store.archived_attempt_bytes(
+        request.source_identity, request.previous_failed_attempt_id
+    ) == old_bytes
+    history = service.store.attempt_history(record.source_ref, record.source_digest)
+    assert [item["attempt_id"] for item in history] == [
+        request.previous_failed_attempt_id,
+        current["attempt_id"],
+    ]
+    assert [item["state"] for item in history] == [
+        nn.CLAIM_FAILED,
+        nn.CLAIM_COMPLETED,
+    ]
+    assert hashlib.sha256(old_bytes).hexdigest() == old_digest
+    assert len(client.requests) == 2
+
+
+def test_manual_retry_exact_request_is_byte_idempotent_and_zero_call_replay(tmp_path):
+    values = runtime(tmp_path)
+    record, source, client, service = values[3], values[4], values[7], values[8]
+    _path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(source, old_digest)
+    first = service.normalize_source(record.source_ref, record.source_digest, manual_retry=request)
+    request_path = service.store._manual_retry_request_path(request.operator_request_id)
+    request_bytes = request_path.read_bytes()
+    attempt_id = service.store._read_manual_retry_record(
+        request.operator_request_id
+    )["attempt_id"]
+    calls = len(client.requests)
+
+    second = service.normalize_source(record.source_ref, record.source_digest, manual_retry=request)
+
+    assert first.status == nn.OUTCOME_DRAFT_READY_FOR_REVIEW
+    assert second.status == nn.OUTCOME_EXISTING_DRAFT
+    assert len(client.requests) == calls
+    assert request_path.read_bytes() == request_bytes
+    assert service.store._read_manual_retry_record(
+        request.operator_request_id
+    )["attempt_id"] == attempt_id
+    assert service.store.archived_attempt_bytes(
+        request.source_identity, request.previous_failed_attempt_id
+    ) == old_bytes
+
+
+@pytest.mark.parametrize(
+    "change",
+    ("source", "profile", "previous-attempt", "previous-digest"),
+)
+def test_manual_retry_divergent_request_conflicts_without_mutation(tmp_path, change):
+    values = runtime(tmp_path)
+    record, source, client, service = values[3], values[4], values[7], values[8]
+    _path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(source, old_digest)
+    service.normalize_source(record.source_ref, record.source_digest, manual_retry=request)
+    claim_before = service.store.claim_path(record.source_ref, record.source_digest).read_bytes()
+    calls_before = len(client.requests)
+    updates = {
+        "source": {"source_identity": "f" * 64},
+        "profile": {"run_profile": nn.run_profiles.FIRST_FIVE_RUN_PROFILE},
+        "previous-attempt": {"previous_failed_attempt_id": "e" * 32},
+        "previous-digest": {"previous_failed_claim_digest": "f" * 64},
+    }[change]
+    divergent = _manual_retry_request(
+        source,
+        old_digest,
+        request_id=request.operator_request_id,
+        **updates,
+    )
+
+    outcome = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=divergent,
+    )
+    assert outcome.status == nn.OUTCOME_FAILED
+    assert outcome.reason_codes in {
+        ("narrative_normalizer_manual_retry_invalid",),
+        ("narrative_normalizer_manual_retry_conflict",),
+    }
+    assert service.store.claim_path(record.source_ref, record.source_digest).read_bytes() == claim_before
+    assert service.store.archived_attempt_bytes(
+        request.source_identity, request.previous_failed_attempt_id
+    ) == old_bytes
+    assert len(client.requests) == calls_before
+
+
+def test_manual_retry_wrong_previous_attempt_rejected_before_claim_or_model(tmp_path):
+    values = runtime(tmp_path)
+    record, source, client, service = values[3], values[4], values[7], values[8]
+    claim_path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(
+        source,
+        old_digest,
+        previous_failed_attempt_id="e" * 32,
+    )
+    outcome = service.normalize_source(
+        record.source_ref, record.source_digest, manual_retry=request
+    )
+    assert outcome.status == nn.OUTCOME_FAILED
+    assert outcome.reason_codes == ("narrative_normalizer_manual_retry_invalid",)
+    assert claim_path.read_bytes() == old_bytes
+    assert client.requests == []
+
+
+def test_manual_retry_transport_failure_keeps_archived_predecessor_byte_exact(tmp_path, monkeypatch):
+    values = runtime(tmp_path)
+    record, source, client, service = values[3], values[4], values[7], values[8]
+    _path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(source, old_digest)
+
+    def fail(_request):
+        raise RuntimeError("private provider failure")
+
+    monkeypatch.setattr(client, "generate_json", fail)
+    with pytest.raises(nn.NarrativeNormalizerError, match="narrative_normalizer_internal_error"):
+        service.normalize_source(record.source_ref, record.source_digest, manual_retry=request)
+    assert service.store.archived_attempt_bytes(
+        request.source_identity, request.previous_failed_attempt_id
+    ) == old_bytes
+    current = service.store.read_claim(record.source_ref, record.source_digest)
+    assert current is not None and current["state"] == nn.CLAIM_FAILED
+    assert current["attempt_id"] != request.previous_failed_attempt_id
+
+
+def test_failed_claim_cannot_advance_without_archived_manual_retry_contract(tmp_path):
+    values = runtime(tmp_path)
+    source, service = values[4], values[8]
+    claim_path, old_bytes, _old_digest = _seed_failed_claim(service, source)
+    timestamp = NOW.isoformat().replace("+00:00", "Z")
+    forged_processing = nn._claim_payload(
+        source,
+        attempt_id="e" * 32,
+        state=nn.CLAIM_PROCESSING,
+        started_at=timestamp,
+        updated_at=timestamp,
+    )
+    with pytest.raises(nn.NarrativeNormalizerError, match="narrative_normalizer_claim_invalid"):
+        service.store._write_claim_locked(forged_processing)
+    assert claim_path.read_bytes() == old_bytes
+
+
 def test_unsupported_fact_reference_fails_without_draft_or_hidden_repair(tmp_path):
     spec, policy, source_path, record = write_source(tmp_path)
     source = nn.read_source_unit(policy, record.source_ref, expected_digest=record.source_digest)
@@ -2957,6 +3148,88 @@ def test_coverage_v2_incomplete_source_persists_safe_manual_attention_package(tm
     assert replay.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
     assert replay.model_call_count == 0
     assert len(evidence_client.requests) == 1
+
+
+def test_manual_retry_can_finish_as_useful_manual_attention_without_broker_event(tmp_path):
+    _, filename, body, _propositions = _GENERIC_E2E_SHAPES[0]
+    inbox = tmp_path / "inbox"
+    outbox = tmp_path / "outbox"
+    registry = tmp_path / "state" / "registry.json"
+    source_path = inbox / "Manual-Retry-Coverage" / "2026-08-20"
+    source_path.mkdir(parents=True)
+    registry.parent.mkdir(parents=True)
+    (source_path / filename).write_text(body, encoding="utf-8")
+    trust_service = nn.trust.NarrativeTrustService(TEST_TRUST_KEY)
+    authority_root = tmp_path / "review-authority"
+    policy = rq.QuarantinePathPolicy(
+        inbox, registry, outbox, trust_service, authority_root
+    )
+    rq.reconcile_complete_backlog(policy, now=NOW)
+    record = rq.read_registry(registry).records[0]
+    documents = nn.read_source_documents(
+        policy, record.source_ref, expected_digest=record.source_digest
+    )
+    source = nn.read_source_unit(
+        policy,
+        record.source_ref,
+        expected_digest=record.source_digest,
+        allow_insufficient=True,
+    )
+    inventory = nn.evidence.build_source_block_inventory(documents)
+    coverage = {
+        "schema_version": nn.evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "run_id": "manual-retry-coverage-run",
+        "block_dispositions": {
+            block.block_id: "ambiguous" for block in inventory.ordered_blocks
+        },
+    }
+    evidence_client = QueueClient([coverage])
+    generation_client = QueueClient([])
+    service = nn.NarrativeNormalizerService(
+        policy=policy,
+        context_provider=nn.TemplateNarrativeContextProvider(
+            fixture_to_input(load_fixture("quiet_object"))
+        ),
+        generation_service=ng.NarrativeGenerationService(
+            generation_client,
+            generation_model="content-model",
+            adjudication_model="review-model",
+        ),
+        evidence_service=nn.evidence.GenericEvidenceService(
+            evidence_client,
+            extraction_model="content-model",
+            adjudication_model="review-model",
+            coverage_v2=True,
+        ),
+        trust_service=trust_service,
+        clock=lambda: NOW,
+    )
+    _path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(source, old_digest, request_id="manual-retry-attention-0001")
+
+    outcome = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=request,
+    )
+
+    assert outcome.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert outcome.model_call_count == 1
+    package = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
+    assert {item.name for item in package.iterdir()} == {
+        "manual-attention.json", "manual-attention.md"
+    }
+    assert not authority_root.exists()
+    assert generation_client.requests == []
+    assert service.store.archived_attempt_bytes(
+        request.source_identity, request.previous_failed_attempt_id
+    ) == old_bytes
+    current = service.store.read_claim(record.source_ref, record.source_digest)
+    assert current is not None and current["attempt_id"] != request.previous_failed_attempt_id
+    assert current["reason_code"] == "narrative_normalizer_manual_attention_package_ready"
 
 
 @pytest.mark.parametrize(

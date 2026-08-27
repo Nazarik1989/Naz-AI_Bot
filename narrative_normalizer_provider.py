@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 import narrative_generation as generation
 import narrative_normalizer as normalizer
 import narrative_normalizer_evidence as evidence
+import narrative_normalizer_run_profiles as run_profiles
 import model_boundary_privacy as privacy
 import narrative_normalizer_review_state as review_state
 import narrative_normalizer_trust as trust
@@ -50,6 +51,11 @@ MIN_TIMEOUT_SECONDS = 10
 MAX_TIMEOUT_SECONDS = 300
 MAX_PROVIDER_CALLS = 25
 FIRST_FIVE_SOURCE_COUNT = 5
+CANARY_SOURCE_COUNT = 1
+CANARY_MAX_PROVIDER_CALLS = 5
+CANARY_RUN_PROFILE = run_profiles.CANARY_RUN_PROFILE
+FIRST_FIVE_RUN_PROFILE = run_profiles.FIRST_FIVE_RUN_PROFILE
+LIVE_RUN_PROFILES = run_profiles.LIVE_RUN_PROFILES
 WORKER_STARTUP_TIMEOUT_SECONDS = 10
 WORKER_BOOTSTRAP_VERSION = "normalizer-provider-worker-bootstrap-v1"
 WORKER_READY_VERSION = "normalizer-provider-worker-ready-v1"
@@ -61,7 +67,9 @@ _IPC_REQUEST_KEYS = frozenset({
     "schema_version", "run_id", "request_id", "source_identity", "operation", "payload",
 })
 _IPC_CONTROL_KEYS = frozenset({"schema_version", "action", "payload"})
-_IPC_CONTROL_ACTIONS = frozenset({"ledger", "calls", "messages", "enqueue", "shutdown", "crash"})
+_IPC_CONTROL_ACTIONS = frozenset({
+    "ledger", "max_calls", "calls", "messages", "enqueue", "shutdown", "crash",
+})
 
 PROVIDER_DISABLED = "normalizer_provider_disabled"
 PROVIDER_CONFIGURATION_INVALID = "normalizer_provider_configuration_invalid"
@@ -172,8 +180,17 @@ class ProviderConfiguration:
         if type(self.max_calls) is not int or self.max_calls != MAX_PROVIDER_CALLS:
             raise TypeError("max_calls")
 
-    def safe_summary(self, *, selected_source_count: int) -> dict[str, object]:
-        if type(selected_source_count) is not int or selected_source_count != FIRST_FIVE_SOURCE_COUNT:
+    def safe_summary(
+        self,
+        *,
+        selected_source_count: int,
+        run_profile: str = FIRST_FIVE_RUN_PROFILE,
+    ) -> dict[str, object]:
+        try:
+            rule = run_profiles.resolve_live_run_profile(run_profile)
+        except ValueError:
+            _raise(PROVIDER_CONFIGURATION_INVALID)
+        if type(selected_source_count) is not int or selected_source_count != rule.source_count:
             _raise(PROVIDER_CONFIGURATION_INVALID)
         return {
             "adapter_version": self.adapter_version,
@@ -187,9 +204,10 @@ class ProviderConfiguration:
             },
             "timeout_seconds": self.timeout_seconds,
             "retry_count": 0,
-            "maximum_model_call_budget": self.max_calls,
+            "run_profile": rule.profile,
+            "maximum_model_call_budget": rule.call_budget,
             "selected_source_count": selected_source_count,
-            "calculated_maximum_calls": selected_source_count * 5,
+            "calculated_maximum_calls": rule.call_budget,
             "live_gate_enabled": True,
             "approval_enabled": False,
             "ready_manifest_enabled": False,
@@ -283,6 +301,7 @@ class LiveProviderRunAuthorization:
     local_execution_authorized: bool
     live_provider_authorized: bool
     live_environment_value: str
+    run_profile: str
     authorized_source_identities: tuple[str, ...]
     global_call_budget: int
     timeout_seconds: int
@@ -294,6 +313,10 @@ class LiveProviderRunAuthorization:
     _consumption: _AuthorizationConsumption
 
     def __post_init__(self) -> None:
+        try:
+            rule = run_profiles.resolve_live_run_profile(self.run_profile)
+        except ValueError:
+            rule = None
         invalid = (
             type(self.adapter_version) is not str
             or self.adapter_version != NORMALIZER_PRODUCTION_ADAPTER_VERSION
@@ -305,13 +328,14 @@ class LiveProviderRunAuthorization:
             or self.live_provider_authorized is not True
             or type(self.live_environment_value) is not str
             or self.live_environment_value != "1"
+            or rule is None
             or type(self.authorized_source_identities) is not tuple
-            or len(self.authorized_source_identities) != FIRST_FIVE_SOURCE_COUNT
-            or len(set(self.authorized_source_identities)) != FIRST_FIVE_SOURCE_COUNT
+            or len(self.authorized_source_identities) != (0 if rule is None else rule.source_count)
+            or len(set(self.authorized_source_identities)) != (0 if rule is None else rule.source_count)
             or any(type(item) is not str or _HEX64.fullmatch(item) is None for item in self.authorized_source_identities)
             or type(self.global_call_budget) is not int
             or isinstance(self.global_call_budget, bool)
-            or self.global_call_budget != MAX_PROVIDER_CALLS
+            or self.global_call_budget != (0 if rule is None else rule.call_budget)
             or type(self.timeout_seconds) is not int
             or isinstance(self.timeout_seconds, bool)
             or not MIN_TIMEOUT_SECONDS <= self.timeout_seconds <= MAX_TIMEOUT_SECONDS
@@ -334,6 +358,7 @@ class LiveProviderRunAuthorization:
     def safe_summary(self) -> dict[str, object]:
         return {
             "adapter_version": self.adapter_version,
+            "run_profile": self.run_profile,
             "models": {
                 "evidence_coverage": self.content_model,
                 "evidence_extraction": self.content_model,
@@ -359,13 +384,19 @@ def authorize_live_provider_run(
     adapter_spec: str,
     local_execution_enabled: bool,
     live_provider_enabled: bool,
+    run_profile: str,
     source_identities: tuple[str, ...],
     env: Mapping[str, str],
     trust_service: trust.NarrativeTrustService,
     review_authority_root: Path,
+    global_call_budget: object = None,
 ) -> LiveProviderRunAuthorization:
     """Mint one immutable, source-bound, one-shot live-run authorization."""
 
+    try:
+        rule = run_profiles.resolve_live_run_profile(run_profile)
+    except ValueError:
+        rule = None
     if (
         type(adapter_spec) is not str
         or adapter_spec != PRODUCTION_ADAPTER_SPEC
@@ -373,9 +404,11 @@ def authorize_live_provider_run(
         or local_execution_enabled is not True
         or type(live_provider_enabled) is not bool
         or live_provider_enabled is not True
+        or global_call_budget is not None
+        or rule is None
         or type(source_identities) is not tuple
-        or len(source_identities) != FIRST_FIVE_SOURCE_COUNT
-        or len(set(source_identities)) != FIRST_FIVE_SOURCE_COUNT
+        or len(source_identities) != (0 if rule is None else rule.source_count)
+        or len(set(source_identities)) != (0 if rule is None else rule.source_count)
         or any(type(item) is not str or _HEX64.fullmatch(item) is None for item in source_identities)
         or type(trust_service) is not trust.NarrativeTrustService
         or not isinstance(review_authority_root, Path)
@@ -395,8 +428,9 @@ def authorize_live_provider_run(
         True,
         True,
         "1",
+        rule.profile,
         tuple(source_identities),
-        MAX_PROVIDER_CALLS,
+        rule.call_budget,
         config.timeout_seconds,
         config.generation_model,
         config.adjudication_model,
@@ -411,11 +445,15 @@ def inspect_live_configuration(
     env: Mapping[str, str] | None = None,
     *,
     selected_source_count: int,
+    run_profile: str = FIRST_FIVE_RUN_PROFILE,
 ) -> dict[str, object]:
     """Validate live configuration without importing an SDK or creating a client."""
 
     config, _secret = _load_configuration(os.environ if env is None else env)
-    return config.safe_summary(selected_source_count=selected_source_count)
+    return config.safe_summary(
+        selected_source_count=selected_source_count,
+        run_profile=run_profile,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +463,7 @@ class _RunCapsule:
     local_execution_authorized: bool
     live_provider_authorized: bool
     live_environment_value: str
+    run_profile: str
     authorized_source_identities: tuple[str, ...]
     global_call_budget: int
     timeout_seconds: int
@@ -435,6 +474,10 @@ class _RunCapsule:
     run_id: str
 
     def __post_init__(self) -> None:
+        try:
+            rule = run_profiles.resolve_live_run_profile(self.run_profile)
+        except ValueError:
+            rule = None
         invalid = (
             type(self.adapter_version) is not str
             or self.adapter_version != NORMALIZER_PRODUCTION_ADAPTER_VERSION
@@ -446,15 +489,16 @@ class _RunCapsule:
             or self.live_provider_authorized is not True
             or type(self.live_environment_value) is not str
             or self.live_environment_value != "1"
+            or rule is None
             or type(self.authorized_source_identities) is not tuple
-            or len(self.authorized_source_identities) != FIRST_FIVE_SOURCE_COUNT
-            or len(set(self.authorized_source_identities)) != FIRST_FIVE_SOURCE_COUNT
+            or len(self.authorized_source_identities) != (0 if rule is None else rule.source_count)
+            or len(set(self.authorized_source_identities)) != (0 if rule is None else rule.source_count)
             or any(
                 type(item) is not str or _HEX64.fullmatch(item) is None
                 for item in self.authorized_source_identities
             )
             or type(self.global_call_budget) is not int
-            or self.global_call_budget != MAX_PROVIDER_CALLS
+            or self.global_call_budget != (0 if rule is None else rule.call_budget)
             or type(self.timeout_seconds) is not int
             or not MIN_TIMEOUT_SECONDS <= self.timeout_seconds <= MAX_TIMEOUT_SECONDS
             or type(self.content_model) is not str
@@ -485,6 +529,7 @@ def _sealed_run_capsule(
             authorization.local_execution_authorized,
             authorization.live_provider_authorized,
             authorization.live_environment_value,
+            authorization.run_profile,
             tuple(item for item in authorization.authorized_source_identities),
             authorization.global_call_budget,
             authorization.timeout_seconds,
@@ -614,6 +659,9 @@ class _ProviderRunState:
         with self.__lock:
             return tuple(replace(item) for item in self.__records)
 
+    def _max_calls(self) -> int:
+        return self.__capsule.global_call_budget
+
     def _begin(
         self,
         request: AuthorizedProviderRequest,
@@ -627,6 +675,9 @@ class _ProviderRunState:
             type(request) is not AuthorizedProviderRequest
             or request.run_id != self.__capsule.run_id
             or request.source_identity not in self.__capsule.authorized_source_identities
+            or request.operation not in run_profiles.resolve_live_run_profile(
+                self.__capsule.run_profile
+            ).allowed_operations
             or type(model) is not str
             or type(timeout_seconds) is not int
             or isinstance(timeout_seconds, bool)
@@ -732,7 +783,14 @@ class _ReadOnlyCallLedger:
 
     @property
     def max_calls(self) -> int:
-        return MAX_PROVIDER_CALLS
+        value = self._client()
+        channel = object.__getattribute__(value, "_ProductionModelClient__channel")
+        result = channel._control("max_calls")
+        if type(result) is not int or result not in {
+            CANARY_MAX_PROVIDER_CALLS, MAX_PROVIDER_CALLS,
+        }:
+            _raise(PROVIDER_TRANSPORT_FAILED)
+        return result
 
     def snapshot(self) -> tuple[_ProviderCallRecord, ...]:
         client = self._client()
@@ -1310,6 +1368,7 @@ def _start_worker_channel(
                 "local_execution_authorized": capsule.local_execution_authorized,
                 "live_provider_authorized": capsule.live_provider_authorized,
                 "live_environment_value": capsule.live_environment_value,
+                "run_profile": capsule.run_profile,
                 "authorized_source_identities": list(capsule.authorized_source_identities),
                 "global_call_budget": capsule.global_call_budget,
                 "timeout_seconds": capsule.timeout_seconds,
@@ -1593,10 +1652,15 @@ __all__ = (
     "ADJUDICATION_MODEL_ENV",
     "API_KEY_ENV",
     "BASE_URL_ENV",
+    "CANARY_MAX_PROVIDER_CALLS",
+    "CANARY_RUN_PROFILE",
+    "CANARY_SOURCE_COUNT",
     "DEFAULT_TIMEOUT_SECONDS",
     "FIRST_FIVE_SOURCE_COUNT",
+    "FIRST_FIVE_RUN_PROFILE",
     "GENERATION_MODEL_ENV",
     "LIVE_ENV",
+    "LIVE_RUN_PROFILES",
     "MAX_PROVIDER_CALLS",
     "NORMALIZER_PRODUCTION_ADAPTER_VERSION",
     "AuthorizedProviderRequest",

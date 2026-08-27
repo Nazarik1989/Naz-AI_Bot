@@ -37,7 +37,7 @@ _CONFIG_KEYS = frozenset({
 })
 _RUN_KEYS = frozenset({
     "adapter_version", "adapter_spec", "local_execution_authorized", "live_provider_authorized",
-    "live_environment_value", "authorized_source_identities", "global_call_budget", "timeout_seconds",
+    "live_environment_value", "run_profile", "authorized_source_identities", "global_call_budget", "timeout_seconds",
     "content_model", "adjudication_model", "trust_key_id", "review_authority_identity", "run_id",
 })
 
@@ -192,7 +192,8 @@ def _bootstrap(value: object):
     capsule = provider._RunCapsule(
         run_value["adapter_version"], run_value["adapter_spec"],
         run_value["local_execution_authorized"], run_value["live_provider_authorized"],
-        run_value["live_environment_value"], tuple(sources), run_value["global_call_budget"],
+        run_value["live_environment_value"], run_value["run_profile"], tuple(sources),
+        run_value["global_call_budget"],
         run_value["timeout_seconds"], run_value["content_model"], run_value["adjudication_model"],
         run_value["trust_key_id"], run_value["review_authority_identity"], run_value["run_id"],
     )
@@ -495,6 +496,8 @@ def _handle_control(
     payload = item["payload"]
     if action == "ledger" and payload is None:
         result: object = [_record_payload(record) for record in state._snapshot()]
+    elif action == "max_calls" and payload is None:
+        result = state._max_calls()
     elif action == "calls" and payload is None and type(transport) is _ScriptedTransport:
         result = list(transport.calls())
     elif action == "messages" and payload is None:

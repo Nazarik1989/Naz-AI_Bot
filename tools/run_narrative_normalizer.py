@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import narrative_normalizer as normalizer
+import narrative_normalizer_run_profiles as run_profiles
 import narrative_normalizer_trust as trust
 import narrative_outbox_permissions as outbox_permissions
 import narrative_review_authority_client as authority_client
@@ -57,6 +58,13 @@ def _parser() -> argparse.ArgumentParser:
         execution.add_argument("--enable-local-execution", action="store_true")
         execution.add_argument("--enable-live-provider", action="store_true")
         execution.add_argument("--adapter")
+        execution.add_argument(
+            "--live-run-profile",
+            choices=run_profiles.LIVE_RUN_PROFILES,
+        )
+        execution.add_argument("--manual-retry-request-id")
+        execution.add_argument("--expected-failed-attempt-id")
+        execution.add_argument("--expected-failed-claim-digest")
 
     sub.add_parser("list")
     show = sub.add_parser("show")
@@ -557,12 +565,27 @@ def run(
                 return 0
             if not args.adapter:
                 raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
+            retry_values = (
+                args.manual_retry_request_id,
+                args.expected_failed_attempt_id,
+                args.expected_failed_claim_digest,
+            )
+            if args.retry_failed or any(value is not None for value in retry_values) != all(
+                value is not None for value in retry_values
+            ):
+                raise normalizer.NarrativeNormalizerError(
+                    "narrative_normalizer_manual_retry_invalid"
+                )
             production_adapter_spec = (
                 "narrative_normalizer_provider:production_adapter_factory"
             )
             live_summary: dict[str, object] | None = None
             dependencies: object
             if args.adapter == production_adapter_spec:
+                if args.live_run_profile is None:
+                    raise normalizer.NarrativeNormalizerError(
+                        "narrative_normalizer_cli_invalid"
+                    )
                 _require_review_authority(
                     policy,
                     broker_client,
@@ -593,6 +616,7 @@ def run(
                         adapter_spec=args.adapter,
                         local_execution_enabled=args.enable_local_execution,
                         live_provider_enabled=args.enable_live_provider,
+                        run_profile=args.live_run_profile,
                         source_identities=requested_identities,
                         env=os.environ,
                         trust_service=trust_service,
@@ -609,7 +633,12 @@ def run(
                 except Exception:
                     raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
             else:
-                if args.enable_live_provider or not args.enable_local_execution:
+                if (
+                    args.enable_live_provider
+                    or not args.enable_local_execution
+                    or args.live_run_profile is not None
+                    or any(value is not None for value in retry_values)
+                ):
                     raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
                 _require_review_authority(
                     policy,
@@ -635,13 +664,38 @@ def run(
                 review_authority=broker_client,
                 permission_policy=permission_policy,
             )
+            manual_retry = None
+            if all(value is not None for value in retry_values):
+                if (
+                    args.live_run_profile != run_profiles.CANARY_RUN_PROFILE
+                    or len(rows) != 1
+                    or len(tuple(args.source_identities or ())) != 1
+                ):
+                    raise normalizer.NarrativeNormalizerError(
+                        "narrative_normalizer_manual_retry_invalid"
+                    )
+                ref, digest = rows[0]
+                try:
+                    manual_retry = normalizer.ManualRetryRequest(
+                        normalizer.source_identity(ref, digest),
+                        digest,
+                        args.expected_failed_attempt_id,
+                        args.expected_failed_claim_digest,
+                        args.manual_retry_request_id,
+                        args.live_run_profile,
+                    )
+                except TypeError:
+                    raise normalizer.NarrativeNormalizerError(
+                        "narrative_normalizer_manual_retry_invalid"
+                    ) from None
             result = service.normalize_batch(
                 rows,
                 limit=None,
                 max_workers=args.workers,
                 dry_run=args.dry_run,
                 retry_uncertain=args.retry_uncertain or command == "resume",
-                retry_failed=args.retry_failed or command == "resume",
+                retry_failed=False,
+                manual_retry=manual_retry,
             )
             summary = result.safe_summary()
             _emit(summary)

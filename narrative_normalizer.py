@@ -33,6 +33,7 @@ import narrative_generation as generation
 import narrative_translator as translator
 import reels_failure_quarantine as quarantine
 import narrative_normalizer_evidence as evidence
+import narrative_normalizer_run_profiles as run_profiles
 import narrative_normalizer_review_state as review_state
 import narrative_normalizer_trust as trust
 import narrative_outbox_permissions as outbox_permissions
@@ -52,6 +53,8 @@ DRAFT_SCHEMA_VERSION = "naz-narrative-draft-v3"
 DRAFT_MANIFEST_SCHEMA_VERSION = "naz-narrative-draft-manifest-v3"
 REVIEW_SCHEMA_VERSION = "naz-narrative-review-v3"
 CLAIM_SCHEMA_VERSION = "naz-narrative-normalization-claim-v3"
+MANUAL_RETRY_REQUEST_SCHEMA_VERSION = "normalizer-manual-retry-request-v1"
+MANUAL_RETRY_REASON_CODE = "narrative_normalizer_manual_retry_requested"
 REVIEWER_VERSION = "deterministic-normalizer-review-v2"
 IDEMPOTENCY_VERSION = "normalizer-source-identity-v2"
 REVIEW_ACTION_VERSION = "normalizer-review-action-v1"
@@ -114,6 +117,9 @@ REASON_CODES = frozenset({
     "narrative_normalizer_persistence_conflict",
     "narrative_normalizer_claim_invalid",
     "narrative_normalizer_claim_uncertain",
+    "narrative_normalizer_manual_retry_invalid",
+    "narrative_normalizer_manual_retry_conflict",
+    MANUAL_RETRY_REASON_CODE,
     "narrative_normalizer_review_not_passed",
     "narrative_normalizer_draft_invalid",
     "narrative_normalizer_approval_conflict",
@@ -221,6 +227,12 @@ _CLAIM_RECORD_KEYS = frozenset({
     "package_digest", "draft_identity", "selected_candidate_id", "human_story_package_digest",
     "factuality_binding_digest", "adjudication_evidence_digest", "ordered_claim_digests", "reason_code",
     "artifact_binding_digest", "key_id", "claim_seal",
+})
+_MANUAL_RETRY_REQUEST_KEYS = frozenset({
+    "schema_version", "source_identity", "source_digest",
+    "previous_failed_attempt_id", "previous_failed_claim_digest",
+    "attempt_id", "operator_request_id", "run_profile", "safe_reason_code",
+    "created_at", "key_id", "request_seal",
 })
 _ADJUDICATION_EVIDENCE_KEYS = frozenset({
     "policy_version", "run_id", "generation_model", "adjudication_model", "repair_model",
@@ -4541,6 +4553,39 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
     return payload
 
 
+@dataclass(frozen=True, slots=True)
+class ManualRetryRequest:
+    source_identity: str
+    source_digest: str
+    previous_failed_attempt_id: str
+    previous_failed_claim_digest: str
+    operator_request_id: str
+    run_profile: str
+    safe_reason_code: str = MANUAL_RETRY_REASON_CODE
+
+    def __post_init__(self) -> None:
+        try:
+            rule = run_profiles.resolve_live_run_profile(self.run_profile)
+        except ValueError:
+            rule = None
+        if (
+            type(self.source_identity) is not str
+            or _HEX64.fullmatch(self.source_identity) is None
+            or type(self.source_digest) is not str
+            or _HEX64.fullmatch(self.source_digest) is None
+            or type(self.previous_failed_attempt_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", self.previous_failed_attempt_id) is None
+            or type(self.previous_failed_claim_digest) is not str
+            or _HEX64.fullmatch(self.previous_failed_claim_digest) is None
+            or type(self.operator_request_id) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", self.operator_request_id) is None
+            or rule is None
+            or type(self.safe_reason_code) is not str
+            or self.safe_reason_code != MANUAL_RETRY_REASON_CODE
+        ):
+            raise TypeError("manual retry request")
+
+
 class NarrativeOutboxStore:
     """Lazy, source-identity keyed persistence for review-only drafts."""
 
@@ -4563,6 +4608,8 @@ class NarrativeOutboxStore:
         self._state = self.root / ".normalizer-state"
         self._locks = self._state / "locks"
         self._claims = self._state / "claims"
+        self._attempt_history = self._state / "attempt-history-v1"
+        self._manual_retry_requests = self._state / "manual-retry-requests-v1"
         self.trust_service = trust_service
         self.review_authority = review_authority
         self.permission_policy = permission_policy
@@ -4692,7 +4739,10 @@ class NarrativeOutboxStore:
 
     def _ensure_write_layout(self) -> None:
         if not self.permission_policy.shared:
-            for path in (self.root, self._state, self._locks, self._claims):
+            for path in (
+                self.root, self._state, self._locks, self._claims,
+                self._attempt_history, self._manual_retry_requests,
+            ):
                 path.mkdir(parents=True, exist_ok=True, mode=0o700)
                 if path.is_symlink() or not path.is_dir():
                     _raise("narrative_normalizer_persistence_invalid")
@@ -4704,6 +4754,8 @@ class NarrativeOutboxStore:
             (self._state, outbox_permissions.SHARED_STATE_MODE),
             (self._locks, outbox_permissions.SHARED_LOCK_DIRECTORY_MODE),
             (self._claims, outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._attempt_history, outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._manual_retry_requests, outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
         ):
             path.mkdir(parents=True, exist_ok=True, mode=mode)
             if path.is_symlink() or not path.is_dir():
@@ -4714,6 +4766,7 @@ class NarrativeOutboxStore:
             self._state,
             self._locks,
             self._claims,
+            (self._attempt_history, self._manual_retry_requests),
         )
 
     def _verify_draft_permissions(self, path: Path) -> None:
@@ -4946,6 +4999,259 @@ class NarrativeOutboxStore:
             claims.append(claim)
         return tuple(claims)
 
+    def _manual_retry_request_path(self, operator_request_id: str) -> Path:
+        if (
+            type(operator_request_id) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", operator_request_id) is None
+        ):
+            _raise("narrative_normalizer_manual_retry_invalid")
+        name = hashlib.sha256(operator_request_id.encode("utf-8")).hexdigest()
+        return self._manual_retry_requests / f"{name}.json"
+
+    def _attempt_history_path(self, source_identity_value: str, attempt_id: str) -> Path:
+        if (
+            type(source_identity_value) is not str
+            or _HEX64.fullmatch(source_identity_value) is None
+            or type(attempt_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+        ):
+            _raise("narrative_normalizer_manual_retry_invalid")
+        return self._attempt_history / source_identity_value / f"{attempt_id}.json"
+
+    def _validate_manual_retry_record(self, value: object) -> dict[str, object]:
+        payload = _exact_mapping(
+            value,
+            _MANUAL_RETRY_REQUEST_KEYS,
+            "narrative_normalizer_manual_retry_invalid",
+        )
+        try:
+            run_profiles.resolve_live_run_profile(payload["run_profile"])
+        except ValueError:
+            _raise("narrative_normalizer_manual_retry_invalid")
+        if (
+            payload["schema_version"] != MANUAL_RETRY_REQUEST_SCHEMA_VERSION
+            or type(payload["source_identity"]) is not str
+            or _HEX64.fullmatch(payload["source_identity"]) is None
+            or type(payload["source_digest"]) is not str
+            or _HEX64.fullmatch(payload["source_digest"]) is None
+            or type(payload["previous_failed_attempt_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", payload["previous_failed_attempt_id"]) is None
+            or type(payload["previous_failed_claim_digest"]) is not str
+            or _HEX64.fullmatch(payload["previous_failed_claim_digest"]) is None
+            or type(payload["attempt_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", payload["attempt_id"]) is None
+            or type(payload["operator_request_id"]) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", payload["operator_request_id"]) is None
+            or payload["safe_reason_code"] != MANUAL_RETRY_REASON_CODE
+            or not _is_timestamp(payload["created_at"])
+            or type(payload["key_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{24}", payload["key_id"]) is None
+            or type(payload["request_seal"]) is not str
+            or _HEX64.fullmatch(payload["request_seal"]) is None
+        ):
+            _raise("narrative_normalizer_manual_retry_invalid")
+        service = self._require_trust()
+        core = dict(payload)
+        seal = str(core.pop("request_seal"))
+        try:
+            receipt = trust.TrustReceipt(
+                trust.TRUST_RECEIPT_SCHEMA_VERSION,
+                trust.TRUST_ALGORITHM,
+                str(payload["key_id"]),
+                trust.TRUST_DOMAIN_CLAIM,
+                hashlib.sha256(trust.canonical_payload(core)).hexdigest(),
+                seal,
+            )
+        except trust.TrustError:
+            _raise("narrative_normalizer_manual_retry_invalid")
+        if not service.verify(trust.TRUST_DOMAIN_CLAIM, core, receipt):
+            _raise("narrative_normalizer_manual_retry_invalid")
+        return payload
+
+    def _read_manual_retry_record(self, operator_request_id: str) -> dict[str, object] | None:
+        path = self._manual_retry_request_path(operator_request_id)
+        if not os.path.lexists(path):
+            return None
+        value = _json_read(
+            path,
+            _MANUAL_RETRY_REQUEST_KEYS,
+            "narrative_normalizer_manual_retry_invalid",
+        )
+        result = self._validate_manual_retry_record(value)
+        if result["operator_request_id"] != operator_request_id:
+            _raise("narrative_normalizer_manual_retry_conflict")
+        return result
+
+    def _manual_retry_binding_matches(
+        self,
+        record: Mapping[str, object],
+        request: ManualRetryRequest,
+    ) -> bool:
+        return all((
+            record["source_identity"] == request.source_identity,
+            record["source_digest"] == request.source_digest,
+            record["previous_failed_attempt_id"] == request.previous_failed_attempt_id,
+            record["previous_failed_claim_digest"] == request.previous_failed_claim_digest,
+            record["operator_request_id"] == request.operator_request_id,
+            record["run_profile"] == request.run_profile,
+            record["safe_reason_code"] == request.safe_reason_code,
+        ))
+
+    def begin_manual_retry_locked(
+        self,
+        source: SourceUnit,
+        request: ManualRetryRequest,
+        *,
+        created_at: str,
+    ) -> tuple[str, bool]:
+        """Archive the terminal predecessor and reserve one retry idempotently.
+
+        The caller owns the source lock.  The previous claim bytes are copied
+        once to append-only history before the mutable current-claim pointer is
+        allowed to advance to the new attempt.
+        """
+
+        identity = source_identity(
+            source.source_ref,
+            source.source_digest,
+            source.receipt.source_contract_version,
+        )
+        if (
+            type(request) is not ManualRetryRequest
+            or request.source_identity != identity
+            or request.source_digest != source.source_digest
+            or not _is_timestamp(created_at)
+        ):
+            _raise("narrative_normalizer_manual_retry_invalid")
+        existing_request = self._read_manual_retry_record(request.operator_request_id)
+        if existing_request is not None:
+            if not self._manual_retry_binding_matches(existing_request, request):
+                _raise("narrative_normalizer_manual_retry_conflict")
+            return str(existing_request["attempt_id"]), True
+
+        previous = self.read_claim(source.source_ref, source.source_digest)
+        claim_path = self.claim_path(source.source_ref, source.source_digest)
+        if (
+            previous is None
+            or previous["state"] != CLAIM_FAILED
+            or previous["attempt_id"] != request.previous_failed_attempt_id
+            or not claim_path.is_file()
+            or claim_path.is_symlink()
+        ):
+            _raise("narrative_normalizer_manual_retry_invalid")
+        previous_bytes = claim_path.read_bytes()
+        if hashlib.sha256(previous_bytes).hexdigest() != request.previous_failed_claim_digest:
+            _raise("narrative_normalizer_manual_retry_invalid")
+
+        self._ensure_write_layout()
+        history_path = self._attempt_history_path(identity, request.previous_failed_attempt_id)
+        history_directory = history_path.parent
+        history_directory.mkdir(mode=0o700, exist_ok=True)
+        if history_directory.is_symlink() or not history_directory.is_dir():
+            _raise("narrative_normalizer_manual_retry_invalid")
+        if self.permission_policy.shared:
+            outbox_permissions.finalize_shared_retry_directory(
+                self.permission_policy, self.root, history_directory
+            )
+        if os.path.lexists(history_path):
+            if history_path.is_symlink() or not history_path.is_file() or history_path.read_bytes() != previous_bytes:
+                _raise("narrative_normalizer_manual_retry_conflict")
+        else:
+            _write_exclusive_file(
+                history_path,
+                previous_bytes,
+                mode=self.permission_policy.claim_file_mode,
+            )
+            if self.permission_policy.shared:
+                outbox_permissions.finalize_shared_claim(
+                    self.permission_policy, self.root, history_path
+                )
+
+        attempt_id = secrets.token_hex(16)
+        core = {
+            "schema_version": MANUAL_RETRY_REQUEST_SCHEMA_VERSION,
+            "source_identity": identity,
+            "source_digest": source.source_digest,
+            "previous_failed_attempt_id": request.previous_failed_attempt_id,
+            "previous_failed_claim_digest": request.previous_failed_claim_digest,
+            "attempt_id": attempt_id,
+            "operator_request_id": request.operator_request_id,
+            "run_profile": request.run_profile,
+            "safe_reason_code": request.safe_reason_code,
+            "created_at": created_at,
+            "key_id": self._require_trust().key_id,
+        }
+        receipt = self._require_trust().sign(trust.TRUST_DOMAIN_CLAIM, core)
+        candidate = self._validate_manual_retry_record(
+            dict(core, request_seal=receipt.seal)
+        )
+        request_path = self._manual_retry_request_path(request.operator_request_id)
+        encoded = _canonical(candidate) + b"\n"
+        try:
+            _write_exclusive_file(
+                request_path,
+                encoded,
+                mode=self.permission_policy.claim_file_mode,
+            )
+        except FileExistsError:
+            winner = self._read_manual_retry_record(request.operator_request_id)
+            if winner is None or not self._manual_retry_binding_matches(winner, request):
+                _raise("narrative_normalizer_manual_retry_conflict")
+            return str(winner["attempt_id"]), True
+        if self.permission_policy.shared:
+            outbox_permissions.finalize_shared_claim(
+                self.permission_policy, self.root, request_path
+            )
+        persisted = self._read_manual_retry_record(request.operator_request_id)
+        if persisted != candidate:
+            _raise("narrative_normalizer_manual_retry_invalid")
+        return attempt_id, False
+
+    def archived_attempt_bytes(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+    ) -> bytes:
+        path = self._attempt_history_path(source_identity_value, attempt_id)
+        if path.is_symlink() or not path.is_file():
+            _raise("narrative_normalizer_manual_retry_invalid")
+        return path.read_bytes()
+
+    def attempt_history(
+        self,
+        source_ref: str,
+        source_digest_value: str,
+    ) -> tuple[dict[str, object], ...]:
+        """Return immutable predecessors followed by the current claim pointer."""
+
+        identity = self._identity(source_ref, source_digest_value)
+        directory = self._attempt_history / identity
+        rows: list[dict[str, object]] = []
+        if os.path.lexists(directory):
+            if directory.is_symlink() or not directory.is_dir():
+                _raise("narrative_normalizer_manual_retry_invalid")
+            for path in sorted(directory.iterdir(), key=lambda item: item.name):
+                match = re.fullmatch(r"([0-9a-f]{32})\.json", path.name)
+                if match is None or path.is_symlink() or not path.is_file():
+                    _raise("narrative_normalizer_manual_retry_invalid")
+                value = _json_read(
+                    path,
+                    _CLAIM_RECORD_KEYS,
+                    "narrative_normalizer_manual_retry_invalid",
+                )
+                claim = self._validate_claim_payload(
+                    value, source_ref, source_digest_value
+                )
+                if claim["attempt_id"] != match.group(1) or claim["state"] != CLAIM_FAILED:
+                    _raise("narrative_normalizer_manual_retry_invalid")
+                rows.append(dict(claim))
+        current = self.read_claim(source_ref, source_digest_value)
+        if current is not None:
+            if any(item["attempt_id"] == current["attempt_id"] for item in rows):
+                _raise("narrative_normalizer_manual_retry_conflict")
+            rows.append(dict(current))
+        return tuple(rows)
+
     def _claim_matches_draft(self, claim: Mapping[str, object], value: Mapping[str, object]) -> bool:
         story = value["story"]
         factuality = value["factuality"]
@@ -4965,7 +5271,12 @@ class NarrativeOutboxStore:
             and claim["key_id"] == _trust_receipt(value["manifest"]["trust_receipt"]).key_id
         )
 
-    def _write_claim_locked(self, payload: Mapping[str, object]) -> bool:
+    def _write_claim_locked(
+        self,
+        payload: Mapping[str, object],
+        *,
+        manual_retry_request: ManualRetryRequest | None = None,
+    ) -> bool:
         payload = self._seal_claim_payload(payload)
         source_ref = payload.get("source_ref")
         source_digest_value = payload.get("source_digest")
@@ -4996,10 +5307,29 @@ class NarrativeOutboxStore:
             new_attempt = str(candidate["attempt_id"])
             old_state = str(existing["state"])
             new_state = str(candidate["state"])
+            archived_retry = False
+            if old_state == CLAIM_FAILED and new_state == CLAIM_PROCESSING:
+                if type(manual_retry_request) is ManualRetryRequest:
+                    record = self._read_manual_retry_record(
+                        manual_retry_request.operator_request_id
+                    )
+                    history_path = self._attempt_history_path(
+                        str(existing["source_identity"]), old_attempt
+                    )
+                    archived_retry = bool(
+                        record is not None
+                        and self._manual_retry_binding_matches(record, manual_retry_request)
+                        and record["attempt_id"] == new_attempt
+                        and new_attempt != old_attempt
+                        and history_path.is_file()
+                        and not history_path.is_symlink()
+                        and hashlib.sha256(history_path.read_bytes()).hexdigest()
+                        == manual_retry_request.previous_failed_claim_digest
+                    )
             allowed = (
                 (old_state == CLAIM_PROCESSING and new_state in {CLAIM_PROCESSING, CLAIM_UNCERTAIN, CLAIM_FAILED, CLAIM_COMPLETED} and old_attempt == new_attempt)
                 or (old_state == CLAIM_UNCERTAIN and new_state == CLAIM_PROCESSING and old_attempt == new_attempt)
-                or (old_state == CLAIM_FAILED and new_state == CLAIM_PROCESSING)
+                or archived_retry
             )
             if not allowed:
                 _raise("narrative_normalizer_claim_invalid")
@@ -6669,7 +6999,14 @@ class NarrativeNormalizerService:
         dry_run: bool = False,
         retry_uncertain: bool = False,
         retry_failed: bool = False,
+        manual_retry: ManualRetryRequest | None = None,
     ) -> NormalizationOutcome:
+        if (
+            (manual_retry is not None and type(manual_retry) is not ManualRetryRequest)
+            or (manual_retry is not None and retry_failed)
+            or (retry_failed and manual_retry is None)
+        ):
+            _raise("narrative_normalizer_manual_retry_invalid")
         documents = read_source_documents(
             self.policy,
             source_ref,
@@ -6816,6 +7153,13 @@ class NarrativeNormalizerService:
         cancellation: BaseException | None = None
         try:
             identity = source_identity(source.source_ref, source.source_digest, source.receipt.source_contract_version)
+            manual_replay = False
+            if manual_retry is not None:
+                attempt_id, manual_replay = self.store.begin_manual_retry_locked(
+                    source,
+                    manual_retry,
+                    created_at=started_at,
+                )
             final = self.store.draft_path(source.source_digest, source_ref=source.source_ref)
             if os.path.lexists(final):
                 if final.is_dir() and not final.is_symlink() and (
@@ -6921,7 +7265,9 @@ class NarrativeNormalizerService:
                 elif previous["state"] == CLAIM_UNCERTAIN:
                     attempt_id = str(previous["attempt_id"])
                     started_at = str(previous["started_at"])
-                elif previous["state"] == CLAIM_FAILED and not retry_failed:
+                elif previous["state"] == CLAIM_FAILED and (
+                    manual_retry is None or manual_replay
+                ):
                     reason = previous["reason_code"] or "narrative_normalizer_generation_failed"
                     prior_status = (
                         OUTCOME_SOURCE_INSUFFICIENT
@@ -6938,7 +7284,10 @@ class NarrativeNormalizerService:
                     )
                     return self._outcome(source, prior_status, reasons=(reason,))
             processing = _claim_payload(source, attempt_id=attempt_id, state=CLAIM_PROCESSING, started_at=started_at, updated_at=started_at)
-            self.store._write_claim_locked(processing)
+            self.store._write_claim_locked(
+                processing,
+                manual_retry_request=manual_retry,
+            )
             claim_started = True
             if not fast_path:
                 assert self.evidence_service is not None
@@ -7186,10 +7535,15 @@ class NarrativeNormalizerService:
         dry_run: bool = False,
         retry_uncertain: bool = False,
         retry_failed: bool = False,
+        manual_retry: ManualRetryRequest | None = None,
     ) -> BatchResult:
         if type(max_workers) is not int or not 1 <= max_workers <= MAX_WORKERS:
             raise TypeError("max_workers")
         ordered = tuple(sorted(rows))
+        if manual_retry is not None and (
+            type(manual_retry) is not ManualRetryRequest or len(ordered) != 1
+        ):
+            raise TypeError("manual_retry")
         if limit is not None:
             if type(limit) is not int or limit < 1:
                 raise TypeError("limit")
@@ -7204,6 +7558,7 @@ class NarrativeNormalizerService:
                         dry_run=dry_run,
                         retry_uncertain=retry_uncertain,
                         retry_failed=retry_failed,
+                        manual_retry=manual_retry,
                     ))
                 except NarrativeNormalizerError as error:
                     serial.append(NormalizationOutcome(
@@ -7216,7 +7571,8 @@ class NarrativeNormalizerService:
                 futures = {
                     pool.submit(
                         self.normalize_source, ref, digest,
-                        dry_run=dry_run, retry_uncertain=retry_uncertain, retry_failed=retry_failed,
+                        dry_run=dry_run, retry_uncertain=retry_uncertain,
+                        retry_failed=retry_failed, manual_retry=manual_retry,
                     ): index
                     for index, (ref, digest) in enumerate(ordered)
                 }

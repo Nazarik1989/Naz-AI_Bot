@@ -202,15 +202,37 @@ def finalize_shared_internal_layout(
     state: Path,
     locks: Path,
     claims: Path,
+    extra_state_directories: tuple[Path, ...] = (),
 ) -> None:
+    if type(extra_state_directories) is not tuple or any(
+        type(path) is not Path for path in extra_state_directories
+    ):
+        _fail()
     uid = finalize_shared_root(policy, root)
     assert policy.shared_gid is not None
     for path, mode in (
         (state, SHARED_STATE_MODE),
         (locks, SHARED_LOCK_DIRECTORY_MODE),
         (claims, SHARED_CLAIM_DIRECTORY_MODE),
+        *((path, SHARED_CLAIM_DIRECTORY_MODE) for path in extra_state_directories),
     ):
         _apply(path, directory=True, uid=uid, gid=policy.shared_gid, mode=mode)
+
+
+def finalize_shared_retry_directory(
+    policy: NarrativeOutboxPermissionPolicy,
+    root: Path,
+    directory: Path,
+) -> None:
+    uid = verify_shared_root(policy, root)
+    assert policy.shared_gid is not None
+    _apply(
+        directory,
+        directory=True,
+        uid=uid,
+        gid=policy.shared_gid,
+        mode=SHARED_CLAIM_DIRECTORY_MODE,
+    )
 
 
 def finalize_shared_draft(

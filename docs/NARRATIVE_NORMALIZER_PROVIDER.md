@@ -28,8 +28,7 @@ The adapter uses existing production names without importing `main.py`:
 - `OPENAI_API_KEY`: OpenAI-compatible credential;
 - `OPENAI_BASE_URL`: explicit HTTPS endpoint without credentials, query or
   fragment;
-- `CONTENT_MODEL_NAME`: extraction, story generation and the one optional
-  structural repair;
+- `CONTENT_MODEL_NAME`: coverage planning, extraction and story generation;
 - `MODEL_NAME`: evidence and story adjudication;
 - `NARRATIVE_NORMALIZER_MODEL_TIMEOUT_SECONDS`: optional exact decimal integer,
   10 through 300 inclusive; default `120`;
@@ -56,7 +55,7 @@ disabled and every component provider request receives the configured bounded
 timeout (default 120 seconds, allowed range 10–300). This is a per-request SDK
 and transport timeout, not a separate whole-run deadline. There is no HTTP or
 adapter retry/backoff for connect/reset failures, timeout, HTTP 429 or HTTP 5xx.
-CP6B's single schema repair is the only optional extra call.
+The closed live profiles do not authorize story repair or hidden retry.
 
 ## Live gates
 
@@ -65,25 +64,37 @@ Live construction and execution require all of:
 1. `normalize` or `resume` with `--enable-local-execution`;
 2. `--enable-live-provider`;
 3. the exact production factory spec;
-4. exactly five distinct, existing `--source-identity` arguments;
+4. an explicit `--live-run-profile` and its exact source count;
 5. `NARRATIVE_NORMALIZER_LIVE=1` exactly;
 6. the exact reviewed adapter version;
 7. all credential, endpoint and model configuration;
 8. the existing Normalizer trust key and external review-authority gates.
 
 `true`, `yes`, `01`, uppercase or whitespace variants do not enable live mode.
-`--all`, `--limit`, a missing identity and a sixth identity fail before adapter
-construction.
+`--all`, `--limit`, a missing identity or a profile/source-count mismatch fail
+before adapter construction.
+
+Two immutable code-owned profiles exist:
+
+| Exact profile | Sources | Budget |
+|---|---:|---:|
+| `normalizer-live-run-canary-v1` | 1 | 5 |
+| `normalizer-live-run-first-five-v1` | 5 | 25 |
+
+Both profiles allow one call for each generic E3 operation: coverage planning,
+evidence extraction, evidence adjudication, story generation and story
+adjudication. Repair is zero. Callers cannot supply a source count, operation
+set or budget override.
 
 The reviewed authorization boundary validates the raw CLI gates, environment,
 trust service, review-authority path, exact adapter version/spec, distinct
-models and exactly five distinct source identities. It copies their order into
+models and the profile's exact distinct source identities. It copies their order into
 an immutable tuple, mints a unique run ID, and can be consumed by the factory
 only once. This is the one-shot authorization boundary. Authorization creation
 itself does not spawn the worker or construct the SDK client.
 Before client construction the CLI emits the authorization's privacy-safe JSON
 preflight with the adapter version, model mapping, timeout, retry count zero,
-five selected sources, and a calculated maximum of 25 calls. It explicitly
+the selected profile/source count and its code-owned calculated budget. It explicitly
 reports that approval, ready manifests and Reels actions are not enabled.
 
 Import, `--help`, `scan`, `coverage-snapshot`, dry-run, `list`, `show`, `status`,
@@ -98,7 +109,7 @@ standard output is a private line-delimited JSON channel; raw worker output is
 never forwarded to the operator. A worker crash permanently fails that run.
 The parent does not restart it and there is no hidden retry.
 
-The worker owns the exact five-source allowlist, immutable run ID, model IDs,
+The worker owns the exact profile-bound source allowlist, immutable run ID, model IDs,
 provider SDK client, per-source operation slots, atomic global budget and call
 ledger. Parent services share only an immutable process proxy and detached
 serialized ledger snapshots. They do not hold the authorization, provider
@@ -139,12 +150,12 @@ not hidden retries.
 ## Source binding, call budget and audit ledger
 
 Every model call runs inside a Normalizer-owned source scope and is bound by the
-worker to the authorization run ID, one of the exactly five immutable source
+worker to the authorization run ID, one of the profile's immutable source
 identities and a closed operation. All returned services use one process-owned
 run budget. An
 unknown, sixth, replacement or resume-introduced source is
 rejected before transport. The content/adjudication services share one private,
-worker-owned run state and one atomic 25-call budget; callers cannot inject a
+worker-owned run state and one atomic profile budget; callers cannot inject a
 ledger or independent budget.
 
 The child-process run state reserves a call immediately before transport and
@@ -160,16 +171,41 @@ Per generic source:
 
 | Operation | Maximum calls |
 |---|---:|
+| Coverage planning | 1 |
 | Evidence extraction | 1 |
 | Evidence adjudication | 1 |
 | Story generation | 1 |
 | Story adjudication | 1 |
-| Optional structural repair | 1 |
+| Story repair | 0 |
 
-The five-source hard maximum is 25. The shared private run state atomically
-rejects concurrent call 26 before client/SDK/HTTP transport, and the factory
+The canary hard maximum is 5 and the first-five hard maximum is 25. The shared private
+run state atomically rejects call 6 or concurrent call 26 before
+client/SDK/HTTP transport, and the factory
 also enforces one call per authorized source/operation. Failed, timed-out and
 cancelled transport attempts consume their operation slot.
+
+## Non-destructive manual retry
+
+`--retry-failed` is not a live retry boundary. A production canary retry must
+provide all three closed arguments: `--manual-retry-request-id`,
+`--expected-failed-attempt-id`, and `--expected-failed-claim-digest`, together
+with the exact canary profile and one source identity.
+
+Before the current claim pointer can advance, the Normalizer verifies the
+expected terminal failed attempt and SHA-256 of its exact persisted bytes. It
+copies those bytes once into append-only attempt history; the archived
+predecessor is terminal, sealed, byte-identical and remains available for
+audit. A separately sealed manual-retry request record binds the source
+identity/digest, predecessor attempt/digest, code-owned new attempt ID,
+operator request ID, run profile, safe reason and creation time. The ordinary
+claim lifecycle remains the sole current-state engine for the new attempt.
+
+An exact repeated operator request resolves to the same new attempt without a
+new provider call. Reusing the request ID with another source, profile or
+predecessor fails closed without mutation. The current claim plus immutable
+predecessors provides one ordered attempt history; successful drafts and useful
+manual-attention packages belong to the new attempt, while the old failure is
+never deleted or rewritten.
 
 ## Privacy and errors
 
