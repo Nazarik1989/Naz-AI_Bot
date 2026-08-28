@@ -1647,7 +1647,8 @@ def test_coverage_v2_duplicate_json_block_is_conflict(tmp_path):
     )
     with pytest.raises(evidence.EvidenceContractError) as caught:
         evidence.parse_coverage_response(raw, bundle, inventory)
-    assert caught.value.reason_code == "evidence_coverage_conflict"
+    assert caught.value.reason_code == "evidence_coverage_incomplete"
+    assert caught.value.evidence.category == "coverage_incomplete"
 
 
 def test_coverage_v2_expands_every_segment_exactly_once(tmp_path):
@@ -1795,10 +1796,11 @@ def test_hard_invalid_coverage_never_becomes_manual_attention(
     result, client = _coverage_resolution(bundle, response)
 
     assert result.status == "failed"
-    assert result.coverage_summary is None
+    assert result.coverage_summary is not None
     assert result.coverage_failure is not None
-    assert result.coverage_failure.category == "hard_invalid"
+    assert result.coverage_failure.category == "coverage_hard_invalid"
     assert result.coverage_failure.stable_reason == stable_reason
+    assert result.coverage_failure.safe_payload()["category"] == "coverage_hard_invalid"
     assert evidence.classify_coverage_failure(result.coverage_failure) is None
     assert len(client.requests) == 1
 
@@ -1822,3 +1824,75 @@ def test_privacy_boundary_failure_never_becomes_manual_attention(tmp_path):
     assert result.reason_code == "evidence_provider_failed"
     assert result.coverage_summary is None
     assert result.coverage_failure is None
+
+
+def test_twenty_one_expected_blocks_partial_dispositions_return_typed_incomplete(tmp_path):
+    body = "\n\n".join(f"Supported fact {index}." for index in range(1, 22))
+    bundle = _write_bundle(tmp_path, {"facts.txt": body})
+    inventory = evidence.build_source_block_inventory(bundle)
+    assert len(inventory.ordered_blocks) == 21
+    payload = _coverage_payload(bundle, inventory)
+    payload["block_dispositions"].pop(inventory.ordered_blocks[-1].block_id)
+
+    result, client = _coverage_resolution(bundle, payload)
+
+    assert result.status == "manual_attention"
+    assert result.model_call_count == 1
+    assert result.coverage_failure is not None
+    assert result.coverage_failure.category == "coverage_incomplete"
+    assert result.coverage_failure.stable_reason == "missing_block_disposition"
+    assert result.coverage_failure.summary.block_count == 21
+    assert result.coverage_failure.summary.returned_disposition_count == 20
+    assert result.coverage_failure.summary.missing_disposition_count == 1
+    assert [item.request_kind for item in client.requests] == ["evidence_coverage"]
+
+
+def test_coverage_failure_safe_payload_round_trips_exactly(tmp_path):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "One.\n\nTwo."})
+    inventory = evidence.build_source_block_inventory(bundle)
+    payload = _coverage_payload(bundle, inventory)
+    payload["block_dispositions"].pop(inventory.ordered_blocks[-1].block_id)
+    result, _client = _coverage_resolution(bundle, payload)
+    assert result.coverage_failure is not None
+
+    encoded = result.coverage_failure.safe_payload()
+    restored = evidence.coverage_failure_from_payload(encoded)
+
+    assert restored == result.coverage_failure
+    assert restored.safe_payload() == encoded
+    assert not any(
+        forbidden in __import__("json").dumps(encoded)
+        for forbidden in ("Supported fact", "prompt", "credential", str(tmp_path))
+    )
+
+
+def test_incomplete_segment_partition_is_typed_manual_attention(tmp_path, monkeypatch):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "One.\n\nTwo."})
+    original = evidence.build_source_block_inventory(bundle)
+    shortened_blocks = original.ordered_blocks[:-1]
+    inventory_core = {
+        "contract_version": evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "ordered_blocks": shortened_blocks,
+    }
+    incomplete = evidence.SourceBlockInventory(
+        **inventory_core,
+        inventory_digest=evidence._sha(inventory_core),
+    )
+    monkeypatch.setattr(evidence, "build_source_block_inventory", lambda _bundle: incomplete)
+    client = FakeEvidenceClient([])
+
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle)
+
+    assert result.status == "manual_attention"
+    assert result.model_call_count == 0
+    assert result.coverage_failure is not None
+    assert result.coverage_failure.category == "coverage_incomplete"
+    assert result.coverage_failure.stable_reason == "incomplete_segment_partition"
+    assert client.requests == []

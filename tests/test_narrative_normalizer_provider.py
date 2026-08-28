@@ -724,6 +724,31 @@ def test_transport_response_type_and_json_boundary_is_strict(response):
     assert len(transport.calls) == 1
 
 
+def test_coverage_provider_response_failure_returns_typed_hard_invalid():
+    transport = FakeTransport(["```json\n{}\n```"])
+    _dependencies, client, _ = adapter(transport)
+
+    result = invoke(client, evidence_request("evidence_coverage", CONTENT_MODEL))
+
+    assert type(result) is evidence.CoverageFailureEvidence
+    assert result.category == "coverage_hard_invalid"
+    assert result.stable_reason == "unsupported_object_type"
+    assert result.summary.block_count == 1
+    assert len(transport.calls) == 1
+
+
+def test_coverage_provider_transport_failure_returns_typed_hard_invalid():
+    transport = FakeTransport([TimeoutError("private-timeout-detail")])
+    _dependencies, client, _ = adapter(transport)
+
+    result = invoke(client, evidence_request("evidence_coverage", CONTENT_MODEL))
+
+    assert type(result) is evidence.CoverageFailureEvidence
+    assert result.category == "coverage_hard_invalid"
+    assert result.stable_reason == "transport_failure"
+    assert len(transport.calls) == 1
+
+
 @pytest.mark.parametrize("response", ({"ok": True}, '{"ok":true}'))
 def test_exact_mapping_or_plain_json_object_string_is_accepted(response):
     transport = FakeTransport([response])

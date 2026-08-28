@@ -54,6 +54,7 @@ DRAFT_MANIFEST_SCHEMA_VERSION = "naz-narrative-draft-manifest-v3"
 REVIEW_SCHEMA_VERSION = "naz-narrative-review-v3"
 CLAIM_SCHEMA_VERSION = "naz-narrative-normalization-claim-v3"
 MANUAL_RETRY_REQUEST_SCHEMA_VERSION = "normalizer-manual-retry-request-v1"
+COVERAGE_DIAGNOSTIC_SCHEMA_VERSION = "normalizer-coverage-diagnostic-v1"
 MANUAL_RETRY_REASON_CODE = "narrative_normalizer_manual_retry_requested"
 REVIEWER_VERSION = "deterministic-normalizer-review-v2"
 IDEMPOTENCY_VERSION = "normalizer-source-identity-v2"
@@ -916,7 +917,11 @@ class NormalizationOutcome:
     package_digest: str | None
     review_status: str | None
     evidence_path: str | None = None
-    evidence_diagnostic: evidence.EvidenceValidationDiagnostic | None = None
+    evidence_diagnostic: (
+        evidence.EvidenceValidationDiagnostic
+        | evidence.CoverageFailureEvidence
+        | None
+    ) = None
 
     def __post_init__(self) -> None:
         if type(self.source_id) is not str or re.fullmatch(r"[0-9a-f]{12}", self.source_id) is None:
@@ -941,9 +946,15 @@ class NormalizationOutcome:
             raise ValueError("review_status")
         if self.evidence_path not in {None, "deterministic_fast_path", "generic"}:
             raise ValueError("evidence_path")
-        if self.evidence_diagnostic is not None and type(self.evidence_diagnostic) is not evidence.EvidenceValidationDiagnostic:
+        if self.evidence_diagnostic is not None and type(self.evidence_diagnostic) not in {
+            evidence.EvidenceValidationDiagnostic,
+            evidence.CoverageFailureEvidence,
+        }:
             raise TypeError("evidence_diagnostic")
-        if self.evidence_diagnostic is not None and self.status != OUTCOME_FAILED:
+        if (
+            self.evidence_diagnostic is not None
+            and self.status not in {OUTCOME_FAILED, OUTCOME_MANUAL_ATTENTION_PACKAGE_READY}
+        ):
             raise ValueError("evidence_diagnostic")
 
 
@@ -4487,6 +4498,24 @@ _MANUAL_ATTENTION_KEYS = frozenset({
 })
 
 
+def _coverage_failure_outcome(
+    failure: evidence.CoverageFailureEvidence,
+) -> str:
+    """Closed application-owned projection from typed evidence to outcome."""
+
+    if type(failure) is not evidence.CoverageFailureEvidence:
+        raise TypeError("coverage failure")
+    if failure.category == "coverage_incomplete":
+        return OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    if failure.category == "coverage_hard_invalid":
+        return OUTCOME_FAILED
+    raise TypeError("coverage failure category")
+_COVERAGE_DIAGNOSTIC_KEYS = frozenset({
+    "schema_version", "source_identity", "attempt_identity",
+    "coverage_failure", "diagnostic_digest",
+})
+
+
 def _manual_attention_artifact(
     source_identity_value: str,
     attempt_identity: str,
@@ -4583,9 +4612,7 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
         or core.get("run_profile") not in {
             *run_profiles.LIVE_RUN_PROFILES, MANUAL_ATTENTION_LOCAL_PROFILE,
         }
-        or core.get("reason_code") not in {
-            "coverage_incomplete", "coverage_conflict", "coverage_ambiguous"
-        }
+        or core.get("reason_code") != "coverage_incomplete"
         or core.get("validation_stage") != "coverage_validation"
         or core.get("stable_reason") not in evidence.COVERAGE_FAILURE_REASONS
         or type(counts) is not dict
@@ -4676,6 +4703,7 @@ class NarrativeOutboxStore:
         self._claims = self._state / "claims"
         self._attempt_history = self._state / "attempt-history-v1"
         self._manual_retry_requests = self._state / "manual-retry-requests-v1"
+        self._coverage_diagnostics = self._state / "coverage-diagnostics-v1"
         self._broker_receipts = self._state / "broker-draft-receipts-v1"
         self.trust_service = trust_service
         self.review_authority = review_authority
@@ -4813,7 +4841,8 @@ class NarrativeOutboxStore:
         if not self.permission_policy.shared:
             for path in (
                 self.root, self._state, self._locks, self._claims,
-                self._attempt_history, self._manual_retry_requests, self._broker_receipts,
+                self._attempt_history, self._manual_retry_requests,
+                self._coverage_diagnostics, self._broker_receipts,
             ):
                 path.mkdir(parents=True, exist_ok=True, mode=0o700)
                 if path.is_symlink() or not path.is_dir():
@@ -4823,7 +4852,8 @@ class NarrativeOutboxStore:
             return
         private_state = (
             self._claims, self._attempt_history,
-            self._manual_retry_requests, self._broker_receipts,
+            self._manual_retry_requests, self._coverage_diagnostics,
+            self._broker_receipts,
         ) if self.broker_trust_mode else ()
         for path, mode in (
             (self.root, outbox_permissions.SHARED_ROOT_MODE),
@@ -4832,6 +4862,7 @@ class NarrativeOutboxStore:
             (self._claims, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._attempt_history, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._manual_retry_requests, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._coverage_diagnostics, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._broker_receipts, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
         ):
             path.mkdir(parents=True, exist_ok=True, mode=mode)
@@ -4844,7 +4875,8 @@ class NarrativeOutboxStore:
             self._locks,
             self._claims,
             (() if self.broker_trust_mode else (
-                self._attempt_history, self._manual_retry_requests, self._broker_receipts,
+                self._attempt_history, self._manual_retry_requests,
+                self._coverage_diagnostics, self._broker_receipts,
             )),
         )
         if self.broker_trust_mode:
@@ -5125,6 +5157,113 @@ class NarrativeOutboxStore:
         ):
             _raise("narrative_normalizer_manual_retry_invalid")
         return self._attempt_history / source_identity_value / f"{attempt_id}.json"
+
+    def _coverage_diagnostic_path(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+    ) -> Path:
+        if (
+            type(source_identity_value) is not str
+            or _HEX64.fullmatch(source_identity_value) is None
+            or type(attempt_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+        ):
+            _raise("narrative_normalizer_persistence_invalid")
+        return self._coverage_diagnostics / source_identity_value / f"{attempt_id}.json"
+
+    @staticmethod
+    def _validate_coverage_diagnostic(value: object) -> dict[str, object]:
+        payload = _exact_mapping(
+            value,
+            _COVERAGE_DIAGNOSTIC_KEYS,
+            "narrative_normalizer_persistence_invalid",
+        )
+        core = dict(payload)
+        digest = core.pop("diagnostic_digest", None)
+        try:
+            failure = evidence.coverage_failure_from_payload(core["coverage_failure"])
+        except (KeyError, TypeError, ValueError):
+            _raise("narrative_normalizer_persistence_invalid")
+        if (
+            core.get("schema_version") != COVERAGE_DIAGNOSTIC_SCHEMA_VERSION
+            or type(core.get("source_identity")) is not str
+            or _HEX64.fullmatch(str(core["source_identity"])) is None
+            or type(core.get("attempt_identity")) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", str(core["attempt_identity"])) is None
+            or failure.safe_payload() != core["coverage_failure"]
+            or type(digest) is not str
+            or digest != _sha(core)
+        ):
+            _raise("narrative_normalizer_persistence_invalid")
+        return payload
+
+    def persist_coverage_diagnostic(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+        failure: evidence.CoverageFailureEvidence,
+    ) -> dict[str, object]:
+        """Append and reread one typed diagnostic before terminal state."""
+
+        if type(failure) is not evidence.CoverageFailureEvidence:
+            raise TypeError("coverage failure")
+        self._ensure_write_layout()
+        path = self._coverage_diagnostic_path(source_identity_value, attempt_id)
+        directory = path.parent
+        directory.mkdir(mode=0o700, exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
+            _raise("narrative_normalizer_persistence_invalid")
+        if self.permission_policy.shared and not self.broker_trust_mode:
+            outbox_permissions.finalize_shared_retry_directory(
+                self.permission_policy, self.root, directory,
+            )
+        elif os.name != "nt":
+            os.chmod(directory, 0o700)
+        core = {
+            "schema_version": COVERAGE_DIAGNOSTIC_SCHEMA_VERSION,
+            "source_identity": source_identity_value,
+            "attempt_identity": attempt_id,
+            "coverage_failure": failure.safe_payload(),
+        }
+        candidate = self._validate_coverage_diagnostic(
+            dict(core, diagnostic_digest=_sha(core))
+        )
+        encoded = _canonical(candidate) + b"\n"
+        if os.path.lexists(path):
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
+                _raise("narrative_normalizer_persistence_invalid")
+        else:
+            _write_exclusive_file(
+                path,
+                encoded,
+                mode=(
+                    0o600
+                    if self.broker_trust_mode
+                    else self.permission_policy.claim_file_mode
+                ),
+            )
+            if self.permission_policy.shared and not self.broker_trust_mode:
+                outbox_permissions.finalize_shared_claim(
+                    self.permission_policy, self.root, path,
+                )
+        persisted = self.read_coverage_diagnostic(source_identity_value, attempt_id)
+        if persisted != candidate:
+            _raise("narrative_normalizer_persistence_invalid")
+        return persisted
+
+    def read_coverage_diagnostic(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+    ) -> dict[str, object]:
+        path = self._coverage_diagnostic_path(source_identity_value, attempt_id)
+        payload = _json_read(
+            path,
+            _COVERAGE_DIAGNOSTIC_KEYS,
+            "narrative_normalizer_persistence_invalid",
+        )
+        return self._validate_coverage_diagnostic(payload)
 
     def _broker_receipt_path(self, source_identity_value: str) -> Path:
         if type(source_identity_value) is not str or _HEX64.fullmatch(source_identity_value) is None:
@@ -7168,7 +7307,11 @@ class NarrativeNormalizerService:
         digest=None,
         review=None,
         evidence_path: str | None = None,
-        evidence_diagnostic: evidence.EvidenceValidationDiagnostic | None = None,
+        evidence_diagnostic: (
+            evidence.EvidenceValidationDiagnostic
+            | evidence.CoverageFailureEvidence
+            | None
+        ) = None,
     ) -> NormalizationOutcome:
         return NormalizationOutcome(
             self._source_id(source.source_ref),
@@ -7538,11 +7681,37 @@ class NarrativeNormalizerService:
                 }
                 if resolution.status != "verified":
                     status = outcome_by_resolution.get(resolution.status, OUTCOME_FAILED)
-                    if (
-                        resolution.status == "manual_attention"
-                        and resolution.coverage_summary is not None
-                        and resolution.coverage_failure is not None
-                    ):
+                    if resolution.coverage_failure is not None:
+                        coverage_outcome = _coverage_failure_outcome(
+                            resolution.coverage_failure
+                        )
+                        self.store.persist_coverage_diagnostic(
+                            identity,
+                            attempt_id,
+                            resolution.coverage_failure,
+                        )
+                        if coverage_outcome == OUTCOME_FAILED:
+                            reason = "narrative_normalizer_evidence_invalid"
+                            self._record_failed_claim_locked(
+                                source,
+                                attempt_id=attempt_id,
+                                started_at=started_at,
+                                reason_code=reason,
+                            )
+                            return self._outcome(
+                                source,
+                                OUTCOME_FAILED,
+                                reasons=(reason,),
+                                calls=model_calls,
+                                evidence_path="generic",
+                                evidence_diagnostic=resolution.coverage_failure,
+                            )
+                        if (
+                            resolution.status != "manual_attention"
+                            or resolution.coverage_summary is None
+                            or coverage_outcome != OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+                        ):
+                            _raise("narrative_normalizer_internal_error")
                         artifact = _manual_attention_artifact(
                             identity,
                             attempt_id,
@@ -7568,6 +7737,7 @@ class NarrativeNormalizerService:
                             reasons=(reason,),
                             calls=model_calls,
                             evidence_path="generic",
+                            evidence_diagnostic=resolution.coverage_failure,
                         )
                     reason = (
                         "narrative_normalizer_source_insufficient"

@@ -492,6 +492,24 @@ Import модуля сам ничего не запускает.
 неопределённой попытки; обычный `normalize` не делает скрытых retry.
 Scheduler, Telegram command, auto-approval и auto-Reels в CP6B отсутствуют.
 
+## Typed coverage diagnostics
+
+Coverage planning has three closed outcomes. `coverage_complete` continues to
+evidence extraction. `coverage_incomplete` writes an append-only,
+attempt-bound diagnostic and then atomically publishes the existing
+`manual-attention.json` / `manual-attention.md` package. Missing, duplicate,
+conflicting, ambiguous, or incomplete segment partitions are incomplete; they
+never authorize a story. `coverage_hard_invalid` remains failed for malformed
+schemas, source-binding failures, privacy rejection, unsupported responses, or
+transport failure.
+
+The diagnostic contains only contract identifiers and counts. It never stores
+source text, blocks, quotations, prompts, model responses, paths, credentials,
+or exception prose. The diagnostic is written and read back before an attempt
+can become terminal. If that write fails, no manual-attention package is
+created. Manual-attention attempts create no Broker, approval, ready, or Reels
+event.
+
 ## Versioned outbox permissions
 
 The versioned `private-v1` policy remains the default and preserves the existing

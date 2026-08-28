@@ -1535,11 +1535,31 @@ class ProductionModelClient:
         finally:
             self._source_context.reset(token)
 
-    def generate_json(self, request: object) -> dict[str, object] | str:
+    def generate_json(
+        self, request: object,
+    ) -> dict[str, object] | str | evidence.CoverageFailureEvidence:
         source_identity = self._source_context.get()
         if type(source_identity) is not str:
             _raise(PROVIDER_CONFIGURATION_INVALID)
-        return self.__channel.call(source_identity, request)
+        try:
+            return self.__channel.call(source_identity, request)
+        except NormalizerProviderError as error:
+            if (
+                type(request) is evidence.EvidenceModelRequest
+                and request.request_kind == "evidence_coverage"
+            ):
+                stable_reason = (
+                    "unsupported_object_type"
+                    if error.reason_code == PROVIDER_RESPONSE_INVALID
+                    else "privacy_violation"
+                    if error.reason_code == PROVIDER_CONFIGURATION_INVALID
+                    else "transport_failure"
+                )
+                return evidence.coverage_hard_failure_for_request(
+                    len(request.required_block_ids),
+                    stable_reason=stable_reason,
+                )
+            raise
 
     def __repr__(self) -> str:
         return "ProductionModelClient(worker=<isolated>, state=<unavailable>)"

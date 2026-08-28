@@ -3073,6 +3073,207 @@ def test_generic_path_schema_repair_uses_exact_five_call_budget_and_model_free_a
     )
 
 
+def _coverage_only_case(tmp_path, response_builder):
+    inbox = tmp_path / "inbox"
+    outbox = tmp_path / "outbox"
+    registry = tmp_path / "state" / "registry.json"
+    source_path = inbox / "Coverage-Case" / "2026-08-20"
+    source_path.mkdir(parents=True)
+    registry.parent.mkdir(parents=True)
+    (source_path / "facts.txt").write_text(
+        "First supported fact.\n\nSecond supported fact.", encoding="utf-8"
+    )
+    trust_service = nn.trust.NarrativeTrustService(TEST_TRUST_KEY)
+    policy = rq.QuarantinePathPolicy(
+        inbox, registry, outbox, trust_service, tmp_path / "review-authority"
+    )
+    rq.reconcile_complete_backlog(policy, now=NOW)
+    record = rq.read_registry(registry).records[0]
+    documents = nn.read_source_documents(
+        policy, record.source_ref, expected_digest=record.source_digest
+    )
+    inventory = nn.evidence.build_source_block_inventory(documents)
+    coverage = {
+        "schema_version": nn.evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "run_id": "coverage-case-run",
+        "block_dispositions": {
+            block.block_id: "evidence_candidate" for block in inventory.ordered_blocks
+        },
+    }
+    response = response_builder(coverage, inventory)
+    evidence_client = QueueClient([response])
+    generation_client = QueueClient([])
+    service = nn.NarrativeNormalizerService(
+        policy=policy,
+        context_provider=nn.TemplateNarrativeContextProvider(
+            fixture_to_input(load_fixture("quiet_object"))
+        ),
+        generation_service=ng.NarrativeGenerationService(
+            generation_client,
+            generation_model="content-model",
+            adjudication_model="review-model",
+        ),
+        evidence_service=nn.evidence.GenericEvidenceService(
+            evidence_client,
+            extraction_model="content-model",
+            adjudication_model="review-model",
+            coverage_v2=True,
+        ),
+        trust_service=trust_service,
+        clock=lambda: NOW,
+    )
+    return record, documents, service, evidence_client, generation_client, registry
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("missing", "duplicate", "conflicting", "ambiguous"),
+)
+def test_typed_coverage_incomplete_cases_persist_manual_package(tmp_path, case):
+    def response_builder(payload, inventory):
+        block_id = inventory.ordered_blocks[0].block_id
+        if case == "missing":
+            payload["block_dispositions"].pop(block_id)
+            return payload
+        if case == "ambiguous":
+            payload["block_dispositions"][block_id] = "ambiguous"
+            return payload
+        raw = json.dumps(payload, separators=(",", ":"))
+        other = "evidence_candidate" if case == "duplicate" else "context_only"
+        return raw.replace(
+            f'"{block_id}":"evidence_candidate"',
+            f'"{block_id}":"evidence_candidate","{block_id}":"{other}"',
+        )
+
+    record, documents, service, evidence_client, generation_client, registry = (
+        _coverage_only_case(tmp_path, response_builder)
+    )
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert type(outcome.evidence_diagnostic) is nn.evidence.CoverageFailureEvidence
+    assert outcome.evidence_diagnostic.category == "coverage_incomplete"
+    assert len(evidence_client.requests) == 1
+    assert generation_client.requests == []
+    package = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
+    assert {item.name for item in package.iterdir()} == {
+        "manual-attention.json", "manual-attention.md",
+    }
+    current = service.store.read_claim(record.source_ref, record.source_digest)
+    assert current is not None
+    assert service.store.read_coverage_diagnostic(
+        documents.source_identity, current["attempt_id"]
+    )["coverage_failure"] == outcome.evidence_diagnostic.safe_payload()
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+    assert not (tmp_path / "review-authority").exists()
+
+
+@pytest.mark.parametrize("case", ("malformed", "schema", "source", "privacy"))
+def test_typed_coverage_hard_invalid_cases_fail_without_manual_package(tmp_path, case):
+    def response_builder(payload, inventory):
+        if case == "malformed":
+            return "{not-json"
+        if case == "schema":
+            payload["schema_version"] = "wrong-version"
+            return payload
+        if case == "source":
+            payload["source_identity"] = "0" * 64
+            return payload
+        return nn.evidence.coverage_hard_failure_for_request(
+            len(inventory.ordered_blocks), stable_reason="privacy_violation"
+        )
+
+    record, documents, service, evidence_client, generation_client, registry = (
+        _coverage_only_case(tmp_path, response_builder)
+    )
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == nn.OUTCOME_FAILED
+    assert type(outcome.evidence_diagnostic) is nn.evidence.CoverageFailureEvidence
+    assert outcome.evidence_diagnostic.category == "coverage_hard_invalid"
+    assert len(evidence_client.requests) == 1
+    assert generation_client.requests == []
+    package = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
+    assert not package.exists()
+    current = service.store.read_claim(record.source_ref, record.source_digest)
+    assert current is not None
+    assert service.store.read_coverage_diagnostic(
+        documents.source_identity, current["attempt_id"]
+    )["coverage_failure"] == outcome.evidence_diagnostic.safe_payload()
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+
+
+def test_coverage_diagnostic_write_failure_creates_no_manual_package(tmp_path, monkeypatch):
+    record, _documents, service, evidence_client, generation_client, registry = (
+        _coverage_only_case(
+            tmp_path,
+            lambda payload, inventory: dict(
+                payload,
+                block_dispositions={
+                    block.block_id: "ambiguous" for block in inventory.ordered_blocks
+                },
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        service.store,
+        "persist_coverage_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            nn.NarrativeNormalizerError("narrative_normalizer_persistence_invalid")
+        ),
+    )
+
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == nn.OUTCOME_FAILED
+    assert outcome.reason_codes == ("narrative_normalizer_persistence_invalid",)
+    assert len(evidence_client.requests) == 1
+    assert generation_client.requests == []
+    assert not service.store.draft_path(
+        record.source_digest, source_ref=record.source_ref
+    ).exists()
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+
+
+def test_incomplete_segment_partition_persists_manual_package_without_model_call(
+    tmp_path, monkeypatch,
+):
+    record, documents, service, evidence_client, generation_client, registry = (
+        _coverage_only_case(tmp_path, lambda payload, _inventory: payload)
+    )
+    original = nn.evidence.build_source_block_inventory(documents)
+    shortened = original.ordered_blocks[:-1]
+    core = {
+        "contract_version": nn.evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "ordered_blocks": shortened,
+    }
+    incomplete = nn.evidence.SourceBlockInventory(
+        **core, inventory_digest=nn.evidence._sha(core)
+    )
+    monkeypatch.setattr(
+        nn.evidence, "build_source_block_inventory", lambda _bundle: incomplete
+    )
+
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert outcome.model_call_count == 0
+    assert type(outcome.evidence_diagnostic) is nn.evidence.CoverageFailureEvidence
+    assert outcome.evidence_diagnostic.stable_reason == "incomplete_segment_partition"
+    assert evidence_client.requests == []
+    assert generation_client.requests == []
+    package = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
+    assert {item.name for item in package.iterdir()} == {
+        "manual-attention.json", "manual-attention.md",
+    }
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+
+
 def test_coverage_v2_incomplete_source_persists_safe_manual_attention_package(tmp_path):
     _, filename, body, _propositions = _GENERIC_E2E_SHAPES[0]
     inbox = tmp_path / "inbox"
@@ -3124,6 +3325,8 @@ def test_coverage_v2_incomplete_source_persists_safe_manual_attention_package(tm
     outcome = service.normalize_source(record.source_ref, record.source_digest)
     assert outcome.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY, outcome
     assert outcome.model_call_count == 1
+    assert type(outcome.evidence_diagnostic) is nn.evidence.CoverageFailureEvidence
+    assert outcome.evidence_diagnostic.category == "coverage_incomplete"
     package = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
     assert {item.name for item in package.iterdir()} == {
         "manual-attention.json", "manual-attention.md"
@@ -3139,6 +3342,17 @@ def test_coverage_v2_incomplete_source_persists_safe_manual_attention_package(tm
     ]
     assert payload["coverage_counts"]["valid_dispositions"] >= 1
     assert payload["coverage_counts"]["ambiguous_blocks"] >= 1
+    claim = service.store.read_claim(record.source_ref, record.source_digest)
+    assert claim is not None
+    persisted_diagnostic = service.store.read_coverage_diagnostic(
+        documents.source_identity, claim["attempt_id"]
+    )
+    assert nn.evidence.coverage_failure_from_payload(
+        persisted_diagnostic["coverage_failure"]
+    ) == outcome.evidence_diagnostic
+    assert service.store._coverage_diagnostic_path(
+        documents.source_identity, claim["attempt_id"]
+    ).stat().st_mtime_ns <= package.stat().st_mtime_ns
     markdown = (package / "manual-attention.md").read_text(encoding="utf-8")
     assert "Confirmed safe facts: 0" in markdown
     assert "Choose one action:" in markdown
@@ -3229,6 +3443,7 @@ def test_manual_retry_can_finish_as_useful_manual_attention_without_broker_event
 
     assert outcome.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
     assert outcome.model_call_count == 1
+    assert type(outcome.evidence_diagnostic) is nn.evidence.CoverageFailureEvidence
     package = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
     assert {item.name for item in package.iterdir()} == {
         "manual-attention.json", "manual-attention.md"
@@ -3241,6 +3456,9 @@ def test_manual_retry_can_finish_as_useful_manual_attention_without_broker_event
     current = service.store.read_claim(record.source_ref, record.source_digest)
     assert current is not None and current["attempt_id"] != request.previous_failed_attempt_id
     assert current["reason_code"] == "narrative_normalizer_manual_attention_package_ready"
+    assert service.store.read_coverage_diagnostic(
+        request.source_identity, current["attempt_id"]
+    )["coverage_failure"] == outcome.evidence_diagnostic.safe_payload()
 
 
 @pytest.mark.parametrize(
