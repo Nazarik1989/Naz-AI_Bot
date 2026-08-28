@@ -430,6 +430,7 @@ def _handle_request(
     outcome = provider.PROVIDER_TRANSPORT_FAILED
     response_digest: str | None = None
     error: provider.NormalizerProviderError | None = None
+    transport_diagnostic: evidence.ProviderTransportDiagnostic | None = None
     result: object = None
     base_exception: str | None = None
     try:
@@ -442,12 +443,20 @@ def _handle_request(
         provider._assert_private_payload(result, secret_values=(secret.reveal(),))
         response_digest = hashlib.sha256(provider._canonical(result)).hexdigest()
         outcome = "completed"
-    except TimeoutError:
+    except TimeoutError as caught:
         outcome = provider.PROVIDER_TIMEOUT
-        error = provider.NormalizerProviderError(provider.PROVIDER_TIMEOUT)
+        transport_diagnostic = provider._classify_transport_failure(caught)
+        error = provider.NormalizerProviderError(
+            provider.PROVIDER_TIMEOUT,
+            transport_diagnostic,
+        )
     except provider.NormalizerProviderError as caught:
         outcome = caught.reason_code
-        error = provider.NormalizerProviderError(caught.reason_code)
+        transport_diagnostic = caught.transport_diagnostic
+        error = provider.NormalizerProviderError(
+            caught.reason_code,
+            transport_diagnostic,
+        )
     except asyncio.CancelledError:
         outcome = provider.PROVIDER_CANCELLED
         base_exception = "CancelledError"
@@ -460,11 +469,20 @@ def _handle_request(
     except GeneratorExit:
         outcome = provider.PROVIDER_CANCELLED
         base_exception = "GeneratorExit"
-    except Exception:
+    except Exception as caught:
         outcome = provider.PROVIDER_TRANSPORT_FAILED
-        error = provider.NormalizerProviderError(provider.PROVIDER_TRANSPORT_FAILED)
+        transport_diagnostic = provider._classify_transport_failure(caught)
+        error = provider.NormalizerProviderError(
+            provider.PROVIDER_TRANSPORT_FAILED,
+            transport_diagnostic,
+        )
     finally:
-        state._finish(permit, outcome=outcome, response_digest=response_digest)
+        state._finish(
+            permit,
+            outcome=outcome,
+            response_digest=response_digest,
+            transport_diagnostic=transport_diagnostic,
+        )
     base = {
         "schema_version": RESPONSE_VERSION,
         "request_id": request_id,
@@ -473,6 +491,8 @@ def _handle_request(
         response = {**base, "status": "base_exception", "exception_type": base_exception}
     elif error is not None:
         response = {**base, "status": "error", "reason_code": error.reason_code}
+        if error.transport_diagnostic is not None:
+            response["transport_diagnostic"] = error.transport_diagnostic.safe_payload()
     else:
         response = {**base, "status": "ok", "result": result}
     coordinator.finish(request_id, request_digest, response)

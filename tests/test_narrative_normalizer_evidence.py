@@ -1866,6 +1866,36 @@ def test_coverage_failure_safe_payload_round_trips_exactly(tmp_path):
     )
 
 
+def test_transport_diagnostic_round_trips_without_raw_values():
+    diagnostic = evidence.ProviderTransportDiagnostic(
+        "http_429", 429, "rate_limit", "req_safe_123", True, "not_applicable"
+    )
+    failure = evidence.coverage_hard_failure_for_request(
+        9,
+        stable_reason="transport_failure",
+        transport_diagnostic=diagnostic,
+    )
+
+    payload = failure.safe_payload()
+    assert payload["transport_diagnostic"] == diagnostic.safe_payload()
+    assert evidence.coverage_failure_from_payload(payload) == failure
+    assert frozenset(diagnostic.safe_payload()) == {
+        "category", "http_status", "provider_error_code", "provider_request_id",
+        "response_received", "timeout_phase",
+    }
+
+
+def test_legacy_coverage_failure_payload_remains_readable_and_byte_semantics_stable():
+    failure = evidence.coverage_hard_failure_for_request(
+        3,
+        stable_reason="transport_failure",
+    )
+
+    payload = failure.safe_payload()
+    assert "transport_diagnostic" not in payload
+    assert evidence.coverage_failure_from_payload(payload) == failure
+
+
 def test_incomplete_segment_partition_is_typed_manual_attention(tmp_path, monkeypatch):
     bundle = _write_bundle(tmp_path, {"facts.txt": "One.\n\nTwo."})
     original = evidence.build_source_block_inventory(bundle)

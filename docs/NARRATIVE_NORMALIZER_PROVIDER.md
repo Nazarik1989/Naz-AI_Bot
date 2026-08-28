@@ -241,6 +241,13 @@ included. `asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit` and
 `GeneratorExit` propagate by exact exception type, with worker-private text
 removed.
 
+Transport failures additionally carry a closed privacy-safe diagnostic through
+worker IPC and the detached ledger. It contains only a category, numeric HTTP
+status, validated provider error code/request ID, response-received flag and a
+closed timeout phase. Exception text, response bodies, request content, prompts,
+headers, credentials and URLs are never serialized. For evidence coverage the
+same diagnostic is persisted append-only with the attempt.
+
 Transport output must be an exact mapping or a plain JSON-object string. Bytes,
 SDK objects, scalar/array JSON, generators, fenced JSON and prose wrappers are
 rejected without transport repair. Normalizer/CP parsers remain the semantic

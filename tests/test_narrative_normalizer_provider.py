@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -746,7 +747,74 @@ def test_coverage_provider_transport_failure_returns_typed_hard_invalid():
     assert type(result) is evidence.CoverageFailureEvidence
     assert result.category == "coverage_hard_invalid"
     assert result.stable_reason == "transport_failure"
+    assert result.transport_diagnostic is not None
+    assert result.transport_diagnostic.category == "timeout"
+    assert result.transport_diagnostic.http_status is None
+    assert result.transport_diagnostic.response_received is False
+    assert result.transport_diagnostic.timeout_phase == "request"
     assert len(transport.calls) == 1
+    record = client.ledger.snapshot()[0]
+    assert record.transport_diagnostic == result.transport_diagnostic
+
+
+class _SafeHTTPError(RuntimeError):
+    def __init__(self, status_code, code="provider_code", request_id="req_safe_123"):
+        self.status_code = status_code
+        self.code = code
+        self.request_id = request_id
+        super().__init__("private body must not be inspected")
+
+
+class RemoteProtocolError(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("error", "category", "status", "response_received", "timeout_phase"),
+    (
+        (TimeoutError("private"), "timeout", None, False, "request"),
+        (socket.gaierror(1, "private"), "dns_connect", None, False, "not_applicable"),
+        (ssl.SSLError("private"), "tls", None, False, "not_applicable"),
+        (ConnectionResetError("private"), "connection_reset", None, False, "not_applicable"),
+        (_SafeHTTPError(400), "http_400", 400, True, "not_applicable"),
+        (_SafeHTTPError(401), "http_401_403", 401, True, "not_applicable"),
+        (_SafeHTTPError(403), "http_401_403", 403, True, "not_applicable"),
+        (_SafeHTTPError(404), "http_404", 404, True, "not_applicable"),
+        (_SafeHTTPError(429), "http_429", 429, True, "not_applicable"),
+        (_SafeHTTPError(503), "http_5xx", 503, True, "not_applicable"),
+        (RemoteProtocolError("private"), "response_read_failure", None, False, "not_applicable"),
+        (RuntimeError("private"), "unknown_transport_failure", None, False, "not_applicable"),
+    ),
+)
+def test_transport_failure_classifier_is_closed_and_privacy_safe(
+    error, category, status, response_received, timeout_phase,
+):
+    diagnostic = provider._classify_transport_failure(error)
+
+    assert diagnostic.category == category
+    assert diagnostic.http_status == status
+    assert diagnostic.response_received is response_received
+    assert diagnostic.timeout_phase == timeout_phase
+    payload = diagnostic.safe_payload()
+    assert "private" not in json.dumps(payload, sort_keys=True)
+    if status is not None:
+        assert diagnostic.provider_error_code == "provider_code"
+        assert diagnostic.provider_request_id == "req_safe_123"
+
+
+def test_unknown_transport_diagnostic_survives_worker_ipc_and_ledger():
+    transport = FakeTransport([RuntimeError("private-response-body")])
+    _dependencies, client, _ = adapter(transport)
+
+    result = invoke(client, evidence_request("evidence_coverage", CONTENT_MODEL))
+
+    assert result.transport_diagnostic is not None
+    assert result.transport_diagnostic.category == "unknown_transport_failure"
+    assert result.transport_diagnostic.response_received is False
+    assert "private-response-body" not in json.dumps(result.safe_payload(), sort_keys=True)
+    records = client.ledger.snapshot()
+    assert len(records) == 1
+    assert records[0].transport_diagnostic == result.transport_diagnostic
 
 
 @pytest.mark.parametrize("response", ({"ok": True}, '{"ok":true}'))

@@ -813,6 +813,78 @@ _COVERAGE_SOURCE_BINDING_RESULTS = frozenset({
     "matched", "mismatched", "not_checked",
 })
 
+_TRANSPORT_FAILURE_CATEGORIES = frozenset({
+    "timeout", "dns_connect", "tls", "connection_reset", "http_400",
+    "http_401_403", "http_404", "http_429", "http_5xx",
+    "response_read_failure", "provider_configuration_invalid",
+    "unknown_transport_failure",
+})
+_TRANSPORT_TIMEOUT_PHASES = frozenset({
+    "not_applicable", "connect", "read", "write", "pool", "request", "unknown",
+})
+_SAFE_PROVIDER_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderTransportDiagnostic:
+    """Closed provider diagnostic containing no request or response content."""
+
+    category: str
+    http_status: int | None
+    provider_error_code: str | None
+    provider_request_id: str | None
+    response_received: bool
+    timeout_phase: str
+
+    def __post_init__(self) -> None:
+        _enum(self.category, _TRANSPORT_FAILURE_CATEGORIES, "category")
+        if self.http_status is not None and (
+            type(self.http_status) is not int or not 100 <= self.http_status <= 599
+        ):
+            raise TypeError("http_status")
+        for name in ("provider_error_code", "provider_request_id"):
+            value = getattr(self, name)
+            if value is not None and (
+                type(value) is not str or _SAFE_PROVIDER_VALUE.fullmatch(value) is None
+            ):
+                raise TypeError(name)
+        if type(self.response_received) is not bool:
+            raise TypeError("response_received")
+        _enum(self.timeout_phase, _TRANSPORT_TIMEOUT_PHASES, "timeout_phase")
+        if self.category == "timeout" and self.timeout_phase == "not_applicable":
+            raise ValueError("timeout_phase")
+        if self.category != "timeout" and self.timeout_phase != "not_applicable":
+            raise ValueError("timeout_phase")
+        if self.http_status is not None and not self.response_received:
+            raise ValueError("response_received")
+
+    def safe_payload(self) -> dict[str, object]:
+        return {
+            "category": self.category,
+            "http_status": self.http_status,
+            "provider_error_code": self.provider_error_code,
+            "provider_request_id": self.provider_request_id,
+            "response_received": self.response_received,
+            "timeout_phase": self.timeout_phase,
+        }
+
+
+_TRANSPORT_DIAGNOSTIC_KEYS = frozenset({
+    "category", "http_status", "provider_error_code", "provider_request_id",
+    "response_received", "timeout_phase",
+})
+
+
+def provider_transport_diagnostic_from_payload(
+    value: object,
+) -> ProviderTransportDiagnostic:
+    if type(value) is not dict or frozenset(value) != _TRANSPORT_DIAGNOSTIC_KEYS:
+        raise TypeError("provider transport diagnostic")
+    try:
+        return ProviderTransportDiagnostic(**value)
+    except (TypeError, ValueError):
+        raise TypeError("provider transport diagnostic") from None
+
 
 @dataclass(frozen=True, slots=True)
 class CoverageFailureEvidence:
@@ -824,6 +896,7 @@ class CoverageFailureEvidence:
     summary: EvidenceCoverageSummary
     source_binding_result: str = "not_checked"
     contract_version: str = EVIDENCE_COVERAGE_CONTRACT_VERSION
+    transport_diagnostic: ProviderTransportDiagnostic | None = None
 
     def __post_init__(self) -> None:
         _enum(self.category, _COVERAGE_FAILURE_CATEGORIES, "category")
@@ -841,11 +914,17 @@ class CoverageFailureEvidence:
             raise ValueError("contract_version")
         if self.summary.reason_code != self.category:
             raise ValueError("summary")
+        if self.transport_diagnostic is not None and (
+            type(self.transport_diagnostic) is not ProviderTransportDiagnostic
+            or self.category != "coverage_hard_invalid"
+            or self.stable_reason != "transport_failure"
+        ):
+            raise TypeError("transport_diagnostic")
 
     def safe_payload(self) -> dict[str, object]:
         """Return the closed, text-free diagnostic persisted by the Normalizer."""
 
-        return {
+        result = {
             "category": self.category,
             "stable_reason": self.stable_reason,
             "validation_stage": self.validation_stage,
@@ -865,6 +944,9 @@ class CoverageFailureEvidence:
             "ambiguous_count": self.summary.ambiguous_count,
             "omitted_count": self.summary.omitted_count,
         }
+        if self.transport_diagnostic is not None:
+            result["transport_diagnostic"] = self.transport_diagnostic.safe_payload()
+        return result
 
 
 _COVERAGE_FAILURE_PAYLOAD_KEYS = frozenset({
@@ -875,13 +957,21 @@ _COVERAGE_FAILURE_PAYLOAD_KEYS = frozenset({
     "conflicting_disposition_count", "evidence_candidate_count",
     "context_only_count", "structural_count", "withheld_count",
     "ambiguous_count", "omitted_count",
+    "transport_diagnostic",
 })
+
+_LEGACY_COVERAGE_FAILURE_PAYLOAD_KEYS = (
+    _COVERAGE_FAILURE_PAYLOAD_KEYS - {"transport_diagnostic"}
+)
 
 
 def coverage_failure_from_payload(value: object) -> CoverageFailureEvidence:
     """Recreate one diagnostic only from its exact privacy-safe schema."""
 
-    if type(value) is not dict or frozenset(value) != _COVERAGE_FAILURE_PAYLOAD_KEYS:
+    if type(value) is not dict or frozenset(value) not in {
+        _COVERAGE_FAILURE_PAYLOAD_KEYS,
+        _LEGACY_COVERAGE_FAILURE_PAYLOAD_KEYS,
+    }:
         raise TypeError("coverage failure payload")
     category = value["category"]
     try:
@@ -908,6 +998,13 @@ def coverage_failure_from_payload(value: object) -> CoverageFailureEvidence:
             summary=summary,
             source_binding_result=value["source_binding_result"],
             contract_version=value["contract_version"],
+            transport_diagnostic=(
+                None
+                if value.get("transport_diagnostic") is None
+                else provider_transport_diagnostic_from_payload(
+                    value["transport_diagnostic"]
+                )
+            ),
         )
     except (TypeError, ValueError):
         raise TypeError("coverage failure payload") from None
@@ -971,6 +1068,7 @@ def coverage_hard_failure_for_request(
     required_block_count: int,
     *,
     stable_reason: str,
+    transport_diagnostic: ProviderTransportDiagnostic | None = None,
 ) -> CoverageFailureEvidence:
     """Provider-boundary projection using only request-owned safe counts."""
 
@@ -996,6 +1094,7 @@ def coverage_hard_failure_for_request(
             reason_code="coverage_hard_invalid",
         ),
         source_binding_result="not_checked",
+        transport_diagnostic=transport_diagnostic,
     )
 
 
@@ -3804,6 +3903,7 @@ __all__ = [
     "EvidenceCoveragePlan",
     "EvidenceCoverageSummary",
     "CoverageFailureEvidence",
+    "ProviderTransportDiagnostic",
     "CoverageValidationError",
     "EvidenceAtom",
     "EvidenceContractError",
@@ -3842,6 +3942,7 @@ __all__ = [
     "coverage_failure_from_payload",
     "coverage_hard_failure",
     "coverage_hard_failure_for_request",
+    "provider_transport_diagnostic_from_payload",
     "evidence_digest",
     "evidence_model_response_schema",
     "parse_adjudication_response",

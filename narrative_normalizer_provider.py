@@ -7,6 +7,7 @@ the OpenAI SDK is not imported, and no client or transport is constructed until
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import importlib
 import json
@@ -15,6 +16,8 @@ import math
 import os
 import re
 import secrets
+import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -108,9 +111,19 @@ _BROKER_CAPABILITY_MINT = object()
 class NormalizerProviderError(RuntimeError):
     """Privacy-safe provider error containing only a stable reason code."""
 
-    def __init__(self, reason_code: str):
+    def __init__(
+        self,
+        reason_code: str,
+        transport_diagnostic: evidence.ProviderTransportDiagnostic | None = None,
+    ):
         safe = reason_code if reason_code in PROVIDER_REASON_CODES else PROVIDER_TRANSPORT_FAILED
+        if transport_diagnostic is not None and (
+            type(transport_diagnostic) is not evidence.ProviderTransportDiagnostic
+            or safe not in {PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED}
+        ):
+            raise TypeError("transport_diagnostic")
         self.reason_code = safe
+        self.transport_diagnostic = transport_diagnostic
         super().__init__(safe)
 
 
@@ -656,6 +669,7 @@ class _ProviderCallRecord:
     started: bool
     completed: bool
     safe_outcome: str
+    transport_diagnostic: evidence.ProviderTransportDiagnostic | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -691,6 +705,12 @@ class _ProviderCallRecord:
             "started", "completed", *PROVIDER_REASON_CODES
         }:
             raise TypeError("safe_outcome")
+        if self.transport_diagnostic is not None and (
+            type(self.transport_diagnostic) is not evidence.ProviderTransportDiagnostic
+            or not self.completed
+            or self.safe_outcome not in {PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED}
+        ):
+            raise TypeError("transport_diagnostic")
 
 
 @dataclass(frozen=True, slots=True)
@@ -806,6 +826,7 @@ class _ProviderRunState:
                 True,
                 False,
                 "started",
+                None,
             )
             permit = _TransportPermit(
                 operation_id,
@@ -824,6 +845,7 @@ class _ProviderRunState:
         *,
         outcome: str,
         response_digest: str | None,
+        transport_diagnostic: evidence.ProviderTransportDiagnostic | None = None,
     ) -> None:
         if (
             type(permit) is not _TransportPermit
@@ -833,6 +855,13 @@ class _ProviderRunState:
             or (
                 response_digest is not None
                 and (type(response_digest) is not str or _HEX64.fullmatch(response_digest) is None)
+            )
+            or (
+                transport_diagnostic is not None
+                and (
+                    type(transport_diagnostic) is not evidence.ProviderTransportDiagnostic
+                    or outcome not in {PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED}
+                )
             )
         ):
             _raise(PROVIDER_TRANSPORT_FAILED)
@@ -852,6 +881,7 @@ class _ProviderRunState:
                 response_digest=response_digest,
                 completed=True,
                 safe_outcome=outcome,
+                transport_diagnostic=transport_diagnostic,
             )
             self.__records = tuple(records)
             del self.__active[permit.operation_id]
@@ -908,6 +938,125 @@ class ProviderTransport(Protocol):
         """Perform exactly one non-streaming, no-retry completion."""
 
 
+_SAFE_PROVIDER_METADATA = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+def _safe_provider_metadata(value: object) -> str | None:
+    return (
+        value
+        if type(value) is str and _SAFE_PROVIDER_METADATA.fullmatch(value) is not None
+        else None
+    )
+
+
+def _safe_response_metadata(error: BaseException) -> tuple[int | None, str | None, str | None, bool]:
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None)
+    if type(status) is not int or isinstance(status, bool) or not 100 <= status <= 599:
+        status = getattr(response, "status_code", None)
+    if type(status) is not int or isinstance(status, bool) or not 100 <= status <= 599:
+        status = None
+    code = _safe_provider_metadata(getattr(error, "code", None))
+    request_id = _safe_provider_metadata(getattr(error, "request_id", None))
+    if request_id is None and response is not None:
+        headers = getattr(response, "headers", None)
+        if isinstance(headers, Mapping):
+            request_id = _safe_provider_metadata(
+                headers.get("x-request-id") or headers.get("X-Request-Id")
+            )
+    return status, code, request_id, response is not None or status is not None
+
+
+def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
+    result: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(result) < 8:
+        seen.add(id(current))
+        result.append(current)
+        next_value = current.__cause__ if current.__cause__ is not None else current.__context__
+        current = next_value if isinstance(next_value, BaseException) else None
+    return tuple(result)
+
+
+def _classify_transport_failure(
+    error: BaseException,
+    *,
+    timeout_types: tuple[type[BaseException], ...] = (),
+) -> evidence.ProviderTransportDiagnostic:
+    """Project an exception to closed metadata without reading exception text or bodies."""
+
+    status, code, request_id, response_received = _safe_response_metadata(error)
+    if status == 400:
+        category = "http_400"
+    elif status in {401, 403}:
+        category = "http_401_403"
+    elif status == 404:
+        category = "http_404"
+    elif status == 429:
+        category = "http_429"
+    elif status in {500, 502, 503, 504}:
+        category = "http_5xx"
+    else:
+        chain = _exception_chain(error)
+        names = {type(item).__name__ for item in chain}
+        timeout_phase = next((
+            phase
+            for name, phase in (
+                ("ConnectTimeout", "connect"),
+                ("ReadTimeout", "read"),
+                ("WriteTimeout", "write"),
+                ("PoolTimeout", "pool"),
+            )
+            if name in names
+        ), None)
+        if (
+            timeout_phase is not None
+            or any(isinstance(item, timeout_types) for item in chain)
+            or any(isinstance(item, TimeoutError) for item in chain)
+        ):
+            return evidence.ProviderTransportDiagnostic(
+                "timeout", status, code, request_id, response_received,
+                timeout_phase or "request",
+            )
+        if any(isinstance(item, ssl.SSLError) for item in chain):
+            category = "tls"
+        elif any(
+            isinstance(item, ConnectionResetError)
+            or getattr(item, "errno", None) == errno.ECONNRESET
+            for item in chain
+        ):
+            category = "connection_reset"
+        elif any(
+            isinstance(item, (socket.gaierror, ConnectionRefusedError, ConnectionError))
+            or getattr(item, "errno", None) in {
+                errno.ECONNREFUSED, errno.ENETDOWN, errno.ENETUNREACH,
+                errno.EHOSTDOWN, errno.EHOSTUNREACH,
+            }
+            for item in chain
+        ):
+            category = "dns_connect"
+        elif names & {"ReadError", "RemoteProtocolError", "IncompleteRead"}:
+            category = "response_read_failure"
+        else:
+            category = "unknown_transport_failure"
+    return evidence.ProviderTransportDiagnostic(
+        category, status, code, request_id, response_received, "not_applicable",
+    )
+
+
+def _response_shape_diagnostic(response: object) -> evidence.ProviderTransportDiagnostic:
+    request_id = _safe_provider_metadata(getattr(response, "_request_id", None))
+    return evidence.ProviderTransportDiagnostic(
+        "provider_configuration_invalid",
+        None,
+        "unsupported_response_format",
+        request_id,
+        True,
+        "not_applicable",
+    )
+
+
 class _OpenAITransport:
     __slots__ = ("_client", "_timeout_types")
 
@@ -926,8 +1075,6 @@ class _OpenAITransport:
         request_id: str,
     ) -> object:
         del operation_id, request_id
-        timeout = False
-        failed = False
         result: object = None
         try:
             response = self._client.chat.completions.create(
@@ -940,17 +1087,23 @@ class _OpenAITransport:
             )
             choices = getattr(response, "choices", None)
             if type(choices) is not list or len(choices) != 1:
-                failed = True
+                raise NormalizerProviderError(
+                    PROVIDER_TRANSPORT_FAILED,
+                    _response_shape_diagnostic(response),
+                )
             else:
                 result = getattr(getattr(choices[0], "message", None), "content", None)
-        except self._timeout_types:
-            timeout = True
-        except Exception:
-            failed = True
-        if timeout:
-            _raise(PROVIDER_TIMEOUT)
-        if failed:
-            _raise(PROVIDER_TRANSPORT_FAILED)
+        except NormalizerProviderError:
+            raise
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except Exception as error:
+            diagnostic = _classify_transport_failure(
+                error,
+                timeout_types=self._timeout_types,
+            )
+            reason = PROVIDER_TIMEOUT if diagnostic.category == "timeout" else PROVIDER_TRANSPORT_FAILED
+            raise NormalizerProviderError(reason, diagnostic) from None
         return result
 
 
@@ -1328,7 +1481,24 @@ class _WorkerChannel:
             if kind == "GeneratorExit":
                 raise GeneratorExit("provider worker cancelled")
         if status == "error" and type(response.get("reason_code")) is str:
-            _raise(response["reason_code"])
+            keys = frozenset(response)
+            diagnostic = None
+            if keys == {
+                "schema_version", "request_id", "status", "reason_code",
+                "transport_diagnostic",
+            }:
+                try:
+                    diagnostic = evidence.provider_transport_diagnostic_from_payload(
+                        response["transport_diagnostic"]
+                    )
+                except TypeError:
+                    _raise(PROVIDER_TRANSPORT_FAILED)
+            elif keys not in {
+                frozenset({"schema_version", "request_id", "status", "reason_code"}),
+                frozenset({"schema_version", "status", "reason_code"}),
+            }:
+                _raise(PROVIDER_TRANSPORT_FAILED)
+            raise NormalizerProviderError(response["reason_code"], diagnostic) from None
         _raise(PROVIDER_TRANSPORT_FAILED)
 
     def _control(self, action: str, payload: object = None) -> object:
@@ -1351,7 +1521,19 @@ class _WorkerChannel:
         if type(values) is not list:
             _raise(PROVIDER_TRANSPORT_FAILED)
         try:
-            return tuple(_ProviderCallRecord(**value) for value in values)
+            records = []
+            for value in values:
+                if type(value) is not dict:
+                    raise TypeError("ledger record")
+                item = dict(value)
+                if item.get("transport_diagnostic") is not None:
+                    item["transport_diagnostic"] = (
+                        evidence.provider_transport_diagnostic_from_payload(
+                            item["transport_diagnostic"]
+                        )
+                    )
+                records.append(_ProviderCallRecord(**item))
+            return tuple(records)
         except (TypeError, ValueError):
             _raise(PROVIDER_TRANSPORT_FAILED)
 
@@ -1558,6 +1740,7 @@ class ProductionModelClient:
                 return evidence.coverage_hard_failure_for_request(
                     len(request.required_block_ids),
                     stable_reason=stable_reason,
+                    transport_diagnostic=error.transport_diagnostic,
                 )
             raise
 
