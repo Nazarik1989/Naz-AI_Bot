@@ -773,6 +773,11 @@ class EvidenceCoveragePlan:
 class EvidenceCoverageSummary:
     block_count: int
     segment_count: int
+    returned_disposition_count: int
+    valid_disposition_count: int
+    missing_disposition_count: int
+    duplicate_disposition_count: int
+    conflicting_disposition_count: int
     evidence_candidate_count: int
     context_only_count: int
     structural_count: int
@@ -788,6 +793,75 @@ class EvidenceCoverageSummary:
                 _enum(value, {"coverage_complete", "coverage_incomplete", "coverage_conflict", "coverage_ambiguous"}, field.name)
             else:
                 _plain_int(value, field.name)
+
+
+_COVERAGE_FAILURE_CATEGORIES = frozenset({
+    "coverage_incomplete", "coverage_conflict", "coverage_ambiguous", "hard_invalid",
+})
+COVERAGE_FAILURE_REASONS = frozenset({
+    "missing_block_disposition", "unexpected_block_disposition",
+    "duplicate_block_disposition", "conflicting_block_disposition",
+    "ambiguous_coverage", "no_evidence_candidate",
+    "malformed_json", "wrong_schema_version", "unknown_or_extra_field",
+    "exact_scalar_type_violation", "source_identity_mismatch",
+    "privacy_violation", "transport_failure", "unsupported_object_type",
+    "invalid_disposition_enum",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageFailureEvidence:
+    """Closed privacy-safe evidence for one coverage outcome decision."""
+
+    category: str
+    validation_stage: str
+    stable_reason: str
+    summary: EvidenceCoverageSummary
+
+    def __post_init__(self) -> None:
+        _enum(self.category, _COVERAGE_FAILURE_CATEGORIES, "category")
+        if self.validation_stage != "coverage_validation":
+            raise ValueError("validation_stage")
+        _enum(self.stable_reason, COVERAGE_FAILURE_REASONS, "stable_reason")
+        if type(self.summary) is not EvidenceCoverageSummary:
+            raise TypeError("summary")
+        if self.category == "hard_invalid" and self.summary.reason_code not in {
+            "coverage_incomplete", "coverage_conflict",
+        }:
+            raise ValueError("summary")
+
+
+class CoverageValidationError(EvidenceContractError):
+    """Coverage rejection carrying typed evidence rather than exception prose."""
+
+    def __init__(self, evidence: CoverageFailureEvidence):
+        if type(evidence) is not CoverageFailureEvidence:
+            raise TypeError("coverage failure evidence")
+        reason_code = (
+            "evidence_coverage_conflict"
+            if evidence.category == "coverage_conflict"
+            else "evidence_coverage_incomplete"
+            if evidence.category != "hard_invalid"
+            else "evidence_source_binding_invalid"
+            if evidence.stable_reason == "source_identity_mismatch"
+            else "evidence_schema_invalid"
+        )
+        super().__init__(reason_code)
+        self.evidence = evidence
+
+
+def classify_coverage_failure(
+    value: CoverageFailureEvidence,
+) -> EvidenceCoverageSummary | None:
+    """Map only code-owned decision-partition failures to manual attention."""
+
+    if type(value) is not CoverageFailureEvidence:
+        raise TypeError("coverage failure evidence")
+    if value.category in {
+        "coverage_incomplete", "coverage_conflict", "coverage_ambiguous",
+    }:
+        return value.summary
+    return None
 
 
 def _char_to_byte_offsets(text: str) -> tuple[int, ...]:
@@ -1607,6 +1681,7 @@ class EvidenceResolution:
     reason_code: str
     diagnostic: EvidenceValidationDiagnostic | None = None
     coverage_summary: EvidenceCoverageSummary | None = None
+    coverage_failure: CoverageFailureEvidence | None = None
 
     def __post_init__(self) -> None:
         _enum(self.status, RESOLUTION_STATUSES, "status")
@@ -1631,6 +1706,14 @@ class EvidenceResolution:
             raise ValueError("diagnostic")
         if self.coverage_summary is not None and type(self.coverage_summary) is not EvidenceCoverageSummary:
             raise TypeError("coverage_summary")
+        if self.coverage_failure is not None and type(self.coverage_failure) is not CoverageFailureEvidence:
+            raise TypeError("coverage_failure")
+        if (
+            self.coverage_failure is not None
+            and self.coverage_summary is not None
+            and self.coverage_failure.summary != self.coverage_summary
+        ):
+            raise ValueError("coverage_failure")
 
 
 _QUOTE_KEYS = frozenset({
@@ -2636,28 +2719,111 @@ def _block_projection(
     }
 
 
-def _unique_json_object(value: Mapping[str, object] | str) -> dict[str, object]:
+class _CoverageJsonObject(list[tuple[object, object]]):
+    """Internal lossless JSON object used only to detect duplicate decisions."""
+
+
+def _coverage_summary_from_values(
+    inventory: SourceBlockInventory,
+    values: Iterable[str],
+    *,
+    reason_code: str,
+    returned: int,
+    missing: int = 0,
+    duplicate: int = 0,
+    conflicting: int = 0,
+) -> EvidenceCoverageSummary:
+    counts = {item: 0 for item in BLOCK_DISPOSITIONS}
+    for value in values:
+        if type(value) is str and value in counts:
+            counts[value] += 1
+    valid = sum(counts.values())
+    return EvidenceCoverageSummary(
+        block_count=len(inventory.ordered_blocks),
+        segment_count=sum(len(item.ordered_segment_ids) for item in inventory.ordered_blocks),
+        returned_disposition_count=returned,
+        valid_disposition_count=valid,
+        missing_disposition_count=missing,
+        duplicate_disposition_count=duplicate,
+        conflicting_disposition_count=conflicting,
+        evidence_candidate_count=counts["evidence_candidate"],
+        context_only_count=counts["context_only"],
+        structural_count=counts["structural"],
+        sensitive_count=counts["sensitive_withheld"],
+        ambiguous_count=counts["ambiguous"],
+        omitted_count=max(0, len(inventory.ordered_blocks) - valid),
+        reason_code=reason_code,
+    )
+
+
+def _reject_coverage(
+    inventory: SourceBlockInventory,
+    *,
+    category: str,
+    stable_reason: str,
+    returned: int = 0,
+    missing: int = 0,
+    duplicate: int = 0,
+    conflicting: int = 0,
+    valid_values: Iterable[str] = (),
+) -> None:
+    reason_code = (
+        "coverage_conflict" if category == "coverage_conflict" else "coverage_incomplete"
+    )
+    raise CoverageValidationError(CoverageFailureEvidence(
+        category=category,
+        validation_stage="coverage_validation",
+        stable_reason=stable_reason,
+        summary=_coverage_summary_from_values(
+            inventory,
+            tuple(valid_values),
+            reason_code=reason_code,
+            returned=returned,
+            missing=missing,
+            duplicate=duplicate,
+            conflicting=conflicting,
+        ),
+    )) from None
+
+
+def _coverage_response_object(
+    value: Mapping[str, object] | str,
+    inventory: SourceBlockInventory,
+) -> tuple[dict[str, object], _CoverageJsonObject | dict[str, object]]:
     if type(value) is str:
-        duplicate = False
-
-        def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-            nonlocal duplicate
-            result: dict[str, object] = {}
-            for key, item in pairs:
-                if key in result:
-                    duplicate = True
-                result[key] = item
-            return result
-
         try:
-            value = json.loads(value, object_pairs_hook=object_pairs)
+            decoded = json.loads(value, object_pairs_hook=_CoverageJsonObject)
         except json.JSONDecodeError:
-            _raise("evidence_coverage_incomplete")
-        if duplicate:
-            _raise("evidence_coverage_conflict")
-    if type(value) is not dict:
-        _raise("evidence_coverage_incomplete")
-    return value
+            _reject_coverage(
+                inventory, category="hard_invalid", stable_reason="malformed_json",
+            )
+        if type(decoded) is not _CoverageJsonObject:
+            _reject_coverage(
+                inventory, category="hard_invalid", stable_reason="unsupported_object_type",
+            )
+        top_pairs = decoded
+        top_keys = tuple(item[0] for item in top_pairs)
+        if any(type(key) is not str for key in top_keys) or len(top_keys) != len(set(top_keys)):
+            _reject_coverage(
+                inventory, category="hard_invalid", stable_reason="unknown_or_extra_field",
+            )
+        raw = dict(top_pairs)
+    elif type(value) is dict:
+        raw = value
+    else:
+        _reject_coverage(
+            inventory, category="hard_invalid", stable_reason="unsupported_object_type",
+        )
+    if frozenset(raw) != _COVERAGE_RESPONSE_KEYS:
+        _reject_coverage(
+            inventory, category="hard_invalid", stable_reason="unknown_or_extra_field",
+        )
+    decisions = raw["block_dispositions"]
+    if type(decisions) not in {dict, _CoverageJsonObject}:
+        _reject_coverage(
+            inventory, category="hard_invalid", stable_reason="exact_scalar_type_violation",
+        )
+    return raw, decisions
 
 
 def parse_coverage_response(
@@ -2665,32 +2831,123 @@ def parse_coverage_response(
     bundle: SourceDocumentBundle,
     inventory: SourceBlockInventory,
 ) -> EvidenceCoveragePlan:
-    raw = _exact_mapping(_unique_json_object(response), _COVERAGE_RESPONSE_KEYS)
+    if type(bundle) is not SourceDocumentBundle or type(inventory) is not SourceBlockInventory:
+        raise TypeError("coverage response")
+    raw, decisions_object = _coverage_response_object(response, inventory)
+    scalar_fields = (
+        "schema_version", "source_identity", "document_bundle_digest", "inventory_digest", "run_id",
+    )
+    if any(type(raw[name]) is not str for name in scalar_fields):
+        _reject_coverage(
+            inventory, category="hard_invalid", stable_reason="exact_scalar_type_violation",
+        )
+    if raw["schema_version"] != EVIDENCE_COVERAGE_CONTRACT_VERSION:
+        _reject_coverage(
+            inventory, category="hard_invalid", stable_reason="wrong_schema_version",
+        )
     if (
-        raw["schema_version"] != EVIDENCE_COVERAGE_CONTRACT_VERSION
-        or raw["source_identity"] != bundle.source_identity
+        raw["source_identity"] != bundle.source_identity
         or raw["document_bundle_digest"] != bundle.bundle_digest
         or raw["inventory_digest"] != inventory.inventory_digest
     ):
-        _raise("evidence_coverage_conflict")
-    decisions_raw = raw["block_dispositions"]
-    if type(decisions_raw) is not dict:
-        _raise("evidence_coverage_incomplete")
+        _reject_coverage(
+            inventory, category="hard_invalid", stable_reason="source_identity_mismatch",
+        )
+    try:
+        _safe_id(raw["run_id"], "run_id")
+    except (TypeError, ValueError):
+        _reject_coverage(
+            inventory, category="hard_invalid", stable_reason="exact_scalar_type_violation",
+        )
+
+    pairs = (
+        list(decisions_object.items())
+        if type(decisions_object) is dict
+        else list(decisions_object)
+    )
+    if any(type(key) is not str or type(value) is not str for key, value in pairs):
+        _reject_coverage(
+            inventory,
+            category="hard_invalid",
+            stable_reason="exact_scalar_type_violation",
+            returned=len(pairs),
+        )
+    if any(value not in BLOCK_DISPOSITIONS for _, value in pairs):
+        _reject_coverage(
+            inventory,
+            category="hard_invalid",
+            stable_reason="invalid_disposition_enum",
+            returned=len(pairs),
+        )
+    decisions_raw: dict[str, str] = {}
+    duplicate = 0
+    conflicting = 0
+    for block_id, disposition in pairs:
+        if block_id in decisions_raw:
+            duplicate += 1
+            conflicting += decisions_raw[block_id] != disposition
+        else:
+            decisions_raw[block_id] = disposition
+    if duplicate:
+        _reject_coverage(
+            inventory,
+            category="coverage_conflict",
+            stable_reason=(
+                "conflicting_block_disposition" if conflicting else "duplicate_block_disposition"
+            ),
+            returned=len(pairs),
+            duplicate=duplicate,
+            conflicting=conflicting,
+            valid_values=decisions_raw.values(),
+        )
     expected_ids = tuple(item.block_id for item in inventory.ordered_blocks)
-    if frozenset(decisions_raw) != frozenset(expected_ids):
-        _raise("evidence_coverage_incomplete")
+    missing_ids = frozenset(expected_ids) - frozenset(decisions_raw)
+    unexpected_ids = frozenset(decisions_raw) - frozenset(expected_ids)
+    if unexpected_ids:
+        _reject_coverage(
+            inventory,
+            category="coverage_incomplete",
+            stable_reason="unexpected_block_disposition",
+            returned=len(pairs),
+            missing=len(missing_ids),
+            conflicting=len(unexpected_ids),
+            valid_values=(
+                decisions_raw[key] for key in expected_ids if key in decisions_raw
+            ),
+        )
+    if missing_ids:
+        _reject_coverage(
+            inventory,
+            category="coverage_incomplete",
+            stable_reason="missing_block_disposition",
+            returned=len(pairs),
+            missing=len(missing_ids),
+            valid_values=decisions_raw.values(),
+        )
     try:
         decisions = tuple(
             BlockCoverageDecision(block_id, decisions_raw[block_id])
             for block_id in expected_ids
         )
     except (TypeError, ValueError):
-        _raise("evidence_coverage_conflict")
+        _reject_coverage(
+            inventory,
+            category="hard_invalid",
+            stable_reason="exact_scalar_type_violation",
+            returned=len(pairs),
+        )
     block_by_id = {item.block_id: item for item in inventory.ordered_blocks}
     for decision in decisions:
         sensitive = block_by_id[decision.block_id].sensitivity_status == "sensitive_withheld"
         if sensitive != (decision.disposition == "sensitive_withheld"):
-            _raise("evidence_coverage_conflict")
+            _reject_coverage(
+                inventory,
+                category="coverage_conflict",
+                stable_reason="conflicting_block_disposition",
+                returned=len(pairs),
+                conflicting=1,
+                valid_values=decisions_raw.values(),
+            )
     payload = {
         "contract_version": EVIDENCE_COVERAGE_CONTRACT_VERSION,
         "source_identity": bundle.source_identity,
@@ -2702,7 +2959,12 @@ def parse_coverage_response(
     try:
         return EvidenceCoveragePlan(**payload, plan_digest=_sha(payload))
     except (TypeError, ValueError):
-        _raise("evidence_coverage_conflict")
+        _reject_coverage(
+            inventory,
+            category="hard_invalid",
+            stable_reason="exact_scalar_type_violation",
+            returned=len(pairs),
+        )
 
 
 def _coverage_summary(
@@ -2715,16 +2977,29 @@ def _coverage_summary(
         for decision in plan.ordered_decisions:
             counts[decision.disposition] += 1
     decided = sum(counts.values())
-    return EvidenceCoverageSummary(
-        block_count=len(inventory.ordered_blocks),
-        segment_count=sum(len(item.ordered_segment_ids) for item in inventory.ordered_blocks),
-        evidence_candidate_count=counts["evidence_candidate"],
-        context_only_count=counts["context_only"],
-        structural_count=counts["structural"],
-        sensitive_count=counts["sensitive_withheld"],
-        ambiguous_count=counts["ambiguous"],
-        omitted_count=max(0, len(inventory.ordered_blocks) - decided),
+    return _coverage_summary_from_values(
+        inventory,
+        tuple(
+            decision.disposition
+            for decision in (() if plan is None else plan.ordered_decisions)
+        ),
         reason_code=reason_code,
+        returned=decided,
+        missing=max(0, len(inventory.ordered_blocks) - decided),
+    )
+
+
+def _coverage_manual_failure(
+    inventory: SourceBlockInventory,
+    plan: EvidenceCoveragePlan,
+    *,
+    stable_reason: str,
+) -> CoverageFailureEvidence:
+    return CoverageFailureEvidence(
+        category="coverage_ambiguous",
+        validation_stage="coverage_validation",
+        stable_reason=stable_reason,
+        summary=_coverage_summary(inventory, plan, "coverage_ambiguous"),
     )
 
 
@@ -2926,19 +3201,32 @@ class GenericEvidenceService:
             plan = parse_coverage_response(
                 self._client.generate_json(coverage_request), bundle, inventory
             )
-        except EvidenceContractError as error:
-            reason = "coverage_conflict" if error.reason_code == "evidence_coverage_conflict" else "coverage_incomplete"
+        except CoverageValidationError as error:
+            summary = classify_coverage_failure(error.evidence)
+            if summary is None:
+                return EvidenceResolution(
+                    "failed", None, calls, error.reason_code, None, None, error.evidence,
+                )
             return EvidenceResolution(
                 "manual_attention", None, calls, "evidence_manual_attention", None,
-                _coverage_summary(inventory, None, reason),
+                summary, error.evidence,
             )
+        except EvidenceContractError as error:
+            return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic)
         except Exception:
             return EvidenceResolution("failed", None, calls, "evidence_provider_failed")
         summary = _coverage_summary(inventory, plan, "coverage_complete")
         if summary.ambiguous_count or not summary.evidence_candidate_count:
+            failure = _coverage_manual_failure(
+                inventory,
+                plan,
+                stable_reason=(
+                    "ambiguous_coverage" if summary.ambiguous_count else "no_evidence_candidate"
+                ),
+            )
             return EvidenceResolution(
                 "manual_attention", None, calls, "evidence_manual_attention", None,
-                _coverage_summary(inventory, plan, "coverage_ambiguous"),
+                failure.summary, failure,
             )
         selected = frozenset(
             item.block_id for item in plan.ordered_decisions
@@ -2984,16 +3272,23 @@ class GenericEvidenceService:
             return EvidenceResolution("failed", None, calls, "evidence_provider_failed", None, summary)
         decisions = {item.decision for item in adjudication.ordered_decisions}
         if not extraction.ordered_evidence or "supported" not in decisions:
+            failure = _coverage_manual_failure(
+                inventory, plan, stable_reason="no_evidence_candidate",
+            )
             return EvidenceResolution(
-                "manual_attention", None, calls, "evidence_manual_attention", None, summary
+                "manual_attention", None, calls, "evidence_manual_attention", None,
+                failure.summary, failure,
             )
         if "ambiguous" in decisions or any(
             item.evidence_kind == "insufficient_or_ambiguous" or item.uncertainty == "ambiguous"
             for item in extraction.ordered_evidence
         ):
+            failure = _coverage_manual_failure(
+                inventory, plan, stable_reason="ambiguous_coverage",
+            )
             return EvidenceResolution(
                 "manual_attention", None, calls, "evidence_manual_attention", None,
-                _coverage_summary(inventory, plan, "coverage_ambiguous"),
+                failure.summary, failure,
             )
         if "rejected" in decisions:
             sensitive = any("sensitive_content" in item.reason_codes for item in adjudication.ordered_decisions)
@@ -3290,6 +3585,7 @@ __all__ = [
     "ADJUDICATION_REASON_CODES",
     "CAUSAL_RELATIONS",
     "COVERAGE_CLASSIFICATIONS",
+    "COVERAGE_FAILURE_REASONS",
     "BLOCK_DISPOSITIONS",
     "EVIDENCE_COVERAGE_CONTRACT_VERSION",
     "EVIDENCE_ADJUDICATION_CONTRACT_VERSION",
@@ -3299,6 +3595,8 @@ __all__ = [
     "EvidenceAdjudicationBundle",
     "EvidenceCoveragePlan",
     "EvidenceCoverageSummary",
+    "CoverageFailureEvidence",
+    "CoverageValidationError",
     "EvidenceAtom",
     "EvidenceContractError",
     "EvidenceDecision",
@@ -3332,6 +3630,7 @@ __all__ = [
     "build_source_block_inventory",
     "build_verified_fact_bindings",
     "classify_source_bundle",
+    "classify_coverage_failure",
     "evidence_digest",
     "evidence_model_response_schema",
     "parse_adjudication_response",

@@ -4476,9 +4476,12 @@ def _write_exclusive_file(path: Path, payload: bytes, *, mode: int = 0o600) -> N
         os.chmod(path, mode)
 
 
-MANUAL_ATTENTION_CONTRACT_VERSION = "normalizer-manual-attention-v1"
+MANUAL_ATTENTION_CONTRACT_VERSION = "normalizer-manual-attention-v2"
+MANUAL_ATTENTION_LOCAL_PROFILE = "normalizer-review-only-v1"
 _MANUAL_ATTENTION_KEYS = frozenset({
-    "schema_version", "source_identity", "reason_code", "coverage_counts",
+    "schema_version", "source_identity", "attempt_identity", "run_profile",
+    "reason_code", "validation_stage", "stable_reason", "coverage_counts",
+    "confirmed_fact_count",
     "verified_candidate_fact_summaries", "why_no_complete_story", "human_actions",
     "narrative_ready", "package_digest",
 })
@@ -4486,38 +4489,73 @@ _MANUAL_ATTENTION_KEYS = frozenset({
 
 def _manual_attention_artifact(
     source_identity_value: str,
+    attempt_identity: str,
+    run_profile: str,
     summary: evidence.EvidenceCoverageSummary,
+    failure: evidence.CoverageFailureEvidence,
 ) -> ManualAttentionArtifact:
+    if (
+        type(attempt_identity) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", attempt_identity) is None
+        or type(run_profile) is not str
+        or run_profile not in {*run_profiles.LIVE_RUN_PROFILES, MANUAL_ATTENTION_LOCAL_PROFILE}
+        or type(failure) is not evidence.CoverageFailureEvidence
+        or failure.summary != summary
+        or evidence.classify_coverage_failure(failure) != summary
+    ):
+        raise TypeError("manual attention evidence")
     counts = {
-        "blocks": summary.block_count,
-        "segments": summary.segment_count,
+        "deterministic_blocks": summary.block_count,
+        "source_segments": summary.segment_count,
+        "returned_dispositions": summary.returned_disposition_count,
+        "valid_dispositions": summary.valid_disposition_count,
+        "missing_dispositions": summary.missing_disposition_count,
+        "duplicate_dispositions": summary.duplicate_disposition_count,
+        "conflicting_dispositions": summary.conflicting_disposition_count,
         "evidence_candidates": summary.evidence_candidate_count,
         "context_only": summary.context_only_count,
         "structural": summary.structural_count,
-        "sensitive_withheld": summary.sensitive_count,
-        "ambiguous": summary.ambiguous_count,
-        "omitted": summary.omitted_count,
+        "sensitive_withheld_blocks": summary.sensitive_count,
+        "ambiguous_blocks": summary.ambiguous_count,
+        "omitted_blocks": summary.omitted_count,
     }
     core = {
         "schema_version": MANUAL_ATTENTION_CONTRACT_VERSION,
         "source_identity": source_identity_value,
+        "attempt_identity": attempt_identity,
+        "run_profile": run_profile,
         "reason_code": summary.reason_code,
+        "validation_stage": failure.validation_stage,
+        "stable_reason": failure.stable_reason,
         "coverage_counts": counts,
+        "confirmed_fact_count": 0,
         "verified_candidate_fact_summaries": [],
         "why_no_complete_story": (
             "Coverage could not safely authorize a complete public story without human judgement."
         ),
-        "human_actions": ["use_selected_facts", "skip", "discuss"],
+        "human_actions": [
+            "use_confirmed_facts", "discuss_ambiguous_parts", "skip_material",
+        ],
         "narrative_ready": False,
     }
     payload = dict(core, package_digest=_sha(core))
     markdown = (
         "# Manual attention required\n\n"
-        f"Reason: {summary.reason_code}.\n\n"
-        f"Coverage: {summary.block_count} blocks and {summary.segment_count} segments; "
-        f"{summary.ambiguous_count} ambiguous, {summary.omitted_count} omitted, "
+        f"Safe reason: {failure.stable_reason} ({summary.reason_code}).\n\n"
+        f"Coverage: {summary.block_count} deterministic blocks across "
+        f"{summary.segment_count} source segments. "
+        f"Received {summary.returned_disposition_count} dispositions; "
+        f"{summary.valid_disposition_count} valid, {summary.missing_disposition_count} missing, "
+        f"{summary.duplicate_disposition_count} duplicate, "
+        f"{summary.conflicting_disposition_count} conflicting, "
+        f"{summary.ambiguous_count} ambiguous, {summary.omitted_count} omitted, and "
         f"{summary.sensitive_count} sensitive withheld.\n\n"
-        "No complete story or approval was produced. Human actions: use selected facts, skip, or discuss.\n"
+        "Confirmed safe facts: 0. No fact reached complete code-owned evidence validation.\n\n"
+        "A complete public story cannot yet be proven from the validated coverage.\n\n"
+        "Choose one action:\n"
+        "1. Use only confirmed facts.\n"
+        "2. Discuss the ambiguous parts.\n"
+        "3. Skip this material.\n"
     )
     return ManualAttentionArtifact(source_identity_value, payload, markdown)
 
@@ -4540,17 +4578,30 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
     if (
         core.get("schema_version") != MANUAL_ATTENTION_CONTRACT_VERSION
         or core.get("source_identity") != expected_identity
+        or type(core.get("attempt_identity")) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", str(core.get("attempt_identity"))) is None
+        or core.get("run_profile") not in {
+            *run_profiles.LIVE_RUN_PROFILES, MANUAL_ATTENTION_LOCAL_PROFILE,
+        }
         or core.get("reason_code") not in {
             "coverage_incomplete", "coverage_conflict", "coverage_ambiguous"
         }
+        or core.get("validation_stage") != "coverage_validation"
+        or core.get("stable_reason") not in evidence.COVERAGE_FAILURE_REASONS
         or type(counts) is not dict
         or frozenset(counts) != frozenset({
-            "blocks", "segments", "evidence_candidates", "context_only", "structural",
-            "sensitive_withheld", "ambiguous", "omitted",
+            "deterministic_blocks", "source_segments", "returned_dispositions",
+            "valid_dispositions", "missing_dispositions", "duplicate_dispositions",
+            "conflicting_dispositions", "evidence_candidates", "context_only",
+            "structural", "sensitive_withheld_blocks", "ambiguous_blocks",
+            "omitted_blocks",
         })
         or any(type(value) is not int or value < 0 for value in counts.values())
+        or core.get("confirmed_fact_count") != 0
         or core.get("verified_candidate_fact_summaries") != []
-        or core.get("human_actions") != ["use_selected_facts", "skip", "discuss"]
+        or core.get("human_actions") != [
+            "use_confirmed_facts", "discuss_ambiguous_parts", "skip_material",
+        ]
         or core.get("narrative_ready") is not False
         or type(digest) is not str
         or digest != _sha(core)
@@ -7490,9 +7541,18 @@ class NarrativeNormalizerService:
                     if (
                         resolution.status == "manual_attention"
                         and resolution.coverage_summary is not None
+                        and resolution.coverage_failure is not None
                     ):
                         artifact = _manual_attention_artifact(
-                            identity, resolution.coverage_summary
+                            identity,
+                            attempt_id,
+                            (
+                                manual_retry.run_profile
+                                if manual_retry is not None
+                                else MANUAL_ATTENTION_LOCAL_PROFILE
+                            ),
+                            resolution.coverage_summary,
+                            resolution.coverage_failure,
                         )
                         self.store.persist_manual_attention(artifact)
                         reason = "narrative_normalizer_manual_attention_package_ready"

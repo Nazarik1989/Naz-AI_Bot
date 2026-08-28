@@ -3131,7 +3131,18 @@ def test_coverage_v2_incomplete_source_persists_safe_manual_attention_package(tm
     payload = json.loads((package / "manual-attention.json").read_text(encoding="utf-8"))
     assert payload["narrative_ready"] is False
     assert payload["verified_candidate_fact_summaries"] == []
-    assert payload["human_actions"] == ["use_selected_facts", "skip", "discuss"]
+    assert payload["schema_version"] == nn.MANUAL_ATTENTION_CONTRACT_VERSION
+    assert payload["confirmed_fact_count"] == 0
+    assert payload["verified_candidate_fact_summaries"] == []
+    assert payload["human_actions"] == [
+        "use_confirmed_facts", "discuss_ambiguous_parts", "skip_material",
+    ]
+    assert payload["coverage_counts"]["valid_dispositions"] >= 1
+    assert payload["coverage_counts"]["ambiguous_blocks"] >= 1
+    markdown = (package / "manual-attention.md").read_text(encoding="utf-8")
+    assert "Confirmed safe facts: 0" in markdown
+    assert "Choose one action:" in markdown
+    assert body not in markdown
     assert not (package / "story.json").exists()
     assert generation_client.requests == []
     assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE

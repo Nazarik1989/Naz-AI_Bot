@@ -1546,7 +1546,7 @@ def test_requested_integration_api_is_exported_exactly() -> None:
     assert required <= set(evidence.__all__)
     assert tuple(evidence.EvidenceResolution.__dataclass_fields__) == (
         "status", "verified_bundle", "model_call_count", "reason_code", "diagnostic",
-        "coverage_summary",
+        "coverage_summary", "coverage_failure",
     )
     assert isinstance(evidence.GenericEvidenceService, type)
 
@@ -1689,3 +1689,136 @@ def test_coverage_v2_ambiguous_plan_returns_useful_manual_summary(tmp_path):
     assert result.coverage_summary is not None
     assert result.coverage_summary.ambiguous_count == len(inventory.ordered_blocks)
     assert [item.request_kind for item in client.requests] == ["evidence_coverage"]
+
+
+def _coverage_resolution(bundle, response):
+    client = FakeEvidenceClient([response])
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle)
+    return result, client
+
+
+def test_coverage_failure_missing_disposition_is_closed_manual_attention(tmp_path):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "One.\nTwo."})
+    inventory = evidence.build_source_block_inventory(bundle)
+    payload = _coverage_payload(bundle, inventory)
+    payload["block_dispositions"].pop(next(iter(payload["block_dispositions"])))
+
+    result, client = _coverage_resolution(bundle, payload)
+
+    assert result.status == "manual_attention"
+    assert result.coverage_failure is not None
+    assert result.coverage_failure.stable_reason == "missing_block_disposition"
+    assert result.coverage_summary.missing_disposition_count == 1
+    assert len(client.requests) == 1
+
+
+def test_coverage_failure_duplicate_disposition_is_closed_manual_attention(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+    payload = _coverage_payload(bundle, inventory)
+    block_id = inventory.ordered_blocks[0].block_id
+    raw = __import__("json").dumps(payload, separators=(",", ":")).replace(
+        f'"{block_id}":"evidence_candidate"',
+        f'"{block_id}":"evidence_candidate","{block_id}":"evidence_candidate"',
+    )
+
+    result, _client = _coverage_resolution(bundle, raw)
+
+    assert result.status == "manual_attention"
+    assert result.coverage_failure is not None
+    assert result.coverage_failure.stable_reason == "duplicate_block_disposition"
+    assert result.coverage_summary.duplicate_disposition_count == 1
+
+
+def test_coverage_failure_conflicting_disposition_is_closed_manual_attention(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+    payload = _coverage_payload(bundle, inventory)
+    block_id = inventory.ordered_blocks[0].block_id
+    raw = __import__("json").dumps(payload, separators=(",", ":")).replace(
+        f'"{block_id}":"evidence_candidate"',
+        f'"{block_id}":"evidence_candidate","{block_id}":"context_only"',
+    )
+
+    result, _client = _coverage_resolution(bundle, raw)
+
+    assert result.status == "manual_attention"
+    assert result.coverage_failure is not None
+    assert result.coverage_failure.stable_reason == "conflicting_block_disposition"
+    assert result.coverage_summary.conflicting_disposition_count == 1
+
+
+def test_coverage_failure_ambiguous_decision_is_closed_manual_attention(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+
+    result, _client = _coverage_resolution(
+        bundle, _coverage_payload(bundle, inventory, disposition="ambiguous"),
+    )
+
+    assert result.status == "manual_attention"
+    assert result.coverage_failure is not None
+    assert result.coverage_failure.stable_reason == "ambiguous_coverage"
+    assert result.coverage_summary.ambiguous_count == len(inventory.ordered_blocks)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "stable_reason"),
+    (
+        ("malformed", "malformed_json"),
+        ("schema", "wrong_schema_version"),
+        ("source", "source_identity_mismatch"),
+        ("scalar", "exact_scalar_type_violation"),
+    ),
+)
+def test_hard_invalid_coverage_never_becomes_manual_attention(
+    tmp_path, mutation, stable_reason,
+):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+    payload = _coverage_payload(bundle, inventory)
+    response = payload
+    if mutation == "malformed":
+        response = "{not-json"
+    elif mutation == "schema":
+        payload["schema_version"] = "unknown-coverage-version"
+    elif mutation == "source":
+        payload["source_identity"] = "0" * 64
+    else:
+        payload["block_dispositions"] = []
+
+    result, client = _coverage_resolution(bundle, response)
+
+    assert result.status == "failed"
+    assert result.coverage_summary is None
+    assert result.coverage_failure is not None
+    assert result.coverage_failure.category == "hard_invalid"
+    assert result.coverage_failure.stable_reason == stable_reason
+    assert evidence.classify_coverage_failure(result.coverage_failure) is None
+    assert len(client.requests) == 1
+
+
+def test_privacy_boundary_failure_never_becomes_manual_attention(tmp_path):
+    bundle = _write_bundle(tmp_path)
+
+    class PrivacyRejectingClient:
+        def generate_json(self, request):
+            del request
+            raise RuntimeError("private provider detail must not escape")
+
+    result = evidence.GenericEvidenceService(
+        PrivacyRejectingClient(),
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle)
+
+    assert result.status == "failed"
+    assert result.reason_code == "evidence_provider_failed"
+    assert result.coverage_summary is None
+    assert result.coverage_failure is None
