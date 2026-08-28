@@ -1868,7 +1868,8 @@ def test_coverage_failure_safe_payload_round_trips_exactly(tmp_path):
 
 def test_transport_diagnostic_round_trips_without_raw_values():
     diagnostic = evidence.ProviderTransportDiagnostic(
-        "http_429", 429, "rate_limit", "req_safe_123", True, "not_applicable"
+        "http_rate_limited", "evidence_coverage", "openai/gpt-5.4-mini",
+        429, "rate_limit", "req_safe_123", True, None, 1,
     )
     failure = evidence.coverage_hard_failure_for_request(
         9,
@@ -1880,9 +1881,32 @@ def test_transport_diagnostic_round_trips_without_raw_values():
     assert payload["transport_diagnostic"] == diagnostic.safe_payload()
     assert evidence.coverage_failure_from_payload(payload) == failure
     assert frozenset(diagnostic.safe_payload()) == {
-        "category", "http_status", "provider_error_code", "provider_request_id",
-        "response_received", "timeout_phase",
+        "category", "operation", "model_id", "http_status", "provider_error_code",
+        "provider_request_id", "response_received", "timeout_phase",
+        "transport_attempt_count", "contract_version",
     }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: {key: item for key, item in value.items() if key != "operation"},
+        lambda value: dict(value, extra="forbidden"),
+        lambda value: dict(value, response_received=1),
+        lambda value: dict(value, timeout_phase="not_applicable"),
+        lambda value: dict(value, transport_attempt_count=2),
+        lambda value: dict(value, contract_version="wrong-version"),
+    ),
+    ids=("missing", "extra", "bool-coercion", "open-timeout", "retry-count", "version"),
+)
+def test_transport_diagnostic_payload_is_closed_and_exact(mutation):
+    payload = evidence.ProviderTransportDiagnostic(
+        "http_rate_limited", "evidence_coverage", "openai/gpt-5.4-mini",
+        429, "rate_limit", "req_safe_123", True, None, 1,
+    ).safe_payload()
+
+    with pytest.raises(TypeError):
+        evidence.provider_transport_diagnostic_from_payload(mutation(payload))
 
 
 def test_legacy_coverage_failure_payload_remains_readable_and_byte_semantics_stable():

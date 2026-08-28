@@ -3206,6 +3206,135 @@ def test_typed_coverage_hard_invalid_cases_fail_without_manual_package(tmp_path,
     assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
 
 
+def test_manual_retry_transport_diagnostic_persists_before_terminal_attempt(
+    tmp_path,
+):
+    diagnostic = nn.evidence.ProviderTransportDiagnostic(
+        category="http_rate_limited",
+        operation="evidence_coverage",
+        model_id="content-model",
+        http_status=429,
+        provider_error_code="rate_limit",
+        provider_request_id="req_safe_123",
+        response_received=True,
+        timeout_phase=None,
+        transport_attempt_count=1,
+    )
+
+    def response_builder(_payload, inventory):
+        return nn.evidence.coverage_hard_failure_for_request(
+            len(inventory.ordered_blocks),
+            stable_reason="transport_failure",
+            transport_diagnostic=diagnostic,
+        )
+
+    record, documents, service, evidence_client, generation_client, registry = (
+        _coverage_only_case(tmp_path, response_builder)
+    )
+    source = nn.read_source_unit(
+        service.policy,
+        record.source_ref,
+        expected_digest=record.source_digest,
+        allow_insufficient=True,
+    )
+    _path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(
+        source,
+        old_digest,
+        request_id="manual-retry-transport-diagnostic-0001",
+    )
+
+    outcome = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=request,
+    )
+
+    assert outcome.status == nn.OUTCOME_FAILED
+    assert outcome.model_call_count == 1
+    assert type(outcome.evidence_diagnostic) is nn.evidence.CoverageFailureEvidence
+    assert outcome.evidence_diagnostic.transport_diagnostic == diagnostic
+    current = service.store.read_claim(record.source_ref, record.source_digest)
+    assert current is not None
+    assert current["state"] == nn.CLAIM_FAILED
+    assert current["attempt_id"] != request.previous_failed_attempt_id
+    persisted = service.store.read_coverage_diagnostic(
+        documents.source_identity,
+        current["attempt_id"],
+    )
+    assert persisted["coverage_failure"] == outcome.evidence_diagnostic.safe_payload()
+    assert service.store.archived_attempt_bytes(
+        request.source_identity,
+        request.previous_failed_attempt_id,
+    ) == old_bytes
+    assert len(evidence_client.requests) == 1
+    assert generation_client.requests == []
+    assert not service.store.draft_path(
+        record.source_digest,
+        source_ref=record.source_ref,
+    ).exists()
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+
+
+def test_manual_retry_transport_diagnostic_persistence_failure_is_safe(
+    tmp_path, monkeypatch,
+):
+    diagnostic = nn.evidence.ProviderTransportDiagnostic(
+        "unknown_transport_failure", "evidence_coverage", "content-model",
+        None, None, None, False, None, 1,
+    )
+
+    def response_builder(_payload, inventory):
+        return nn.evidence.coverage_hard_failure_for_request(
+            len(inventory.ordered_blocks),
+            stable_reason="transport_failure",
+            transport_diagnostic=diagnostic,
+        )
+
+    record, _documents, service, evidence_client, generation_client, registry = (
+        _coverage_only_case(tmp_path, response_builder)
+    )
+    source = nn.read_source_unit(
+        service.policy,
+        record.source_ref,
+        expected_digest=record.source_digest,
+        allow_insufficient=True,
+    )
+    _path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(
+        source,
+        old_digest,
+        request_id="manual-retry-transport-persist-failure-0001",
+    )
+    monkeypatch.setattr(
+        service.store,
+        "persist_coverage_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            nn.NarrativeNormalizerError("narrative_normalizer_persistence_invalid")
+        ),
+    )
+
+    outcome = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=request,
+    )
+
+    assert outcome.status == nn.OUTCOME_FAILED
+    assert outcome.reason_codes == ("narrative_normalizer_persistence_invalid",)
+    assert len(evidence_client.requests) == 1
+    assert generation_client.requests == []
+    assert service.store.archived_attempt_bytes(
+        request.source_identity,
+        request.previous_failed_attempt_id,
+    ) == old_bytes
+    assert not service.store.draft_path(
+        record.source_digest,
+        source_ref=record.source_ref,
+    ).exists()
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+
+
 def test_coverage_diagnostic_write_failure_creates_no_manual_package(tmp_path, monkeypatch):
     record, _documents, service, evidence_client, generation_client, registry = (
         _coverage_only_case(

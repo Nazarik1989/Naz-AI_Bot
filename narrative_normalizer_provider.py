@@ -81,6 +81,8 @@ PROVIDER_DISABLED = "normalizer_provider_disabled"
 PROVIDER_CONFIGURATION_INVALID = "normalizer_provider_configuration_invalid"
 PROVIDER_TIMEOUT = "normalizer_provider_timeout"
 PROVIDER_TRANSPORT_FAILED = "normalizer_provider_transport_failed"
+PROVIDER_PROTOCOL_FAILED = "normalizer_provider_protocol_failed"
+PROVIDER_WORKER_FAILED = "normalizer_provider_worker_failed"
 PROVIDER_RESPONSE_INVALID = "normalizer_provider_response_invalid"
 PROVIDER_CANCELLED = "normalizer_provider_cancelled"
 PROVIDER_BUDGET_EXCEEDED = "normalizer_provider_budget_exceeded"
@@ -90,6 +92,8 @@ PROVIDER_REASON_CODES = frozenset({
     PROVIDER_CONFIGURATION_INVALID,
     PROVIDER_TIMEOUT,
     PROVIDER_TRANSPORT_FAILED,
+    PROVIDER_PROTOCOL_FAILED,
+    PROVIDER_WORKER_FAILED,
     PROVIDER_RESPONSE_INVALID,
     PROVIDER_CANCELLED,
     PROVIDER_BUDGET_EXCEEDED,
@@ -108,6 +112,23 @@ _LOG = logging.getLogger(__name__)
 _BROKER_CAPABILITY_MINT = object()
 
 
+def _diagnostic_matches_reason(
+    reason_code: str,
+    diagnostic: evidence.ProviderTransportDiagnostic,
+) -> bool:
+    if reason_code == PROVIDER_TIMEOUT:
+        return diagnostic.category == "timeout"
+    if reason_code == PROVIDER_RESPONSE_INVALID:
+        return diagnostic.category == "response_validation_failure"
+    if reason_code == PROVIDER_CONFIGURATION_INVALID:
+        return diagnostic.category == "provider_configuration_invalid"
+    if reason_code == PROVIDER_TRANSPORT_FAILED:
+        return diagnostic.category not in {
+            "timeout", "response_validation_failure", "provider_configuration_invalid",
+        }
+    return False
+
+
 class NormalizerProviderError(RuntimeError):
     """Privacy-safe provider error containing only a stable reason code."""
 
@@ -119,7 +140,11 @@ class NormalizerProviderError(RuntimeError):
         safe = reason_code if reason_code in PROVIDER_REASON_CODES else PROVIDER_TRANSPORT_FAILED
         if transport_diagnostic is not None and (
             type(transport_diagnostic) is not evidence.ProviderTransportDiagnostic
-            or safe not in {PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED}
+            or safe not in {
+                PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED,
+                PROVIDER_RESPONSE_INVALID, PROVIDER_CONFIGURATION_INVALID,
+            }
+            or not _diagnostic_matches_reason(safe, transport_diagnostic)
         ):
             raise TypeError("transport_diagnostic")
         self.reason_code = safe
@@ -708,7 +733,16 @@ class _ProviderCallRecord:
         if self.transport_diagnostic is not None and (
             type(self.transport_diagnostic) is not evidence.ProviderTransportDiagnostic
             or not self.completed
-            or self.safe_outcome not in {PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED}
+            or self.safe_outcome not in {
+                PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED,
+                PROVIDER_RESPONSE_INVALID, PROVIDER_CONFIGURATION_INVALID,
+            }
+            or self.transport_diagnostic.operation != self.operation
+            or self.transport_diagnostic.model_id != self.model_id
+            or not _diagnostic_matches_reason(
+                self.safe_outcome,
+                self.transport_diagnostic,
+            )
         ):
             raise TypeError("transport_diagnostic")
 
@@ -860,7 +894,10 @@ class _ProviderRunState:
                 transport_diagnostic is not None
                 and (
                     type(transport_diagnostic) is not evidence.ProviderTransportDiagnostic
-                    or outcome not in {PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED}
+                    or outcome not in {
+                        PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED,
+                        PROVIDER_RESPONSE_INVALID, PROVIDER_CONFIGURATION_INVALID,
+                    }
                 )
             )
         ):
@@ -934,6 +971,7 @@ class ProviderTransport(Protocol):
         timeout_seconds: int,
         operation_id: str,
         request_id: str,
+        operation: str,
     ) -> object:
         """Perform exactly one non-streaming, no-retry completion."""
 
@@ -982,24 +1020,32 @@ def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
 def _classify_transport_failure(
     error: BaseException,
     *,
+    operation: str,
+    model_id: str,
     timeout_types: tuple[type[BaseException], ...] = (),
 ) -> evidence.ProviderTransportDiagnostic:
     """Project an exception to closed metadata without reading exception text or bodies."""
 
     status, code, request_id, response_received = _safe_response_metadata(error)
     if status == 400:
-        category = "http_400"
-    elif status in {401, 403}:
-        category = "http_401_403"
+        category = "http_bad_request"
+    elif status == 401:
+        category = "http_authentication_failure"
+    elif status == 403:
+        category = "http_permission_denied"
     elif status == 404:
-        category = "http_404"
+        category = "http_not_found"
     elif status == 429:
-        category = "http_429"
-    elif status in {500, 502, 503, 504}:
-        category = "http_5xx"
+        category = "http_rate_limited"
+    elif status is not None and 500 <= status <= 599:
+        category = "http_server_error"
     else:
         chain = _exception_chain(error)
         names = {type(item).__name__ for item in chain}
+        if "APIResponseValidationError" in names:
+            category = "response_validation_failure"
+        else:
+            category = ""
         timeout_phase = next((
             phase
             for name, phase in (
@@ -1010,24 +1056,24 @@ def _classify_transport_failure(
             )
             if name in names
         ), None)
-        if (
+        if category == "" and (
             timeout_phase is not None
             or any(isinstance(item, timeout_types) for item in chain)
             or any(isinstance(item, TimeoutError) for item in chain)
         ):
             return evidence.ProviderTransportDiagnostic(
-                "timeout", status, code, request_id, response_received,
-                timeout_phase or "request",
+                "timeout", operation, model_id, None, code, request_id,
+                response_received, timeout_phase or "request", 1,
             )
-        if any(isinstance(item, ssl.SSLError) for item in chain):
-            category = "tls"
-        elif any(
+        if category == "" and any(isinstance(item, ssl.SSLError) for item in chain):
+            category = "tls_failure"
+        elif category == "" and any(
             isinstance(item, ConnectionResetError)
             or getattr(item, "errno", None) == errno.ECONNRESET
             for item in chain
         ):
             category = "connection_reset"
-        elif any(
+        elif category == "" and any(
             isinstance(item, (socket.gaierror, ConnectionRefusedError, ConnectionError))
             or getattr(item, "errno", None) in {
                 errno.ECONNREFUSED, errno.ENETDOWN, errno.ENETUNREACH,
@@ -1035,25 +1081,50 @@ def _classify_transport_failure(
             }
             for item in chain
         ):
-            category = "dns_connect"
-        elif names & {"ReadError", "RemoteProtocolError", "IncompleteRead"}:
+            category = "dns_or_connect_failure"
+        elif category == "" and names & {"ReadError", "RemoteProtocolError", "IncompleteRead"}:
             category = "response_read_failure"
-        else:
+        elif category == "" and "APIConnectionError" in names:
+            category = "dns_or_connect_failure"
+        elif category == "":
             category = "unknown_transport_failure"
     return evidence.ProviderTransportDiagnostic(
-        category, status, code, request_id, response_received, "not_applicable",
+        category, operation, model_id, status, code, request_id,
+        response_received, None, 1,
     )
 
 
-def _response_shape_diagnostic(response: object) -> evidence.ProviderTransportDiagnostic:
+def _response_shape_diagnostic(
+    response: object,
+    *,
+    operation: str,
+    model_id: str,
+) -> evidence.ProviderTransportDiagnostic:
     request_id = _safe_provider_metadata(getattr(response, "_request_id", None))
     return evidence.ProviderTransportDiagnostic(
-        "provider_configuration_invalid",
+        "response_validation_failure",
+        operation,
+        model_id,
         None,
         "unsupported_response_format",
         request_id,
         True,
-        "not_applicable",
+        None,
+        1,
+    )
+
+
+def _closed_transport_fallback(
+    *,
+    operation: str,
+    model_id: str,
+    response_received: bool,
+    category: str = "unknown_transport_failure",
+    provider_error_code: str | None = None,
+) -> evidence.ProviderTransportDiagnostic:
+    return evidence.ProviderTransportDiagnostic(
+        category, operation, model_id, None, provider_error_code, None,
+        response_received, None, 1,
     )
 
 
@@ -1073,6 +1144,7 @@ class _OpenAITransport:
         timeout_seconds: int,
         operation_id: str,
         request_id: str,
+        operation: str,
     ) -> object:
         del operation_id, request_id
         result: object = None
@@ -1088,8 +1160,12 @@ class _OpenAITransport:
             choices = getattr(response, "choices", None)
             if type(choices) is not list or len(choices) != 1:
                 raise NormalizerProviderError(
-                    PROVIDER_TRANSPORT_FAILED,
-                    _response_shape_diagnostic(response),
+                    PROVIDER_RESPONSE_INVALID,
+                    _response_shape_diagnostic(
+                        response,
+                        operation=operation,
+                        model_id=model,
+                    ),
                 )
             else:
                 result = getattr(getattr(choices[0], "message", None), "content", None)
@@ -1100,6 +1176,8 @@ class _OpenAITransport:
         except Exception as error:
             diagnostic = _classify_transport_failure(
                 error,
+                operation=operation,
+                model_id=model,
                 timeout_types=self._timeout_types,
             )
             reason = PROVIDER_TIMEOUT if diagnostic.category == "timeout" else PROVIDER_TRANSPORT_FAILED
@@ -1316,6 +1394,8 @@ def _ipc_request_payload(request: object) -> dict[str, object]:
 
 
 def _scripted_reply_payload(value: object) -> dict[str, object]:
+    if type(value) is evidence.ProviderTransportDiagnostic:
+        return {"kind": "transport_diagnostic", "value": value.safe_payload()}
     if isinstance(value, TimeoutError):
         return {"kind": "exception", "value": "TimeoutError"}
     if isinstance(value, asyncio.CancelledError):
@@ -1416,7 +1496,7 @@ class _WorkerChannel:
         with self.__lock:
             if self.__failed or self.__process.poll() is not None:
                 object.__setattr__(self, "_WorkerChannel__failed", True)
-                _raise(PROVIDER_TRANSPORT_FAILED)
+                _raise(PROVIDER_WORKER_FAILED)
             try:
                 encoded = json.dumps(
                     payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -1435,14 +1515,16 @@ class _WorkerChannel:
                 return response
             except (KeyboardInterrupt, SystemExit, GeneratorExit):
                 raise
-            except NormalizerProviderError:
+            except NormalizerProviderError as error:
                 object.__setattr__(self, "_WorkerChannel__failed", True)
                 self._terminate()
+                if error.reason_code == PROVIDER_TRANSPORT_FAILED:
+                    _raise(PROVIDER_WORKER_FAILED)
                 raise
             except Exception:
                 object.__setattr__(self, "_WorkerChannel__failed", True)
                 self._terminate()
-                _raise(PROVIDER_TRANSPORT_FAILED)
+                _raise(PROVIDER_PROTOCOL_FAILED)
 
     def call(self, source_identity: str, request: object) -> dict[str, object] | str:
         if type(source_identity) is not str or _HEX64.fullmatch(source_identity) is None:
@@ -1460,9 +1542,9 @@ class _WorkerChannel:
             "payload": _ipc_request_payload(request),
         })
         if response.get("schema_version") != IPC_RESPONSE_VERSION:
-            _raise(PROVIDER_TRANSPORT_FAILED)
+            _raise(PROVIDER_PROTOCOL_FAILED)
         if response.get("request_id") not in {None, request_id}:
-            _raise(PROVIDER_TRANSPORT_FAILED)
+            _raise(PROVIDER_PROTOCOL_FAILED)
         status = response.get("status")
         if status == "ok" and frozenset(response) == {
             "schema_version", "request_id", "status", "result"
@@ -1492,14 +1574,32 @@ class _WorkerChannel:
                         response["transport_diagnostic"]
                     )
                 except TypeError:
-                    _raise(PROVIDER_TRANSPORT_FAILED)
+                    _raise(PROVIDER_PROTOCOL_FAILED)
+                if (
+                    diagnostic.operation != operation
+                    or diagnostic.model_id != getattr(request, "model", None)
+                ):
+                    _raise(PROVIDER_PROTOCOL_FAILED)
             elif keys not in {
                 frozenset({"schema_version", "request_id", "status", "reason_code"}),
                 frozenset({"schema_version", "status", "reason_code"}),
             }:
-                _raise(PROVIDER_TRANSPORT_FAILED)
-            raise NormalizerProviderError(response["reason_code"], diagnostic) from None
-        _raise(PROVIDER_TRANSPORT_FAILED)
+                _raise(PROVIDER_PROTOCOL_FAILED)
+            reason_code = response["reason_code"]
+            if (
+                reason_code in {
+                    PROVIDER_TIMEOUT, PROVIDER_TRANSPORT_FAILED, PROVIDER_RESPONSE_INVALID,
+                }
+                and diagnostic is None
+            ):
+                _raise(PROVIDER_PROTOCOL_FAILED)
+            if diagnostic is not None and not _diagnostic_matches_reason(
+                reason_code,
+                diagnostic,
+            ):
+                _raise(PROVIDER_PROTOCOL_FAILED)
+            raise NormalizerProviderError(reason_code, diagnostic) from None
+        _raise(PROVIDER_PROTOCOL_FAILED)
 
     def _control(self, action: str, payload: object = None) -> object:
         response = self._exchange({
@@ -1519,7 +1619,7 @@ class _WorkerChannel:
     def ledger_snapshot(self) -> tuple[_ProviderCallRecord, ...]:
         values = self._control("ledger")
         if type(values) is not list:
-            _raise(PROVIDER_TRANSPORT_FAILED)
+            _raise(PROVIDER_PROTOCOL_FAILED)
         try:
             records = []
             for value in values:
@@ -1535,7 +1635,7 @@ class _WorkerChannel:
                 records.append(_ProviderCallRecord(**item))
             return tuple(records)
         except (TypeError, ValueError):
-            _raise(PROVIDER_TRANSPORT_FAILED)
+            _raise(PROVIDER_PROTOCOL_FAILED)
 
     def _test_calls(self) -> list[dict[str, object]]:
         values = self._control("calls")
@@ -1973,8 +2073,10 @@ __all__ = (
     "PROVIDER_DISABLED",
     "PROVIDER_RESPONSE_INVALID",
     "PROVIDER_REQUEST_CONFLICT",
+    "PROVIDER_PROTOCOL_FAILED",
     "PROVIDER_TIMEOUT",
     "PROVIDER_TRANSPORT_FAILED",
+    "PROVIDER_WORKER_FAILED",
     "ProductionModelClient",
     "ProductionNarrativeContextProvider",
     "ProviderConfiguration",

@@ -734,8 +734,15 @@ def test_coverage_provider_response_failure_returns_typed_hard_invalid():
     assert type(result) is evidence.CoverageFailureEvidence
     assert result.category == "coverage_hard_invalid"
     assert result.stable_reason == "unsupported_object_type"
+    assert result.transport_diagnostic is not None
+    assert result.transport_diagnostic.category == "response_validation_failure"
+    assert result.transport_diagnostic.operation == "evidence_coverage"
+    assert result.transport_diagnostic.model_id == CONTENT_MODEL
+    assert result.transport_diagnostic.response_received is True
+    assert result.transport_diagnostic.transport_attempt_count == 1
     assert result.summary.block_count == 1
     assert len(transport.calls) == 1
+    assert client.ledger.snapshot()[0].transport_diagnostic == result.transport_diagnostic
 
 
 def test_coverage_provider_transport_failure_returns_typed_hard_invalid():
@@ -752,6 +759,9 @@ def test_coverage_provider_transport_failure_returns_typed_hard_invalid():
     assert result.transport_diagnostic.http_status is None
     assert result.transport_diagnostic.response_received is False
     assert result.transport_diagnostic.timeout_phase == "request"
+    assert result.transport_diagnostic.operation == "evidence_coverage"
+    assert result.transport_diagnostic.model_id == CONTENT_MODEL
+    assert result.transport_diagnostic.transport_attempt_count == 1
     assert len(transport.calls) == 1
     record = client.ledger.snapshot()[0]
     assert record.transport_diagnostic == result.transport_diagnostic
@@ -769,37 +779,158 @@ class RemoteProtocolError(RuntimeError):
     pass
 
 
+class APIResponseValidationError(RuntimeError):
+    pass
+
+
 @pytest.mark.parametrize(
     ("error", "category", "status", "response_received", "timeout_phase"),
     (
         (TimeoutError("private"), "timeout", None, False, "request"),
-        (socket.gaierror(1, "private"), "dns_connect", None, False, "not_applicable"),
-        (ssl.SSLError("private"), "tls", None, False, "not_applicable"),
-        (ConnectionResetError("private"), "connection_reset", None, False, "not_applicable"),
-        (_SafeHTTPError(400), "http_400", 400, True, "not_applicable"),
-        (_SafeHTTPError(401), "http_401_403", 401, True, "not_applicable"),
-        (_SafeHTTPError(403), "http_401_403", 403, True, "not_applicable"),
-        (_SafeHTTPError(404), "http_404", 404, True, "not_applicable"),
-        (_SafeHTTPError(429), "http_429", 429, True, "not_applicable"),
-        (_SafeHTTPError(503), "http_5xx", 503, True, "not_applicable"),
-        (RemoteProtocolError("private"), "response_read_failure", None, False, "not_applicable"),
-        (RuntimeError("private"), "unknown_transport_failure", None, False, "not_applicable"),
+        (socket.gaierror(1, "private"), "dns_or_connect_failure", None, False, None),
+        (ssl.SSLError("private"), "tls_failure", None, False, None),
+        (ConnectionResetError("private"), "connection_reset", None, False, None),
+        (_SafeHTTPError(400), "http_bad_request", 400, True, None),
+        (_SafeHTTPError(401), "http_authentication_failure", 401, True, None),
+        (_SafeHTTPError(403), "http_permission_denied", 403, True, None),
+        (_SafeHTTPError(404), "http_not_found", 404, True, None),
+        (_SafeHTTPError(429), "http_rate_limited", 429, True, None),
+        (_SafeHTTPError(500), "http_server_error", 500, True, None),
+        (_SafeHTTPError(502), "http_server_error", 502, True, None),
+        (_SafeHTTPError(503), "http_server_error", 503, True, None),
+        (_SafeHTTPError(504), "http_server_error", 504, True, None),
+        (RemoteProtocolError("private"), "response_read_failure", None, False, None),
+        (APIResponseValidationError("private"), "response_validation_failure", None, False, None),
+        (RuntimeError("private"), "unknown_transport_failure", None, False, None),
     ),
 )
 def test_transport_failure_classifier_is_closed_and_privacy_safe(
     error, category, status, response_received, timeout_phase,
 ):
-    diagnostic = provider._classify_transport_failure(error)
+    diagnostic = provider._classify_transport_failure(
+        error,
+        operation="evidence_coverage",
+        model_id=CONTENT_MODEL,
+    )
 
     assert diagnostic.category == category
     assert diagnostic.http_status == status
     assert diagnostic.response_received is response_received
     assert diagnostic.timeout_phase == timeout_phase
+    assert diagnostic.operation == "evidence_coverage"
+    assert diagnostic.model_id == CONTENT_MODEL
+    assert diagnostic.transport_attempt_count == 1
+    assert diagnostic.contract_version == evidence.PROVIDER_TRANSPORT_DIAGNOSTIC_VERSION
     payload = diagnostic.safe_payload()
     assert "private" not in json.dumps(payload, sort_keys=True)
     if status is not None:
         assert diagnostic.provider_error_code == "provider_code"
         assert diagnostic.provider_request_id == "req_safe_123"
+
+
+def _transport_diagnostic(category):
+    statuses = {
+        "http_bad_request": 400,
+        "http_authentication_failure": 401,
+        "http_permission_denied": 403,
+        "http_not_found": 404,
+        "http_rate_limited": 429,
+        "http_server_error": 503,
+    }
+    response_received = category in {
+        *statuses,
+        "response_read_failure",
+        "response_validation_failure",
+        "provider_configuration_invalid",
+    }
+    return evidence.ProviderTransportDiagnostic(
+        category=category,
+        operation="evidence_coverage",
+        model_id=CONTENT_MODEL,
+        http_status=statuses.get(category),
+        provider_error_code=("safe_provider_code" if response_received else None),
+        provider_request_id=("safe_request_id" if response_received else None),
+        response_received=response_received,
+        timeout_phase=("request" if category == "timeout" else None),
+        transport_attempt_count=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "category",
+    (
+        "timeout",
+        "dns_or_connect_failure",
+        "tls_failure",
+        "connection_reset",
+        "http_bad_request",
+        "http_authentication_failure",
+        "http_permission_denied",
+        "http_not_found",
+        "http_rate_limited",
+        "http_server_error",
+        "response_read_failure",
+        "response_validation_failure",
+        "provider_configuration_invalid",
+        "unknown_transport_failure",
+    ),
+)
+def test_every_transport_diagnostic_round_trips_worker_parent_and_ledger(category):
+    diagnostic = _transport_diagnostic(category)
+    transport = FakeTransport([diagnostic])
+    _dependencies, client, _ = adapter(transport)
+
+    result = invoke(client, evidence_request("evidence_coverage", CONTENT_MODEL))
+
+    assert type(result) is evidence.CoverageFailureEvidence
+    assert result.transport_diagnostic == diagnostic
+    assert result.stable_reason == (
+        "unsupported_object_type"
+        if category == "response_validation_failure"
+        else "privacy_violation"
+        if category == "provider_configuration_invalid"
+        else "transport_failure"
+    )
+    assert len(transport.calls) == 1
+    records = client.ledger.snapshot()
+    assert len(records) == 1
+    assert records[0].attempt_number == 1
+    assert records[0].transport_diagnostic == diagnostic
+    rendered = json.dumps(result.safe_payload(), sort_keys=True)
+    assert "private" not in rendered
+    assert "Authorization" not in rendered
+
+
+def test_openai_sdk_boundary_projects_structured_failure_without_exception_text():
+    error = _SafeHTTPError(429, code="rate_limit", request_id="req_sdk_safe")
+
+    class Completions:
+        @staticmethod
+        def create(**_kwargs):
+            raise error
+
+    client = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=Completions())
+    )
+    transport = provider._OpenAITransport(client, (TimeoutError,))
+
+    with pytest.raises(provider.NormalizerProviderError) as caught:
+        transport.complete(
+            model=CONTENT_MODEL,
+            messages=({"role": "user", "content": "safe"},),
+            response_format={"type": "json_object"},
+            timeout_seconds=120,
+            operation_id="operation-safe",
+            request_id="request-safe",
+            operation="evidence_coverage",
+        )
+
+    assert caught.value.reason_code == provider.PROVIDER_TRANSPORT_FAILED
+    assert caught.value.transport_diagnostic == evidence.ProviderTransportDiagnostic(
+        "http_rate_limited", "evidence_coverage", CONTENT_MODEL,
+        429, "rate_limit", "req_sdk_safe", True, None, 1,
+    )
+    assert "private body" not in repr(caught.value)
 
 
 def test_unknown_transport_diagnostic_survives_worker_ipc_and_ledger():
@@ -1945,6 +2076,50 @@ def test_parent_rejects_malformed_ipc_before_worker_message(message):
     assert client.ledger.snapshot() == ()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: {key: item for key, item in value.items() if key != "category"},
+        lambda value: dict(value, extra="forbidden"),
+        lambda value: dict(value, http_status="429"),
+        lambda value: dict(value, transport_attempt_count=2),
+        lambda value: dict(value, contract_version="wrong-version"),
+        lambda value: dict(value, operation="generation"),
+        lambda value: dict(value, model_id=REVIEW_MODEL),
+    ),
+    ids=(
+        "missing", "extra", "wrong-scalar", "retry-count", "wrong-version",
+        "wrong-operation-binding", "wrong-model-binding",
+    ),
+)
+def test_parent_rejects_malformed_worker_transport_diagnostic_as_protocol_failure(
+    monkeypatch, mutation,
+):
+    _dependencies, client, transport = adapter()
+    channel = object.__getattribute__(client, "_ProductionModelClient__channel")
+    assert channel._test_messages() == 0
+    assert transport.calls == []
+    diagnostic = mutation(_transport_diagnostic("http_rate_limited").safe_payload())
+    request_id = "a" * 24
+
+    monkeypatch.setattr(
+        provider._WorkerChannel,
+        "_exchange",
+        lambda _self, _message: {
+            "schema_version": provider.IPC_RESPONSE_VERSION,
+            "request_id": request_id,
+            "status": "error",
+            "reason_code": provider.PROVIDER_TRANSPORT_FAILED,
+            "transport_diagnostic": diagnostic,
+        },
+    )
+    monkeypatch.setattr(provider.secrets, "token_hex", lambda _count: request_id)
+
+    with pytest.raises(provider.NormalizerProviderError) as caught:
+        channel.call(AUTHORIZED_SOURCES[0], evidence_request("evidence_coverage", CONTENT_MODEL))
+    assert caught.value.reason_code == provider.PROVIDER_PROTOCOL_FAILED
+
+
 def test_worker_defensively_rejects_plain_but_wrong_run_id_without_transport():
     _dependencies, client, transport = adapter()
     channel = object.__getattribute__(client, "_ProductionModelClient__channel")
@@ -2199,8 +2374,9 @@ def test_worker_crash_is_privacy_safe_and_never_restarts():
     for _ in range(2):
         with pytest.raises(provider.NormalizerProviderError) as caught:
             invoke(client, narrative_request("generation", CONTENT_MODEL))
-        assert caught.value.reason_code == provider.PROVIDER_TRANSPORT_FAILED
-        assert "worker" not in str(caught.value).lower()
+        assert caught.value.reason_code == provider.PROVIDER_WORKER_FAILED
+        assert caught.value.transport_diagnostic is None
+        assert str(caught.value) == provider.PROVIDER_WORKER_FAILED
     assert object.__getattribute__(channel, "_WorkerChannel__process") is process
     assert process.pid == original_pid
     assert process.poll() is not None

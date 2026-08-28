@@ -814,15 +814,21 @@ _COVERAGE_SOURCE_BINDING_RESULTS = frozenset({
 })
 
 _TRANSPORT_FAILURE_CATEGORIES = frozenset({
-    "timeout", "dns_connect", "tls", "connection_reset", "http_400",
-    "http_401_403", "http_404", "http_429", "http_5xx",
-    "response_read_failure", "provider_configuration_invalid",
-    "unknown_transport_failure",
+    "timeout", "dns_or_connect_failure", "tls_failure", "connection_reset",
+    "http_bad_request", "http_authentication_failure", "http_permission_denied",
+    "http_not_found", "http_rate_limited", "http_server_error",
+    "response_read_failure", "response_validation_failure",
+    "provider_configuration_invalid", "unknown_transport_failure",
 })
 _TRANSPORT_TIMEOUT_PHASES = frozenset({
-    "not_applicable", "connect", "read", "write", "pool", "request", "unknown",
+    "connect", "read", "write", "pool", "request", "unknown",
 })
 _SAFE_PROVIDER_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_TRANSPORT_OPERATION = re.compile(
+    r"(?:evidence_coverage|evidence_extraction|evidence_adjudication|generation|adjudication|repair)\Z"
+)
+_TRANSPORT_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+PROVIDER_TRANSPORT_DIAGNOSTIC_VERSION = "normalizer-provider-transport-diagnostic-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,14 +836,22 @@ class ProviderTransportDiagnostic:
     """Closed provider diagnostic containing no request or response content."""
 
     category: str
+    operation: str
+    model_id: str
     http_status: int | None
     provider_error_code: str | None
     provider_request_id: str | None
     response_received: bool
-    timeout_phase: str
+    timeout_phase: str | None
+    transport_attempt_count: int
+    contract_version: str = PROVIDER_TRANSPORT_DIAGNOSTIC_VERSION
 
     def __post_init__(self) -> None:
         _enum(self.category, _TRANSPORT_FAILURE_CATEGORIES, "category")
+        if type(self.operation) is not str or _TRANSPORT_OPERATION.fullmatch(self.operation) is None:
+            raise TypeError("operation")
+        if type(self.model_id) is not str or _TRANSPORT_MODEL.fullmatch(self.model_id) is None:
+            raise TypeError("model_id")
         if self.http_status is not None and (
             type(self.http_status) is not int or not 100 <= self.http_status <= 599
         ):
@@ -850,28 +864,61 @@ class ProviderTransportDiagnostic:
                 raise TypeError(name)
         if type(self.response_received) is not bool:
             raise TypeError("response_received")
-        _enum(self.timeout_phase, _TRANSPORT_TIMEOUT_PHASES, "timeout_phase")
-        if self.category == "timeout" and self.timeout_phase == "not_applicable":
+        if self.timeout_phase is not None:
+            _enum(self.timeout_phase, _TRANSPORT_TIMEOUT_PHASES, "timeout_phase")
+        if self.category == "timeout" and self.timeout_phase is None:
             raise ValueError("timeout_phase")
-        if self.category != "timeout" and self.timeout_phase != "not_applicable":
+        if self.category != "timeout" and self.timeout_phase is not None:
             raise ValueError("timeout_phase")
         if self.http_status is not None and not self.response_received:
             raise ValueError("response_received")
+        expected_statuses = {
+            "http_bad_request": {400},
+            "http_authentication_failure": {401},
+            "http_permission_denied": {403},
+            "http_not_found": {404},
+            "http_rate_limited": {429},
+            "http_server_error": set(range(500, 600)),
+        }
+        if self.category in expected_statuses and self.http_status not in expected_statuses[self.category]:
+            raise ValueError("http_status")
+        if (
+            self.category not in expected_statuses
+            and self.category != "unknown_transport_failure"
+            and self.http_status is not None
+        ):
+            raise ValueError("http_status")
+        if (
+            type(self.transport_attempt_count) is not int
+            or isinstance(self.transport_attempt_count, bool)
+            or self.transport_attempt_count != 1
+        ):
+            raise TypeError("transport_attempt_count")
+        if (
+            type(self.contract_version) is not str
+            or self.contract_version != PROVIDER_TRANSPORT_DIAGNOSTIC_VERSION
+        ):
+            raise ValueError("contract_version")
 
     def safe_payload(self) -> dict[str, object]:
         return {
             "category": self.category,
+            "operation": self.operation,
+            "model_id": self.model_id,
             "http_status": self.http_status,
             "provider_error_code": self.provider_error_code,
             "provider_request_id": self.provider_request_id,
             "response_received": self.response_received,
             "timeout_phase": self.timeout_phase,
+            "transport_attempt_count": self.transport_attempt_count,
+            "contract_version": self.contract_version,
         }
 
 
 _TRANSPORT_DIAGNOSTIC_KEYS = frozenset({
-    "category", "http_status", "provider_error_code", "provider_request_id",
-    "response_received", "timeout_phase",
+    "category", "operation", "model_id", "http_status", "provider_error_code",
+    "provider_request_id", "response_received", "timeout_phase",
+    "transport_attempt_count", "contract_version",
 })
 
 
@@ -917,7 +964,9 @@ class CoverageFailureEvidence:
         if self.transport_diagnostic is not None and (
             type(self.transport_diagnostic) is not ProviderTransportDiagnostic
             or self.category != "coverage_hard_invalid"
-            or self.stable_reason != "transport_failure"
+            or self.stable_reason not in {
+                "transport_failure", "unsupported_object_type", "privacy_violation",
+            }
         ):
             raise TypeError("transport_diagnostic")
 
@@ -1044,6 +1093,7 @@ def coverage_hard_failure(
     *,
     stable_reason: str,
     source_binding_result: str = "not_checked",
+    transport_diagnostic: ProviderTransportDiagnostic | None = None,
 ) -> CoverageFailureEvidence:
     """Create one closed hard-invalid diagnostic without response content."""
 
@@ -1061,6 +1111,7 @@ def coverage_hard_failure(
             missing=len(inventory.ordered_blocks),
         ),
         source_binding_result=source_binding_result,
+        transport_diagnostic=transport_diagnostic,
     )
 
 
@@ -3499,6 +3550,7 @@ class GenericEvidenceService:
                     inventory,
                     stable_reason=coverage_response.stable_reason,
                     source_binding_result=coverage_response.source_binding_result,
+                    transport_diagnostic=coverage_response.transport_diagnostic,
                 )
                 return EvidenceResolution(
                     "failed", None, calls, "evidence_provider_failed", None,
@@ -3917,6 +3969,7 @@ __all__ = [
     "EvidenceValidationDiagnostic",
     "GenericEvidenceService",
     "PUBLIC_SAFETY",
+    "PROVIDER_TRANSPORT_DIAGNOSTIC_VERSION",
     "REASON_CODES",
     "RESOLUTION_STATUSES",
     "SOURCE_DOCUMENT_CONTRACT_VERSION",

@@ -117,6 +117,18 @@ def _decode_scripted_reply(value: object) -> object:
     payload = item["value"]
     if kind == "value":
         return _decode_value(payload)
+    if kind == "transport_diagnostic":
+        diagnostic = evidence.provider_transport_diagnostic_from_payload(payload)
+        reason = (
+            provider.PROVIDER_TIMEOUT
+            if diagnostic.category == "timeout"
+            else provider.PROVIDER_RESPONSE_INVALID
+            if diagnostic.category == "response_validation_failure"
+            else provider.PROVIDER_CONFIGURATION_INVALID
+            if diagnostic.category == "provider_configuration_invalid"
+            else provider.PROVIDER_TRANSPORT_FAILED
+        )
+        return provider.NormalizerProviderError(reason, diagnostic)
     if kind == "bytes":
         if type(payload) is not str:
             raise provider.NormalizerProviderError(provider.PROVIDER_CONFIGURATION_INVALID)
@@ -437,15 +449,43 @@ def _handle_request(
         result = transport.complete(
             model=expected_model, messages=messages, response_format=response_format,
             timeout_seconds=config.timeout_seconds, operation_id=record.operation_id,
-            request_id=record.request_id,
+            request_id=record.request_id, operation=operation,
         )
-        result = provider._strict_response(result)
-        provider._assert_private_payload(result, secret_values=(secret.reveal(),))
+        try:
+            result = provider._strict_response(result)
+            provider._assert_private_payload(result, secret_values=(secret.reveal(),))
+        except provider.NormalizerProviderError as caught:
+            if caught.reason_code == provider.PROVIDER_RESPONSE_INVALID:
+                diagnostic = provider._closed_transport_fallback(
+                    operation=operation,
+                    model_id=expected_model,
+                    response_received=True,
+                    category="response_validation_failure",
+                    provider_error_code="invalid_response_payload",
+                )
+            elif caught.reason_code == provider.PROVIDER_CONFIGURATION_INVALID:
+                diagnostic = provider._closed_transport_fallback(
+                    operation=operation,
+                    model_id=expected_model,
+                    response_received=True,
+                    category="provider_configuration_invalid",
+                    provider_error_code="response_privacy_rejected",
+                )
+            else:
+                raise
+            raise provider.NormalizerProviderError(
+                caught.reason_code,
+                diagnostic,
+            ) from None
         response_digest = hashlib.sha256(provider._canonical(result)).hexdigest()
         outcome = "completed"
     except TimeoutError as caught:
         outcome = provider.PROVIDER_TIMEOUT
-        transport_diagnostic = provider._classify_transport_failure(caught)
+        transport_diagnostic = provider._classify_transport_failure(
+            caught,
+            operation=operation,
+            model_id=expected_model,
+        )
         error = provider.NormalizerProviderError(
             provider.PROVIDER_TIMEOUT,
             transport_diagnostic,
@@ -453,6 +493,19 @@ def _handle_request(
     except provider.NormalizerProviderError as caught:
         outcome = caught.reason_code
         transport_diagnostic = caught.transport_diagnostic
+        if (
+            transport_diagnostic is None
+            and caught.reason_code in {
+                provider.PROVIDER_TIMEOUT,
+                provider.PROVIDER_TRANSPORT_FAILED,
+                provider.PROVIDER_RESPONSE_INVALID,
+            }
+        ):
+            transport_diagnostic = provider._closed_transport_fallback(
+                operation=operation,
+                model_id=expected_model,
+                response_received=False,
+            )
         error = provider.NormalizerProviderError(
             caught.reason_code,
             transport_diagnostic,
@@ -471,7 +524,11 @@ def _handle_request(
         base_exception = "GeneratorExit"
     except Exception as caught:
         outcome = provider.PROVIDER_TRANSPORT_FAILED
-        transport_diagnostic = provider._classify_transport_failure(caught)
+        transport_diagnostic = provider._classify_transport_failure(
+            caught,
+            operation=operation,
+            model_id=expected_model,
+        )
         error = provider.NormalizerProviderError(
             provider.PROVIDER_TRANSPORT_FAILED,
             transport_diagnostic,

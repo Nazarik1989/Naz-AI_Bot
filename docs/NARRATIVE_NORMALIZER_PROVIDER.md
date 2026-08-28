@@ -231,6 +231,8 @@ Provider failures expose only these stable reasons:
 - `normalizer_provider_configuration_invalid`;
 - `normalizer_provider_timeout`;
 - `normalizer_provider_transport_failed`;
+- `normalizer_provider_protocol_failed`;
+- `normalizer_provider_worker_failed`;
 - `normalizer_provider_response_invalid`;
 - `normalizer_provider_cancelled`;
 - `normalizer_provider_budget_exceeded`.
@@ -241,12 +243,25 @@ included. `asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit` and
 `GeneratorExit` propagate by exact exception type, with worker-private text
 removed.
 
-Transport failures additionally carry a closed privacy-safe diagnostic through
-worker IPC and the detached ledger. It contains only a category, numeric HTTP
-status, validated provider error code/request ID, response-received flag and a
-closed timeout phase. Exception text, response bodies, request content, prompts,
-headers, credentials and URLs are never serialized. For evidence coverage the
-same diagnostic is persisted append-only with the attempt.
+Every actual terminal transport failure carries the immutable
+`normalizer-provider-transport-diagnostic-v1` contract through the SDK boundary,
+worker response, parent proxy, detached ledger, coverage boundary and append-only
+attempt diagnostic. Its exact fields are `category`, `operation`, `model_id`,
+`http_status`, `provider_error_code`, `provider_request_id`,
+`response_received`, `timeout_phase`, `transport_attempt_count`, and
+`contract_version`; absent optional values are explicit JSON nulls. The closed
+categories distinguish timeout, DNS/connect, TLS, connection reset, HTTP
+400/401/403/404/429/5xx, response read/validation, provider configuration and
+unknown transport failures. A malformed or missing diagnostic on an actual
+transport-failure response is a provider protocol failure. A dead child is a
+separate worker failure and is never restarted automatically.
+
+Classification uses only structured SDK/HTTP attributes and exception types.
+Exception text, repr/traceback, response bodies, request content, prompts,
+headers, credentials, URLs and filesystem paths are never serialized. For
+evidence coverage the exact validated diagnostic is persisted before the new
+attempt becomes terminal; persistence failure creates no package and makes no
+extra model call.
 
 Transport output must be an exact mapping or a plain JSON-object string. Bytes,
 SDK objects, scalar/array JSON, generators, fenced JSON and prose wrappers are
