@@ -22,6 +22,9 @@ import narrative_normalizer as normalizer
 import narrative_normalizer_evidence as evidence
 import narrative_normalizer_provider as provider
 import narrative_normalizer_trust as trust
+import narrative_review_authority as review_authority
+import narrative_review_authority_client as review_authority_client
+import narrative_review_authority_protocol as review_authority_protocol
 import reels_failure_quarantine as quarantine
 import tools.run_narrative_normalizer as cli
 from tools.run_narrative_generation_fixture import fake_adjudication_payload, load_fixture
@@ -111,6 +114,88 @@ def authorization(
         trust_service=TEST_TRUST_SERVICE,
         review_authority_root=TEST_AUTHORITY_ROOT,
     )
+
+
+def broker_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> provider.BrokerReadinessCapability:
+    monkeypatch.setattr(
+        review_authority_client.socket, "AF_UNIX",
+        getattr(review_authority_client.socket, "AF_UNIX", 1), raising=False,
+    )
+    proxy = review_authority_client.ReviewAuthorityClient(
+        (tmp_path / "authority.sock").resolve(), owner_uid=1, owner_gid=2
+    )
+    monkeypatch.setattr(
+        review_authority_client.ReviewAuthorityClient,
+        "health",
+        lambda self, request_id: {
+            "status": "ok",
+            "contract_version": review_authority.BROKER_CONTRACT_VERSION,
+            "narrative_outbox_layout_version": review_authority.NARRATIVE_OUTBOX_LAYOUT_VERSION,
+            "key_id": "a" * 24,
+            "authenticated_role": review_authority_protocol.ROLE_NORMALIZER,
+        },
+    )
+    return provider.broker_readiness_capability(proxy)
+
+
+def test_broker_capability_authorizes_provider_without_local_trust_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = broker_capability(tmp_path, monkeypatch)
+    approved = provider.authorize_live_provider_run(
+        adapter_spec=provider.PRODUCTION_ADAPTER_SPEC,
+        local_execution_enabled=True,
+        live_provider_enabled=True,
+        run_profile=provider.CANARY_RUN_PROFILE,
+        source_identities=(AUTHORIZED_SOURCES[0],),
+        env=live_env(),
+        broker_capability=capability,
+    )
+    assert approved.trust_key_id == "a" * 24
+    assert approved.global_call_budget == 5
+    assert len(approved.authorized_source_identities) == 1
+
+
+@pytest.mark.parametrize("forged", [True, False, "/tmp/authority", object()])
+def test_provider_rejects_forged_broker_capability(forged: object) -> None:
+    with pytest.raises(provider.NormalizerProviderError) as caught:
+        provider.authorize_live_provider_run(
+            adapter_spec=provider.PRODUCTION_ADAPTER_SPEC,
+            local_execution_enabled=True,
+            live_provider_enabled=True,
+            run_profile=provider.CANARY_RUN_PROFILE,
+            source_identities=(AUTHORIZED_SOURCES[0],),
+            env=live_env(),
+            broker_capability=forged,
+        )
+    assert caught.value.reason_code == provider.PROVIDER_CONFIGURATION_INVALID
+
+
+def test_broker_capability_requires_normalizer_authenticated_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        review_authority_client.socket, "AF_UNIX",
+        getattr(review_authority_client.socket, "AF_UNIX", 1), raising=False,
+    )
+    proxy = review_authority_client.ReviewAuthorityClient(
+        (tmp_path / "authority.sock").resolve(), owner_uid=1, owner_gid=2
+    )
+    monkeypatch.setattr(
+        review_authority_client.ReviewAuthorityClient,
+        "health",
+        lambda self, request_id: {
+            "status": "ok",
+            "contract_version": review_authority.BROKER_CONTRACT_VERSION,
+            "narrative_outbox_layout_version": review_authority.NARRATIVE_OUTBOX_LAYOUT_VERSION,
+            "key_id": "a" * 24,
+            "authenticated_role": review_authority_protocol.ROLE_CONSUMER,
+        },
+    )
+    with pytest.raises(provider.NormalizerProviderError):
+        provider.broker_readiness_capability(proxy)
 
 
 def adapter(

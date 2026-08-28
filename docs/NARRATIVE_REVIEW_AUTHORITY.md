@@ -195,3 +195,20 @@ python tools/run_narrative_review_authority.py \
 
 Importing any broker module and invoking CLI `--help` are inert: no key read,
 socket creation, authority-root creation, worker, provider, or network activity.
+
+## Broker-owned draft bundle trust
+
+Production Broker mode uses the closed IPC operation `seal_draft_bundle`.
+Only an OS-authenticated `normalizer` peer may call it. The request contains
+source, attempt, and draft identities plus exact story JSON, story Markdown,
+evidence, review, manifest, completed-claim, and artifact-binding digests. It
+contains no path, raw story, quote, prompt, response, or arbitrary byte field.
+The Broker returns a detached `normalizer-draft-bundle-v1` receipt and remains
+the only process that loads or owns the HMAC key. Generic signing is not an IPC
+operation.
+
+Broker health includes the peer role selected from kernel credentials. Provider
+authorization accepts an immutable readiness capability only after exact V2
+protocol, Broker contract, layout, key ID, and authenticated `normalizer` role
+checks. A boolean, path, key object, or caller-constructed substitute is not a
+capability.

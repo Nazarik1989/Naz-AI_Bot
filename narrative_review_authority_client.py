@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import socket
 from pathlib import Path
 from typing import Callable
@@ -80,8 +81,18 @@ class ReviewAuthorityClient:
     def health(self, request_id: str) -> dict[str, object]:
         return self.exchange(request_id, protocol.OP_HEALTH, {})
 
+    def transport_identity(self) -> str:
+        value = (
+            f"review-authority-client-v1\0{self._socket_path}\0{self._owner_uid}\0"
+            f"{self._owner_gid}\0{self._mode}"
+        )
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
     def register_draft(self, request_id: str, payload: dict[str, object]) -> dict[str, object]:
         return self.exchange(request_id, protocol.OP_REGISTER_DRAFT, payload)
+
+    def seal_draft_bundle(self, request_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return self.exchange(request_id, protocol.OP_SEAL_DRAFT_BUNDLE, payload)
 
     def latest_state(self, request_id: str, payload: dict[str, object]) -> dict[str, object]:
         return self.exchange(request_id, protocol.OP_LATEST_STATE, payload)

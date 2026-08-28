@@ -599,8 +599,6 @@ def run(
                     raise normalizer.NarrativeNormalizerError(
                         "narrative_normalizer_review_authority_unavailable"
                     )
-                trust_service = _load_trust_service(args)
-                policy = replace(policy, narrative_trust_service=trust_service)
                 try:
                     import narrative_normalizer_provider as production_provider
 
@@ -612,6 +610,15 @@ def run(
                         raise production_provider.NormalizerProviderError(
                             production_provider.PROVIDER_CONFIGURATION_INVALID
                         )
+                    if broker_client is not None:
+                        broker_capability = production_provider.broker_readiness_capability(
+                            broker_client
+                        )
+                        trust_service = None
+                    else:
+                        broker_capability = None
+                        trust_service = _load_trust_service(args)
+                        policy = replace(policy, narrative_trust_service=trust_service)
                     authorization = production_provider.authorize_live_provider_run(
                         adapter_spec=args.adapter,
                         local_execution_enabled=args.enable_local_execution,
@@ -620,7 +627,11 @@ def run(
                         source_identities=requested_identities,
                         env=os.environ,
                         trust_service=trust_service,
-                        review_authority_root=policy.narrative_review_authority_root,
+                        review_authority_root=(
+                            None if broker_capability is not None
+                            else policy.narrative_review_authority_root
+                        ),
+                        broker_capability=broker_capability,
                     )
                     live_summary = authorization.safe_summary()
                     _emit({"live_provider_preflight": live_summary})
@@ -645,8 +656,11 @@ def run(
                     broker_client,
                     allow_local_test_adapter=_allow_local_review_authority_for_tests,
                 )
-                trust_service = _load_trust_service(args)
-                policy = replace(policy, narrative_trust_service=trust_service)
+                if broker_client is None:
+                    trust_service = _load_trust_service(args)
+                    policy = replace(policy, narrative_trust_service=trust_service)
+                else:
+                    trust_service = None
                 dependencies = normalizer.load_adapter(args.adapter)
             if type(dependencies) is not tuple or len(dependencies) not in {2, 3}:
                 raise normalizer.NarrativeNormalizerError("narrative_normalizer_cli_invalid")
@@ -662,6 +676,7 @@ def run(
                 evidence_service=evidence_service,
                 trust_service=trust_service,
                 review_authority=broker_client,
+                broker_owned_trust=broker_client is not None,
                 permission_policy=permission_policy,
             )
             manual_retry = None

@@ -59,6 +59,9 @@ class CoreBrokerClient:
     def register_draft(self, request_id: str, payload: dict[str, object]) -> dict[str, object]:
         return self._exchange(protocol.ROLE_NORMALIZER, protocol.OP_REGISTER_DRAFT, request_id, payload)
 
+    def seal_draft_bundle(self, request_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return self._exchange(protocol.ROLE_NORMALIZER, protocol.OP_SEAL_DRAFT_BUNDLE, request_id, payload)
+
     def latest_state(self, request_id: str, payload: dict[str, object]) -> dict[str, object]:
         return self._exchange(protocol.ROLE_REVIEWER, protocol.OP_LATEST_STATE, request_id, payload)
 
@@ -255,6 +258,76 @@ def test_successful_normalize_registers_only_canonical_binding(integrated):
     for forbidden in ("source_facts", "human_story_package", "raw source", "prompt"):
         assert forbidden not in serialized
     assert _event_count(integrated) == 1
+
+
+def test_broker_owned_trust_normalizes_without_loading_or_receiving_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NARRATIVE_NORMALIZER_TRUST_KEY", raising=False)
+    values = normalizer_tests.runtime(tmp_path)
+    policy = values[1]
+    record = values[3]
+    service = values[-1]
+    broker = authority.ReviewAuthority(
+        tmp_path / "broker-authority",
+        trust.NarrativeTrustService(normalizer_tests.TEST_TRUST_KEY),
+        narrative_outbox_root=policy.narrative_outbox_root,
+    )
+    client = CoreBrokerClient(broker)
+    service.trust_service = None
+    service.store = nn.NarrativeOutboxStore(
+        policy,
+        review_authority=client,
+        broker_owned_trust=True,
+    )
+    monkeypatch.setattr(
+        nn, "_require_trust_service",
+        lambda value: (_ for _ in ()).throw(AssertionError("local key access")),
+    )
+
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == nn.OUTCOME_CREATED, (outcome.status, outcome.reason_codes)
+    assert [call[0] for call in client.calls].count(protocol.OP_SEAL_DRAFT_BUNDLE) == 1
+    assert [call[0] for call in client.calls].count(protocol.OP_REGISTER_DRAFT) == 1
+    draft = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
+    value = nn.validate_draft_directory(
+        draft, validate_ready=False, broker_mode=True,
+    )
+    assert value["manifest"]["trust_receipt"] is None
+    assert value["review"]["trust_receipt"] is None
+    receipt = service.store._broker_receipt_path(value["story"]["source_identity"])
+    assert receipt.is_file()
+    rendered = receipt.read_text(encoding="utf-8") + repr(service.store.__dict__)
+    assert base64.b64encode(normalizer_tests.TEST_TRUST_KEY).decode("ascii") not in rendered
+
+
+def test_broker_owned_trust_rejects_mismatched_seal_without_register_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NARRATIVE_NORMALIZER_TRUST_KEY", raising=False)
+    values = normalizer_tests.runtime(tmp_path)
+    policy = values[1]
+    record = values[3]
+    service = values[-1]
+    broker = authority.ReviewAuthority(
+        tmp_path / "broker-authority", trust.NarrativeTrustService(normalizer_tests.TEST_TRUST_KEY),
+        narrative_outbox_root=policy.narrative_outbox_root,
+    )
+    client = CoreBrokerClient(broker)
+    client.after[protocol.OP_SEAL_DRAFT_BUNDLE] = lambda result: result.update(
+        binding_digest="0" * 64
+    )
+    service.trust_service = None
+    service.store = nn.NarrativeOutboxStore(
+        policy, review_authority=client, broker_owned_trust=True,
+    )
+
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == nn.OUTCOME_MANUAL_ATTENTION, (outcome.status, outcome.reason_codes)
+    assert outcome.reason_codes == ("narrative_normalizer_review_authority_unavailable",)
+    assert [call[0] for call in client.calls].count(protocol.OP_REGISTER_DRAFT) == 0
 
 
 def test_duplicate_register_is_event_idempotent(integrated):

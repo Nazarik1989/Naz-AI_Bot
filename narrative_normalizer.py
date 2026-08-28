@@ -139,6 +139,9 @@ REASON_CODES = frozenset({
 
 BROKER_DRAFT_CONTRACT_VERSION = "normalizer-draft-identity-v1"
 BROKER_REGISTER_BINDING_VERSION = "narrative-review-authority-draft-binding-v1"
+BROKER_DRAFT_BUNDLE_SEAL_VERSION = "narrative-review-authority-draft-bundle-seal-v1"
+BROKER_PRIVATE_STATE_VERSION = "normalizer-broker-private-state-v1"
+BROKER_PRIVATE_STATE_KEY_ID = hashlib.sha256(BROKER_PRIVATE_STATE_VERSION.encode("ascii")).hexdigest()[:24]
 BROKER_PREPARED_APPROVAL_VERSION = "narrative-review-authority-prepared-approval-v2"
 BROKER_READY_VERDICT_VERSION = "narrative-review-authority-ready-verdict-v2"
 BROKER_STORAGE_ADAPTER_VERSION = "narrative-review-authority-state-adapter-v2"
@@ -1017,6 +1020,7 @@ class ReviewAuthorityTransport(Protocol):
     """State-free Broker proxy used by production-capable review operations."""
 
     def register_draft(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
+    def seal_draft_bundle(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
     def latest_state(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
     def append_review(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
     def prepare_approval(self, request_id: str, payload: dict[str, object]) -> dict[str, object]: ...
@@ -2950,7 +2954,7 @@ def assemble_draft_artifact(
     normalization_input: NormalizationInput,
     captured_evidence: _CapturedCP2Evidence,
     generation_service: generation.NarrativeGenerationService,
-    trust_service: trust.NarrativeTrustService,
+    trust_service: trust.NarrativeTrustService | None,
     evidence_model_call_count: int = 0,
     supersedes: Mapping[str, object] | None = None,
 ) -> DraftArtifact:
@@ -3073,22 +3077,25 @@ def assemble_draft_artifact(
         "source_document_digest": base["source_document_digest"],
         "evidence_bundle_digest": None if base["source_evidence_bundle"] is None else _sha(base["source_evidence_bundle"]),
         "verified_fact_projection_digest": _sha(base["verified_fact_bindings"]),
+        "trust_receipt": None,
     }
     manifest_core = dict(draft_manifest)
+    manifest_core.pop("trust_receipt", None)
     artifact_binding = _artifact_binding_payload(story_payload, story_markdown, manifest_core)
     artifact_binding_digest = _sha(artifact_binding)
-    try:
-        manifest_receipt = trust_service.sign(trust.TRUST_DOMAIN_DRAFT_REVIEW, artifact_binding)
-        draft_manifest["trust_receipt"] = trust.receipt_to_payload(manifest_receipt)
-        review_core = dict(review_payload)
-        review_core.pop("trust_receipt", None)
-        review_receipt = trust_service.sign(
-            trust.TRUST_DOMAIN_DRAFT_REVIEW,
-            _review_trust_payload(review_core, artifact_binding_digest),
-        )
-        review_payload["trust_receipt"] = trust.receipt_to_payload(review_receipt)
-    except trust.TrustError:
-        _raise("narrative_normalizer_trust_invalid")
+    if trust_service is not None:
+        try:
+            manifest_receipt = trust_service.sign(trust.TRUST_DOMAIN_DRAFT_REVIEW, artifact_binding)
+            draft_manifest["trust_receipt"] = trust.receipt_to_payload(manifest_receipt)
+            review_core = dict(review_payload)
+            review_core.pop("trust_receipt", None)
+            review_receipt = trust_service.sign(
+                trust.TRUST_DOMAIN_DRAFT_REVIEW,
+                _review_trust_payload(review_core, artifact_binding_digest),
+            )
+            review_payload["trust_receipt"] = trust.receipt_to_payload(review_receipt)
+        except trust.TrustError:
+            _raise("narrative_normalizer_trust_invalid")
     return DraftArtifact(
         source.source_ref,
         source.source_digest,
@@ -3994,6 +4001,7 @@ def validate_draft_directory(
     trust_service: trust.NarrativeTrustService | None = None,
     review_authority_root: Path | None = None,
     require_trust: bool = False,
+    broker_mode: bool = False,
 ) -> dict[str, object]:
     """Reread and independently reconstruct one immutable narrative draft."""
     path = Path(path)
@@ -4026,7 +4034,7 @@ def validate_draft_directory(
         or review["status"] not in REVIEW_STATES
     ):
         _raise("narrative_normalizer_draft_invalid")
-    if require_trust and type(trust_service) is not trust.NarrativeTrustService:
+    if require_trust and not broker_mode and type(trust_service) is not trust.NarrativeTrustService:
         _raise("narrative_normalizer_trust_unavailable")
     if not _is_safe_source_ref(story["source_ref"]):
         _raise("narrative_normalizer_draft_invalid")
@@ -4302,10 +4310,14 @@ def validate_draft_directory(
     artifact_binding_digest = _sha(artifact_binding)
     review_core = dict(review)
     review_receipt_payload = review_core.pop("trust_receipt", None)
-    manifest_receipt = _trust_receipt(manifest_receipt_payload)
-    review_receipt = _trust_receipt(review_receipt_payload)
     trust_verified = False
-    if trust_service is not None:
+    if broker_mode:
+        if manifest_receipt_payload is not None or review_receipt_payload is not None or trust_service is not None:
+            _raise("narrative_normalizer_trust_invalid")
+    else:
+        manifest_receipt = _trust_receipt(manifest_receipt_payload)
+        review_receipt = _trust_receipt(review_receipt_payload)
+    if not broker_mode and trust_service is not None:
         try:
             trust_service.require_valid(trust.TRUST_DOMAIN_DRAFT_REVIEW, artifact_binding, manifest_receipt)
             trust_service.require_valid(
@@ -4595,6 +4607,7 @@ class NarrativeOutboxStore:
         *,
         trust_service: trust.NarrativeTrustService | None = None,
         review_authority: ReviewAuthorityTransport | None = None,
+        broker_owned_trust: bool = False,
         permission_policy: outbox_permissions.NarrativeOutboxPermissionPolicy = (
             outbox_permissions.PRIVATE_POLICY
         ),
@@ -4603,6 +4616,8 @@ class NarrativeOutboxStore:
             raise TypeError("policy")
         if type(permission_policy) is not outbox_permissions.NarrativeOutboxPermissionPolicy:
             raise TypeError("permission_policy")
+        if type(broker_owned_trust) is not bool or (broker_owned_trust and review_authority is None):
+            raise TypeError("broker_owned_trust")
         self.policy = policy
         self.root = policy.narrative_outbox_root
         self._state = self.root / ".normalizer-state"
@@ -4610,8 +4625,10 @@ class NarrativeOutboxStore:
         self._claims = self._state / "claims"
         self._attempt_history = self._state / "attempt-history-v1"
         self._manual_retry_requests = self._state / "manual-retry-requests-v1"
+        self._broker_receipts = self._state / "broker-draft-receipts-v1"
         self.trust_service = trust_service
         self.review_authority = review_authority
+        self.broker_owned_trust = broker_owned_trust
         self.permission_policy = permission_policy
 
     def _require_trust(self) -> trust.NarrativeTrustService:
@@ -4628,6 +4645,10 @@ class NarrativeOutboxStore:
     @property
     def broker_mode(self) -> bool:
         return self.review_authority is not None
+
+    @property
+    def broker_trust_mode(self) -> bool:
+        return self.broker_owned_trust
 
     @staticmethod
     def _review_state_error(error: review_state.ReviewStateError) -> None:
@@ -4741,7 +4762,7 @@ class NarrativeOutboxStore:
         if not self.permission_policy.shared:
             for path in (
                 self.root, self._state, self._locks, self._claims,
-                self._attempt_history, self._manual_retry_requests,
+                self._attempt_history, self._manual_retry_requests, self._broker_receipts,
             ):
                 path.mkdir(parents=True, exist_ok=True, mode=0o700)
                 if path.is_symlink() or not path.is_dir():
@@ -4749,13 +4770,18 @@ class NarrativeOutboxStore:
                 if os.name != "nt":
                     os.chmod(path, 0o700)
             return
+        private_state = (
+            self._claims, self._attempt_history,
+            self._manual_retry_requests, self._broker_receipts,
+        ) if self.broker_trust_mode else ()
         for path, mode in (
             (self.root, outbox_permissions.SHARED_ROOT_MODE),
             (self._state, outbox_permissions.SHARED_STATE_MODE),
             (self._locks, outbox_permissions.SHARED_LOCK_DIRECTORY_MODE),
-            (self._claims, outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
-            (self._attempt_history, outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
-            (self._manual_retry_requests, outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._claims, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._attempt_history, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._manual_retry_requests, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._broker_receipts, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
         ):
             path.mkdir(parents=True, exist_ok=True, mode=mode)
             if path.is_symlink() or not path.is_dir():
@@ -4766,8 +4792,23 @@ class NarrativeOutboxStore:
             self._state,
             self._locks,
             self._claims,
-            (self._attempt_history, self._manual_retry_requests),
+            (() if self.broker_trust_mode else (
+                self._attempt_history, self._manual_retry_requests, self._broker_receipts,
+            )),
         )
+        if self.broker_trust_mode:
+            if os.name != "nt":
+                uid = os.geteuid()
+                gid = os.getegid()
+                for path in private_state:
+                    os.chown(path, uid, gid)
+                    os.chmod(path, 0o700)
+                    info = os.lstat(path)
+                    if info.st_uid != uid or info.st_gid != gid:
+                        _raise("narrative_outbox_permission_invalid")
+            else:
+                for path in private_state:
+                    os.chmod(path, 0o700)
 
     def _verify_draft_permissions(self, path: Path) -> None:
         if self.permission_policy.shared:
@@ -4925,7 +4966,15 @@ class NarrativeOutboxStore:
             )
         ):
             _raise("narrative_normalizer_claim_invalid")
-        if self.trust_service is not None:
+        if self.broker_trust_mode and payload["key_id"] == BROKER_PRIVATE_STATE_KEY_ID:
+            core = dict(payload)
+            seal = core.pop("claim_seal")
+            expected = hashlib.sha256(
+                BROKER_PRIVATE_STATE_VERSION.encode("ascii") + b"\0" + _canonical(core)
+            ).hexdigest()
+            if seal != expected:
+                _raise("narrative_normalizer_claim_invalid")
+        elif self.trust_service is not None:
             core = dict(payload)
             seal = core.pop("claim_seal")
             try:
@@ -4944,6 +4993,14 @@ class NarrativeOutboxStore:
         return payload
 
     def _seal_claim_payload(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if self.broker_trust_mode:
+            core = dict(payload)
+            core["key_id"] = BROKER_PRIVATE_STATE_KEY_ID
+            core.pop("claim_seal", None)
+            seal = hashlib.sha256(
+                BROKER_PRIVATE_STATE_VERSION.encode("ascii") + b"\0" + _canonical(core)
+            ).hexdigest()
+            return dict(core, claim_seal=seal)
         service = self._require_trust()
         core = dict(payload)
         core["key_id"] = service.key_id
@@ -5018,6 +5075,11 @@ class NarrativeOutboxStore:
             _raise("narrative_normalizer_manual_retry_invalid")
         return self._attempt_history / source_identity_value / f"{attempt_id}.json"
 
+    def _broker_receipt_path(self, source_identity_value: str) -> Path:
+        if type(source_identity_value) is not str or _HEX64.fullmatch(source_identity_value) is None:
+            _raise("narrative_normalizer_review_authority_unavailable")
+        return self._broker_receipts / f"{source_identity_value}.json"
+
     def _validate_manual_retry_record(self, value: object) -> dict[str, object]:
         payload = _exact_mapping(
             value,
@@ -5050,9 +5112,18 @@ class NarrativeOutboxStore:
             or _HEX64.fullmatch(payload["request_seal"]) is None
         ):
             _raise("narrative_normalizer_manual_retry_invalid")
-        service = self._require_trust()
         core = dict(payload)
         seal = str(core.pop("request_seal"))
+        if self.broker_trust_mode:
+            if payload["key_id"] != BROKER_PRIVATE_STATE_KEY_ID:
+                _raise("narrative_normalizer_manual_retry_invalid")
+            expected = hashlib.sha256(
+                BROKER_PRIVATE_STATE_VERSION.encode("ascii") + b"\0" + _canonical(core)
+            ).hexdigest()
+            if seal != expected:
+                _raise("narrative_normalizer_manual_retry_invalid")
+            return payload
+        service = self._require_trust()
         try:
             receipt = trust.TrustReceipt(
                 trust.TRUST_RECEIPT_SCHEMA_VERSION,
@@ -5149,10 +5220,12 @@ class NarrativeOutboxStore:
         history_directory.mkdir(mode=0o700, exist_ok=True)
         if history_directory.is_symlink() or not history_directory.is_dir():
             _raise("narrative_normalizer_manual_retry_invalid")
-        if self.permission_policy.shared:
+        if self.permission_policy.shared and not self.broker_trust_mode:
             outbox_permissions.finalize_shared_retry_directory(
                 self.permission_policy, self.root, history_directory
             )
+        elif os.name != "nt":
+            os.chmod(history_directory, 0o700)
         if os.path.lexists(history_path):
             if history_path.is_symlink() or not history_path.is_file() or history_path.read_bytes() != previous_bytes:
                 _raise("narrative_normalizer_manual_retry_conflict")
@@ -5160,9 +5233,9 @@ class NarrativeOutboxStore:
             _write_exclusive_file(
                 history_path,
                 previous_bytes,
-                mode=self.permission_policy.claim_file_mode,
+                mode=0o600 if self.broker_trust_mode else self.permission_policy.claim_file_mode,
             )
-            if self.permission_policy.shared:
+            if self.permission_policy.shared and not self.broker_trust_mode:
                 outbox_permissions.finalize_shared_claim(
                     self.permission_policy, self.root, history_path
                 )
@@ -5179,11 +5252,22 @@ class NarrativeOutboxStore:
             "run_profile": request.run_profile,
             "safe_reason_code": request.safe_reason_code,
             "created_at": created_at,
-            "key_id": self._require_trust().key_id,
+            "key_id": (
+                BROKER_PRIVATE_STATE_KEY_ID
+                if self.broker_trust_mode
+                else self._require_trust().key_id
+            ),
         }
-        receipt = self._require_trust().sign(trust.TRUST_DOMAIN_CLAIM, core)
+        if self.broker_trust_mode:
+            request_seal = hashlib.sha256(
+                BROKER_PRIVATE_STATE_VERSION.encode("ascii") + b"\0" + _canonical(core)
+            ).hexdigest()
+        else:
+            request_seal = self._require_trust().sign(
+                trust.TRUST_DOMAIN_CLAIM, core
+            ).seal
         candidate = self._validate_manual_retry_record(
-            dict(core, request_seal=receipt.seal)
+            dict(core, request_seal=request_seal)
         )
         request_path = self._manual_retry_request_path(request.operator_request_id)
         encoded = _canonical(candidate) + b"\n"
@@ -5191,14 +5275,14 @@ class NarrativeOutboxStore:
             _write_exclusive_file(
                 request_path,
                 encoded,
-                mode=self.permission_policy.claim_file_mode,
+                mode=0o600 if self.broker_trust_mode else self.permission_policy.claim_file_mode,
             )
         except FileExistsError:
             winner = self._read_manual_retry_record(request.operator_request_id)
             if winner is None or not self._manual_retry_binding_matches(winner, request):
                 _raise("narrative_normalizer_manual_retry_conflict")
             return str(winner["attempt_id"]), True
-        if self.permission_policy.shared:
+        if self.permission_policy.shared and not self.broker_trust_mode:
             outbox_permissions.finalize_shared_claim(
                 self.permission_policy, self.root, request_path
             )
@@ -5268,7 +5352,10 @@ class NarrativeOutboxStore:
             == story["cp2_adjudication_evidence"]["evidence_digest"]
             and claim["ordered_claim_digests"] == list(factuality.claim_digests)
             and claim["artifact_binding_digest"] == value["artifact_binding_digest"]
-            and claim["key_id"] == _trust_receipt(value["manifest"]["trust_receipt"]).key_id
+            and (
+                self.broker_trust_mode
+                or claim["key_id"] == _trust_receipt(value["manifest"]["trust_receipt"]).key_id
+            )
         )
 
     def _write_claim_locked(
@@ -5338,14 +5425,18 @@ class NarrativeOutboxStore:
             value = validate_draft_directory(
                 self.root / identity,
                 expected_identity=identity,
-                trust_service=self._require_trust(),
+                trust_service=None if self.broker_trust_mode else self._require_trust(),
                 review_authority_root=self.policy.narrative_review_authority_root,
-                require_trust=True,
+                require_trust=not self.broker_trust_mode,
+                broker_mode=self.broker_trust_mode,
             )
             if not self._claim_matches_draft(candidate, value):
                 _raise("narrative_normalizer_claim_invalid")
-        _atomic_write(path, encoded, mode=self.permission_policy.claim_file_mode)
-        if self.permission_policy.shared:
+        _atomic_write(
+            path, encoded,
+            mode=0o600 if self.broker_trust_mode else self.permission_policy.claim_file_mode,
+        )
+        if self.permission_policy.shared and not self.broker_trust_mode:
             outbox_permissions.finalize_shared_claim(
                 self.permission_policy,
                 self.root,
@@ -5426,7 +5517,7 @@ class NarrativeOutboxStore:
 
     @_privacy_boundary("narrative_normalizer_persistence_invalid")
     def persist(self, artifact: DraftArtifact) -> tuple[Path, bool]:
-        trust_service = self._require_trust()
+        trust_service = None if self.broker_trust_mode else self._require_trust()
         source_ref = str(artifact.story_payload["source_ref"])
         identity = str(artifact.story_payload["source_identity"])
         final = self.draft_path(artifact.source_digest, source_ref=source_ref)
@@ -5437,7 +5528,8 @@ class NarrativeOutboxStore:
             current = validate_draft_directory(
                 final, expected_identity=identity, trust_service=trust_service,
                 review_authority_root=self.policy.narrative_review_authority_root,
-                require_trust=True
+                require_trust=not self.broker_trust_mode,
+                broker_mode=self.broker_trust_mode,
             )
             if (
                 current["story"] == artifact.story_payload
@@ -5474,7 +5566,8 @@ class NarrativeOutboxStore:
             validate_draft_directory(
                 staging, expected_identity=identity, trust_service=trust_service,
                 review_authority_root=self.policy.narrative_review_authority_root,
-                require_trust=True
+                require_trust=not self.broker_trust_mode,
+                broker_mode=self.broker_trust_mode,
             )
             try:
                 staging_stat = os.stat(staging, follow_symlinks=False)
@@ -5485,7 +5578,8 @@ class NarrativeOutboxStore:
                 current = validate_draft_directory(
                     final, expected_identity=identity, trust_service=trust_service,
                     review_authority_root=self.policy.narrative_review_authority_root,
-                    require_trust=True
+                    require_trust=not self.broker_trust_mode,
+                    broker_mode=self.broker_trust_mode,
                 )
                 if current["story"] == artifact.story_payload and current["manifest"] == artifact.draft_manifest:
                     _cleanup_owned_path(staging)
@@ -5524,7 +5618,8 @@ class NarrativeOutboxStore:
             validate_draft_directory(
                 final, expected_identity=identity, trust_service=trust_service,
                 review_authority_root=self.policy.narrative_review_authority_root,
-                require_trust=True
+                require_trust=not self.broker_trust_mode,
+                broker_mode=self.broker_trust_mode,
             )
             if not self.broker_mode:
                 try:
@@ -5560,9 +5655,10 @@ class NarrativeOutboxStore:
         value = validate_draft_directory(
             path,
             expected_identity=identity,
-            trust_service=self._require_trust(),
+            trust_service=(None if self.broker_trust_mode else self._require_trust()),
             review_authority_root=self.policy.narrative_review_authority_root,
-            require_trust=True,
+            require_trust=not self.broker_trust_mode,
+            broker_mode=self.broker_trust_mode,
             validate_ready=False,
         )
         story = value["story"]
@@ -5571,6 +5667,62 @@ class NarrativeOutboxStore:
         if claim is None or not self._claim_matches_draft(claim, value):
             _raise("narrative_normalizer_claim_uncertain")
         operator_request_id = f"register-{claim['attempt_id']}"
+        if self.broker_trust_mode:
+            seal_request_id = f"seal-{claim['attempt_id']}"
+            seal_payload = {
+                "source_identity": identity,
+                "source_ref": source_ref,
+                "source_digest": source_digest_value,
+                "attempt_identity": claim["attempt_id"],
+                "draft_identity": manifest["draft_identity"],
+                "draft_package_digest": story["package_digest"],
+                "story_json_digest": _file_digest(path / "story.json"),
+                "story_markdown_digest": _file_digest(path / "story.md"),
+                "evidence_digest": story["cp2_adjudication_evidence"]["evidence_digest"],
+                "review_digest": _file_digest(path / "review.json"),
+                "draft_manifest_digest": _file_digest(path / "draft-manifest.json"),
+                "completed_claim_digest": _file_digest(
+                    self.claim_path(source_ref, source_digest_value)
+                ),
+                "artifact_binding_digest": value["artifact_binding_digest"],
+                "contract_versions": {
+                    "draft": BROKER_DRAFT_CONTRACT_VERSION,
+                    "seal": BROKER_DRAFT_BUNDLE_SEAL_VERSION,
+                    "source": SOURCE_CONTRACT_VERSION,
+                },
+                "operator_request_id": seal_request_id,
+            }
+            seal_result = self._broker_call(
+                "seal_draft_bundle", seal_request_id, seal_payload
+            )
+            expected_binding = dict(
+                version=BROKER_DRAFT_BUNDLE_SEAL_VERSION,
+                **seal_payload,
+            )
+            if (
+                frozenset(seal_result) != {"binding", "binding_digest", "receipt"}
+                or seal_result.get("binding") != expected_binding
+                or type(seal_result.get("binding_digest")) is not str
+                or seal_result["binding_digest"] != _sha(expected_binding)
+            ):
+                _raise("narrative_normalizer_review_authority_unavailable")
+            try:
+                detached_receipt = trust.receipt_from_payload(seal_result["receipt"])
+            except trust.TrustError:
+                _raise("narrative_normalizer_review_authority_unavailable")
+            if (
+                detached_receipt.domain != trust.TRUST_DOMAIN_DRAFT_BUNDLE
+                or detached_receipt.payload_digest != seal_result["binding_digest"]
+            ):
+                _raise("narrative_normalizer_review_authority_unavailable")
+            self._ensure_write_layout()
+            receipt_path = self._broker_receipt_path(identity)
+            receipt_bytes = _canonical(seal_result) + b"\n"
+            if os.path.lexists(receipt_path):
+                if receipt_path.is_symlink() or not receipt_path.is_file() or receipt_path.read_bytes() != receipt_bytes:
+                    _raise("narrative_normalizer_review_identity_conflict")
+            else:
+                _write_exclusive_file(receipt_path, receipt_bytes, mode=0o600)
         payload = {
             "source_identity": identity,
             "source_ref": source_ref,
@@ -6922,6 +7074,7 @@ class NarrativeNormalizerService:
         evidence_service: evidence.GenericEvidenceService | None = None,
         trust_service: trust.NarrativeTrustService | None = None,
         review_authority: ReviewAuthorityTransport | None = None,
+        broker_owned_trust: bool = False,
         permission_policy: outbox_permissions.NarrativeOutboxPermissionPolicy = (
             outbox_permissions.PRIVATE_POLICY
         ),
@@ -6947,6 +7100,7 @@ class NarrativeNormalizerService:
             policy,
             trust_service=trust_service,
             review_authority=review_authority,
+            broker_owned_trust=broker_owned_trust,
             permission_policy=permission_policy,
         )
 
@@ -7129,17 +7283,28 @@ class NarrativeNormalizerService:
                 reasons=("narrative_normalizer_review_authority_unavailable",),
                 evidence_path="deterministic_fast_path" if fast_path else "generic",
             )
-        try:
-            trust_service = _require_trust_service(self.trust_service)
-        except NarrativeNormalizerError:
-            return self._outcome(
-                source,
-                OUTCOME_MANUAL_ATTENTION,
-                reasons=("narrative_normalizer_trust_unavailable",),
-                evidence_path="deterministic_fast_path" if fast_path else "generic",
-            )
-        self.trust_service = trust_service
-        self.store.trust_service = trust_service
+        trust_service: trust.NarrativeTrustService | None
+        if self.store.broker_trust_mode:
+            if self.trust_service is not None or self.store.trust_service is not None:
+                return self._outcome(
+                    source,
+                    OUTCOME_MANUAL_ATTENTION,
+                    reasons=("narrative_normalizer_trust_invalid",),
+                    evidence_path="deterministic_fast_path" if fast_path else "generic",
+                )
+            trust_service = None
+        else:
+            try:
+                trust_service = _require_trust_service(self.trust_service)
+            except NarrativeNormalizerError:
+                return self._outcome(
+                    source,
+                    OUTCOME_MANUAL_ATTENTION,
+                    reasons=("narrative_normalizer_trust_unavailable",),
+                    evidence_path="deterministic_fast_path" if fast_path else "generic",
+                )
+            self.trust_service = trust_service
+            self.store.trust_service = trust_service
         self.store._ensure_write_layout()
         lock = self.store.lock_for(source.source_ref, source.source_digest, blocking=False)
         if not lock.acquire():
@@ -7183,7 +7348,8 @@ class NarrativeNormalizerService:
                     expected_identity=identity,
                     trust_service=trust_service,
                     review_authority_root=self.policy.narrative_review_authority_root,
-                    require_trust=True,
+                    require_trust=not self.store.broker_trust_mode,
+                    broker_mode=self.store.broker_trust_mode,
                 )
                 replayed_source = _replay_source_for_story(source, documents, value["story"])
                 value = validate_draft_directory(
@@ -7192,7 +7358,8 @@ class NarrativeNormalizerService:
                     expected_source=replayed_source,
                     trust_service=trust_service,
                     review_authority_root=self.policy.narrative_review_authority_root,
-                    require_trust=True,
+                    require_trust=not self.store.broker_trust_mode,
+                    broker_mode=self.store.broker_trust_mode,
                 )
                 try:
                     completed_claim = self.store.read_claim(source.source_ref, source.source_digest)

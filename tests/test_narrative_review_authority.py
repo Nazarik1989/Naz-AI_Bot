@@ -221,6 +221,86 @@ def draft_payload(**changes: object) -> dict[str, object]:
     return value
 
 
+def draft_bundle_payload(**changes: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "source_identity": H,
+        "source_ref": SOURCE_REF,
+        "source_digest": H2,
+        "attempt_identity": "1" * 32,
+        "draft_identity": H3,
+        "draft_package_digest": H4,
+        "story_json_digest": H,
+        "story_markdown_digest": H5,
+        "evidence_digest": H2,
+        "review_digest": H,
+        "draft_manifest_digest": H6,
+        "completed_claim_digest": H2,
+        "artifact_binding_digest": H3,
+        "contract_versions": {
+            "draft": DRAFT_CONTRACT,
+            "seal": a.BROKER_DRAFT_BUNDLE_SEAL_VERSION,
+            "source": SOURCE_CONTRACT,
+        },
+        "operator_request_id": "seal-11111111111111111111111111111111",
+    }
+    value.update(changes)
+    return value
+
+
+def test_seal_draft_bundle_returns_exact_detached_broker_receipt(
+    broker: a.ReviewAuthority,
+) -> None:
+    response = broker.handle(
+        p.ROLE_NORMALIZER,
+        request("seal-bundle-001", p.OP_SEAL_DRAFT_BUNDLE, draft_bundle_payload()),
+    )
+    assert response.ok, response.error
+    assert response.result is not None
+    binding = response.result["binding"]
+    assert binding["attempt_identity"] == "1" * 32
+    assert binding["story_json_digest"] == H
+    assert binding["evidence_digest"] == H2
+    receipt = trust.receipt_from_payload(response.result["receipt"])
+    assert receipt.domain == trust.TRUST_DOMAIN_DRAFT_BUNDLE
+    assert service().verify(trust.TRUST_DOMAIN_DRAFT_BUNDLE, binding, receipt)
+    assert not broker._store.root.exists()
+
+
+@pytest.mark.parametrize("role", [p.ROLE_REVIEWER, p.ROLE_CONSUMER])
+def test_seal_draft_bundle_is_normalizer_only_and_has_no_generic_signing(
+    broker: a.ReviewAuthority, role: str,
+) -> None:
+    response = broker.handle(
+        role, request(f"seal-denied-{role}", p.OP_SEAL_DRAFT_BUNDLE, draft_bundle_payload())
+    )
+    assert not response.ok and response.error == p.ACCESS_DENIED
+    assert "sign" not in p.OPERATIONS
+    assert not broker._store.root.exists()
+
+
+def test_seal_draft_bundle_rejects_paths_and_unknown_fields_without_mutation(
+    broker: a.ReviewAuthority,
+) -> None:
+    response = broker.handle(
+        p.ROLE_NORMALIZER,
+        request(
+            "seal-path-rejected", p.OP_SEAL_DRAFT_BUNDLE,
+            draft_bundle_payload(story_path="/private/story.json"),
+        ),
+    )
+    assert not response.ok
+    assert not broker._store.root.exists()
+
+
+def test_health_attests_authenticated_peer_role(broker: a.ReviewAuthority) -> None:
+    response = broker.handle(
+        p.ROLE_NORMALIZER, request("health-role", p.OP_HEALTH, {})
+    )
+    assert response.ok
+    assert response.result is not None
+    assert response.result["authenticated_role"] == p.ROLE_NORMALIZER
+
+
 def register(broker: a.ReviewAuthority, *, request_id: str = "ipc-register-001") -> dict[str, object]:
     response = broker.handle(p.ROLE_NORMALIZER, request(request_id, p.OP_REGISTER_DRAFT, draft_payload()))
     assert response.ok, response.error

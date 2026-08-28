@@ -12,6 +12,7 @@ import re
 import stat
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ import narrative_review_authority_protocol as protocol
 
 
 BROKER_CONTRACT_VERSION = "narrative-review-authority-v2"
+BROKER_DRAFT_BUNDLE_SEAL_VERSION = "narrative-review-authority-draft-bundle-seal-v1"
 STORAGE_ADAPTER_VERSION = "narrative-review-authority-state-adapter-v2"
 PREPARED_APPROVAL_VERSION = "narrative-review-authority-prepared-approval-v2"
 VERIFY_READY_VERSION = "narrative-review-authority-ready-verdict-v2"
@@ -43,11 +45,21 @@ AUTHORITY_INTERNAL = "review_authority_internal_error"
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _EVENT_FILE = re.compile(r"(?P<revision>[0-9]{8})-(?P<digest>[0-9a-f]{64})\.json\Z")
+_AUTHENTICATED_ROLE: ContextVar[str | None] = ContextVar(
+    "review_authority_authenticated_role", default=None
+)
 _DRAFT_KEYS = frozenset({
     "source_identity", "source_ref", "source_digest", "draft_identity",
     "draft_package_digest", "story_markdown_digest", "draft_manifest_digest",
     "review_digest", "completed_claim_digest", "artifact_binding_digest",
     "contract_versions", "operator_request_id", "timestamp",
+})
+_DRAFT_BUNDLE_KEYS = frozenset({
+    "source_identity", "source_ref", "source_digest", "attempt_identity",
+    "draft_identity", "draft_package_digest", "story_json_digest",
+    "story_markdown_digest", "evidence_digest", "review_digest",
+    "draft_manifest_digest", "completed_claim_digest", "artifact_binding_digest",
+    "contract_versions", "operator_request_id",
 })
 _REVIEW_KEYS = frozenset({
     "source_identity", "draft_identity", "draft_package_digest",
@@ -636,7 +648,11 @@ class ReviewAuthority:
             self._requests[request.request_id] = record
         try:
             protocol.require_capability(role, request.operation)
-            result = self._dispatch(request.operation, request.payload)
+            role_token = _AUTHENTICATED_ROLE.set(role)
+            try:
+                result = self._dispatch(request.operation, request.payload)
+            finally:
+                _AUTHENTICATED_ROLE.reset(role_token)
             response = protocol.Response(request.request_id, True, result, None)
         except AuthorityError as error:
             response = protocol.make_error(request.request_id, error.reason_code)
@@ -668,7 +684,10 @@ class ReviewAuthority:
                 "contract_version": BROKER_CONTRACT_VERSION,
                 "narrative_outbox_layout_version": NARRATIVE_OUTBOX_LAYOUT_VERSION,
                 "key_id": self.key_id,
+                "authenticated_role": _AUTHENTICATED_ROLE.get(),
             }
+        if operation == protocol.OP_SEAL_DRAFT_BUNDLE:
+            return self._seal_draft_bundle(payload)
         if operation == protocol.OP_REGISTER_DRAFT:
             return self._register(payload)
         if operation == protocol.OP_LATEST_STATE:
@@ -682,6 +701,62 @@ class ReviewAuthority:
         if operation == protocol.OP_VERIFY_READY:
             return self._verify(payload)
         _fail()
+
+    def _seal_draft_bundle(self, payload: dict[str, object]) -> dict[str, object]:
+        value = _keys(payload, _DRAFT_BUNDLE_KEYS)
+        contracts = _contracts(value["contract_versions"])
+        if frozenset(contracts) != {"draft", "source", "seal"} or (
+            contracts["draft"] != "normalizer-draft-identity-v1"
+            or contracts["seal"] != BROKER_DRAFT_BUNDLE_SEAL_VERSION
+        ):
+            _fail()
+        source_ref = _source_ref(value["source_ref"])
+        source_digest = _hex(value["source_digest"])
+        source_identity = _hex(value["source_identity"])
+        expected_source = hashlib.sha256(
+            source_ref.encode("utf-8") + b"\0" + source_digest.encode("ascii")
+            + b"\0" + contracts["source"].encode("utf-8")
+        ).hexdigest()
+        draft_package_digest = _hex(value["draft_package_digest"])
+        expected_draft = _digest({
+            "version": contracts["draft"],
+            "source_identity": source_identity,
+            "package_digest": draft_package_digest,
+        })
+        attempt_identity = _safe(value["attempt_identity"])
+        if (
+            source_identity != expected_source
+            or _hex(value["draft_identity"]) != expected_draft
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_identity) is None
+        ):
+            _fail()
+        binding = {
+            "version": BROKER_DRAFT_BUNDLE_SEAL_VERSION,
+            "source_identity": source_identity,
+            "source_ref": source_ref,
+            "source_digest": source_digest,
+            "attempt_identity": attempt_identity,
+            "draft_identity": expected_draft,
+            "draft_package_digest": draft_package_digest,
+            "story_json_digest": _hex(value["story_json_digest"]),
+            "story_markdown_digest": _hex(value["story_markdown_digest"]),
+            "evidence_digest": _hex(value["evidence_digest"]),
+            "review_digest": _hex(value["review_digest"]),
+            "draft_manifest_digest": _hex(value["draft_manifest_digest"]),
+            "completed_claim_digest": _hex(value["completed_claim_digest"]),
+            "artifact_binding_digest": _hex(value["artifact_binding_digest"]),
+            "contract_versions": contracts,
+            "operator_request_id": _safe(value["operator_request_id"]),
+        }
+        try:
+            receipt = self.__service.sign(trust.TRUST_DOMAIN_DRAFT_BUNDLE, binding)
+        except trust.TrustError:
+            _fail(AUTHORITY_ATTESTATION_INVALID)
+        return {
+            "binding": binding,
+            "binding_digest": _digest(binding),
+            "receipt": trust.receipt_to_payload(receipt),
+        }
 
     def _draft_binding(self, value: Mapping[str, object]) -> dict[str, object]:
         contracts = _contracts(value["contract_versions"])

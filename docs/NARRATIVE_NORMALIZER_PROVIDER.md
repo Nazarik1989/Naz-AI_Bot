@@ -289,3 +289,19 @@ counts, a stable reason, and the closed human actions `use_selected_facts`,
 `skip`, and `discuss`. It contains no source text, quotes, prompts, paths, or
 credentials; it is not a draft, cannot be approved, does not create Broker
 state, and cannot become `narrative_ready`.
+
+## Broker-backed provider prerequisite
+
+In explicit production Broker mode the Normalizer does not read a trust-key
+file or environment value and receives no `NarrativeTrustService`. Before a
+live worker can be authorized, the state-free Broker client performs an
+authenticated health exchange and mints one immutable readiness capability.
+The provider boundary requires that exact capability while preserving the
+closed run profile, exact source tuple, operation slots, and five-call canary
+budget. Local/offline test mode retains its existing local trust-service
+prerequisite as a separate explicit path.
+
+Normalizer retry and claim records in this mode are private, non-authoritative
+process state: directories are `0700` and files are `0600`. Draft authority is
+not derived from those records; it comes only from the detached Broker bundle
+receipt followed by the existing closed `register_draft` transition.

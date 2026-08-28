@@ -33,6 +33,9 @@ import narrative_normalizer_run_profiles as run_profiles
 import model_boundary_privacy as privacy
 import narrative_normalizer_review_state as review_state
 import narrative_normalizer_trust as trust
+import narrative_review_authority as review_authority
+import narrative_review_authority_client as review_authority_client
+import narrative_review_authority_protocol as review_authority_protocol
 import narrative_translator as contract
 
 
@@ -99,6 +102,7 @@ _CREDENTIAL_ASSIGNMENT = privacy.CREDENTIAL_ASSIGNMENT
 _ENV_ASSIGNMENT = privacy.ENV_ASSIGNMENT
 _ABSOLUTE_PATH = privacy.ABSOLUTE_PATH
 _LOG = logging.getLogger(__name__)
+_BROKER_CAPABILITY_MINT = object()
 
 
 class NormalizerProviderError(RuntimeError):
@@ -112,6 +116,80 @@ class NormalizerProviderError(RuntimeError):
 
 def _raise(reason_code: str) -> None:
     raise NormalizerProviderError(reason_code) from None
+
+
+class BrokerReadinessCapability:
+    """Immutable proof minted only after authenticated Broker health."""
+
+    __slots__ = (
+        "__contract_version", "__protocol_version", "__key_id",
+        "__authority_identity", "__role", "__layout_version",
+    )
+
+    def __init__(
+        self, mint: object, *, contract_version: str, protocol_version: str,
+        key_id: str, authority_identity: str, role: str, layout_version: str,
+    ):
+        if mint is not _BROKER_CAPABILITY_MINT:
+            raise TypeError("broker capability")
+        values = (contract_version, protocol_version, key_id, authority_identity, role, layout_version)
+        if (
+            any(type(item) is not str for item in values)
+            or contract_version != review_authority.BROKER_CONTRACT_VERSION
+            or protocol_version != review_authority_protocol.IPC_SCHEMA_VERSION
+            or _HEX24.fullmatch(key_id) is None
+            or _HEX64.fullmatch(authority_identity) is None
+            or role != review_authority_protocol.ROLE_NORMALIZER
+            or layout_version != review_authority.NARRATIVE_OUTBOX_LAYOUT_VERSION
+        ):
+            raise TypeError("broker capability")
+        object.__setattr__(self, "_BrokerReadinessCapability__contract_version", contract_version)
+        object.__setattr__(self, "_BrokerReadinessCapability__protocol_version", protocol_version)
+        object.__setattr__(self, "_BrokerReadinessCapability__key_id", key_id)
+        object.__setattr__(self, "_BrokerReadinessCapability__authority_identity", authority_identity)
+        object.__setattr__(self, "_BrokerReadinessCapability__role", role)
+        object.__setattr__(self, "_BrokerReadinessCapability__layout_version", layout_version)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("broker capability is immutable")
+
+    @property
+    def key_id(self) -> str:
+        return self.__key_id
+
+    @property
+    def authority_identity(self) -> str:
+        return self.__authority_identity
+
+
+def broker_readiness_capability(
+    client: review_authority_client.ReviewAuthorityClient,
+) -> BrokerReadinessCapability:
+    if type(client) is not review_authority_client.ReviewAuthorityClient:
+        _raise(PROVIDER_CONFIGURATION_INVALID)
+    try:
+        result = client.health(f"provider-readiness-{secrets.token_hex(12)}")
+    except Exception:
+        _raise(PROVIDER_CONFIGURATION_INVALID)
+    expected = {
+        "status", "contract_version", "narrative_outbox_layout_version",
+        "key_id", "authenticated_role",
+    }
+    if type(result) is not dict or set(result) != expected or result["status"] != "ok":
+        _raise(PROVIDER_CONFIGURATION_INVALID)
+    try:
+        return BrokerReadinessCapability(
+            _BROKER_CAPABILITY_MINT,
+            contract_version=result["contract_version"],
+            protocol_version=review_authority_protocol.IPC_SCHEMA_VERSION,
+            key_id=result["key_id"],
+            authority_identity=client.transport_identity(),
+            role=result["authenticated_role"],
+            layout_version=result["narrative_outbox_layout_version"],
+        )
+    except TypeError:
+        _raise(PROVIDER_CONFIGURATION_INVALID)
 
 
 def _plain_env(env: Mapping[str, str], name: str, *, secret: bool = False) -> str:
@@ -387,8 +465,9 @@ def authorize_live_provider_run(
     run_profile: str,
     source_identities: tuple[str, ...],
     env: Mapping[str, str],
-    trust_service: trust.NarrativeTrustService,
-    review_authority_root: Path,
+    trust_service: trust.NarrativeTrustService | None = None,
+    review_authority_root: Path | None = None,
+    broker_capability: BrokerReadinessCapability | None = None,
     global_call_budget: object = None,
 ) -> LiveProviderRunAuthorization:
     """Mint one immutable, source-bound, one-shot live-run authorization."""
@@ -410,17 +489,34 @@ def authorize_live_provider_run(
         or len(source_identities) != (0 if rule is None else rule.source_count)
         or len(set(source_identities)) != (0 if rule is None else rule.source_count)
         or any(type(item) is not str or _HEX64.fullmatch(item) is None for item in source_identities)
-        or type(trust_service) is not trust.NarrativeTrustService
-        or not isinstance(review_authority_root, Path)
+        or not (
+            (
+                type(broker_capability) is BrokerReadinessCapability
+                and trust_service is None
+                and review_authority_root is None
+            )
+            or (
+                broker_capability is None
+                and type(trust_service) is trust.NarrativeTrustService
+                and isinstance(review_authority_root, Path)
+            )
+        )
     ):
         _raise(PROVIDER_CONFIGURATION_INVALID)
     config, secret = _load_configuration(env)
-    try:
-        authority = review_state.ReviewStateStore(review_authority_root, trust_service)
-        authority_text = str(authority.root)
-    except Exception:
-        _raise(PROVIDER_CONFIGURATION_INVALID)
-    authority_identity = hashlib.sha256(authority_text.encode("utf-8")).hexdigest()
+    if type(broker_capability) is BrokerReadinessCapability:
+        authority_identity = broker_capability.authority_identity
+        trust_key_id = broker_capability.key_id
+    else:
+        try:
+            assert isinstance(review_authority_root, Path)
+            assert type(trust_service) is trust.NarrativeTrustService
+            authority = review_state.ReviewStateStore(review_authority_root, trust_service)
+            authority_text = str(authority.root)
+        except Exception:
+            _raise(PROVIDER_CONFIGURATION_INVALID)
+        authority_identity = hashlib.sha256(authority_text.encode("utf-8")).hexdigest()
+        trust_key_id = trust_service.key_id
     consumption = _AuthorizationConsumption(config, secret)
     return LiveProviderRunAuthorization(
         NORMALIZER_PRODUCTION_ADAPTER_VERSION,
@@ -434,7 +530,7 @@ def authorize_live_provider_run(
         config.timeout_seconds,
         config.generation_model,
         config.adjudication_model,
-        trust_service.key_id,
+        trust_key_id,
         authority_identity,
         secrets.token_hex(12),
         consumption,
@@ -1664,6 +1760,7 @@ __all__ = (
     "MAX_PROVIDER_CALLS",
     "NORMALIZER_PRODUCTION_ADAPTER_VERSION",
     "AuthorizedProviderRequest",
+    "BrokerReadinessCapability",
     "LiveProviderRunAuthorization",
     "NormalizerProviderError",
     "PRODUCTION_ADAPTER_SPEC",
@@ -1680,6 +1777,7 @@ __all__ = (
     "ProviderConfiguration",
     "TIMEOUT_ENV",
     "authorize_live_provider_run",
+    "broker_readiness_capability",
     "inspect_live_configuration",
     "production_adapter_factory",
 )
