@@ -66,6 +66,18 @@ def _parser() -> argparse.ArgumentParser:
         execution.add_argument("--expected-failed-attempt-id")
         execution.add_argument("--expected-failed-claim-digest")
 
+    materialize = sub.add_parser("materialize-manual-attention")
+    materialize.add_argument("--source-identity", required=True)
+    materialize.add_argument("--parent-attempt-id", required=True)
+    materialize.add_argument("--parent-attempt-digest", required=True)
+    materialize.add_argument("--diagnostic-digest", required=True)
+    materialize.add_argument("--operator-request-id", required=True)
+    materialize.add_argument(
+        "--run-profile",
+        choices=run_profiles.LIVE_RUN_PROFILES,
+        required=True,
+    )
+
     sub.add_parser("list")
     show = sub.add_parser("show")
     show.add_argument("source_ref")
@@ -336,6 +348,60 @@ def run(
         broker_client = _load_broker_client(args)
         if broker_client is not None:
             policy = replace(policy, review_authority_client=broker_client)
+        if command == "materialize-manual-attention":
+            _require_review_authority(
+                policy,
+                broker_client,
+                allow_local_test_adapter=_allow_local_review_authority_for_tests,
+            )
+            if broker_client is None:
+                trust_service = _load_trust_service(args)
+                policy = replace(policy, narrative_trust_service=trust_service)
+            else:
+                trust_service = None
+            rows = normalizer.scan_needs_narrative(policy)
+            matches = tuple(
+                (ref, digest)
+                for ref, digest in rows
+                if normalizer.source_identity(ref, digest) == args.source_identity
+            )
+            if len(matches) != 1:
+                raise normalizer.NarrativeNormalizerError(
+                    "narrative_normalizer_manual_attention_materialization_invalid"
+                )
+            source_ref, source_digest = matches[0]
+            source = normalizer.read_source_unit(
+                policy,
+                source_ref,
+                expected_digest=source_digest,
+                allow_insufficient=True,
+            )
+            try:
+                request = normalizer.ManualAttentionMaterializationRequest(
+                    args.source_identity,
+                    source_digest,
+                    args.parent_attempt_id,
+                    args.parent_attempt_digest,
+                    args.diagnostic_digest,
+                    args.operator_request_id,
+                    args.run_profile,
+                )
+            except TypeError:
+                raise normalizer.NarrativeNormalizerError(
+                    "narrative_normalizer_manual_attention_materialization_invalid"
+                ) from None
+            materialization_store = normalizer.NarrativeOutboxStore(
+                policy,
+                trust_service=trust_service,
+                review_authority=broker_client,
+                broker_owned_trust=broker_client is not None,
+                permission_policy=permission_policy,
+            )
+            result = materialization_store.materialize_manual_attention(
+                source, request,
+            )
+            _emit(result.safe_summary())
+            return 0
         if command not in {"normalize", "resume"}:
             if command in {"approve", "pass", "reject", "supersede", "verify"}:
                 _require_review_authority(

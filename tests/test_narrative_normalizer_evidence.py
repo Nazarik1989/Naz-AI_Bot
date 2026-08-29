@@ -1474,6 +1474,71 @@ def test_provider_evidence_schema_is_closed_versioned_and_fresh(operation: str, 
     assert "caller_mutation" not in second["properties"]
 
 
+def _persisted_semantic_failure(reason: str, *, binding: str = "matched"):
+    stage = "relation_binding" if "relation" in reason else "semantic_validation"
+    diagnostic = evidence.EvidenceValidationDiagnostic(
+        stage,
+        reason,
+        "$.evidence[].temporal_relation"
+        if reason.startswith("temporal")
+        else "$.evidence[].causal_relation"
+        if reason.startswith("causal")
+        else "$.evidence[].polarity",
+        "str",
+        (), (), (),
+        (("$.evidence", "list"),),
+        (("$.evidence", 5),),
+        evidence.EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+        "not_applicable",
+        "matched" if binding == "matched" else "mismatched",
+        100,
+        100,
+    )
+    summary = evidence.EvidenceCoverageSummary(
+        6, 6, 6, 6, 0, 0, 0, 5, 0, 0, 0, 0, 0,
+        "coverage_hard_invalid",
+    )
+    return evidence.CoverageFailureEvidence(
+        "coverage_hard_invalid", stage, reason, summary, binding,
+        evidence_diagnostic=diagnostic,
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ("temporal_relation_mismatch", "causal_relation_mismatch", "polarity_mismatch"),
+)
+def test_persisted_typed_relation_conflicts_project_to_manual_attention(reason):
+    projected = evidence.materializable_post_extraction_failure(
+        _persisted_semantic_failure(reason)
+    )
+    assert projected.category == "coverage_incomplete"
+    assert projected.summary.reason_code == "coverage_incomplete"
+    assert projected.stable_reason == reason
+
+
+@pytest.mark.parametrize("reason", ("malformed_json", "transport_failure"))
+def test_hard_evidence_failures_cannot_be_materialized(reason):
+    summary = evidence.EvidenceCoverageSummary(
+        1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1,
+        "coverage_hard_invalid",
+    )
+    failure = evidence.CoverageFailureEvidence(
+        "coverage_hard_invalid", "coverage_validation", reason, summary,
+    )
+    with pytest.raises(TypeError, match="post extraction failure"):
+        evidence.materializable_post_extraction_failure(failure)
+
+
+def test_source_identity_mismatch_cannot_be_materialized():
+    with pytest.raises(TypeError, match="post extraction failure"):
+        evidence.materializable_post_extraction_failure(
+            _persisted_semantic_failure(
+                "temporal_relation_mismatch", binding="mismatched",
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "relation_field",
     ("temporal_relation", "causal_relation"),

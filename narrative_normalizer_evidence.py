@@ -12,7 +12,7 @@ The module performs no network I/O.  Model access is dependency-injected via
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -866,6 +866,9 @@ COVERAGE_FAILURE_REASONS = frozenset({
     "evidence_count_or_coverage_policy_invalid",
     "unsupported_or_ambiguous_proposition",
     "generic_or_meaning_anchor_rejection",
+    "temporal_relation_mismatch", "temporal_relation_operands_incomplete",
+    "causal_relation_mismatch", "causal_relation_operands_incomplete",
+    "polarity_mismatch", "evidence_references_withheld_segment",
 })
 
 _POST_EXTRACTION_INCOMPLETE_REASONS = frozenset({
@@ -876,6 +879,12 @@ _POST_EXTRACTION_INCOMPLETE_REASONS = frozenset({
     "evidence_count_or_coverage_policy_invalid",
     "unsupported_or_ambiguous_proposition",
     "generic_or_meaning_anchor_rejection",
+    "temporal_relation_mismatch",
+    "temporal_relation_operands_incomplete",
+    "causal_relation_mismatch",
+    "causal_relation_operands_incomplete",
+    "polarity_mismatch",
+    "evidence_references_withheld_segment",
 })
 _COVERAGE_SOURCE_BINDING_RESULTS = frozenset({
     "matched", "mismatched", "not_checked",
@@ -3594,6 +3603,31 @@ def _post_extraction_failure(
     )
 
 
+def materializable_post_extraction_failure(
+    failure: CoverageFailureEvidence,
+) -> CoverageFailureEvidence:
+    """Return the closed manual projection for one persisted semantic conflict."""
+
+    if (
+        type(failure) is not CoverageFailureEvidence
+        or type(failure.evidence_diagnostic) is not EvidenceValidationDiagnostic
+        or failure.evidence_diagnostic.stable_subreason
+        not in _POST_EXTRACTION_INCOMPLETE_REASONS
+        or failure.source_binding_result != "matched"
+        or failure.transport_diagnostic is not None
+    ):
+        raise TypeError("post extraction failure")
+    summary = replace(failure.summary, reason_code="coverage_incomplete")
+    return CoverageFailureEvidence(
+        category="coverage_incomplete",
+        validation_stage=failure.evidence_diagnostic.validation_stage,
+        stable_reason=failure.evidence_diagnostic.stable_subreason,
+        summary=summary,
+        source_binding_result="matched",
+        evidence_diagnostic=failure.evidence_diagnostic,
+    )
+
+
 def parse_extraction_v2_response(
     response: Mapping[str, object] | str,
     bundle: SourceDocumentBundle,
@@ -4286,6 +4320,7 @@ __all__ = [
     "coverage_failure_from_payload",
     "coverage_hard_failure",
     "coverage_hard_failure_for_request",
+    "materializable_post_extraction_failure",
     "provider_transport_diagnostic_from_payload",
     "evidence_digest",
     "evidence_model_response_schema",

@@ -6074,3 +6074,188 @@ def test_broken_identity_directory_symlink_fails_closed_not_missing(tmp_path):
         pytest.skip("symlinks unavailable")
     with pytest.raises(rq.EligibilityError, match="narrative_manifest_invalid"):
         rq.validate_narrative_ready_manifest(policy, record.source_ref)
+
+
+def _persisted_relation_failure(reason: str = "temporal_relation_mismatch"):
+    stage = "relation_binding" if "relation" in reason else "semantic_validation"
+    field_path = (
+        "$.evidence[].temporal_relation"
+        if reason.startswith("temporal")
+        else "$.evidence[].causal_relation"
+        if reason.startswith("causal")
+        else "$.evidence[].polarity"
+    )
+    diagnostic = nn.evidence.EvidenceValidationDiagnostic(
+        stage,
+        reason,
+        field_path,
+        "str",
+        (),
+        (),
+        (),
+        (("$.evidence", "list"),),
+        (("$.evidence", 5), ("$.segment_dispositions", 6)),
+        nn.evidence.EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+        "not_applicable",
+        "matched",
+        1024,
+        1024,
+    )
+    summary = nn.evidence.EvidenceCoverageSummary(
+        6, 6, 6, 6, 0, 0, 0, 5, 0, 0, 0, 0, 0,
+        "coverage_hard_invalid",
+    )
+    return nn.evidence.CoverageFailureEvidence(
+        "coverage_hard_invalid",
+        stage,
+        reason,
+        summary,
+        "matched",
+        evidence_diagnostic=diagnostic,
+    )
+
+
+def _materialization_case(tmp_path, *, reason="temporal_relation_mismatch"):
+    values = runtime(tmp_path)
+    record, source, client, service = values[3], values[4], values[7], values[8]
+    _, parent_bytes, parent_digest = _seed_failed_claim(
+        service, source, attempt_id="e" * 32,
+    )
+    failure = _persisted_relation_failure(reason)
+    diagnostic = service.store.persist_coverage_diagnostic(
+        nn.source_identity(source.source_ref, source.source_digest),
+        "e" * 32,
+        failure,
+    )
+    request = nn.ManualAttentionMaterializationRequest(
+        nn.source_identity(source.source_ref, source.source_digest),
+        source.source_digest,
+        "e" * 32,
+        parent_digest,
+        diagnostic["diagnostic_digest"],
+        "materialize-manual-attention-0001",
+        nn.run_profiles.CANARY_RUN_PROFILE,
+    )
+    return record, source, client, service, parent_bytes, request
+
+
+def test_materialization_creates_linked_manual_package_without_provider_or_downstream(tmp_path):
+    record, source, client, service, parent_bytes, request = _materialization_case(tmp_path)
+
+    result = service.store.materialize_manual_attention(
+        source, request, created_at=NOW.isoformat().replace("+00:00", "Z"),
+    )
+
+    assert result.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert result.parent_attempt_id == request.parent_attempt_id
+    assert result.attempt_id != request.parent_attempt_id
+    assert result.coverage_failure.category == "coverage_incomplete"
+    assert not client.requests
+    assert service.store.archived_attempt_bytes(
+        request.source_identity, request.parent_attempt_id,
+    ) == parent_bytes
+    claim = service.store.read_claim(record.source_ref, record.source_digest)
+    assert claim["attempt_id"] == result.attempt_id
+    assert claim["state"] == nn.CLAIM_FAILED
+    assert claim["reason_code"] == "narrative_normalizer_manual_attention_package_ready"
+    package_dir = service.store.root / request.source_identity
+    assert {item.name for item in package_dir.iterdir()} == {
+        "manual-attention.json", "manual-attention.md",
+    }
+    package = json.loads((package_dir / "manual-attention.json").read_text("utf-8"))
+    assert package["parent_attempt_identity"] == request.parent_attempt_id
+    assert package["attempt_identity"] == result.attempt_id
+    assert package["confirmed_fact_count"] == 0
+    assert package["coverage_counts"]["returned_evidence"] == 5
+    assert package["coverage_counts"]["temporal_conflicts"] == 1
+    assert package["human_actions"] == [
+        "использовать только подтверждённые факты",
+        "вручную уточнить порядок событий",
+        "пропустить материал",
+    ]
+    combined = (package_dir / "manual-attention.json").read_text("utf-8") + (
+        package_dir / "manual-attention.md"
+    ).read_text("utf-8")
+    for forbidden in (
+        source.source_ref, "First observed event", "prompt", "secret",
+        str(service.store.root), "approval-attestation",
+    ):
+        assert forbidden not in combined
+
+
+def test_materialization_exact_duplicate_is_byte_idempotent(tmp_path):
+    _, source, client, service, _, request = _materialization_case(tmp_path)
+    timestamp = NOW.isoformat().replace("+00:00", "Z")
+    first = service.store.materialize_manual_attention(source, request, created_at=timestamp)
+    before = _filesystem_metadata_snapshot(service.store.root)
+
+    second = service.store.materialize_manual_attention(source, request, created_at=timestamp)
+
+    assert second.attempt_id == first.attempt_id
+    assert second.idempotent is True
+    assert _filesystem_metadata_snapshot(service.store.root) == before
+    assert not client.requests
+
+
+def test_materialization_divergent_request_conflicts_without_mutation(tmp_path):
+    _, source, client, service, _, request = _materialization_case(tmp_path)
+    timestamp = NOW.isoformat().replace("+00:00", "Z")
+    service.store.materialize_manual_attention(source, request, created_at=timestamp)
+    before = _filesystem_metadata_snapshot(service.store.root)
+    divergent = dataclasses.replace(request, diagnostic_digest="f" * 64)
+
+    with pytest.raises(
+        nn.NarrativeNormalizerError,
+        match="narrative_normalizer_manual_attention_materialization_conflict",
+    ):
+        service.store.materialize_manual_attention(
+            source, divergent, created_at=timestamp,
+        )
+
+    assert _filesystem_metadata_snapshot(service.store.root) == before
+    assert not client.requests
+
+
+def test_materialization_cli_is_zero_model_and_never_constructs_adapter(
+    tmp_path, monkeypatch, capsys,
+):
+    _, source, client, service, _, request = _materialization_case(tmp_path)
+    monkeypatch.setattr(
+        nn, "load_adapter", lambda *_: pytest.fail("adapter constructed"),
+    )
+
+    exit_code = _cli_run_with_local_test_authority([
+        *_cli_base(service.policy),
+        "materialize-manual-attention",
+        "--source-identity", request.source_identity,
+        "--parent-attempt-id", request.parent_attempt_id,
+        "--parent-attempt-digest", request.parent_attempt_digest,
+        "--diagnostic-digest", request.diagnostic_digest,
+        "--operator-request-id", request.operator_request_id,
+        "--run-profile", request.run_profile,
+    ])
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert output["status"] == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert output["provider_model_calls"] == 0
+    assert not client.requests
+
+
+@pytest.mark.parametrize(
+    "reason,expected_count",
+    (("causal_relation_mismatch", "causal_conflicts"), ("polarity_mismatch", "polarity_conflicts")),
+)
+def test_materialization_closed_relation_conflicts_are_manual_attention(
+    tmp_path, reason, expected_count,
+):
+    _, source, client, service, _, request = _materialization_case(tmp_path, reason=reason)
+    result = service.store.materialize_manual_attention(
+        source, request, created_at=NOW.isoformat().replace("+00:00", "Z"),
+    )
+    payload = json.loads(
+        (service.store.root / request.source_identity / "manual-attention.json").read_text("utf-8")
+    )
+    assert result.coverage_failure.category == "coverage_incomplete"
+    assert payload["coverage_counts"][expected_count] == 1
+    assert not client.requests

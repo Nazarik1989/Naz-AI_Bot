@@ -54,8 +54,14 @@ DRAFT_MANIFEST_SCHEMA_VERSION = "naz-narrative-draft-manifest-v3"
 REVIEW_SCHEMA_VERSION = "naz-narrative-review-v3"
 CLAIM_SCHEMA_VERSION = "naz-narrative-normalization-claim-v3"
 MANUAL_RETRY_REQUEST_SCHEMA_VERSION = "normalizer-manual-retry-request-v1"
+MANUAL_ATTENTION_MATERIALIZATION_SCHEMA_VERSION = (
+    "normalizer-manual-attention-materialization-v1"
+)
 COVERAGE_DIAGNOSTIC_SCHEMA_VERSION = "normalizer-coverage-diagnostic-v1"
 MANUAL_RETRY_REASON_CODE = "narrative_normalizer_manual_retry_requested"
+MANUAL_ATTENTION_MATERIALIZATION_REASON_CODE = (
+    "narrative_normalizer_manual_attention_materialized"
+)
 REVIEWER_VERSION = "deterministic-normalizer-review-v2"
 IDEMPOTENCY_VERSION = "normalizer-source-identity-v2"
 REVIEW_ACTION_VERSION = "normalizer-review-action-v1"
@@ -121,6 +127,9 @@ REASON_CODES = frozenset({
     "narrative_normalizer_manual_retry_invalid",
     "narrative_normalizer_manual_retry_conflict",
     MANUAL_RETRY_REASON_CODE,
+    "narrative_normalizer_manual_attention_materialization_invalid",
+    "narrative_normalizer_manual_attention_materialization_conflict",
+    MANUAL_ATTENTION_MATERIALIZATION_REASON_CODE,
     "narrative_normalizer_review_not_passed",
     "narrative_normalizer_draft_invalid",
     "narrative_normalizer_approval_conflict",
@@ -4495,8 +4504,15 @@ _MANUAL_ATTENTION_VALIDATION_STAGES = frozenset({
     "quote_binding", "proposition_binding", "value_binding", "relation_binding",
     "semantic_validation",
 })
+_MANUAL_ATTENTION_MATERIALIZATION_KEYS = frozenset({
+    "schema_version", "source_identity", "source_digest",
+    "parent_attempt_id", "parent_attempt_digest", "diagnostic_digest",
+    "attempt_id", "operator_request_id", "run_profile", "safe_reason_code",
+    "created_at", "key_id", "request_seal",
+})
 _MANUAL_ATTENTION_KEYS = frozenset({
     "schema_version", "source_identity", "attempt_identity", "run_profile",
+    "parent_attempt_identity",
     "reason_code", "validation_stage", "stable_reason", "coverage_counts",
     "confirmed_fact_count",
     "verified_candidate_fact_summaries", "why_no_complete_story", "human_actions",
@@ -4528,6 +4544,8 @@ def _manual_attention_artifact(
     run_profile: str,
     summary: evidence.EvidenceCoverageSummary,
     failure: evidence.CoverageFailureEvidence,
+    *,
+    parent_attempt_identity: str | None = None,
 ) -> ManualAttentionArtifact:
     if (
         type(attempt_identity) is not str
@@ -4537,6 +4555,14 @@ def _manual_attention_artifact(
         or type(failure) is not evidence.CoverageFailureEvidence
         or failure.summary != summary
         or evidence.classify_coverage_failure(failure) != summary
+        or (
+            parent_attempt_identity is not None
+            and (
+                type(parent_attempt_identity) is not str
+                or re.fullmatch(r"[0-9a-f]{32}", parent_attempt_identity) is None
+                or parent_attempt_identity == attempt_identity
+            )
+        )
     ):
         raise TypeError("manual attention evidence")
     counts = {
@@ -4553,11 +4579,35 @@ def _manual_attention_artifact(
         "sensitive_withheld_blocks": summary.sensitive_count,
         "ambiguous_blocks": summary.ambiguous_count,
         "omitted_blocks": summary.omitted_count,
+        "returned_evidence": next((
+            count
+            for path, count in (
+                ()
+                if failure.evidence_diagnostic is None
+                else failure.evidence_diagnostic.list_item_counts
+            )
+            if path == "$.evidence"
+        ), 0),
+        "valid_evidence": 0,
+        "temporal_conflicts": int(failure.stable_reason.startswith("temporal_relation_")),
+        "causal_conflicts": int(failure.stable_reason.startswith("causal_relation_")),
+        "polarity_conflicts": int(failure.stable_reason == "polarity_mismatch"),
     }
+    derived = parent_attempt_identity is not None
+    human_actions = (
+        [
+            "использовать только подтверждённые факты",
+            "вручную уточнить порядок событий",
+            "пропустить материал",
+        ]
+        if derived
+        else ["use_confirmed_facts", "discuss_ambiguous_parts", "skip_material"]
+    )
     core = {
         "schema_version": MANUAL_ATTENTION_CONTRACT_VERSION,
         "source_identity": source_identity_value,
         "attempt_identity": attempt_identity,
+        "parent_attempt_identity": parent_attempt_identity,
         "run_profile": run_profile,
         "reason_code": summary.reason_code,
         "validation_stage": failure.validation_stage,
@@ -4568,13 +4618,33 @@ def _manual_attention_artifact(
         "why_no_complete_story": (
             "Coverage could not safely authorize a complete public story without human judgement."
         ),
-        "human_actions": [
-            "use_confirmed_facts", "discuss_ambiguous_parts", "skip_material",
-        ],
+        "human_actions": human_actions,
         "narrative_ready": False,
     }
     payload = dict(core, package_digest=_sha(core))
     markdown = (
+        (
+            "# Требуется ручное внимание\n\n"
+            f"Безопасная причина: {failure.stable_reason}.\n\n"
+            f"Этап проверки: {failure.validation_stage}.\n\n"
+            f"Покрытие: {summary.block_count} блоков и {summary.segment_count} сегментов. "
+            f"Получено {counts['returned_evidence']} элементов evidence; "
+            f"полностью подтверждено: {counts['valid_evidence']}. "
+            f"Темпоральных конфликтов: {counts['temporal_conflicts']}; "
+            f"каузальных: {counts['causal_conflicts']}; "
+            f"конфликтов полярности: {counts['polarity_conflicts']}. "
+            f"Пропущено блоков: {summary.omitted_count}; "
+            f"скрыто чувствительных блоков: {summary.sensitive_count}.\n\n"
+            "Подтверждённых безопасных фактов: 0. Ни один факт не прошёл полный "
+            "набор code-owned проверок независимо от отклонённой связи.\n\n"
+            "Полную историю пока нельзя доказать без ручного решения о порядке событий.\n\n"
+            "Выберите одно действие:\n"
+            "1. Использовать только подтверждённые факты.\n"
+            "2. Вручную уточнить порядок событий.\n"
+            "3. Пропустить материал.\n"
+        )
+        if derived
+        else
         "# Manual attention required\n\n"
         f"Safe reason: {failure.stable_reason} ({summary.reason_code}).\n\n"
         f"Coverage: {summary.block_count} deterministic blocks across "
@@ -4628,14 +4698,45 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
             "conflicting_dispositions", "evidence_candidates", "context_only",
             "structural", "sensitive_withheld_blocks", "ambiguous_blocks",
             "omitted_blocks",
+            "returned_evidence", "valid_evidence", "temporal_conflicts",
+            "causal_conflicts", "polarity_conflicts",
         })
         or any(type(value) is not int or value < 0 for value in counts.values())
         or core.get("confirmed_fact_count") != 0
         or core.get("verified_candidate_fact_summaries") != []
-        or core.get("human_actions") != [
-            "use_confirmed_facts", "discuss_ambiguous_parts", "skip_material",
-        ]
+        or core.get("human_actions") not in (
+            ["use_confirmed_facts", "discuss_ambiguous_parts", "skip_material"],
+            [
+                "использовать только подтверждённые факты",
+                "вручную уточнить порядок событий",
+                "пропустить материал",
+            ],
+        )
+        or (
+            core.get("parent_attempt_identity") is None
+            and core.get("human_actions") != [
+                "use_confirmed_facts", "discuss_ambiguous_parts", "skip_material",
+            ]
+        )
+        or (
+            core.get("parent_attempt_identity") is not None
+            and core.get("human_actions") != [
+                "использовать только подтверждённые факты",
+                "вручную уточнить порядок событий",
+                "пропустить материал",
+            ]
+        )
         or core.get("narrative_ready") is not False
+        or (
+            core.get("parent_attempt_identity") is not None
+            and (
+                type(core.get("parent_attempt_identity")) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{32}", core["parent_attempt_identity"]
+                ) is None
+                or core.get("parent_attempt_identity") == core.get("attempt_identity")
+            )
+        )
         or type(digest) is not str
         or digest != _sha(core)
     ):
@@ -4682,6 +4783,84 @@ class ManualRetryRequest:
             raise TypeError("manual retry request")
 
 
+@dataclass(frozen=True, slots=True)
+class ManualAttentionMaterializationRequest:
+    source_identity: str
+    source_digest: str
+    parent_attempt_id: str
+    parent_attempt_digest: str
+    diagnostic_digest: str
+    operator_request_id: str
+    run_profile: str
+    safe_reason_code: str = MANUAL_ATTENTION_MATERIALIZATION_REASON_CODE
+
+    def __post_init__(self) -> None:
+        try:
+            rule = run_profiles.resolve_live_run_profile(self.run_profile)
+        except ValueError:
+            rule = None
+        if (
+            type(self.source_identity) is not str
+            or _HEX64.fullmatch(self.source_identity) is None
+            or type(self.source_digest) is not str
+            or _HEX64.fullmatch(self.source_digest) is None
+            or type(self.parent_attempt_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", self.parent_attempt_id) is None
+            or type(self.parent_attempt_digest) is not str
+            or _HEX64.fullmatch(self.parent_attempt_digest) is None
+            or type(self.diagnostic_digest) is not str
+            or _HEX64.fullmatch(self.diagnostic_digest) is None
+            or type(self.operator_request_id) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", self.operator_request_id) is None
+            or rule is None
+            or self.run_profile != run_profiles.CANARY_RUN_PROFILE
+            or type(self.safe_reason_code) is not str
+            or self.safe_reason_code != MANUAL_ATTENTION_MATERIALIZATION_REASON_CODE
+        ):
+            raise TypeError("manual attention materialization request")
+
+
+@dataclass(frozen=True, slots=True)
+class ManualAttentionMaterializationResult:
+    source_identity: str
+    parent_attempt_id: str
+    attempt_id: str
+    status: str
+    idempotent: bool
+    package_digest: str
+    coverage_failure: evidence.CoverageFailureEvidence
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.source_identity) is not str
+            or _HEX64.fullmatch(self.source_identity) is None
+            or type(self.parent_attempt_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", self.parent_attempt_id) is None
+            or type(self.attempt_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", self.attempt_id) is None
+            or self.attempt_id == self.parent_attempt_id
+            or self.status != OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+            or type(self.idempotent) is not bool
+            or type(self.package_digest) is not str
+            or _HEX64.fullmatch(self.package_digest) is None
+            or type(self.coverage_failure) is not evidence.CoverageFailureEvidence
+        ):
+            raise TypeError("manual attention materialization result")
+
+    def safe_summary(self) -> dict[str, object]:
+        return {
+            "ok": True,
+            "status": self.status,
+            "source_identity": self.source_identity,
+            "parent_attempt_id": self.parent_attempt_id,
+            "attempt_id": self.attempt_id,
+            "idempotent": self.idempotent,
+            "package_digest": self.package_digest,
+            "provider_model_calls": 0,
+            "coverage_failure": self.coverage_failure.safe_payload(),
+        }
+
+
 class NarrativeOutboxStore:
     """Lazy, source-identity keyed persistence for review-only drafts."""
 
@@ -4709,6 +4888,9 @@ class NarrativeOutboxStore:
         self._claims = self._state / "claims"
         self._attempt_history = self._state / "attempt-history-v1"
         self._manual_retry_requests = self._state / "manual-retry-requests-v1"
+        self._manual_attention_materializations = (
+            self._state / "manual-attention-materializations-v1"
+        )
         self._coverage_diagnostics = self._state / "coverage-diagnostics-v1"
         self._broker_receipts = self._state / "broker-draft-receipts-v1"
         self.trust_service = trust_service
@@ -4848,6 +5030,7 @@ class NarrativeOutboxStore:
             for path in (
                 self.root, self._state, self._locks, self._claims,
                 self._attempt_history, self._manual_retry_requests,
+                self._manual_attention_materializations,
                 self._coverage_diagnostics, self._broker_receipts,
             ):
                 path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -4858,7 +5041,8 @@ class NarrativeOutboxStore:
             return
         private_state = (
             self._claims, self._attempt_history,
-            self._manual_retry_requests, self._coverage_diagnostics,
+            self._manual_retry_requests, self._manual_attention_materializations,
+            self._coverage_diagnostics,
             self._broker_receipts,
         ) if self.broker_trust_mode else ()
         for path, mode in (
@@ -4868,6 +5052,7 @@ class NarrativeOutboxStore:
             (self._claims, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._attempt_history, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._manual_retry_requests, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._manual_attention_materializations, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._coverage_diagnostics, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._broker_receipts, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
         ):
@@ -4882,6 +5067,7 @@ class NarrativeOutboxStore:
             self._claims,
             (() if self.broker_trust_mode else (
                 self._attempt_history, self._manual_retry_requests,
+                self._manual_attention_materializations,
                 self._coverage_diagnostics, self._broker_receipts,
             )),
         )
@@ -5271,6 +5457,284 @@ class NarrativeOutboxStore:
         )
         return self._validate_coverage_diagnostic(payload)
 
+    def _manual_attention_materialization_path(
+        self, operator_request_id: str,
+    ) -> Path:
+        if (
+            type(operator_request_id) is not str
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", operator_request_id
+            ) is None
+        ):
+            _raise("narrative_normalizer_manual_attention_materialization_invalid")
+        name = hashlib.sha256(operator_request_id.encode("utf-8")).hexdigest()
+        return self._manual_attention_materializations / f"{name}.json"
+
+    def _validate_manual_attention_materialization_record(
+        self, value: object,
+    ) -> dict[str, object]:
+        reason = "narrative_normalizer_manual_attention_materialization_invalid"
+        payload = _exact_mapping(
+            value, _MANUAL_ATTENTION_MATERIALIZATION_KEYS, reason,
+        )
+        try:
+            rule = run_profiles.resolve_live_run_profile(payload["run_profile"])
+        except (TypeError, ValueError):
+            rule = None
+        if (
+            payload["schema_version"]
+            != MANUAL_ATTENTION_MATERIALIZATION_SCHEMA_VERSION
+            or type(payload["source_identity"]) is not str
+            or _HEX64.fullmatch(payload["source_identity"]) is None
+            or type(payload["source_digest"]) is not str
+            or _HEX64.fullmatch(payload["source_digest"]) is None
+            or type(payload["parent_attempt_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", payload["parent_attempt_id"]) is None
+            or type(payload["parent_attempt_digest"]) is not str
+            or _HEX64.fullmatch(payload["parent_attempt_digest"]) is None
+            or type(payload["diagnostic_digest"]) is not str
+            or _HEX64.fullmatch(payload["diagnostic_digest"]) is None
+            or type(payload["attempt_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", payload["attempt_id"]) is None
+            or payload["attempt_id"] == payload["parent_attempt_id"]
+            or type(payload["operator_request_id"]) is not str
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}",
+                payload["operator_request_id"],
+            ) is None
+            or rule is None
+            or payload["run_profile"] != run_profiles.CANARY_RUN_PROFILE
+            or payload["safe_reason_code"]
+            != MANUAL_ATTENTION_MATERIALIZATION_REASON_CODE
+            or not _is_timestamp(payload["created_at"])
+            or type(payload["key_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{24}", payload["key_id"]) is None
+            or type(payload["request_seal"]) is not str
+            or _HEX64.fullmatch(payload["request_seal"]) is None
+        ):
+            _raise(reason)
+        core = dict(payload)
+        seal = str(core.pop("request_seal"))
+        if self.broker_trust_mode:
+            expected = hashlib.sha256(
+                BROKER_PRIVATE_STATE_VERSION.encode("ascii")
+                + b"\0"
+                + _canonical(core)
+            ).hexdigest()
+            if payload["key_id"] != BROKER_PRIVATE_STATE_KEY_ID or seal != expected:
+                _raise(reason)
+            return payload
+        service = self._require_trust()
+        try:
+            receipt = trust.TrustReceipt(
+                trust.TRUST_RECEIPT_SCHEMA_VERSION,
+                trust.TRUST_ALGORITHM,
+                str(payload["key_id"]),
+                trust.TRUST_DOMAIN_CLAIM,
+                hashlib.sha256(trust.canonical_payload(core)).hexdigest(),
+                seal,
+            )
+        except trust.TrustError:
+            _raise(reason)
+        if not service.verify(trust.TRUST_DOMAIN_CLAIM, core, receipt):
+            _raise(reason)
+        return payload
+
+    def _read_manual_attention_materialization_record(
+        self, operator_request_id: str,
+    ) -> dict[str, object] | None:
+        path = self._manual_attention_materialization_path(operator_request_id)
+        if not os.path.lexists(path):
+            return None
+        payload = _json_read(
+            path,
+            _MANUAL_ATTENTION_MATERIALIZATION_KEYS,
+            "narrative_normalizer_manual_attention_materialization_invalid",
+        )
+        result = self._validate_manual_attention_materialization_record(payload)
+        if result["operator_request_id"] != operator_request_id:
+            _raise("narrative_normalizer_manual_attention_materialization_conflict")
+        return result
+
+    @staticmethod
+    def _manual_attention_materialization_binding_matches(
+        record: Mapping[str, object],
+        request: ManualAttentionMaterializationRequest,
+    ) -> bool:
+        return all((
+            record["source_identity"] == request.source_identity,
+            record["source_digest"] == request.source_digest,
+            record["parent_attempt_id"] == request.parent_attempt_id,
+            record["parent_attempt_digest"] == request.parent_attempt_digest,
+            record["diagnostic_digest"] == request.diagnostic_digest,
+            record["operator_request_id"] == request.operator_request_id,
+            record["run_profile"] == request.run_profile,
+            record["safe_reason_code"] == request.safe_reason_code,
+        ))
+
+    def begin_manual_attention_materialization_locked(
+        self,
+        source: SourceUnit,
+        request: ManualAttentionMaterializationRequest,
+        *,
+        created_at: str,
+    ) -> tuple[str, bool, evidence.CoverageFailureEvidence]:
+        identity = source_identity(
+            source.source_ref,
+            source.source_digest,
+            source.receipt.source_contract_version,
+        )
+        invalid = "narrative_normalizer_manual_attention_materialization_invalid"
+        conflict = "narrative_normalizer_manual_attention_materialization_conflict"
+        if (
+            type(request) is not ManualAttentionMaterializationRequest
+            or request.source_identity != identity
+            or request.source_digest != source.source_digest
+            or not _is_timestamp(created_at)
+        ):
+            _raise(invalid)
+        existing_request = self._read_manual_attention_materialization_record(
+            request.operator_request_id
+        )
+        if existing_request is not None:
+            if not self._manual_attention_materialization_binding_matches(
+                existing_request, request
+            ):
+                _raise(conflict)
+            diagnostic = self.read_coverage_diagnostic(
+                identity, request.parent_attempt_id
+            )
+            try:
+                failure = evidence.coverage_failure_from_payload(
+                    diagnostic["coverage_failure"]
+                )
+                projected = evidence.materializable_post_extraction_failure(failure)
+            except (TypeError, ValueError):
+                _raise(invalid)
+            return str(existing_request["attempt_id"]), True, projected
+
+        previous = self.read_claim(source.source_ref, source.source_digest)
+        claim_path = self.claim_path(source.source_ref, source.source_digest)
+        if (
+            previous is None
+            or previous["state"] != CLAIM_FAILED
+            or previous["attempt_id"] != request.parent_attempt_id
+            or not claim_path.is_file()
+            or claim_path.is_symlink()
+        ):
+            _raise(invalid)
+        previous_bytes = claim_path.read_bytes()
+        if hashlib.sha256(previous_bytes).hexdigest() != request.parent_attempt_digest:
+            _raise(invalid)
+        diagnostic = self.read_coverage_diagnostic(identity, request.parent_attempt_id)
+        if diagnostic["diagnostic_digest"] != request.diagnostic_digest:
+            _raise(invalid)
+        try:
+            failure = evidence.coverage_failure_from_payload(
+                diagnostic["coverage_failure"]
+            )
+            projected = evidence.materializable_post_extraction_failure(failure)
+        except (TypeError, ValueError):
+            _raise(invalid)
+
+        self._ensure_write_layout()
+        history_path = self._attempt_history_path(identity, request.parent_attempt_id)
+        history_directory = history_path.parent
+        history_directory.mkdir(mode=0o700, exist_ok=True)
+        if history_directory.is_symlink() or not history_directory.is_dir():
+            _raise(invalid)
+        if self.permission_policy.shared and not self.broker_trust_mode:
+            outbox_permissions.finalize_shared_retry_directory(
+                self.permission_policy, self.root, history_directory
+            )
+        elif os.name != "nt":
+            os.chmod(history_directory, 0o700)
+        if os.path.lexists(history_path):
+            if (
+                history_path.is_symlink()
+                or not history_path.is_file()
+                or history_path.read_bytes() != previous_bytes
+            ):
+                _raise(conflict)
+        else:
+            _write_exclusive_file(
+                history_path,
+                previous_bytes,
+                mode=(
+                    0o600
+                    if self.broker_trust_mode
+                    else self.permission_policy.claim_file_mode
+                ),
+            )
+            if self.permission_policy.shared and not self.broker_trust_mode:
+                outbox_permissions.finalize_shared_claim(
+                    self.permission_policy, self.root, history_path
+                )
+
+        attempt_id = secrets.token_hex(16)
+        core = {
+            "schema_version": MANUAL_ATTENTION_MATERIALIZATION_SCHEMA_VERSION,
+            "source_identity": identity,
+            "source_digest": source.source_digest,
+            "parent_attempt_id": request.parent_attempt_id,
+            "parent_attempt_digest": request.parent_attempt_digest,
+            "diagnostic_digest": request.diagnostic_digest,
+            "attempt_id": attempt_id,
+            "operator_request_id": request.operator_request_id,
+            "run_profile": request.run_profile,
+            "safe_reason_code": request.safe_reason_code,
+            "created_at": created_at,
+            "key_id": (
+                BROKER_PRIVATE_STATE_KEY_ID
+                if self.broker_trust_mode
+                else self._require_trust().key_id
+            ),
+        }
+        request_seal = (
+            hashlib.sha256(
+                BROKER_PRIVATE_STATE_VERSION.encode("ascii")
+                + b"\0"
+                + _canonical(core)
+            ).hexdigest()
+            if self.broker_trust_mode
+            else self._require_trust().sign(trust.TRUST_DOMAIN_CLAIM, core).seal
+        )
+        candidate = self._validate_manual_attention_materialization_record(
+            dict(core, request_seal=request_seal)
+        )
+        request_path = self._manual_attention_materialization_path(
+            request.operator_request_id
+        )
+        encoded = _canonical(candidate) + b"\n"
+        try:
+            _write_exclusive_file(
+                request_path,
+                encoded,
+                mode=(
+                    0o600
+                    if self.broker_trust_mode
+                    else self.permission_policy.claim_file_mode
+                ),
+            )
+        except FileExistsError:
+            winner = self._read_manual_attention_materialization_record(
+                request.operator_request_id
+            )
+            if winner is None or not self._manual_attention_materialization_binding_matches(
+                winner, request
+            ):
+                _raise(conflict)
+            return str(winner["attempt_id"]), True, projected
+        if self.permission_policy.shared and not self.broker_trust_mode:
+            outbox_permissions.finalize_shared_claim(
+                self.permission_policy, self.root, request_path
+            )
+        if self._read_manual_attention_materialization_record(
+            request.operator_request_id
+        ) != candidate:
+            _raise(invalid)
+        return attempt_id, False, projected
+
     def _broker_receipt_path(self, source_identity_value: str) -> Path:
         if type(source_identity_value) is not str or _HEX64.fullmatch(source_identity_value) is None:
             _raise("narrative_normalizer_review_authority_unavailable")
@@ -5559,7 +6023,10 @@ class NarrativeOutboxStore:
         payload: Mapping[str, object],
         *,
         manual_retry_request: ManualRetryRequest | None = None,
+        materialization_request: ManualAttentionMaterializationRequest | None = None,
     ) -> bool:
+        if manual_retry_request is not None and materialization_request is not None:
+            _raise("narrative_normalizer_claim_invalid")
         payload = self._seal_claim_payload(payload)
         source_ref = payload.get("source_ref")
         source_digest_value = payload.get("source_digest")
@@ -5608,6 +6075,25 @@ class NarrativeOutboxStore:
                         and not history_path.is_symlink()
                         and hashlib.sha256(history_path.read_bytes()).hexdigest()
                         == manual_retry_request.previous_failed_claim_digest
+                    )
+                elif type(materialization_request) is ManualAttentionMaterializationRequest:
+                    record = self._read_manual_attention_materialization_record(
+                        materialization_request.operator_request_id
+                    )
+                    history_path = self._attempt_history_path(
+                        str(existing["source_identity"]), old_attempt
+                    )
+                    archived_retry = bool(
+                        record is not None
+                        and self._manual_attention_materialization_binding_matches(
+                            record, materialization_request
+                        )
+                        and record["attempt_id"] == new_attempt
+                        and new_attempt != old_attempt
+                        and history_path.is_file()
+                        and not history_path.is_symlink()
+                        and hashlib.sha256(history_path.read_bytes()).hexdigest()
+                        == materialization_request.parent_attempt_digest
                     )
             allowed = (
                 (old_state == CLAIM_PROCESSING and new_state in {CLAIM_PROCESSING, CLAIM_UNCERTAIN, CLAIM_FAILED, CLAIM_COMPLETED} and old_attempt == new_attempt)
@@ -5710,6 +6196,118 @@ class NarrativeOutboxStore:
         finally:
             if os.path.lexists(staging):
                 _cleanup_owned_path(staging)
+
+    @_privacy_boundary("narrative_normalizer_manual_attention_materialization_invalid")
+    def materialize_manual_attention(
+        self,
+        source: SourceUnit,
+        request: ManualAttentionMaterializationRequest,
+        *,
+        created_at: str | None = None,
+    ) -> ManualAttentionMaterializationResult:
+        """Project one persisted typed conflict without constructing a provider."""
+
+        if type(source) is not SourceUnit or type(request) is not ManualAttentionMaterializationRequest:
+            raise TypeError("manual attention materialization")
+        timestamp = (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            if created_at is None
+            else created_at
+        )
+        identity = source_identity(
+            source.source_ref,
+            source.source_digest,
+            source.receipt.source_contract_version,
+        )
+        if request.source_identity != identity or request.source_digest != source.source_digest:
+            _raise("narrative_normalizer_manual_attention_materialization_invalid")
+        self._ensure_write_layout()
+        with self.lock_for(source.source_ref, source.source_digest, blocking=True):
+            attempt_id, replay, failure = (
+                self.begin_manual_attention_materialization_locked(
+                    source, request, created_at=timestamp,
+                )
+            )
+            current = self.read_claim(source.source_ref, source.source_digest)
+            if current is None:
+                _raise("narrative_normalizer_manual_attention_materialization_invalid")
+            if (
+                current["state"] == CLAIM_FAILED
+                and current["attempt_id"] == request.parent_attempt_id
+            ):
+                processing = _claim_payload(
+                    source,
+                    attempt_id=attempt_id,
+                    state=CLAIM_PROCESSING,
+                    started_at=timestamp,
+                    updated_at=timestamp,
+                )
+                self._write_claim_locked(
+                    processing, materialization_request=request,
+                )
+            elif (
+                current["state"] == CLAIM_PROCESSING
+                and current["attempt_id"] == attempt_id
+            ):
+                pass
+            elif not (
+                current["state"] == CLAIM_FAILED
+                and current["attempt_id"] == attempt_id
+                and current["reason_code"]
+                == "narrative_normalizer_manual_attention_package_ready"
+            ):
+                _raise("narrative_normalizer_manual_attention_materialization_conflict")
+
+            persisted_diagnostic = self.persist_coverage_diagnostic(
+                identity, attempt_id, failure,
+            )
+            if persisted_diagnostic["coverage_failure"] != failure.safe_payload():
+                _raise("narrative_normalizer_persistence_invalid")
+            artifact = _manual_attention_artifact(
+                identity,
+                attempt_id,
+                request.run_profile,
+                failure.summary,
+                failure,
+                parent_attempt_identity=request.parent_attempt_id,
+            )
+            _, package_replay = self.persist_manual_attention(artifact)
+            current = self.read_claim(source.source_ref, source.source_digest)
+            if current is None:
+                _raise("narrative_normalizer_claim_invalid")
+            if current["state"] == CLAIM_PROCESSING:
+                terminal = _claim_payload(
+                    source,
+                    attempt_id=attempt_id,
+                    state=CLAIM_FAILED,
+                    started_at=str(current["started_at"]),
+                    updated_at=timestamp,
+                    reason_code="narrative_normalizer_manual_attention_package_ready",
+                )
+                self._write_claim_locked(terminal)
+            else:
+                terminal = current
+            if (
+                terminal["state"] != CLAIM_FAILED
+                or terminal["attempt_id"] != attempt_id
+                or terminal["reason_code"]
+                != "narrative_normalizer_manual_attention_package_ready"
+            ):
+                _raise("narrative_normalizer_claim_invalid")
+            parent_bytes = self.archived_attempt_bytes(
+                identity, request.parent_attempt_id,
+            )
+            if hashlib.sha256(parent_bytes).hexdigest() != request.parent_attempt_digest:
+                _raise("narrative_normalizer_manual_attention_materialization_invalid")
+            return ManualAttentionMaterializationResult(
+                identity,
+                request.parent_attempt_id,
+                attempt_id,
+                OUTCOME_MANUAL_ATTENTION_PACKAGE_READY,
+                replay or package_replay,
+                str(artifact.payload["package_digest"]),
+                failure,
+            )
 
     @_privacy_boundary("narrative_normalizer_persistence_invalid")
     def persist(self, artifact: DraftArtifact) -> tuple[Path, bool]:

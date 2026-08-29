@@ -514,11 +514,23 @@ Post-extraction validation uses the same fail-closed boundary. Every rejected
 coverage-v2 extraction carries a closed `EvidenceValidationDiagnostic`; a
 terminal result may not silently replace it with `null`. Incomplete or
 conflicting evidence partitions are projected to the append-only manual
-attention package. Schema, source, privacy, exact quote/span, value ownership,
-polarity, and relation violations remain hard-invalid and cannot create a
-story. The persisted diagnostic contains only stages, stable reason codes,
+attention package. Typed temporal, causal, polarity, duplicate, conflicting,
+ambiguous, withheld-segment, and safe-ordering conflicts are incomplete: their
+evidence remains rejected, but a human can choose how to proceed. Schema,
+source, privacy, exact quote/span, and value ownership violations remain
+hard-invalid and cannot create a story. The persisted diagnostic contains only stages, stable reason codes,
 field paths, exact type/key inventories, counts, contract identity, binding
 status, and response size—not response values or source content.
+
+`materialize-manual-attention` is the closed zero-provider projection for an
+already terminal hard-invalid attempt whose persisted typed diagnostic is now
+classified as incomplete. It binds the exact source, parent attempt and claim
+digest, diagnostic digest, canary run profile, and operator request ID. The
+parent bytes are archived unchanged; a new terminal derived attempt owns the
+existing `manual-attention.json` / `manual-attention.md` package. Exact request
+replay returns the same attempt, while divergent request-ID reuse fails before
+mutation. This operation never constructs the Provider Adapter and creates no
+Broker, approval, ready, quarantine, Reels, or publication event.
 
 ## Versioned outbox permissions
 
