@@ -386,6 +386,57 @@ class EvidenceValidationDiagnostic:
         }
 
 
+_EVIDENCE_VALIDATION_DIAGNOSTIC_KEYS = frozenset({
+    "validation_stage", "stable_subreason", "field_path",
+    "response_top_level_exact_type", "top_level_key_set", "missing_keys",
+    "extra_keys", "nested_field_types", "list_item_counts",
+    "schema_contract_version", "span_quote_validation_category",
+    "source_identity_binding_result", "response_byte_size",
+    "response_character_size",
+})
+
+
+def evidence_validation_diagnostic_from_payload(
+    value: object,
+) -> EvidenceValidationDiagnostic:
+    """Recreate a diagnostic only from its closed privacy-safe payload."""
+
+    if type(value) is not dict or frozenset(value) != _EVIDENCE_VALIDATION_DIAGNOSTIC_KEYS:
+        raise TypeError("evidence validation diagnostic")
+    nested = value["nested_field_types"]
+    counts = value["list_item_counts"]
+    if (
+        type(nested) is not list
+        or any(type(item) is not dict or frozenset(item) != {"field_path", "exact_type"} for item in nested)
+        or type(counts) is not list
+        or any(type(item) is not dict or frozenset(item) != {"field_path", "item_count"} for item in counts)
+    ):
+        raise TypeError("evidence validation diagnostic")
+    try:
+        return EvidenceValidationDiagnostic(
+            validation_stage=value["validation_stage"],
+            stable_subreason=value["stable_subreason"],
+            field_path=value["field_path"],
+            response_top_level_exact_type=value["response_top_level_exact_type"],
+            top_level_key_set=tuple(value["top_level_key_set"]),
+            missing_keys=tuple(value["missing_keys"]),
+            extra_keys=tuple(value["extra_keys"]),
+            nested_field_types=tuple(
+                (item["field_path"], item["exact_type"]) for item in nested
+            ),
+            list_item_counts=tuple(
+                (item["field_path"], item["item_count"]) for item in counts
+            ),
+            schema_contract_version=value["schema_contract_version"],
+            span_quote_validation_category=value["span_quote_validation_category"],
+            source_identity_binding_result=value["source_identity_binding_result"],
+            response_byte_size=value["response_byte_size"],
+            response_character_size=value["response_character_size"],
+        )
+    except (KeyError, TypeError, ValueError):
+        raise TypeError("evidence validation diagnostic") from None
+
+
 class EvidenceContractError(ValueError):
     """Privacy-safe public failure for the evidence boundary."""
 
@@ -808,6 +859,23 @@ COVERAGE_FAILURE_REASONS = frozenset({
     "exact_scalar_type_violation", "source_identity_mismatch",
     "privacy_violation", "transport_failure", "unsupported_object_type",
     "invalid_disposition_enum",
+    "disposition_partition_mismatch",
+    "duplicate_or_missing_segment_disposition",
+    "evidence_item_not_bound_to_source_segment",
+    "duplicate_or_conflicting_evidence",
+    "evidence_count_or_coverage_policy_invalid",
+    "unsupported_or_ambiguous_proposition",
+    "generic_or_meaning_anchor_rejection",
+})
+
+_POST_EXTRACTION_INCOMPLETE_REASONS = frozenset({
+    "disposition_partition_mismatch",
+    "duplicate_or_missing_segment_disposition",
+    "evidence_item_not_bound_to_source_segment",
+    "duplicate_or_conflicting_evidence",
+    "evidence_count_or_coverage_policy_invalid",
+    "unsupported_or_ambiguous_proposition",
+    "generic_or_meaning_anchor_rejection",
 })
 _COVERAGE_SOURCE_BINDING_RESULTS = frozenset({
     "matched", "mismatched", "not_checked",
@@ -944,12 +1012,19 @@ class CoverageFailureEvidence:
     source_binding_result: str = "not_checked"
     contract_version: str = EVIDENCE_COVERAGE_CONTRACT_VERSION
     transport_diagnostic: ProviderTransportDiagnostic | None = None
+    evidence_diagnostic: EvidenceValidationDiagnostic | None = None
 
     def __post_init__(self) -> None:
         _enum(self.category, _COVERAGE_FAILURE_CATEGORIES, "category")
-        if self.validation_stage != "coverage_validation":
+        if self.validation_stage != "coverage_validation" and self.validation_stage not in _DIAGNOSTIC_STAGES:
             raise ValueError("validation_stage")
-        _enum(self.stable_reason, COVERAGE_FAILURE_REASONS, "stable_reason")
+        if self.evidence_diagnostic is None:
+            _enum(self.stable_reason, COVERAGE_FAILURE_REASONS, "stable_reason")
+        elif (
+            type(self.stable_reason) is not str
+            or _DIAGNOSTIC_KEY.fullmatch(self.stable_reason) is None
+        ):
+            raise TypeError("stable_reason")
         if type(self.summary) is not EvidenceCoverageSummary:
             raise TypeError("summary")
         _enum(
@@ -969,6 +1044,19 @@ class CoverageFailureEvidence:
             }
         ):
             raise TypeError("transport_diagnostic")
+        if self.evidence_diagnostic is not None and (
+            type(self.evidence_diagnostic) is not EvidenceValidationDiagnostic
+            or self.transport_diagnostic is not None
+            or self.validation_stage != self.evidence_diagnostic.validation_stage
+            or self.stable_reason != self.evidence_diagnostic.stable_subreason
+            or self.source_binding_result
+            != {
+                "matched": "matched",
+                "mismatched": "mismatched",
+                "unavailable": "not_checked",
+            }[self.evidence_diagnostic.source_identity_binding_result]
+        ):
+            raise TypeError("evidence_diagnostic")
 
     def safe_payload(self) -> dict[str, object]:
         """Return the closed, text-free diagnostic persisted by the Normalizer."""
@@ -995,6 +1083,8 @@ class CoverageFailureEvidence:
         }
         if self.transport_diagnostic is not None:
             result["transport_diagnostic"] = self.transport_diagnostic.safe_payload()
+        if self.evidence_diagnostic is not None:
+            result["evidence_diagnostic"] = self.evidence_diagnostic.safe_payload()
         return result
 
 
@@ -1007,20 +1097,23 @@ _COVERAGE_FAILURE_PAYLOAD_KEYS = frozenset({
     "context_only_count", "structural_count", "withheld_count",
     "ambiguous_count", "omitted_count",
     "transport_diagnostic",
+    "evidence_diagnostic",
 })
 
-_LEGACY_COVERAGE_FAILURE_PAYLOAD_KEYS = (
-    _COVERAGE_FAILURE_PAYLOAD_KEYS - {"transport_diagnostic"}
-)
+_COVERAGE_FAILURE_OPTIONAL_KEYS = frozenset({
+    "transport_diagnostic", "evidence_diagnostic",
+})
 
 
 def coverage_failure_from_payload(value: object) -> CoverageFailureEvidence:
     """Recreate one diagnostic only from its exact privacy-safe schema."""
 
-    if type(value) is not dict or frozenset(value) not in {
-        _COVERAGE_FAILURE_PAYLOAD_KEYS,
-        _LEGACY_COVERAGE_FAILURE_PAYLOAD_KEYS,
-    }:
+    if (
+        type(value) is not dict
+        or not (_COVERAGE_FAILURE_PAYLOAD_KEYS - _COVERAGE_FAILURE_OPTIONAL_KEYS)
+        <= frozenset(value)
+        or frozenset(value) - _COVERAGE_FAILURE_PAYLOAD_KEYS
+    ):
         raise TypeError("coverage failure payload")
     category = value["category"]
     try:
@@ -1052,6 +1145,13 @@ def coverage_failure_from_payload(value: object) -> CoverageFailureEvidence:
                 if value.get("transport_diagnostic") is None
                 else provider_transport_diagnostic_from_payload(
                     value["transport_diagnostic"]
+                )
+            ),
+            evidence_diagnostic=(
+                None
+                if value.get("evidence_diagnostic") is None
+                else evidence_validation_diagnostic_from_payload(
+                    value["evidence_diagnostic"]
                 )
             ),
         )
@@ -2394,7 +2494,7 @@ def _nested_shape_inventory(
         if type(value) is list and len(counts) < 48:
             counts.append((path, len(value)))
 
-    for name in sorted(_EXTRACTION_RESPONSE_KEYS):
+    for name in sorted(_EXTRACTION_RESPONSE_KEYS | _EXTRACTION_V2_RESPONSE_KEYS):
         if name in raw:
             add(f"$.{name}", raw[name])
     evidence_items = raw.get("evidence")
@@ -2406,6 +2506,8 @@ def _nested_shape_inventory(
             for name in sorted(_EVIDENCE_KEYS):
                 if name in item:
                     add(f"$.evidence[].{name}", item[name])
+            if "ordered_block_refs" in item:
+                add("$.evidence[].ordered_block_refs", item["ordered_block_refs"])
             quote_items = item.get("exact_quotes")
             if type(quote_items) is list:
                 for quote in quote_items:
@@ -2531,6 +2633,122 @@ def _extraction_diagnostic(
             and decoded.get("schema_version") != EVIDENCE_EXTRACTION_CONTRACT_VERSION
         ):
             stage, subreason, field_path = "contract_version", "contract_version_mismatch", "$.schema_version"
+    return EvidenceValidationDiagnostic(
+        validation_stage=stage,
+        stable_subreason=subreason,
+        field_path=field_path,
+        response_top_level_exact_type=_diagnostic_type(response),
+        top_level_key_set=safe_keys,
+        missing_keys=missing,
+        extra_keys=extra,
+        nested_field_types=nested,
+        list_item_counts=counts,
+        schema_contract_version=version,
+        span_quote_validation_category=span_category,
+        source_identity_binding_result=binding,
+        response_byte_size=byte_size,
+        response_character_size=character_size,
+    )
+
+
+def _first_extraction_v2_shape_issue(raw: object) -> tuple[str, str, str]:
+    if type(raw) is not dict:
+        return "response_type", "top_level_exact_type_invalid", "$"
+    if frozenset(raw) != _EXTRACTION_V2_RESPONSE_KEYS:
+        return "top_level_schema", "top_level_key_set_invalid", "$"
+    for name in (
+        "schema_version", "source_identity", "document_bundle_digest",
+        "coverage_plan_digest", "run_id",
+    ):
+        if type(raw[name]) is not str:
+            return "nested_schema", "exact_scalar_type_invalid", f"$.{name}"
+    if type(raw["evidence"]) is not list:
+        return "nested_schema", "exact_list_type_invalid", "$.evidence"
+    expected_item_keys = _EVIDENCE_KEYS | {"ordered_block_refs"}
+    for item in raw["evidence"]:
+        if type(item) is not dict:
+            return "nested_schema", "list_item_exact_type_invalid", "$.evidence[]"
+        if frozenset(item) != expected_item_keys:
+            return "nested_schema", "nested_key_set_invalid", "$.evidence[]"
+        if type(item["ordered_block_refs"]) is not list:
+            return "nested_schema", "exact_list_type_invalid", "$.evidence[].ordered_block_refs"
+        reduced = {key: value for key, value in item.items() if key != "ordered_block_refs"}
+        projected = {
+            "schema_version": EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+            "source_identity": raw["source_identity"],
+            "document_bundle_digest": raw["document_bundle_digest"],
+            "run_id": raw["run_id"],
+            "evidence": [reduced],
+            "segment_dispositions": [],
+        }
+        stage, reason, path = _first_extraction_shape_issue(projected)
+        if stage != "semantic_validation":
+            return stage, reason, path
+    return "semantic_validation", "code_owned_validation_rejected", "$"
+
+
+def _extraction_v2_diagnostic(
+    response: object,
+    source_bundle: SourceDocumentBundle,
+    reason_code: str,
+    semantic_rejection: str | None = None,
+) -> EvidenceValidationDiagnostic:
+    byte_size, character_size = _diagnostic_dimensions(response)
+    decoded: object = response
+    json_invalid = False
+    if type(response) is str:
+        try:
+            decoded = json.loads(response)
+        except (json.JSONDecodeError, RecursionError):
+            json_invalid = True
+    if type(decoded) is dict:
+        safe_keys = tuple(sorted({_diagnostic_key(item) for item in decoded}))
+        actual_keys = frozenset(item for item in decoded if type(item) is str)
+        missing = tuple(sorted(_EXTRACTION_V2_RESPONSE_KEYS - actual_keys))
+        extra = tuple(sorted({
+            _diagnostic_key(item) for item in decoded
+            if item not in _EXTRACTION_V2_RESPONSE_KEYS
+        }))
+        nested, counts = _nested_shape_inventory(decoded)
+        version = _safe_contract_version(
+            decoded.get("schema_version"), EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+        )
+        binding = (
+            "matched"
+            if type(decoded.get("source_identity")) is str
+            and decoded.get("source_identity") == source_bundle.source_identity
+            else "mismatched"
+            if type(decoded.get("source_identity")) is str
+            else "unavailable"
+        )
+    else:
+        safe_keys = ()
+        missing = tuple(sorted(_EXTRACTION_V2_RESPONSE_KEYS))
+        extra = ()
+        nested = ()
+        counts = ()
+        version = "missing"
+        binding = "unavailable"
+    if json_invalid:
+        stage, subreason, field_path, span_category = (
+            "json_parse", "json_document_invalid", "$", "not_applicable",
+        )
+    else:
+        stage, subreason, field_path = _first_extraction_v2_shape_issue(decoded)
+        span_category = "not_applicable"
+        if stage == "semantic_validation":
+            stage, subreason, field_path, span_category = _semantic_diagnostic(
+                reason_code, semantic_rejection,
+            )
+        if (
+            type(decoded) is dict
+            and frozenset(decoded) == _EXTRACTION_V2_RESPONSE_KEYS
+            and type(decoded.get("schema_version")) is str
+            and decoded.get("schema_version") != EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION
+        ):
+            stage, subreason, field_path = (
+                "contract_version", "contract_version_mismatch", "$.schema_version",
+            )
     return EvidenceValidationDiagnostic(
         validation_stage=stage,
         stable_subreason=subreason,
@@ -3343,89 +3561,135 @@ def _coverage_manual_failure(
     )
 
 
+def _post_extraction_failure(
+    inventory: SourceBlockInventory,
+    plan: EvidenceCoveragePlan,
+    diagnostic: EvidenceValidationDiagnostic,
+) -> CoverageFailureEvidence:
+    """Project one typed extraction rejection into a closed product outcome."""
+
+    if (
+        type(inventory) is not SourceBlockInventory
+        or type(plan) is not EvidenceCoveragePlan
+        or type(diagnostic) is not EvidenceValidationDiagnostic
+    ):
+        raise TypeError("post extraction failure")
+    category = (
+        "coverage_incomplete"
+        if diagnostic.stable_subreason in _POST_EXTRACTION_INCOMPLETE_REASONS
+        else "coverage_hard_invalid"
+    )
+    summary = _coverage_summary(inventory, plan, category)
+    return CoverageFailureEvidence(
+        category=category,
+        validation_stage=diagnostic.validation_stage,
+        stable_reason=diagnostic.stable_subreason,
+        summary=summary,
+        source_binding_result={
+            "matched": "matched",
+            "mismatched": "mismatched",
+            "unavailable": "not_checked",
+        }[diagnostic.source_identity_binding_result],
+        evidence_diagnostic=diagnostic,
+    )
+
+
 def parse_extraction_v2_response(
     response: Mapping[str, object] | str,
     bundle: SourceDocumentBundle,
     inventory: SourceBlockInventory,
     plan: EvidenceCoveragePlan,
 ) -> EvidenceExtractionBundle:
-    raw = _exact_mapping(_mapping_response(response), _EXTRACTION_V2_RESPONSE_KEYS)
-    if (
-        raw["schema_version"] != EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION
-        or raw["source_identity"] != bundle.source_identity
-        or raw["document_bundle_digest"] != bundle.bundle_digest
-        or raw["coverage_plan_digest"] != plan.plan_digest
-    ):
-        _raise("evidence_source_binding_invalid")
-    block_by_id = {item.block_id: item for item in inventory.ordered_blocks}
-    selected = tuple(
-        item.block_id for item in plan.ordered_decisions
-        if item.disposition == "evidence_candidate"
-    )
-    selected_set = frozenset(selected)
-    evidence_items: list[SourceEvidence] = []
-    refs_by_evidence: dict[str, tuple[str, ...]] = {}
-    for value in _exact_list(raw["evidence"]):
-        if type(value) is not dict or frozenset(value) != _EVIDENCE_KEYS | {"ordered_block_refs"}:
-            _raise("evidence_schema_invalid")
-        block_refs = value["ordered_block_refs"]
-        if (
-            type(block_refs) is not list
-            or not block_refs
-            or any(type(item) is not str for item in block_refs)
-            or len(block_refs) != len(set(block_refs))
-            or any(item not in selected_set for item in block_refs)
-        ):
-            _raise("evidence_segment_binding_invalid")
-        reduced = {key: item for key, item in value.items() if key != "ordered_block_refs"}
-        evidence_item = _evidence_from(reduced)
-        allowed_segments = {
-            segment_id
-            for block_id in block_refs
-            for segment_id in block_by_id[block_id].ordered_segment_ids
-        }
-        if not set(evidence_item.ordered_segment_refs) <= allowed_segments:
-            _raise("evidence_segment_binding_invalid")
-        evidence_items.append(evidence_item)
-        refs_by_evidence[evidence_item.evidence_id] = evidence_item.ordered_segment_refs
-    evidence_by_segment: dict[str, list[str]] = {}
-    for evidence_id, refs in refs_by_evidence.items():
-        for segment_id in refs:
-            evidence_by_segment.setdefault(segment_id, []).append(evidence_id)
-    disposition_by_block = {item.block_id: item.disposition for item in plan.ordered_decisions}
-    block_for_segment = {
-        segment_id: block
-        for block in inventory.ordered_blocks
-        for segment_id in block.ordered_segment_ids
-    }
-    dispositions: list[SegmentDisposition] = []
-    for segment in _segments(bundle):
-        block = block_for_segment[segment.segment_id]
-        evidence_ids = tuple(evidence_by_segment.get(segment.segment_id, ()))
-        planned = disposition_by_block[block.block_id]
-        disposition = (
-            "sensitive" if planned == "sensitive_withheld"
-            else "ambiguous" if planned == "ambiguous"
-            else "evidence" if evidence_ids
-            else "irrelevant"
-        )
-        dispositions.append(SegmentDisposition(segment.segment_id, disposition, evidence_ids))
-    payload = {
-        "source_identity": bundle.source_identity,
-        "document_bundle_digest": bundle.bundle_digest,
-        "contract_version": EVIDENCE_EXTRACTION_CONTRACT_VERSION,
-        "run_id": raw["run_id"],
-        "ordered_evidence": tuple(evidence_items),
-        "ordered_segment_dispositions": tuple(dispositions),
-    }
     try:
+        raw = _exact_mapping(_mapping_response(response), _EXTRACTION_V2_RESPONSE_KEYS)
+        if (
+            raw["schema_version"] != EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION
+            or raw["source_identity"] != bundle.source_identity
+            or raw["document_bundle_digest"] != bundle.bundle_digest
+            or raw["coverage_plan_digest"] != plan.plan_digest
+        ):
+            _raise("evidence_source_binding_invalid")
+        block_by_id = {item.block_id: item for item in inventory.ordered_blocks}
+        selected = tuple(
+            item.block_id for item in plan.ordered_decisions
+            if item.disposition == "evidence_candidate"
+        )
+        selected_set = frozenset(selected)
+        evidence_items: list[SourceEvidence] = []
+        refs_by_evidence: dict[str, tuple[str, ...]] = {}
+        for value in _exact_list(raw["evidence"]):
+            if type(value) is not dict or frozenset(value) != _EVIDENCE_KEYS | {"ordered_block_refs"}:
+                _raise("evidence_schema_invalid")
+            block_refs = value["ordered_block_refs"]
+            if (
+                type(block_refs) is not list
+                or not block_refs
+                or any(type(item) is not str for item in block_refs)
+                or len(block_refs) != len(set(block_refs))
+                or any(item not in selected_set for item in block_refs)
+            ):
+                _raise(
+                    "evidence_segment_binding_invalid",
+                    semantic_rejection="evidence_item_not_bound_to_source_segment",
+                )
+            reduced = {key: item for key, item in value.items() if key != "ordered_block_refs"}
+            evidence_item = _evidence_from(reduced)
+            allowed_segments = {
+                segment_id
+                for block_id in block_refs
+                for segment_id in block_by_id[block_id].ordered_segment_ids
+            }
+            if not set(evidence_item.ordered_segment_refs) <= allowed_segments:
+                _raise(
+                    "evidence_segment_binding_invalid",
+                    semantic_rejection="evidence_item_not_bound_to_source_segment",
+                )
+            evidence_items.append(evidence_item)
+            refs_by_evidence[evidence_item.evidence_id] = evidence_item.ordered_segment_refs
+        evidence_by_segment: dict[str, list[str]] = {}
+        for evidence_id, refs in refs_by_evidence.items():
+            for segment_id in refs:
+                evidence_by_segment.setdefault(segment_id, []).append(evidence_id)
+        disposition_by_block = {item.block_id: item.disposition for item in plan.ordered_decisions}
+        block_for_segment = {
+            segment_id: block
+            for block in inventory.ordered_blocks
+            for segment_id in block.ordered_segment_ids
+        }
+        dispositions: list[SegmentDisposition] = []
+        for segment in _segments(bundle):
+            block = block_for_segment[segment.segment_id]
+            evidence_ids = tuple(evidence_by_segment.get(segment.segment_id, ()))
+            planned = disposition_by_block[block.block_id]
+            disposition = (
+                "sensitive" if planned == "sensitive_withheld"
+                else "ambiguous" if planned == "ambiguous"
+                else "evidence" if evidence_ids
+                else "irrelevant"
+            )
+            dispositions.append(SegmentDisposition(segment.segment_id, disposition, evidence_ids))
+        payload = {
+            "source_identity": bundle.source_identity,
+            "document_bundle_digest": bundle.bundle_digest,
+            "contract_version": EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+            "run_id": raw["run_id"],
+            "ordered_evidence": tuple(evidence_items),
+            "ordered_segment_dispositions": tuple(dispositions),
+        }
         result = EvidenceExtractionBundle(**payload, bundle_digest=_sha(payload))
         validate_extraction(bundle, result)
         return result
-    except EvidenceContractError:
-        raise
+    except EvidenceContractError as error:
+        if error.diagnostic is None:
+            error.diagnostic = _extraction_v2_diagnostic(
+                response, bundle, error.reason_code, error._semantic_rejection,
+            )
+        raise error from None
     except (TypeError, ValueError):
-        _raise("evidence_schema_invalid")
+        diagnostic = _extraction_v2_diagnostic(
+            response, bundle, "evidence_schema_invalid",
+        )
+        raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
 
 
 class GenericEvidenceService:
@@ -3610,6 +3874,33 @@ class GenericEvidenceService:
             extraction = parse_extraction_v2_response(
                 self._client.generate_json(extraction_request), bundle, inventory, plan
             )
+        except EvidenceContractError as error:
+            diagnostic = error.diagnostic
+            if type(diagnostic) is not EvidenceValidationDiagnostic:
+                diagnostic = _extraction_v2_diagnostic(
+                    {}, bundle, error.reason_code, error._semantic_rejection,
+                )
+            failure = _post_extraction_failure(inventory, plan, diagnostic)
+            return EvidenceResolution(
+                (
+                    "manual_attention"
+                    if failure.category == "coverage_incomplete"
+                    else "failed"
+                ),
+                None,
+                calls,
+                (
+                    "evidence_manual_attention"
+                    if failure.category == "coverage_incomplete"
+                    else error.reason_code
+                ),
+                None,
+                failure.summary,
+                failure,
+            )
+        except Exception:
+            return EvidenceResolution("failed", None, calls, "evidence_provider_failed", None, summary)
+        try:
             adjudication_payload = {
                 "source": _source_projection(bundle),
                 "coverage_plan_digest": plan.plan_digest,

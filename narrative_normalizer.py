@@ -4489,6 +4489,12 @@ def _write_exclusive_file(path: Path, payload: bytes, *, mode: int = 0o600) -> N
 
 MANUAL_ATTENTION_CONTRACT_VERSION = "normalizer-manual-attention-v2"
 MANUAL_ATTENTION_LOCAL_PROFILE = "normalizer-review-only-v1"
+_MANUAL_ATTENTION_VALIDATION_STAGES = frozenset({
+    "coverage_validation", "response_type", "json_parse", "top_level_schema",
+    "contract_version", "source_binding", "nested_schema", "segment_binding",
+    "quote_binding", "proposition_binding", "value_binding", "relation_binding",
+    "semantic_validation",
+})
 _MANUAL_ATTENTION_KEYS = frozenset({
     "schema_version", "source_identity", "attempt_identity", "run_profile",
     "reason_code", "validation_stage", "stable_reason", "coverage_counts",
@@ -4613,7 +4619,7 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
             *run_profiles.LIVE_RUN_PROFILES, MANUAL_ATTENTION_LOCAL_PROFILE,
         }
         or core.get("reason_code") != "coverage_incomplete"
-        or core.get("validation_stage") != "coverage_validation"
+        or core.get("validation_stage") not in _MANUAL_ATTENTION_VALIDATION_STAGES
         or core.get("stable_reason") not in evidence.COVERAGE_FAILURE_REASONS
         or type(counts) is not dict
         or frozenset(counts) != frozenset({

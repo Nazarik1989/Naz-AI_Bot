@@ -305,6 +305,13 @@ non-retryable operation slots: coverage, extraction, evidence adjudication,
 story generation, and story adjudication. Story repair is not available on this
 path.
 
+The extraction response is revalidated after a complete coverage plan. Every
+coverage-v2 rejection is converted to a typed, privacy-safe post-extraction
+diagnostic before it reaches the parent result. Incomplete/conflicting evidence
+creates the manual-attention package and consumes no adjudication or story
+slot. Hard-invalid schema, source binding, privacy, quote/span, entity/value,
+polarity, or relation failures stop the run with the same non-null diagnostic.
+
 An incomplete or ambiguous coverage plan creates a safe
 `normalizer-manual-attention-v1` package containing only opaque identity,
 counts, a stable reason, and the closed human actions `use_selected_facts`,

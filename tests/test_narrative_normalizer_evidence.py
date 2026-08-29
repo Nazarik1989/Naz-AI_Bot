@@ -1664,6 +1664,77 @@ def test_coverage_v2_expands_every_segment_exactly_once(tmp_path):
     assert len(actual) == len(set(actual))
 
 
+@pytest.mark.parametrize(
+    "mutation,expected_category,expected_reason",
+    (
+        ("unsupported-proposition", "coverage_incomplete", "generic_or_meaning_anchor_rejection"),
+        ("wrong-block", "coverage_incomplete", "evidence_item_not_bound_to_source_segment"),
+        ("quote-span", "coverage_hard_invalid", "quote_span_or_ownership_invalid"),
+        ("source-binding", "coverage_hard_invalid", "source_or_document_binding_mismatch"),
+    ),
+)
+def test_coverage_v2_post_extraction_rejection_is_typed_and_product_classified(
+    tmp_path, mutation, expected_category, expected_reason,
+):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    extraction = _v2_extraction(bundle, inventory, plan)
+    if mutation == "unsupported-proposition":
+        extraction["evidence"][0]["proposition"] = "Unsupported synthesized proposition."
+    elif mutation == "wrong-block":
+        extraction["evidence"][0]["ordered_block_refs"] = ["block-unknown"]
+    elif mutation == "quote-span":
+        extraction["evidence"][0]["exact_quotes"][0]["byte_end"] -= 1
+    else:
+        extraction["source_identity"] = "0" * 64
+    client = FakeEvidenceClient([coverage, extraction])
+
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle)
+
+    assert result.status == (
+        "manual_attention" if expected_category == "coverage_incomplete" else "failed"
+    )
+    assert result.model_call_count == 2
+    assert [item.request_kind for item in client.requests] == [
+        "evidence_coverage", "evidence_extraction",
+    ]
+    failure = result.coverage_failure
+    assert type(failure) is evidence.CoverageFailureEvidence
+    assert failure.category == expected_category
+    assert failure.stable_reason == expected_reason
+    assert type(failure.evidence_diagnostic) is evidence.EvidenceValidationDiagnostic
+    assert failure.evidence_diagnostic.stable_subreason == expected_reason
+    assert evidence.coverage_failure_from_payload(failure.safe_payload()) == failure
+    encoded = evidence.json.dumps(failure.safe_payload(), ensure_ascii=False)
+    assert "Unsupported synthesized proposition" not in encoded
+
+
+def test_coverage_v2_direct_parser_never_drops_post_extraction_diagnostic(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(
+        _coverage_payload(bundle, inventory), bundle, inventory,
+    )
+    extraction = _v2_extraction(bundle, inventory, plan)
+    extraction["evidence"][0]["exact_quotes"][0]["character_end"] -= 1
+
+    with pytest.raises(evidence.EvidenceContractError) as caught:
+        evidence.parse_extraction_v2_response(
+            extraction, bundle, inventory, plan,
+        )
+
+    assert type(caught.value.diagnostic) is evidence.EvidenceValidationDiagnostic
+    assert caught.value.diagnostic.validation_stage == "quote_binding"
+    assert caught.value.diagnostic.stable_subreason == "quote_span_or_ownership_invalid"
+
+
 def test_coverage_v2_sensitive_block_text_never_enters_provider_projection(tmp_path):
     bundle = _write_bundle(tmp_path, {"facts.txt": "Public fact.\nAPI_KEY=sk-secret-value"})
     inventory = evidence.build_source_block_inventory(bundle)

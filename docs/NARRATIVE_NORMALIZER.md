@@ -510,6 +510,16 @@ can become terminal. If that write fails, no manual-attention package is
 created. Manual-attention attempts create no Broker, approval, ready, or Reels
 event.
 
+Post-extraction validation uses the same fail-closed boundary. Every rejected
+coverage-v2 extraction carries a closed `EvidenceValidationDiagnostic`; a
+terminal result may not silently replace it with `null`. Incomplete or
+conflicting evidence partitions are projected to the append-only manual
+attention package. Schema, source, privacy, exact quote/span, value ownership,
+polarity, and relation violations remain hard-invalid and cannot create a
+story. The persisted diagnostic contains only stages, stable reason codes,
+field paths, exact type/key inventories, counts, contract identity, binding
+status, and response size—not response values or source content.
+
 ## Versioned outbox permissions
 
 The versioned `private-v1` policy remains the default and preserves the existing

@@ -3198,6 +3198,82 @@ def test_typed_coverage_hard_invalid_cases_fail_without_manual_package(tmp_path,
     assert generation_client.requests == []
     package = service.store.draft_path(record.source_digest, source_ref=record.source_ref)
     assert not package.exists()
+
+
+@pytest.mark.parametrize(
+    "case,expected_status,expected_category",
+    (
+        (
+            "incomplete",
+            nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY,
+            "coverage_incomplete",
+        ),
+        ("hard-invalid", nn.OUTCOME_FAILED, "coverage_hard_invalid"),
+    ),
+)
+def test_post_extraction_rejection_persists_typed_terminal_outcome(
+    tmp_path, case, expected_status, expected_category,
+):
+    record, documents, service, evidence_client, generation_client, registry = (
+        _coverage_only_case(tmp_path, lambda payload, _inventory: payload)
+    )
+    inventory = nn.evidence.build_source_block_inventory(documents)
+    coverage = evidence_client.replies[0]
+    plan = nn.evidence.parse_coverage_response(
+        coverage, documents, inventory,
+    )
+    first_segment = next(
+        segment
+        for document in documents.ordered_documents
+        for segment in document.ordered_segments
+        if segment.exact_text.strip()
+    )
+    legacy, _ = generic_evidence_responses(documents, (first_segment.exact_text,))
+    block_id = next(
+        block.block_id for block in inventory.ordered_blocks
+        if first_segment.segment_id in block.ordered_segment_ids
+    )
+    extraction = {
+        "schema_version": nn.evidence.EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "coverage_plan_digest": plan.plan_digest,
+        "run_id": "post-extraction-test-run",
+        "evidence": [dict(legacy["evidence"][0], ordered_block_refs=[block_id])],
+    }
+    if case == "incomplete":
+        extraction["evidence"][0]["proposition"] = "Unverified generated summary."
+    else:
+        extraction["evidence"][0]["exact_quotes"][0]["byte_end"] -= 1
+    evidence_client.replies.append(extraction)
+
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == expected_status
+    assert outcome.model_call_count == 2
+    assert type(outcome.evidence_diagnostic) is nn.evidence.CoverageFailureEvidence
+    assert outcome.evidence_diagnostic.category == expected_category
+    assert type(outcome.evidence_diagnostic.evidence_diagnostic) is nn.evidence.EvidenceValidationDiagnostic
+    assert [item.request_kind for item in evidence_client.requests] == [
+        "evidence_coverage", "evidence_extraction",
+    ]
+    assert generation_client.requests == []
+    claim = service.store.read_claim(record.source_ref, record.source_digest)
+    assert claim is not None and claim["state"] == nn.CLAIM_FAILED
+    persisted = service.store.read_coverage_diagnostic(
+        documents.source_identity, claim["attempt_id"],
+    )["coverage_failure"]
+    assert persisted == outcome.evidence_diagnostic.safe_payload()
+    package = service.store.draft_path(
+        record.source_digest, source_ref=record.source_ref,
+    )
+    if case == "incomplete":
+        assert {item.name for item in package.iterdir()} == {
+            "manual-attention.json", "manual-attention.md",
+        }
+        assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+    else:
+        assert not package.exists()
     current = service.store.read_claim(record.source_ref, record.source_digest)
     assert current is not None
     assert service.store.read_coverage_diagnostic(
