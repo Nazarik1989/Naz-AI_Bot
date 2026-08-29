@@ -1611,7 +1611,7 @@ def test_requested_integration_api_is_exported_exactly() -> None:
     assert required <= set(evidence.__all__)
     assert tuple(evidence.EvidenceResolution.__dataclass_fields__) == (
         "status", "verified_bundle", "model_call_count", "reason_code", "diagnostic",
-        "coverage_summary", "coverage_failure",
+        "coverage_summary", "coverage_failure", "fact_relation_summary",
     )
     assert isinstance(evidence.GenericEvidenceService, type)
 
@@ -1649,6 +1649,210 @@ def _v2_extraction(bundle, inventory, plan):
         "run_id": "extract-test-run",
         "evidence": [dict(legacy["evidence"][0], ordered_block_refs=[block_id])],
     }
+
+
+def _v3_extraction(bundle, inventory, plan, *, invalid_relation=False):
+    segments = _all_segments(bundle)
+    block_for_segment = {
+        segment_id: block.block_id
+        for block in inventory.ordered_blocks
+        for segment_id in block.ordered_segment_ids
+    }
+    facts = []
+    for index, segment in enumerate(segments[:3], start=1):
+        facts.append({
+            "fact_id": f"fact-{index}",
+            "proposition": segment.exact_text,
+            "evidence_kind": "observed_fact",
+            "ordered_block_refs": [block_for_segment[segment.segment_id]],
+            "ordered_segment_refs": [segment.segment_id],
+            "exact_quotes": [_quote_payload(
+                bundle, segment, quote_id=f"fact-quote-{index}",
+            )],
+            "entities": [], "numbers": [], "dates": [],
+            "polarity": "affirmed", "uncertainty": "certain",
+            "public_safety": "safe",
+        })
+    relations = []
+    if len(segments) > 3:
+        relations.append({
+            "relation_id": "relation-1",
+            "relation_kind": "temporal_after" if invalid_relation else "temporal_before",
+            "left_fact_id": "fact-1",
+            "right_fact_id": "fact-2",
+            "support_quote": _quote_payload(
+                bundle, segments[3], quote_id="relation-quote-1",
+            ),
+        })
+    return {
+        "schema_version": evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "coverage_plan_digest": plan.plan_digest,
+        "run_id": "extract-v3-test-run",
+        "facts": facts,
+        "relations": relations,
+    }
+
+
+def test_v3_three_valid_facts_survive_invalid_temporal_relation(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nAlpha happened before Beta."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(
+        _coverage_payload(bundle, inventory), bundle, inventory,
+    )
+
+    result = evidence.parse_extraction_v3_response(
+        _v3_extraction(bundle, inventory, plan, invalid_relation=True),
+        bundle, inventory, plan,
+    )
+
+    assert len(result.extraction.ordered_evidence) == 3
+    assert result.summary.valid_fact_count == 3
+    assert result.summary.rejected_fact_count == 0
+    assert result.summary.verified_relation_count == 0
+    assert result.summary.rejected_relation_count == 1
+    assert result.summary.temporal_conflict_count == 1
+
+
+def test_v3_hidden_temporal_claim_rejects_only_affected_fact(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nDelta exists.\nDelta happened after Gamma."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(
+        _coverage_payload(bundle, inventory), bundle, inventory,
+    )
+    payload = _v3_extraction(bundle, inventory, plan)
+    segment = _all_segments(bundle)[4]
+    block_id = next(
+        block.block_id for block in inventory.ordered_blocks
+        if segment.segment_id in block.ordered_segment_ids
+    )
+    payload["facts"].append({
+        "fact_id": "fact-hidden-relation",
+        "proposition": segment.exact_text,
+        "evidence_kind": "observed_fact",
+        "ordered_block_refs": [block_id],
+        "ordered_segment_refs": [segment.segment_id],
+        "exact_quotes": [_quote_payload(bundle, segment, quote_id="hidden-quote")],
+        "entities": [], "numbers": [], "dates": [],
+        "polarity": "affirmed", "uncertainty": "certain", "public_safety": "safe",
+    })
+
+    result = evidence.parse_extraction_v3_response(payload, bundle, inventory, plan)
+
+    assert result.summary.returned_fact_count == 4
+    assert result.summary.valid_fact_count == 3
+    assert result.summary.rejected_fact_count == 1
+    assert {item.evidence_id for item in result.extraction.ordered_evidence} == {
+        "fact-1", "fact-2", "fact-3",
+    }
+
+
+def test_v3_closed_schema_separates_facts_and_relations():
+    schema = evidence.evidence_model_response_schema(
+        "evidence_extraction",
+        evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
+        ("block-1",),
+    )
+    assert set(schema["required"]) == {
+        "schema_version", "source_identity", "document_bundle_digest",
+        "coverage_plan_digest", "run_id", "facts", "relations",
+    }
+    fact = schema["properties"]["facts"]["items"]
+    assert "temporal_relation" not in fact["properties"]
+    assert "causal_relation" not in fact["properties"]
+    assert schema["properties"]["relations"]["items"]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    ("relation_kind", "conflict_field"),
+    (("causal", "causal_conflict_count"), ("contradicts", "polarity_conflict_count")),
+)
+def test_v3_relation_conflict_is_scoped_and_preserves_atomic_facts(
+    tmp_path, relation_kind, conflict_field,
+):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nAlpha happened before Beta."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(
+        _coverage_payload(bundle, inventory), bundle, inventory,
+    )
+    payload = _v3_extraction(bundle, inventory, plan)
+    payload["relations"][0]["relation_kind"] = relation_kind
+
+    result = evidence.parse_extraction_v3_response(payload, bundle, inventory, plan)
+
+    assert result.summary.valid_fact_count == 3
+    assert result.summary.rejected_relation_count == 1
+    assert getattr(result.summary, conflict_field) == 1
+
+
+def test_v3_complete_verified_relation_path_reaches_verified_evidence(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nAlpha happened before Beta."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    extraction_raw = _v3_extraction(bundle, inventory, plan)
+    parsed = evidence.parse_extraction_v3_response(
+        extraction_raw, bundle, inventory, plan,
+    )
+    adjudication = _adjudication_payload(parsed.extraction)
+    client = FakeEvidenceClient([coverage, extraction_raw, adjudication])
+
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle)
+
+    assert result.status == "verified"
+    assert result.model_call_count == 3
+    assert result.fact_relation_summary.verified_relation_count == 1
+    assert all(
+        item.temporal_relation is None and item.causal_relation is None
+        for item in result.verified_bundle.extraction.ordered_evidence
+    )
+    adjudication_payload = __import__("json").loads(client.requests[2].payload_json)
+    assert "relations" not in adjudication_payload["extraction"]
+
+
+def test_v3_insufficient_independent_facts_yield_useful_manual_attention(tmp_path):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "Alpha exists.\nBeta exists."})
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    extraction_raw = _v3_extraction(bundle, inventory, plan)
+    client = FakeEvidenceClient([coverage, extraction_raw])
+
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle)
+
+    assert result.status == "manual_attention"
+    assert result.model_call_count == 2
+    assert result.coverage_failure.stable_reason == "independent_fact_count_insufficient"
+    assert result.fact_relation_summary.valid_fact_count == 2
+    assert result.fact_relation_summary.verified_fact_summaries == (
+        "Alpha exists.", "Beta exists.",
+    )
+    assert [item.request_kind for item in client.requests] == [
+        "evidence_coverage", "evidence_extraction",
+    ]
 
 
 def test_coverage_v2_twenty_one_segments_have_deterministic_bounded_blocks(tmp_path):
@@ -1732,9 +1936,9 @@ def test_coverage_v2_expands_every_segment_exactly_once(tmp_path):
 @pytest.mark.parametrize(
     "mutation,expected_category,expected_reason",
     (
-        ("unsupported-proposition", "coverage_incomplete", "generic_or_meaning_anchor_rejection"),
-        ("wrong-block", "coverage_incomplete", "evidence_item_not_bound_to_source_segment"),
-        ("quote-span", "coverage_hard_invalid", "quote_span_or_ownership_invalid"),
+        ("unsupported-proposition", "coverage_incomplete", "independent_fact_count_insufficient"),
+        ("wrong-block", "coverage_incomplete", "independent_fact_count_insufficient"),
+        ("quote-span", "coverage_incomplete", "independent_fact_count_insufficient"),
         ("source-binding", "coverage_hard_invalid", "source_or_document_binding_mismatch"),
     ),
 )
@@ -1745,13 +1949,13 @@ def test_coverage_v2_post_extraction_rejection_is_typed_and_product_classified(
     inventory = evidence.build_source_block_inventory(bundle)
     coverage = _coverage_payload(bundle, inventory)
     plan = evidence.parse_coverage_response(coverage, bundle, inventory)
-    extraction = _v2_extraction(bundle, inventory, plan)
+    extraction = _v3_extraction(bundle, inventory, plan)
     if mutation == "unsupported-proposition":
-        extraction["evidence"][0]["proposition"] = "Unsupported synthesized proposition."
+        extraction["facts"][0]["proposition"] = "Unsupported synthesized proposition."
     elif mutation == "wrong-block":
-        extraction["evidence"][0]["ordered_block_refs"] = ["block-unknown"]
+        extraction["facts"][0]["ordered_block_refs"] = ["block-unknown"]
     elif mutation == "quote-span":
-        extraction["evidence"][0]["exact_quotes"][0]["byte_end"] -= 1
+        extraction["facts"][0]["exact_quotes"][0]["byte_end"] -= 1
     else:
         extraction["source_identity"] = "0" * 64
     client = FakeEvidenceClient([coverage, extraction])
@@ -1774,8 +1978,12 @@ def test_coverage_v2_post_extraction_rejection_is_typed_and_product_classified(
     assert type(failure) is evidence.CoverageFailureEvidence
     assert failure.category == expected_category
     assert failure.stable_reason == expected_reason
-    assert type(failure.evidence_diagnostic) is evidence.EvidenceValidationDiagnostic
-    assert failure.evidence_diagnostic.stable_subreason == expected_reason
+    if expected_category == "coverage_hard_invalid":
+        assert type(failure.evidence_diagnostic) is evidence.EvidenceValidationDiagnostic
+        assert failure.evidence_diagnostic.stable_subreason == expected_reason
+    else:
+        assert failure.evidence_diagnostic is None
+        assert type(result.fact_relation_summary) is evidence.FactRelationValidationSummary
     assert evidence.coverage_failure_from_payload(failure.safe_payload()) == failure
     encoded = evidence.json.dumps(failure.safe_payload(), ensure_ascii=False)
     assert "Unsupported synthesized proposition" not in encoded

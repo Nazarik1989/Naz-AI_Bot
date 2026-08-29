@@ -27,6 +27,7 @@ SOURCE_DOCUMENT_CONTRACT_VERSION = "normalizer-source-document-v1"
 EVIDENCE_EXTRACTION_CONTRACT_VERSION = "normalizer-evidence-extraction-v1"
 EVIDENCE_COVERAGE_CONTRACT_VERSION = "normalizer-evidence-coverage-v2"
 EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION = "normalizer-evidence-extraction-v2"
+EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION = "normalizer-evidence-extraction-v3"
 EVIDENCE_ADJUDICATION_CONTRACT_VERSION = "normalizer-evidence-adjudication-v1"
 VERIFIED_EVIDENCE_CONTRACT_VERSION = "normalizer-verified-evidence-v1"
 VERIFIED_FACT_BINDING_VERSION = "normalizer-verified-fact-binding-v1"
@@ -86,6 +87,12 @@ EVIDENCE_KINDS = frozenset({
 ATOM_KINDS = frozenset({"entity", "number", "date"})
 TEMPORAL_RELATIONS = frozenset({"before", "after", "sequence"})
 CAUSAL_RELATIONS = frozenset({"because", "therefore", "caused"})
+FACT_RELATION_KINDS = frozenset({
+    "temporal_before", "temporal_after", "temporal_overlap",
+    "causal", "enables", "contradicts",
+})
+ATOMIC_EVIDENCE_KINDS = frozenset({"observed_fact", "quoted_statement"})
+MIN_INDEPENDENT_FACTS = 3
 POLARITIES = frozenset({"affirmed", "negated", "quoted"})
 UNCERTAINTIES = frozenset({"certain", "uncertain", "ambiguous"})
 PUBLIC_SAFETY = frozenset({"safe", "sensitive", "mixed", "unknown"})
@@ -848,6 +855,49 @@ class EvidenceCoverageSummary:
                 _plain_int(value, field.name)
 
 
+@dataclass(frozen=True, slots=True)
+class FactRelationValidationSummary:
+    """Privacy-safe counts from independent fact and relation validation."""
+
+    returned_fact_count: int
+    valid_fact_count: int
+    rejected_fact_count: int
+    returned_relation_count: int
+    verified_relation_count: int
+    rejected_relation_count: int
+    temporal_conflict_count: int
+    causal_conflict_count: int
+    polarity_conflict_count: int
+    verified_fact_summaries: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if field.name == "verified_fact_summaries":
+                _strings(value, field.name)
+                if len(value) > 7 or any(_is_sensitive(item) for item in value):
+                    raise ValueError(field.name)
+            else:
+                _plain_int(value, field.name)
+        if (
+            self.valid_fact_count + self.rejected_fact_count != self.returned_fact_count
+            or self.verified_relation_count + self.rejected_relation_count
+            != self.returned_relation_count
+            or len(self.verified_fact_summaries) > self.valid_fact_count
+        ):
+            raise ValueError("fact relation counts")
+
+    def safe_payload(self) -> dict[str, object]:
+        return {
+            field.name: (
+                list(getattr(self, field.name))
+                if field.name == "verified_fact_summaries"
+                else getattr(self, field.name)
+            )
+            for field in fields(self)
+        }
+
+
 _COVERAGE_FAILURE_CATEGORIES = frozenset({
     "coverage_incomplete", "coverage_hard_invalid",
 })
@@ -869,6 +919,7 @@ COVERAGE_FAILURE_REASONS = frozenset({
     "temporal_relation_mismatch", "temporal_relation_operands_incomplete",
     "causal_relation_mismatch", "causal_relation_operands_incomplete",
     "polarity_mismatch", "evidence_references_withheld_segment",
+    "independent_fact_count_insufficient",
 })
 
 _POST_EXTRACTION_INCOMPLETE_REASONS = frozenset({
@@ -2122,6 +2173,7 @@ class EvidenceResolution:
     diagnostic: EvidenceValidationDiagnostic | None = None
     coverage_summary: EvidenceCoverageSummary | None = None
     coverage_failure: CoverageFailureEvidence | None = None
+    fact_relation_summary: FactRelationValidationSummary | None = None
 
     def __post_init__(self) -> None:
         _enum(self.status, RESOLUTION_STATUSES, "status")
@@ -2148,6 +2200,11 @@ class EvidenceResolution:
             raise TypeError("coverage_summary")
         if self.coverage_failure is not None and type(self.coverage_failure) is not CoverageFailureEvidence:
             raise TypeError("coverage_failure")
+        if (
+            self.fact_relation_summary is not None
+            and type(self.fact_relation_summary) is not FactRelationValidationSummary
+        ):
+            raise TypeError("fact_relation_summary")
         if (
             self.coverage_failure is not None
             and self.coverage_summary is not None
@@ -2181,6 +2238,19 @@ _COVERAGE_RESPONSE_KEYS = frozenset({
 _EXTRACTION_V2_RESPONSE_KEYS = frozenset({
     "schema_version", "source_identity", "document_bundle_digest", "coverage_plan_digest",
     "run_id", "evidence",
+})
+_V3_FACT_KEYS = frozenset({
+    "fact_id", "proposition", "evidence_kind", "ordered_block_refs",
+    "ordered_segment_refs", "exact_quotes", "entities", "numbers", "dates",
+    "polarity", "uncertainty", "public_safety",
+})
+_V3_RELATION_KEYS = frozenset({
+    "relation_id", "relation_kind", "left_fact_id", "right_fact_id",
+    "support_quote",
+})
+_EXTRACTION_V3_RESPONSE_KEYS = frozenset({
+    "schema_version", "source_identity", "document_bundle_digest",
+    "coverage_plan_digest", "run_id", "facts", "relations",
 })
 _DECISION_KEYS = frozenset({"evidence_id", "evidence_digest", "decision", "reason_codes"})
 _ADJUDICATION_RESPONSE_KEYS = frozenset({
@@ -2239,6 +2309,7 @@ def evidence_model_response_schema(
         if response_schema_version not in {
             EVIDENCE_EXTRACTION_CONTRACT_VERSION,
             EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+            EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
         }:
             raise ValueError("evidence response schema")
         quote = _closed_object_schema({
@@ -2286,6 +2357,51 @@ def evidence_model_response_schema(
             "uncertainty": {"type": "string", "enum": sorted(UNCERTAINTIES)},
             "public_safety": {"type": "string", "enum": sorted(PUBLIC_SAFETY)},
         })
+        if response_schema_version == EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION:
+            if (
+                type(required_block_ids) is not tuple
+                or not required_block_ids
+                or len(required_block_ids) != len(set(required_block_ids))
+            ):
+                raise ValueError("evidence response schema")
+            fact = _closed_object_schema({
+                "fact_id": dict(safe_id),
+                "proposition": {"type": "string"},
+                "evidence_kind": {
+                    "type": "string", "enum": sorted(ATOMIC_EVIDENCE_KINDS),
+                },
+                "ordered_block_refs": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(required_block_ids)},
+                    "minItems": 1,
+                },
+                "ordered_segment_refs": dict(string_array),
+                "exact_quotes": {"type": "array", "items": quote, "minItems": 1},
+                "entities": {"type": "array", "items": atom},
+                "numbers": {"type": "array", "items": atom},
+                "dates": {"type": "array", "items": atom},
+                "polarity": {"type": "string", "enum": sorted(POLARITIES)},
+                "uncertainty": {"type": "string", "enum": sorted(UNCERTAINTIES)},
+                "public_safety": {"type": "string", "enum": sorted(PUBLIC_SAFETY)},
+            })
+            relation_v3 = _closed_object_schema({
+                "relation_id": dict(safe_id),
+                "relation_kind": {"type": "string", "enum": sorted(FACT_RELATION_KINDS)},
+                "left_fact_id": dict(safe_id),
+                "right_fact_id": dict(safe_id),
+                "support_quote": quote,
+            })
+            return _closed_object_schema({
+                "schema_version": {
+                    "type": "string", "const": EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
+                },
+                "source_identity": dict(hex64),
+                "document_bundle_digest": dict(hex64),
+                "coverage_plan_digest": dict(hex64),
+                "run_id": dict(safe_id),
+                "facts": {"type": "array", "items": fact},
+                "relations": {"type": "array", "items": relation_v3},
+            })
         if response_schema_version == EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION:
             if (
                 type(required_block_ids) is not tuple
@@ -3726,6 +3842,385 @@ def parse_extraction_v2_response(
         raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
 
 
+@dataclass(frozen=True, slots=True)
+class IndependentExtractionResult:
+    extraction: EvidenceExtractionBundle
+    summary: FactRelationValidationSummary
+
+    def __post_init__(self) -> None:
+        if type(self.extraction) is not EvidenceExtractionBundle:
+            raise TypeError("extraction")
+        if type(self.summary) is not FactRelationValidationSummary:
+            raise TypeError("summary")
+
+
+def _v3_diagnostic(
+    response: object,
+    bundle: SourceDocumentBundle,
+    stable_subreason: str,
+    field_path: str = "$",
+) -> EvidenceValidationDiagnostic:
+    byte_size, character_size = _diagnostic_dimensions(response)
+    raw: object = response
+    if type(response) is str:
+        try:
+            raw = json.loads(response)
+        except json.JSONDecodeError:
+            raw = None
+    safe_keys = (
+        tuple(sorted(_diagnostic_key(item) for item in raw))
+        if type(raw) is dict
+        else ()
+    )
+    actual = frozenset(raw) if type(raw) is dict else frozenset()
+    version = (
+        _safe_contract_version(raw.get("schema_version"), EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION)
+        if type(raw) is dict
+        else "missing"
+    )
+    binding = (
+        "matched"
+        if type(raw) is dict and raw.get("source_identity") == bundle.source_identity
+        else "mismatched"
+        if type(raw) is dict and type(raw.get("source_identity")) is str
+        else "unavailable"
+    )
+    return EvidenceValidationDiagnostic(
+        validation_stage="semantic_validation",
+        stable_subreason=stable_subreason,
+        field_path=field_path,
+        response_top_level_exact_type=_diagnostic_type(response),
+        top_level_key_set=safe_keys,
+        missing_keys=tuple(sorted(_EXTRACTION_V3_RESPONSE_KEYS - actual)),
+        extra_keys=tuple(sorted(
+            _diagnostic_key(item) for item in actual - _EXTRACTION_V3_RESPONSE_KEYS
+        )),
+        nested_field_types=(),
+        list_item_counts=tuple(
+            (f"$.{name}", len(raw[name]))
+            for name in ("facts", "relations")
+            if type(raw) is dict and type(raw.get(name)) is list
+        ),
+        schema_contract_version=version,
+        span_quote_validation_category=(
+            "rejected" if "quote" in stable_subreason or "span" in stable_subreason
+            else "not_applicable"
+        ),
+        source_identity_binding_result=binding,
+        response_byte_size=byte_size,
+        response_character_size=character_size,
+    )
+
+
+def _atomic_fact_has_relation_claim(proposition: str) -> bool:
+    return any(
+        pattern.search(proposition) is not None
+        for pattern in (*_TEMPORAL_MARKERS.values(), *_CAUSAL_MARKERS.values())
+    )
+
+
+def _fact_dispositions(
+    bundle: SourceDocumentBundle,
+    facts: tuple[SourceEvidence, ...],
+) -> tuple[SegmentDisposition, ...]:
+    refs: dict[str, list[str]] = {}
+    for fact in facts:
+        for segment_id in fact.ordered_segment_refs:
+            refs.setdefault(segment_id, []).append(fact.evidence_id)
+    return tuple(
+        SegmentDisposition(
+            segment.segment_id,
+            "sensitive" if _is_sensitive(segment.exact_text)
+            else "evidence" if segment.segment_id in refs
+            else "irrelevant",
+            tuple(refs.get(segment.segment_id, ())),
+        )
+        for segment in _segments(bundle)
+    )
+
+
+def _validate_one_atomic_fact(
+    bundle: SourceDocumentBundle,
+    fact: SourceEvidence,
+    run_id: str,
+) -> None:
+    if (
+        fact.evidence_kind not in ATOMIC_EVIDENCE_KINDS
+        or _atomic_fact_has_relation_claim(fact.proposition)
+    ):
+        _raise(
+            "evidence_proposition_binding_invalid",
+            semantic_rejection="unsupported_or_ambiguous_proposition",
+        )
+    payload = {
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "contract_version": EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+        "run_id": run_id,
+        "ordered_evidence": (fact,),
+        "ordered_segment_dispositions": _fact_dispositions(bundle, (fact,)),
+    }
+    candidate = EvidenceExtractionBundle(**payload, bundle_digest=_sha(payload))
+    validate_extraction(bundle, candidate)
+
+
+def _quote_is_exact_source_span(
+    quote: EvidenceQuote,
+    bundle: SourceDocumentBundle,
+) -> bool:
+    segment = next(
+        (item for item in _segments(bundle) if item.segment_id == quote.segment_id), None
+    )
+    document = next(
+        (item for item in bundle.ordered_documents if item.document_id == quote.document_id), None
+    )
+    if (
+        segment is None
+        or document is None
+        or segment.document_id != quote.document_id
+        or quote.character_start < segment.character_start
+        or quote.character_end > segment.character_end
+        or quote.byte_start < segment.byte_start
+        or quote.byte_end > segment.byte_end
+        or _is_sensitive(quote.exact_text)
+    ):
+        return False
+    try:
+        byte_text = document.exact_text.encode("utf-8")[
+            quote.byte_start:quote.byte_end
+        ].decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    return (
+        document.exact_text[quote.character_start:quote.character_end]
+        == quote.exact_text == byte_text
+    )
+
+
+_TEMPORAL_OVERLAP_MARKER = re.compile(
+    r"\b(?:while|during|simultaneously|concurrently|at\s+the\s+same\s+time|"
+    r"одновременно|в\s+то\s+же\s+время|пока)\b",
+    re.IGNORECASE,
+)
+_CONTRADICTION_MARKER = re.compile(
+    r"\b(?:but|however|contradicts?|whereas|но|однако|противоречит|тогда\s+как)\b",
+    re.IGNORECASE,
+)
+
+
+def _relation_is_code_verified(
+    raw: dict[str, object],
+    valid_by_id: Mapping[str, SourceEvidence],
+    bundle: SourceDocumentBundle,
+) -> tuple[bool, str]:
+    try:
+        relation_id = raw["relation_id"]
+        relation_kind = raw["relation_kind"]
+        left_id = raw["left_fact_id"]
+        right_id = raw["right_fact_id"]
+        if any(type(item) is not str for item in (relation_id, relation_kind, left_id, right_id)):
+            return False, "causal"
+        _safe_id(relation_id, "relation_id")
+        if relation_kind not in FACT_RELATION_KINDS or left_id == right_id:
+            return False, "causal"
+        if left_id not in valid_by_id or right_id not in valid_by_id:
+            return False, "polarity" if relation_kind == "contradicts" else (
+                "temporal" if relation_kind.startswith("temporal_") else "causal"
+            )
+        quote = _quote_from(raw["support_quote"])
+    except (EvidenceContractError, TypeError, ValueError, KeyError):
+        return False, "causal"
+    if not _quote_is_exact_source_span(quote, bundle):
+        return False, "temporal" if relation_kind.startswith("temporal_") else "causal"
+    marker = quote.exact_text
+    if relation_kind == "temporal_before":
+        verified = _TEMPORAL_MARKERS["before"].search(marker) is not None
+        category = "temporal"
+    elif relation_kind == "temporal_after":
+        verified = _TEMPORAL_MARKERS["after"].search(marker) is not None
+        category = "temporal"
+    elif relation_kind == "temporal_overlap":
+        verified = _TEMPORAL_OVERLAP_MARKER.search(marker) is not None
+        category = "temporal"
+    elif relation_kind in {"causal", "enables"}:
+        verified = any(pattern.search(marker) is not None for pattern in _CAUSAL_MARKERS.values())
+        category = "causal"
+    else:
+        left = valid_by_id[left_id]
+        right = valid_by_id[right_id]
+        verified = (
+            _CONTRADICTION_MARKER.search(marker) is not None
+            and left.polarity != right.polarity
+        )
+        category = "polarity"
+    return verified, category
+
+
+def parse_extraction_v3_response(
+    response: Mapping[str, object] | str,
+    bundle: SourceDocumentBundle,
+    inventory: SourceBlockInventory,
+    plan: EvidenceCoveragePlan,
+) -> IndependentExtractionResult:
+    """Validate atomic facts independently and relations on a separate boundary."""
+
+    try:
+        raw = _exact_mapping(_mapping_response(response), _EXTRACTION_V3_RESPONSE_KEYS)
+        if raw["schema_version"] != EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION:
+            _raise("evidence_schema_invalid")
+        if (
+            raw["source_identity"] != bundle.source_identity
+            or raw["document_bundle_digest"] != bundle.bundle_digest
+            or raw["coverage_plan_digest"] != plan.plan_digest
+        ):
+            _raise("evidence_source_binding_invalid")
+        _safe_id(raw["run_id"], "run_id")
+        fact_values = _exact_list(raw["facts"])
+        relation_values = _exact_list(raw["relations"])
+    except EvidenceContractError as error:
+        if error.diagnostic is None:
+            error.diagnostic = _v3_diagnostic(
+                response, bundle,
+                "source_or_document_binding_mismatch"
+                if error.reason_code == "evidence_source_binding_invalid"
+                else "schema_or_contract_invalid",
+            )
+        raise error from None
+    except (TypeError, ValueError):
+        diagnostic = _v3_diagnostic(response, bundle, "schema_or_contract_invalid")
+        raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
+
+    selected = frozenset(
+        item.block_id for item in plan.ordered_decisions
+        if item.disposition == "evidence_candidate"
+    )
+    block_by_id = {item.block_id: item for item in inventory.ordered_blocks}
+    raw_ids = [
+        value.get("fact_id") if type(value) is dict else None
+        for value in fact_values
+    ]
+    duplicate_ids = {
+        item for item in raw_ids
+        if type(item) is str and raw_ids.count(item) > 1
+    }
+    valid: list[SourceEvidence] = []
+    rejected_facts = 0
+    polarity_conflicts = 0
+    for value in fact_values:
+        try:
+            fact_raw = _exact_mapping(value, _V3_FACT_KEYS)
+            block_refs = _exact_list(fact_raw["ordered_block_refs"])
+            if (
+                not block_refs
+                or any(type(item) is not str or item not in selected for item in block_refs)
+                or len(block_refs) != len(set(block_refs))
+            ):
+                _raise(
+                    "evidence_segment_binding_invalid",
+                    semantic_rejection="evidence_item_not_bound_to_source_segment",
+                )
+            if fact_raw["fact_id"] in duplicate_ids:
+                _raise(
+                    "evidence_schema_invalid",
+                    semantic_rejection="duplicate_or_conflicting_evidence",
+                )
+            allowed_segments = {
+                segment_id for block_id in block_refs
+                for segment_id in block_by_id[block_id].ordered_segment_ids
+            }
+            if not set(_exact_list(fact_raw["ordered_segment_refs"])) <= allowed_segments:
+                _raise(
+                    "evidence_segment_binding_invalid",
+                    semantic_rejection="evidence_item_not_bound_to_source_segment",
+                )
+            if (
+                fact_raw["public_safety"] != "safe"
+                or _is_sensitive(fact_raw["proposition"])
+                or any(
+                    type(item) is dict
+                    and type(item.get("exact_text")) is str
+                    and _is_sensitive(item["exact_text"])
+                    for item in _exact_list(fact_raw["exact_quotes"])
+                )
+            ):
+                _raise(
+                    "evidence_sensitive",
+                    semantic_rejection="privacy_classification_rejected",
+                )
+            legacy = {
+                "evidence_id": fact_raw["fact_id"],
+                **{
+                    key: item for key, item in fact_raw.items()
+                    if key not in {"fact_id", "ordered_block_refs"}
+                },
+                "temporal_relation": None,
+                "causal_relation": None,
+            }
+            fact = _evidence_from(legacy)
+            _validate_one_atomic_fact(bundle, fact, raw["run_id"])
+            valid.append(fact)
+        except EvidenceContractError as error:
+            if error.reason_code == "evidence_sensitive":
+                diagnostic = _v3_diagnostic(
+                    response, bundle, "privacy_classification_rejected", "$.facts[]",
+                )
+                raise EvidenceContractError("evidence_sensitive", diagnostic) from None
+            rejected_facts += 1
+            polarity_conflicts += int(error._semantic_rejection == "polarity_mismatch")
+        except (TypeError, ValueError, KeyError):
+            diagnostic = _v3_diagnostic(response, bundle, "schema_or_contract_invalid", "$.facts[]")
+            raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
+
+    valid_by_id = {item.evidence_id: item for item in valid}
+    relation_ids: set[str] = set()
+    verified_relations = 0
+    rejected_relations = 0
+    temporal_conflicts = 0
+    causal_conflicts = 0
+    for value in relation_values:
+        if type(value) is not dict or frozenset(value) != _V3_RELATION_KEYS:
+            diagnostic = _v3_diagnostic(response, bundle, "schema_or_contract_invalid", "$.relations[]")
+            raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
+        relation_id = value.get("relation_id")
+        if type(relation_id) is str and relation_id not in relation_ids:
+            relation_ids.add(relation_id)
+            verified, category = _relation_is_code_verified(value, valid_by_id, bundle)
+        else:
+            verified, category = False, "causal"
+        if verified:
+            verified_relations += 1
+        else:
+            rejected_relations += 1
+            temporal_conflicts += int(category == "temporal")
+            causal_conflicts += int(category == "causal")
+            polarity_conflicts += int(category == "polarity")
+
+    dispositions = _fact_dispositions(bundle, tuple(valid))
+    payload = {
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "contract_version": EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+        "run_id": raw["run_id"],
+        "ordered_evidence": tuple(valid),
+        "ordered_segment_dispositions": dispositions,
+    }
+    extraction = EvidenceExtractionBundle(**payload, bundle_digest=_sha(payload))
+    validate_extraction(bundle, extraction)
+    summary = FactRelationValidationSummary(
+        returned_fact_count=len(fact_values),
+        valid_fact_count=len(valid),
+        rejected_fact_count=rejected_facts,
+        returned_relation_count=len(relation_values),
+        verified_relation_count=verified_relations,
+        rejected_relation_count=rejected_relations,
+        temporal_conflict_count=temporal_conflicts,
+        causal_conflict_count=causal_conflicts,
+        polarity_conflict_count=polarity_conflicts,
+        verified_fact_summaries=tuple(item.proposition for item in valid[:7]),
+    )
+    return IndependentExtractionResult(extraction, summary)
+
+
 class GenericEvidenceService:
     """Legacy evidence flow plus an explicitly enabled coverage-v2 flow."""
 
@@ -3894,20 +4389,22 @@ class GenericEvidenceService:
                 bundle, inventory, selected_block_ids=selected
             )
             extraction_payload.update({
-                "schema_version": EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+                "schema_version": EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
                 "coverage_plan_digest": plan.plan_digest,
             })
             extraction_request = EvidenceModelRequest(
                 "evidence_extraction",
                 self.extraction_model,
                 _canonical(extraction_payload).decode("utf-8"),
-                EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+                EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
                 tuple(item for item in (block.block_id for block in inventory.ordered_blocks) if item in selected),
             )
             calls += 1
-            extraction = parse_extraction_v2_response(
+            independent = parse_extraction_v3_response(
                 self._client.generate_json(extraction_request), bundle, inventory, plan
             )
+            extraction = independent.extraction
+            fact_relation_summary = independent.summary
         except EvidenceContractError as error:
             diagnostic = error.diagnostic
             if type(diagnostic) is not EvidenceValidationDiagnostic:
@@ -3934,6 +4431,14 @@ class GenericEvidenceService:
             )
         except Exception:
             return EvidenceResolution("failed", None, calls, "evidence_provider_failed", None, summary)
+        if fact_relation_summary.valid_fact_count < MIN_INDEPENDENT_FACTS:
+            failure = _coverage_manual_failure(
+                inventory, plan, stable_reason="independent_fact_count_insufficient",
+            )
+            return EvidenceResolution(
+                "manual_attention", None, calls, "evidence_manual_attention", None,
+                failure.summary, failure, fact_relation_summary,
+            )
         try:
             adjudication_payload = {
                 "source": _source_projection(bundle),
@@ -3951,9 +4456,15 @@ class GenericEvidenceService:
                 self._client.generate_json(adjudication_request), extraction
             )
         except EvidenceContractError as error:
-            return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic, summary)
+            return EvidenceResolution(
+                "failed", None, calls, error.reason_code, error.diagnostic, summary,
+                None, fact_relation_summary,
+            )
         except Exception:
-            return EvidenceResolution("failed", None, calls, "evidence_provider_failed", None, summary)
+            return EvidenceResolution(
+                "failed", None, calls, "evidence_provider_failed", None, summary,
+                None, fact_relation_summary,
+            )
         decisions = {item.decision for item in adjudication.ordered_decisions}
         if not extraction.ordered_evidence or "supported" not in decisions:
             failure = _coverage_manual_failure(
@@ -3961,7 +4472,7 @@ class GenericEvidenceService:
             )
             return EvidenceResolution(
                 "manual_attention", None, calls, "evidence_manual_attention", None,
-                failure.summary, failure,
+                failure.summary, failure, fact_relation_summary,
             )
         if "ambiguous" in decisions or any(
             item.evidence_kind == "insufficient_or_ambiguous" or item.uncertainty == "ambiguous"
@@ -3972,23 +4483,55 @@ class GenericEvidenceService:
             )
             return EvidenceResolution(
                 "manual_attention", None, calls, "evidence_manual_attention", None,
-                failure.summary, failure,
+                failure.summary, failure, fact_relation_summary,
             )
-        if "rejected" in decisions:
-            sensitive = any("sensitive_content" in item.reason_codes for item in adjudication.ordered_decisions)
+        if "rejected" in decisions and any(
+            "sensitive_content" in item.reason_codes
+            for item in adjudication.ordered_decisions
+        ):
             return EvidenceResolution(
-                "sensitive_rejected" if sensitive else "source_insufficient",
+                "sensitive_rejected",
                 None,
                 calls,
-                "evidence_sensitive" if sensitive else "evidence_source_insufficient",
+                "evidence_sensitive",
                 None,
-                summary,
+                summary, None, fact_relation_summary,
+            )
+        supported_ids = frozenset(
+            item.evidence_id for item in adjudication.ordered_decisions
+            if item.decision == "supported"
+        )
+        if len(supported_ids) < MIN_INDEPENDENT_FACTS:
+            supported = tuple(
+                item.proposition for item in extraction.ordered_evidence
+                if item.evidence_id in supported_ids
+            )[:7]
+            supported_summary = replace(
+                fact_relation_summary,
+                valid_fact_count=len(supported_ids),
+                rejected_fact_count=(
+                    fact_relation_summary.returned_fact_count - len(supported_ids)
+                ),
+                verified_fact_summaries=supported,
+            )
+            failure = _coverage_manual_failure(
+                inventory, plan, stable_reason="independent_fact_count_insufficient",
+            )
+            return EvidenceResolution(
+                "manual_attention", None, calls, "evidence_manual_attention", None,
+                failure.summary, failure, supported_summary,
             )
         try:
             verified = _make_verified(bundle, extraction, adjudication)
         except EvidenceContractError as error:
-            return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic, summary)
-        return EvidenceResolution("verified", verified, calls, "evidence_verified", None, summary)
+            return EvidenceResolution(
+                "failed", None, calls, error.reason_code, error.diagnostic, summary,
+                None, fact_relation_summary,
+            )
+        return EvidenceResolution(
+            "verified", verified, calls, "evidence_verified", None, summary,
+            None, fact_relation_summary,
+        )
 
 
 def _extraction_payload(extraction: EvidenceExtractionBundle) -> dict[str, object]:
@@ -4275,10 +4818,12 @@ __all__ = [
     "EVIDENCE_ADJUDICATION_CONTRACT_VERSION",
     "EVIDENCE_EXTRACTION_CONTRACT_VERSION",
     "EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION",
+    "EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION",
     "EVIDENCE_KINDS",
     "EvidenceAdjudicationBundle",
     "EvidenceCoveragePlan",
     "EvidenceCoverageSummary",
+    "FactRelationValidationSummary",
     "CoverageFailureEvidence",
     "ProviderTransportDiagnostic",
     "CoverageValidationError",
@@ -4328,6 +4873,7 @@ __all__ = [
     "parse_extraction_response",
     "parse_coverage_response",
     "parse_extraction_v2_response",
+    "parse_extraction_v3_response",
     "revalidate_verified_bundle",
     "source_identity",
     "validate_extraction",

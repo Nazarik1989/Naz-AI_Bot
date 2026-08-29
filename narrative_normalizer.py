@@ -4497,6 +4497,7 @@ def _write_exclusive_file(path: Path, payload: bytes, *, mode: int = 0o600) -> N
 
 
 MANUAL_ATTENTION_CONTRACT_VERSION = "normalizer-manual-attention-v2"
+MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION = "normalizer-manual-attention-v3"
 MANUAL_ATTENTION_LOCAL_PROFILE = "normalizer-review-only-v1"
 _MANUAL_ATTENTION_VALIDATION_STAGES = frozenset({
     "coverage_validation", "response_type", "json_parse", "top_level_schema",
@@ -4546,6 +4547,7 @@ def _manual_attention_artifact(
     failure: evidence.CoverageFailureEvidence,
     *,
     parent_attempt_identity: str | None = None,
+    fact_relation_summary: evidence.FactRelationValidationSummary | None = None,
 ) -> ManualAttentionArtifact:
     if (
         type(attempt_identity) is not str
@@ -4556,6 +4558,10 @@ def _manual_attention_artifact(
         or failure.summary != summary
         or evidence.classify_coverage_failure(failure) != summary
         or (
+            fact_relation_summary is not None
+            and type(fact_relation_summary) is not evidence.FactRelationValidationSummary
+        )
+        or (
             parent_attempt_identity is not None
             and (
                 type(parent_attempt_identity) is not str
@@ -4565,6 +4571,13 @@ def _manual_attention_artifact(
         )
     ):
         raise TypeError("manual attention evidence")
+    relation_summary = fact_relation_summary or evidence.FactRelationValidationSummary(
+        0, 0, 0, 0, 0, 0,
+        int(failure.stable_reason.startswith("temporal_relation_")),
+        int(failure.stable_reason.startswith("causal_relation_")),
+        int(failure.stable_reason == "polarity_mismatch"),
+        (),
+    )
     counts = {
         "deterministic_blocks": summary.block_count,
         "source_segments": summary.segment_count,
@@ -4588,11 +4601,22 @@ def _manual_attention_artifact(
             )
             if path == "$.evidence"
         ), 0),
-        "valid_evidence": 0,
-        "temporal_conflicts": int(failure.stable_reason.startswith("temporal_relation_")),
-        "causal_conflicts": int(failure.stable_reason.startswith("causal_relation_")),
-        "polarity_conflicts": int(failure.stable_reason == "polarity_mismatch"),
+        "valid_evidence": (
+            relation_summary.valid_fact_count if fact_relation_summary is not None else 0
+        ),
+        "temporal_conflicts": relation_summary.temporal_conflict_count,
+        "causal_conflicts": relation_summary.causal_conflict_count,
+        "polarity_conflicts": relation_summary.polarity_conflict_count,
     }
+    if fact_relation_summary is not None:
+        counts.update({
+            "returned_facts": relation_summary.returned_fact_count,
+            "valid_facts": relation_summary.valid_fact_count,
+            "rejected_facts": relation_summary.rejected_fact_count,
+            "returned_relations": relation_summary.returned_relation_count,
+            "verified_relations": relation_summary.verified_relation_count,
+            "rejected_relations": relation_summary.rejected_relation_count,
+        })
     derived = parent_attempt_identity is not None
     human_actions = (
         [
@@ -4604,7 +4628,11 @@ def _manual_attention_artifact(
         else ["use_confirmed_facts", "discuss_ambiguous_parts", "skip_material"]
     )
     core = {
-        "schema_version": MANUAL_ATTENTION_CONTRACT_VERSION,
+        "schema_version": (
+            MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION
+            if fact_relation_summary is not None
+            else MANUAL_ATTENTION_CONTRACT_VERSION
+        ),
         "source_identity": source_identity_value,
         "attempt_identity": attempt_identity,
         "parent_attempt_identity": parent_attempt_identity,
@@ -4613,8 +4641,10 @@ def _manual_attention_artifact(
         "validation_stage": failure.validation_stage,
         "stable_reason": failure.stable_reason,
         "coverage_counts": counts,
-        "confirmed_fact_count": 0,
-        "verified_candidate_fact_summaries": [],
+        "confirmed_fact_count": relation_summary.valid_fact_count,
+        "verified_candidate_fact_summaries": list(
+            relation_summary.verified_fact_summaries
+        ),
         "why_no_complete_story": (
             "Coverage could not safely authorize a complete public story without human judgement."
         ),
@@ -4655,7 +4685,15 @@ def _manual_attention_artifact(
         f"{summary.conflicting_disposition_count} conflicting, "
         f"{summary.ambiguous_count} ambiguous, {summary.omitted_count} omitted, and "
         f"{summary.sensitive_count} sensitive withheld.\n\n"
-        "Confirmed safe facts: 0. No fact reached complete code-owned evidence validation.\n\n"
+        f"Confirmed safe facts: {relation_summary.valid_fact_count}. "
+        + (
+            "\n".join(
+                f"- {item}" for item in relation_summary.verified_fact_summaries
+            )
+            if relation_summary.verified_fact_summaries
+            else "No fact reached complete code-owned evidence validation."
+        )
+        + "\n\n"
         "A complete public story cannot yet be proven from the validated coverage.\n\n"
         "Choose one action:\n"
         "1. Use only confirmed facts.\n"
@@ -4680,8 +4718,25 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
     core = dict(payload)
     digest = core.pop("package_digest", None)
     counts = core.get("coverage_counts")
+    schema_version = core.get("schema_version")
+    legacy_counts = frozenset({
+        "deterministic_blocks", "source_segments", "returned_dispositions",
+        "valid_dispositions", "missing_dispositions", "duplicate_dispositions",
+        "conflicting_dispositions", "evidence_candidates", "context_only",
+        "structural", "sensitive_withheld_blocks", "ambiguous_blocks",
+        "omitted_blocks", "returned_evidence", "valid_evidence",
+        "temporal_conflicts", "causal_conflicts", "polarity_conflicts",
+    })
+    fact_relation_counts = legacy_counts | frozenset({
+        "returned_facts", "valid_facts", "rejected_facts",
+        "returned_relations", "verified_relations", "rejected_relations",
+    })
+    fact_summaries = core.get("verified_candidate_fact_summaries")
     if (
-        core.get("schema_version") != MANUAL_ATTENTION_CONTRACT_VERSION
+        schema_version not in {
+            MANUAL_ATTENTION_CONTRACT_VERSION,
+            MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION,
+        }
         or core.get("source_identity") != expected_identity
         or type(core.get("attempt_identity")) is not str
         or re.fullmatch(r"[0-9a-f]{32}", str(core.get("attempt_identity"))) is None
@@ -4692,18 +4747,33 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
         or core.get("validation_stage") not in _MANUAL_ATTENTION_VALIDATION_STAGES
         or core.get("stable_reason") not in evidence.COVERAGE_FAILURE_REASONS
         or type(counts) is not dict
-        or frozenset(counts) != frozenset({
-            "deterministic_blocks", "source_segments", "returned_dispositions",
-            "valid_dispositions", "missing_dispositions", "duplicate_dispositions",
-            "conflicting_dispositions", "evidence_candidates", "context_only",
-            "structural", "sensitive_withheld_blocks", "ambiguous_blocks",
-            "omitted_blocks",
-            "returned_evidence", "valid_evidence", "temporal_conflicts",
-            "causal_conflicts", "polarity_conflicts",
-        })
+        or frozenset(counts) != (
+            legacy_counts
+            if schema_version == MANUAL_ATTENTION_CONTRACT_VERSION
+            else fact_relation_counts
+        )
         or any(type(value) is not int or value < 0 for value in counts.values())
-        or core.get("confirmed_fact_count") != 0
-        or core.get("verified_candidate_fact_summaries") != []
+        or type(core.get("confirmed_fact_count")) is not int
+        or core.get("confirmed_fact_count") < 0
+        or type(fact_summaries) is not list
+        or len(fact_summaries) > 7
+        or any(type(item) is not str or not item or _is_sensitive(item) for item in fact_summaries)
+        or len(fact_summaries) > core.get("confirmed_fact_count")
+        or (
+            schema_version == MANUAL_ATTENTION_CONTRACT_VERSION
+            and (core.get("confirmed_fact_count") != 0 or fact_summaries != [])
+        )
+        or (
+            schema_version == MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION
+            and (
+                counts["valid_facts"] != core.get("confirmed_fact_count")
+                or counts["valid_evidence"] != counts["valid_facts"]
+                or counts["valid_facts"] + counts["rejected_facts"]
+                != counts["returned_facts"]
+                or counts["verified_relations"] + counts["rejected_relations"]
+                != counts["returned_relations"]
+            )
+        )
         or core.get("human_actions") not in (
             ["use_confirmed_facts", "discuss_ambiguous_parts", "skip_material"],
             [
@@ -7761,6 +7831,13 @@ def _claim_payload(
 _CP2_CAPTURE_ADAPTER_VERSION = "normalizer-cp2-final-parse-capture-v1"
 _CP2_CAPTURE_GENERATION_CONTRACT = "narrative-generation-contract-v1"
 _CP2_CAPTURE_CALL_PARSE_PARAMETERS = ("self", "request", "parser", "calls", "repair_used")
+_NON_CHRONOLOGICAL_STORY_INSTRUCTION = (
+    " No temporal or causal relation has been authorized for this Normalizer run. "
+    "Do not use first, then, after, before, because, therefore, caused, led to, "
+    "сначала, затем, после, до, потому что, поэтому, вследствие, or привело к. "
+    "Treat source-fact order only as presentation order. During adjudication, "
+    "reject any candidate containing an unsupported temporal or causal connector."
+)
 
 
 class _EvidenceCapturingGenerationService(generation.NarrativeGenerationService):
@@ -7796,6 +7873,9 @@ class _EvidenceCapturingGenerationService(generation.NarrativeGenerationService)
         self._repair_allowed: ContextVar[bool] = ContextVar(
             f"normalizer_cp2_repair_allowed_{id(self)}", default=True
         )
+        self._forbid_unverified_relations: ContextVar[bool] = ContextVar(
+            f"normalizer_relation_guard_{id(self)}", default=False
+        )
 
     def _call_parse(
         self,
@@ -7804,6 +7884,14 @@ class _EvidenceCapturingGenerationService(generation.NarrativeGenerationService)
         calls: list[str],
         repair_used: list[bool],
     ) -> object:
+        if (
+            self._forbid_unverified_relations.get()
+            and request.request_kind in {"generation", "adjudication"}
+        ):
+            request = replace(
+                request,
+                system_prompt=request.system_prompt + _NON_CHRONOLOGICAL_STORY_INSTRUCTION,
+            )
         if self._repair_allowed.get():
             parsed = super()._call_parse(request, parser, calls, repair_used)
         else:
@@ -7819,15 +7907,20 @@ class _EvidenceCapturingGenerationService(generation.NarrativeGenerationService)
         context: generation.NarrativeGenerationInput,
         *,
         allow_repair: bool = True,
+        forbid_unverified_relations: bool = False,
     ) -> tuple[generation.NarrativeGenerationResult, _CapturedCP2Evidence]:
-        if type(allow_repair) is not bool:
+        if type(allow_repair) is not bool or type(forbid_unverified_relations) is not bool:
             raise TypeError("allow_repair")
         token = self._evidence_capture.set(())
         repair_token = self._repair_allowed.set(allow_repair)
+        relation_token = self._forbid_unverified_relations.set(
+            forbid_unverified_relations
+        )
         try:
             result = super().generate(context)
             records = self._evidence_capture.get()
         finally:
+            self._forbid_unverified_relations.reset(relation_token)
             self._repair_allowed.reset(repair_token)
             self._evidence_capture.reset(token)
         if records is None or tuple(item[0] for item in records) != ("generation", "adjudication"):
@@ -8326,6 +8419,7 @@ class NarrativeNormalizerService:
                             ),
                             resolution.coverage_summary,
                             resolution.coverage_failure,
+                            fact_relation_summary=resolution.fact_relation_summary,
                         )
                         self.store.persist_manual_attention(artifact)
                         reason = "narrative_normalizer_manual_attention_package_ready"
@@ -8381,6 +8475,11 @@ class NarrativeNormalizerService:
                         fast_path
                         or self.evidence_service is None
                         or not self.evidence_service.coverage_v2
+                    ),
+                    forbid_unverified_relations=bool(
+                        not fast_path
+                        and self.evidence_service is not None
+                        and self.evidence_service.coverage_v2
                     ),
                 )
             model_calls += result.model_call_count

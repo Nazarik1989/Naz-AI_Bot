@@ -333,14 +333,18 @@ def _generic_v2_responses(documents, propositions):
         for segment_id in block.ordered_segment_ids
     }
     extraction = {
-        "schema_version": evidence.EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+        "schema_version": evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
         "source_identity": documents.source_identity,
         "document_bundle_digest": documents.bundle_digest,
         "coverage_plan_digest": plan.plan_digest,
         "run_id": "extraction-run-v2",
-        "evidence": [
+        "facts": [
             dict(
-                item,
+                {
+                    key: value for key, value in item.items()
+                    if key not in {"evidence_id", "temporal_relation", "causal_relation"}
+                },
+                fact_id=item["evidence_id"],
                 ordered_block_refs=list(dict.fromkeys(
                     block_for_segment[segment_id]
                     for segment_id in item["ordered_segment_refs"]
@@ -348,10 +352,11 @@ def _generic_v2_responses(documents, propositions):
             )
             for item in legacy_extraction["evidence"]
         ],
+        "relations": [],
     }
-    parsed = evidence.parse_extraction_v2_response(
+    parsed = evidence.parse_extraction_v3_response(
         extraction, documents, inventory, plan
-    )
+    ).extraction
     adjudication = {
         "schema_version": evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
         "source_identity": documents.source_identity,
@@ -517,6 +522,18 @@ def test_evidence_transport_uses_code_owned_strict_closed_schema(operation, mode
     assert "withheld_segments" not in schema["properties"]
     invoke(client, request)
     assert len(transport.calls) == 1
+
+
+def test_v3_extraction_transport_prompt_separates_atomic_facts_from_relations():
+    request = evidence.EvidenceModelRequest(
+        "evidence_extraction", CONTENT_MODEL, '{"safe":"payload"}',
+        evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION, ("block-0001",),
+    )
+
+    messages = provider._request_payload(request)[2]
+
+    assert "Separate atomic facts from relations" in messages[0]["content"]
+    assert "must not assert temporal or causal order" in messages[0]["content"]
 
 
 @pytest.mark.parametrize(

@@ -298,19 +298,23 @@ Sensitive blocks contain only opaque identifiers and digests at the provider
 boundary.
 
 Only blocks classified as `evidence_candidate` enter the extraction request.
-Code then expands the block plan back to every original segment exactly once
-and applies the existing quote, span, entity, number, date, polarity, temporal,
-causal, source-binding, and adjudication validators. The generic path owns five
+The production extraction request uses the closed
+`normalizer-evidence-extraction-v3` response schema. Atomic `facts` and typed
+`relations` are separate arrays. Code expands the block plan back to every
+original segment, validates every fact independently, and validates relations
+only from exact source support. A rejected temporal/causal/polarity relation is
+omitted and cannot erase unrelated valid facts. The generic path owns five
 non-retryable operation slots: coverage, extraction, evidence adjudication,
 story generation, and story adjudication. Story repair is not available on this
 path.
 
 The extraction response is revalidated after a complete coverage plan. Every
-coverage-v2 rejection is converted to a typed, privacy-safe post-extraction
+post-extraction rejection is converted to a typed, privacy-safe
 diagnostic before it reaches the parent result. Incomplete/conflicting evidence
 creates the manual-attention package and consumes no adjudication or story
-slot. Hard-invalid schema, source binding, privacy, quote/span, entity/value,
-polarity, or relation failures stop the run with the same non-null diagnostic.
+slot. Hard-invalid schema, source binding, privacy, or transport failures stop
+the run. Fact-level quote/span, entity/value, and polarity failures reject only
+the affected fact; relation failures reject only that relation.
 
 An incomplete or ambiguous coverage plan creates a safe
 `normalizer-manual-attention-v1` package containing only opaque identity,

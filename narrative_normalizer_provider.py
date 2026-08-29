@@ -1248,6 +1248,13 @@ def _request_payload(request: object) -> tuple[str, str, tuple[dict[str, str], .
             )
         except (TypeError, ValueError):
             _raise(PROVIDER_CONFIGURATION_INVALID)
+        contract_instruction = (
+            " Separate atomic facts from relations. Facts must not assert temporal or causal "
+            "order; put only explicit source-supported links in relations."
+            if request.response_schema_version
+            == evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION
+            else ""
+        )
         messages = (
             {
                 "role": "system",
@@ -1255,6 +1262,7 @@ def _request_payload(request: object) -> tuple[str, str, tuple[dict[str, str], .
                     f"Return exactly one JSON object for {operation} under "
                     f"{request.response_schema_version}. Follow the supplied strict schema; "
                     "do not add wrapper keys. Copy source bindings and exact span offsets."
+                    f"{contract_instruction}"
                 ),
             },
             {"role": "user", "content": request.payload_json},

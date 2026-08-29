@@ -522,6 +522,31 @@ hard-invalid and cannot create a story. The persisted diagnostic contains only s
 field paths, exact type/key inventories, counts, contract identity, binding
 status, and response size—not response values or source content.
 
+## Independent facts and relations (extraction v3)
+
+`normalizer-evidence-extraction-v3` has two closed arrays: `facts` and
+`relations`. Each atomic fact is independently rebound to its selected block,
+source segment, exact byte/character span, entities, numbers, dates, polarity,
+uncertainty, and privacy classification. A rejected fact does not authorize any
+claim, but it also does not erase other facts that passed every code-owned
+check. A fact containing its own unsupported temporal or causal connector is
+rejected as non-atomic.
+
+Relations are separate source-supported links between exact fact IDs. The only
+accepted kinds are `temporal_before`, `temporal_after`, `temporal_overlap`,
+`causal`, `enables`, and `contradicts`. Document or segment order is presentation
+order, never chronology proof. A relation is verified only from an exact source
+span with a compatible code-owned marker; otherwise it is counted and omitted
+without invalidating unrelated facts. With at least three independently valid
+facts the pipeline may generate a non-chronological story. Its generation and
+adjudication requests explicitly prohibit unsupported temporal/causal
+connectors, and the existing code-owned claim validator rejects them again.
+
+If fewer than three facts remain, `normalizer-manual-attention-v3` records only
+closed fact/relation counts and up to seven already public-safe verified fact
+summaries. It never becomes ready and creates no Broker, approval, or Reels
+event.
+
 `materialize-manual-attention` is the closed zero-provider projection for an
 already terminal hard-invalid attempt whose persisted typed diagnostic is now
 classified as incomplete. It binds the exact source, parent attempt and claim

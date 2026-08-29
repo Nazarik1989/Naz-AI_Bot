@@ -3233,18 +3233,27 @@ def test_post_extraction_rejection_persists_typed_terminal_outcome(
         block.block_id for block in inventory.ordered_blocks
         if first_segment.segment_id in block.ordered_segment_ids
     )
+    source_item = legacy["evidence"][0]
     extraction = {
-        "schema_version": nn.evidence.EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
+        "schema_version": nn.evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
         "source_identity": documents.source_identity,
         "document_bundle_digest": documents.bundle_digest,
         "coverage_plan_digest": plan.plan_digest,
         "run_id": "post-extraction-test-run",
-        "evidence": [dict(legacy["evidence"][0], ordered_block_refs=[block_id])],
+        "facts": [dict(
+            {
+                key: value for key, value in source_item.items()
+                if key not in {"evidence_id", "temporal_relation", "causal_relation"}
+            },
+            fact_id=source_item["evidence_id"],
+            ordered_block_refs=[block_id],
+        )],
+        "relations": [],
     }
     if case == "incomplete":
-        extraction["evidence"][0]["proposition"] = "Unverified generated summary."
+        extraction["facts"][0]["proposition"] = "Unverified generated summary."
     else:
-        extraction["evidence"][0]["exact_quotes"][0]["byte_end"] -= 1
+        extraction["source_identity"] = "0" * 64
     evidence_client.replies.append(extraction)
 
     outcome = service.normalize_source(record.source_ref, record.source_digest)
@@ -3253,7 +3262,10 @@ def test_post_extraction_rejection_persists_typed_terminal_outcome(
     assert outcome.model_call_count == 2
     assert type(outcome.evidence_diagnostic) is nn.evidence.CoverageFailureEvidence
     assert outcome.evidence_diagnostic.category == expected_category
-    assert type(outcome.evidence_diagnostic.evidence_diagnostic) is nn.evidence.EvidenceValidationDiagnostic
+    if case == "hard-invalid":
+        assert type(outcome.evidence_diagnostic.evidence_diagnostic) is nn.evidence.EvidenceValidationDiagnostic
+    else:
+        assert outcome.evidence_diagnostic.evidence_diagnostic is None
     assert [item.request_kind for item in evidence_client.requests] == [
         "evidence_coverage", "evidence_extraction",
     ]
@@ -3280,6 +3292,76 @@ def test_post_extraction_rejection_persists_typed_terminal_outcome(
         documents.source_identity, current["attempt_id"]
     )["coverage_failure"] == outcome.evidence_diagnostic.safe_payload()
     assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+
+
+def _relation_free_generic_source_for_claim_test():
+    source_ref = "Generic/2026-08-30"
+    labels = ("Alpha exists.", "Beta exists.", "Gamma exists.")
+    bindings = []
+    facts = []
+    for order, label in enumerate(labels, start=1):
+        anchor = f"meaning-001-{hashlib.sha256(label.encode('utf-8')).hexdigest()[:16]}"
+        fact_id = f"fact-{order}"
+        bindings.append(nn.evidence.VerifiedFactBinding(
+            nn.evidence.VERIFIED_FACT_BINDING_VERSION,
+            fact_id, fact_id, f"{order:064x}", label, label,
+            (f"segment-{order}",), "b" * 64, order,
+            (), (label.split()[0],), (), "affirmed", None, None, "certain", "c" * 64,
+            (anchor,), (label,),
+        ))
+        facts.append(nn.SourceFact(fact_id, label, source_ref, order))
+    return nn.SourceUnit(
+        source_ref, "d" * 64, tuple(facts),
+        nn.FactExtractionReceipt(nn.SOURCE_CONTRACT_VERSION, 1, 3, 0, 0, True),
+        verified_evidence=None,
+        verified_fact_bindings=tuple(bindings),
+        evidence_mode="generic",
+    )
+
+
+def test_generic_story_adjudication_rejects_unsupported_temporal_connector():
+    source = _relation_free_generic_source_for_claim_test()
+    binding = source.verified_fact_bindings[0]
+    claim = nn.SupportedStoryClaim(
+        "claim-hook", "fact_sequence", "Alpha exists, then Beta follows.",
+        (binding.fact_id,), tuple(f"evidence:{item}" for item in binding.meaning_anchor_ids),
+        (), (), "sequence", None, "literal",
+    )
+    plain = nn.SupportedStoryClaim(
+        "claim-hook", "fact_paraphrase", binding.public_proposition,
+        (binding.fact_id,), tuple(f"evidence:{item}" for item in binding.meaning_anchor_ids),
+        (), nn._extract_entities(binding.public_proposition), None, None, "literal",
+    )
+
+    assert nn._generic_claim_supported(source, claim) is False
+    assert nn._generic_claim_supported(source, plain) is True
+
+
+def test_fact_relation_manual_attention_contains_only_verified_fact_summaries():
+    coverage = nn.evidence.EvidenceCoverageSummary(
+        3, 3, 3, 3, 0, 0, 0, 3, 0, 0, 0, 0, 0, "coverage_incomplete",
+    )
+    failure = nn.evidence.CoverageFailureEvidence(
+        "coverage_incomplete", "coverage_validation",
+        "independent_fact_count_insufficient", coverage, "matched",
+    )
+    relation_summary = nn.evidence.FactRelationValidationSummary(
+        3, 2, 1, 1, 0, 1, 1, 0, 0,
+        ("Alpha exists.", "Beta exists."),
+    )
+
+    artifact = nn._manual_attention_artifact(
+        "a" * 64, "b" * 32, nn.run_profiles.CANARY_RUN_PROFILE, coverage, failure,
+        fact_relation_summary=relation_summary,
+    )
+
+    assert artifact.payload["schema_version"] == nn.MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION
+    assert artifact.payload["confirmed_fact_count"] == 2
+    assert artifact.payload["verified_candidate_fact_summaries"] == [
+        "Alpha exists.", "Beta exists.",
+    ]
+    assert artifact.payload["coverage_counts"]["rejected_relations"] == 1
+    assert "Alpha exists." in artifact.markdown
 
 
 def test_manual_retry_transport_diagnostic_persists_before_terminal_attempt(
