@@ -1512,6 +1512,24 @@ def test_cli_one_source_canary_requires_profile_and_builds_non_destructive_retry
         sources=(identity,), run_profile=provider.CANARY_RUN_PROFILE
     )
     fake_authorization = FakeAuthorization()
+    source = object()
+    permit = normalizer.ManualRetryExecutionPermit(
+        identity,
+        "manual-canary-retry-0001",
+        "e" * 32,
+        provider.CANARY_RUN_PROFILE,
+    )
+
+    class ReservationStore:
+        def __init__(self, *_args, **kwargs):
+            captured["reservation_store"] = kwargs
+
+        def reserve_manual_retry_execution(self, actual_source, request, *, created_at):
+            captured["reservation"] = (actual_source, request, created_at)
+            return permit, True
+
+    monkeypatch.setattr(normalizer, "NarrativeOutboxStore", ReservationStore)
+    monkeypatch.setattr(normalizer, "read_source_unit", lambda *_a, **_k: source)
     def authorize(**kwargs):
         captured["authorization"] = kwargs
         return fake_authorization
@@ -1545,8 +1563,75 @@ def test_cli_one_source_canary_requires_profile_and_builds_non_destructive_retry
     assert captured["authorization"]["source_identities"] == (identity,)
     assert captured["authorization"]["run_profile"] == provider.CANARY_RUN_PROFILE
     assert captured["selected"] == (row,)
+    assert captured["reservation"][0] is source
+    assert captured["reservation"][1] is retry
+    assert captured["batch"]["manual_retry_permit"] == permit
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert output[0]["live_provider_preflight"]["calculated_maximum_calls"] == 5
+
+
+def test_cli_retry_claim_conflict_rejects_before_provider_worker_construction(
+    tmp_path,
+    monkeypatch,
+):
+    row = ("source/one", "a" * 64)
+    identity = normalizer.source_identity(*row)
+    monkeypatch.setattr(normalizer, "scan_needs_narrative", lambda _policy: (row,))
+    monkeypatch.setattr(normalizer, "read_source_unit", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        cli,
+        "_load_trust_service",
+        lambda _args: trust.NarrativeTrustService(b"x" * 32),
+    )
+
+    class FakeAuthorization:
+        def safe_summary(self):
+            return {
+                "adapter_version": provider.NORMALIZER_PRODUCTION_ADAPTER_VERSION,
+                "run_profile": provider.CANARY_RUN_PROFILE,
+                "selected_source_count": 1,
+                "calculated_maximum_calls": 5,
+                "retry_count": 0,
+            }
+
+    class ConflictStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def reserve_manual_retry_execution(self, *_args, **_kwargs):
+            raise normalizer.NarrativeNormalizerError(
+                "narrative_normalizer_manual_retry_conflict"
+            )
+
+    factory_calls = []
+    monkeypatch.setattr(normalizer, "NarrativeOutboxStore", ConflictStore)
+    monkeypatch.setattr(
+        provider,
+        "authorize_live_provider_run",
+        lambda **_kwargs: FakeAuthorization(),
+    )
+    monkeypatch.setattr(
+        provider,
+        "production_adapter_factory",
+        lambda *_args: factory_calls.append(True),
+    )
+
+    rc = cli.run([
+        *_cli_paths(tmp_path),
+        "--review-authority-root", str(tmp_path / "authority"),
+        "normalize",
+        "--enable-local-execution",
+        "--enable-live-provider",
+        "--live-run-profile", provider.CANARY_RUN_PROFILE,
+        "--adapter", provider.PRODUCTION_ADAPTER_SPEC,
+        "--source-identity", identity,
+        "--manual-retry-request-id", "manual-canary-conflict-0001",
+        "--expected-failed-attempt-id", "b" * 32,
+        "--expected-failed-claim-digest", "c" * 64,
+    ], _allow_local_review_authority_for_tests=True)
+
+    assert rc == 2
+    assert factory_calls == []
 
 
 def test_cli_live_construction_without_explicit_profile_is_rejected_before_authorization(

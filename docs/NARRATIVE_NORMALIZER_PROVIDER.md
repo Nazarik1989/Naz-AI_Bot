@@ -207,6 +207,22 @@ predecessors provides one ordered attempt history; successful drafts and useful
 manual-attention packages belong to the new attempt, while the old failure is
 never deleted or rewritten.
 
+The retry request record is also the durable reservation for its code-owned
+attempt ID.  If a process stops after reservation but before claim promotion,
+the same request resumes that exact attempt.  Under the source lock, the claim
+must move from the bound failed predecessor to the reserved attempt's
+`processing` state before the production provider worker is constructed.  A
+claim conflict therefore consumes no provider operation.
+
+A source-level manual-attention package is not a wildcard replay marker.  It is
+replayed only when its embedded attempt identity is the exact terminal attempt
+for the request.  When a later retry must retain an older source-level package,
+the new manual-attention result is stored in the closed
+`.normalizer-attempt-artifacts-v1/<source-identity>/<attempt-id>/` layout.  The
+package binds both the new attempt and its predecessor; the old package remains
+byte-identical and readable.  Repeating the exact completed request reads only
+the package owned by that attempt.
+
 ## Privacy and errors
 
 Only the CP2 system/user request or the reviewed evidence JSON projection is

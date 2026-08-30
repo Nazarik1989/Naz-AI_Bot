@@ -642,6 +642,31 @@ def run(
                 raise normalizer.NarrativeNormalizerError(
                     "narrative_normalizer_manual_retry_invalid"
                 )
+            manual_retry = None
+            manual_retry_permit = None
+            if all(value is not None for value in retry_values):
+                if (
+                    args.live_run_profile != run_profiles.CANARY_RUN_PROFILE
+                    or len(rows) != 1
+                    or len(tuple(args.source_identities or ())) != 1
+                ):
+                    raise normalizer.NarrativeNormalizerError(
+                        "narrative_normalizer_manual_retry_invalid"
+                    )
+                ref, digest = rows[0]
+                try:
+                    manual_retry = normalizer.ManualRetryRequest(
+                        normalizer.source_identity(ref, digest),
+                        digest,
+                        args.expected_failed_attempt_id,
+                        args.expected_failed_claim_digest,
+                        args.manual_retry_request_id,
+                        args.live_run_profile,
+                    )
+                except TypeError:
+                    raise normalizer.NarrativeNormalizerError(
+                        "narrative_normalizer_manual_retry_invalid"
+                    ) from None
             production_adapter_spec = (
                 "narrative_normalizer_provider:production_adapter_factory"
             )
@@ -701,6 +726,43 @@ def run(
                     )
                     live_summary = authorization.safe_summary()
                     _emit({"live_provider_preflight": live_summary})
+                    if manual_retry is not None:
+                        ref, digest = rows[0]
+                        retry_source = normalizer.read_source_unit(
+                            policy,
+                            ref,
+                            expected_digest=digest,
+                            allow_insufficient=True,
+                        )
+                        reservation_store = normalizer.NarrativeOutboxStore(
+                            policy,
+                            trust_service=trust_service,
+                            review_authority=broker_client,
+                            broker_owned_trust=broker_client is not None,
+                            permission_policy=permission_policy,
+                        )
+                        manual_retry_permit, execute_reserved_retry = (
+                            reservation_store.reserve_manual_retry_execution(
+                                retry_source,
+                                manual_retry,
+                                created_at=now,
+                            )
+                        )
+                        if not execute_reserved_retry:
+                            replay = reservation_store.manual_retry_replay_outcome(
+                                retry_source,
+                                manual_retry,
+                                manual_retry_permit,
+                            )
+                            summary = normalizer.BatchResult(
+                                1,
+                                (replay,),
+                            ).safe_summary()
+                            _emit(summary)
+                            return 3 if summary["status_counts"].get(
+                                normalizer.OUTCOME_FAILED,
+                                0,
+                            ) else 0
                     dependencies = production_provider.production_adapter_factory(
                         authorization
                     )
@@ -745,30 +807,6 @@ def run(
                 broker_owned_trust=broker_client is not None,
                 permission_policy=permission_policy,
             )
-            manual_retry = None
-            if all(value is not None for value in retry_values):
-                if (
-                    args.live_run_profile != run_profiles.CANARY_RUN_PROFILE
-                    or len(rows) != 1
-                    or len(tuple(args.source_identities or ())) != 1
-                ):
-                    raise normalizer.NarrativeNormalizerError(
-                        "narrative_normalizer_manual_retry_invalid"
-                    )
-                ref, digest = rows[0]
-                try:
-                    manual_retry = normalizer.ManualRetryRequest(
-                        normalizer.source_identity(ref, digest),
-                        digest,
-                        args.expected_failed_attempt_id,
-                        args.expected_failed_claim_digest,
-                        args.manual_retry_request_id,
-                        args.live_run_profile,
-                    )
-                except TypeError:
-                    raise normalizer.NarrativeNormalizerError(
-                        "narrative_normalizer_manual_retry_invalid"
-                    ) from None
             result = service.normalize_batch(
                 rows,
                 limit=None,
@@ -777,6 +815,7 @@ def run(
                 retry_uncertain=args.retry_uncertain or command == "resume",
                 retry_failed=False,
                 manual_retry=manual_retry,
+                manual_retry_permit=manual_retry_permit,
             )
             summary = result.safe_summary()
             _emit(summary)

@@ -3746,6 +3746,185 @@ def test_manual_retry_can_finish_as_useful_manual_attention_without_broker_event
     assert service.store.read_coverage_diagnostic(
         request.source_identity, current["attempt_id"]
     )["coverage_failure"] == outcome.evidence_diagnostic.safe_payload()
+    package_bytes = {
+        path.name: path.read_bytes() for path in package.iterdir()
+    }
+    replay = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=request,
+    )
+    assert replay.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert replay.model_call_count == 0
+    assert len(evidence_client.requests) == 1
+    assert {
+        path.name: path.read_bytes() for path in package.iterdir()
+    } == package_bytes
+
+
+def test_reserved_retry_ignores_older_source_manual_package_and_reuses_exact_attempt(
+    tmp_path,
+):
+    def ambiguous(payload, inventory):
+        payload["block_dispositions"][
+            inventory.ordered_blocks[0].block_id
+        ] = "ambiguous"
+        return payload
+
+    record, documents, service, evidence_client, generation_client, _registry = (
+        _coverage_only_case(tmp_path, ambiguous)
+    )
+    first = service.normalize_source(record.source_ref, record.source_digest)
+    assert first.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    source_package = service.store.draft_path(
+        record.source_digest,
+        source_ref=record.source_ref,
+    )
+    old_package_bytes = {
+        path.name: path.read_bytes() for path in source_package.iterdir()
+    }
+    old_claim_path = service.store.claim_path(
+        record.source_ref,
+        record.source_digest,
+    )
+    old_claim_bytes = old_claim_path.read_bytes()
+    old_claim = service.store.read_claim(record.source_ref, record.source_digest)
+    assert old_claim is not None
+    request = _manual_retry_request(
+        nn.read_source_unit(
+            service.policy,
+            record.source_ref,
+            expected_digest=record.source_digest,
+            allow_insufficient=True,
+        ),
+        hashlib.sha256(old_claim_bytes).hexdigest(),
+        request_id="reserved-manual-retry-0001",
+        previous_failed_attempt_id=old_claim["attempt_id"],
+    )
+    with service.store.lock_for(
+        record.source_ref,
+        record.source_digest,
+        blocking=True,
+    ):
+        reserved_attempt, replay = service.store.begin_manual_retry_locked(
+            nn.read_source_unit(
+                service.policy,
+                record.source_ref,
+                expected_digest=record.source_digest,
+                allow_insufficient=True,
+            ),
+            request,
+            created_at=NOW.isoformat().replace("+00:00", "Z"),
+        )
+    assert replay is False
+    assert old_claim_path.read_bytes() == old_claim_bytes
+
+    inventory = nn.evidence.build_source_block_inventory(documents)
+    retry_coverage = {
+        "schema_version": nn.evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "run_id": "reserved-manual-retry-run",
+        "block_dispositions": {
+            block.block_id: (
+                "ambiguous" if index == 0 else "evidence_candidate"
+            )
+            for index, block in enumerate(inventory.ordered_blocks)
+        },
+    }
+    evidence_client.replies.append(retry_coverage)
+    calls_before = len(evidence_client.requests)
+
+    resumed = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=request,
+    )
+
+    assert resumed.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY, resumed.reason_codes
+    assert resumed.model_call_count == 1
+    current = service.store.read_claim(record.source_ref, record.source_digest)
+    assert current is not None and current["attempt_id"] == reserved_attempt
+    assert current["attempt_id"] != old_claim["attempt_id"]
+    attempt_payload = service.store.read_attempt_manual_attention(
+        request.source_identity,
+        reserved_attempt,
+    )
+    assert attempt_payload["attempt_identity"] == reserved_attempt
+    assert attempt_payload["parent_attempt_identity"] == old_claim["attempt_id"]
+    assert {
+        path.name: path.read_bytes() for path in source_package.iterdir()
+    } == old_package_bytes
+    assert service.store.archived_attempt_bytes(
+        request.source_identity,
+        old_claim["attempt_id"],
+    ) == old_claim_bytes
+    assert generation_client.requests == []
+
+    replayed = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=request,
+    )
+    assert replayed.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert replayed.model_call_count == 0
+    assert len(evidence_client.requests) == calls_before + 1
+    assert service.store._read_manual_retry_record(
+        request.operator_request_id
+    )["attempt_id"] == reserved_attempt
+
+
+def test_preclaimed_retry_owns_processing_claim_before_first_provider_call(tmp_path):
+    values = runtime(tmp_path)
+    record, source, client, service = values[3], values[4], values[7], values[8]
+    _claim_path, old_bytes, old_digest = _seed_failed_claim(service, source)
+    request = _manual_retry_request(
+        source,
+        old_digest,
+        request_id="preclaimed-manual-retry-0001",
+    )
+
+    permit, execute = service.store.reserve_manual_retry_execution(
+        source,
+        request,
+        created_at=NOW.isoformat().replace("+00:00", "Z"),
+    )
+
+    assert execute is True
+    assert client.requests == []
+    claimed = service.store.read_claim(record.source_ref, record.source_digest)
+    assert claimed is not None
+    assert claimed["state"] == nn.CLAIM_PROCESSING
+    assert claimed["attempt_id"] == permit.attempt_id
+    duplicate, duplicate_execute = service.store.reserve_manual_retry_execution(
+        source,
+        request,
+        created_at=NOW.isoformat().replace("+00:00", "Z"),
+    )
+    assert duplicate == permit
+    assert duplicate_execute is False
+    assert client.requests == []
+    in_progress = service.store.manual_retry_replay_outcome(
+        source,
+        request,
+        duplicate,
+    )
+    assert in_progress.status == nn.OUTCOME_PROCESSING
+    assert in_progress.model_call_count == 0
+
+    outcome = service.normalize_source(
+        record.source_ref,
+        record.source_digest,
+        manual_retry=request,
+        manual_retry_permit=permit,
+    )
+    assert outcome.status == nn.OUTCOME_DRAFT_READY_FOR_REVIEW
+    assert service.store.archived_attempt_bytes(
+        request.source_identity,
+        request.previous_failed_attempt_id,
+    ) == old_bytes
+    assert len(client.requests) == 2
 
 
 @pytest.mark.parametrize(
