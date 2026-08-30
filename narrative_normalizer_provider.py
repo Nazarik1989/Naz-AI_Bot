@@ -1248,13 +1248,27 @@ def _request_payload(request: object) -> tuple[str, str, tuple[dict[str, str], .
             )
         except (TypeError, ValueError):
             _raise(PROVIDER_CONFIGURATION_INVALID)
-        contract_instruction = (
-            " Separate atomic facts from relations. Facts must not assert temporal or causal "
-            "order; put only explicit source-supported links in relations."
-            if request.response_schema_version
+        if (
+            request.response_schema_version
+            == evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION
+        ):
+            contract_instruction = (
+                " Select only exact character spans from the supplied public segments. "
+                "Offsets are absolute within the containing document and must stay inside "
+                "the selected segment. Return IDs and offsets only. Do not return factual "
+                "text, propositions, entities, numbers, dates, polarity, uncertainty, or "
+                "temporal/causal relations."
+            )
+        elif (
+            request.response_schema_version
             == evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION
-            else ""
-        )
+        ):
+            contract_instruction = (
+                " Separate atomic facts from relations. Facts must not assert temporal or causal "
+                "order; put only explicit source-supported links in relations."
+            )
+        else:
+            contract_instruction = ""
         messages = (
             {
                 "role": "system",

@@ -1695,6 +1695,137 @@ def _v3_extraction(bundle, inventory, plan, *, invalid_relation=False):
     }
 
 
+def _span_selection(bundle, plan, segments=None):
+    selected = tuple(_all_segments(bundle) if segments is None else segments)
+    return {
+        "schema_version": evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "coverage_plan_digest": plan.plan_digest,
+        "run_id": "span-selection-test-run",
+        "selections": [
+            {
+                "selection_id": f"selection-{index}",
+                "segment_id": segment.segment_id,
+                "character_start": segment.character_start,
+                "character_end": segment.character_end,
+            }
+            for index, segment in enumerate(selected, start=1)
+        ],
+    }
+
+
+def test_span_selection_schema_physically_excludes_model_fact_fields():
+    schema = evidence.evidence_model_response_schema(
+        "evidence_extraction",
+        evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
+        ("segment-001-000001",),
+    )
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {
+        "schema_version", "source_identity", "document_bundle_digest",
+        "coverage_plan_digest", "run_id", "selections",
+    }
+    selection = schema["properties"]["selections"]["items"]
+    assert selection["additionalProperties"] is False
+    assert set(selection["required"]) == {
+        "selection_id", "segment_id", "character_start", "character_end",
+    }
+    forbidden = {
+        "proposition", "fact", "fact_text", "entities", "numbers", "dates",
+        "polarity", "uncertainty", "temporal_relation", "causal_relation",
+    }
+    assert forbidden.isdisjoint(schema["properties"])
+    assert forbidden.isdisjoint(selection["properties"])
+
+
+def test_span_selection_materializes_code_owned_exact_source_substrings(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha opened the notebook.\nBeta recorded 12 pages.\nGamma closed the cover."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(
+        _coverage_payload(bundle, inventory), bundle, inventory,
+    )
+    segments = _all_segments(bundle)
+    payload = _span_selection(bundle, plan, segments[:3])
+
+    result = evidence.parse_span_selection_response(
+        payload, bundle, inventory, plan,
+    )
+
+    assert result.summary.returned_fact_count == 3
+    assert result.summary.valid_fact_count == 3
+    assert result.summary.rejected_fact_count == 0
+    assert tuple(
+        item.proposition for item in result.extraction.ordered_evidence
+    ) == tuple(item.exact_text for item in segments[:3])
+    assert all(
+        item.proposition == item.exact_quotes[0].exact_text
+        for item in result.extraction.ordered_evidence
+    )
+    assert result.extraction.ordered_evidence[1].numbers[0].exact_lexeme == "12"
+
+
+@pytest.mark.parametrize(
+    "forbidden_field",
+    (
+        "proposition", "fact_text", "entities", "numbers", "dates",
+        "polarity", "uncertainty", "temporal_relation", "causal_relation",
+    ),
+)
+def test_span_selection_rejects_any_model_supplied_semantic_field(
+    tmp_path, forbidden_field,
+):
+    bundle = _write_bundle(tmp_path)
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(
+        _coverage_payload(bundle, inventory), bundle, inventory,
+    )
+    payload = _span_selection(bundle, plan, _all_segments(bundle)[:1])
+    payload["selections"][0][forbidden_field] = "forbidden"
+
+    with pytest.raises(evidence.EvidenceContractError) as caught:
+        evidence.parse_span_selection_response(payload, bundle, inventory, plan)
+
+    assert caught.value.reason_code == "evidence_schema_invalid"
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.field_path == "$.selections[]"
+
+
+def test_span_selection_rejects_out_of_segment_and_relation_spans_independently(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists after Alpha.\nGamma exists."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(
+        _coverage_payload(bundle, inventory), bundle, inventory,
+    )
+    segments = _all_segments(bundle)
+    payload = _span_selection(bundle, plan, segments)
+    payload["selections"].append({
+        "selection_id": "selection-outside",
+        "segment_id": segments[0].segment_id,
+        "character_start": segments[0].character_start,
+        "character_end": segments[0].character_end + 2,
+    })
+
+    result = evidence.parse_span_selection_response(
+        payload, bundle, inventory, plan,
+    )
+
+    assert result.summary.returned_fact_count == 4
+    assert result.summary.valid_fact_count == 2
+    assert result.summary.rejected_fact_count == 2
+    assert result.summary.returned_relation_count == 0
+    assert result.summary.verified_fact_summaries == (
+        "Alpha exists.", "Gamma exists.",
+    )
+
+
 def test_v3_three_valid_facts_survive_invalid_temporal_relation(tmp_path):
     bundle = _write_bundle(
         tmp_path,
@@ -1795,7 +1926,7 @@ def test_v3_relation_conflict_is_scoped_and_preserves_atomic_facts(
     assert getattr(result.summary, conflict_field) == 1
 
 
-def test_v3_complete_verified_relation_path_reaches_verified_evidence(tmp_path):
+def test_span_selection_complete_path_reaches_verified_evidence(tmp_path):
     bundle = _write_bundle(
         tmp_path,
         {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nAlpha happened before Beta."},
@@ -1803,8 +1934,8 @@ def test_v3_complete_verified_relation_path_reaches_verified_evidence(tmp_path):
     inventory = evidence.build_source_block_inventory(bundle)
     coverage = _coverage_payload(bundle, inventory)
     plan = evidence.parse_coverage_response(coverage, bundle, inventory)
-    extraction_raw = _v3_extraction(bundle, inventory, plan)
-    parsed = evidence.parse_extraction_v3_response(
+    extraction_raw = _span_selection(bundle, plan, _all_segments(bundle)[:3])
+    parsed = evidence.parse_span_selection_response(
         extraction_raw, bundle, inventory, plan,
     )
     adjudication = _adjudication_payload(parsed.extraction)
@@ -1819,7 +1950,7 @@ def test_v3_complete_verified_relation_path_reaches_verified_evidence(tmp_path):
 
     assert result.status == "verified"
     assert result.model_call_count == 3
-    assert result.fact_relation_summary.verified_relation_count == 1
+    assert result.fact_relation_summary.verified_relation_count == 0
     assert all(
         item.temporal_relation is None and item.causal_relation is None
         for item in result.verified_bundle.extraction.ordered_evidence
@@ -1828,12 +1959,12 @@ def test_v3_complete_verified_relation_path_reaches_verified_evidence(tmp_path):
     assert "relations" not in adjudication_payload["extraction"]
 
 
-def test_v3_insufficient_independent_facts_yield_useful_manual_attention(tmp_path):
+def test_span_selection_insufficient_facts_yield_useful_manual_attention(tmp_path):
     bundle = _write_bundle(tmp_path, {"facts.txt": "Alpha exists.\nBeta exists."})
     inventory = evidence.build_source_block_inventory(bundle)
     coverage = _coverage_payload(bundle, inventory)
     plan = evidence.parse_coverage_response(coverage, bundle, inventory)
-    extraction_raw = _v3_extraction(bundle, inventory, plan)
+    extraction_raw = _span_selection(bundle, plan)
     client = FakeEvidenceClient([coverage, extraction_raw])
 
     result = evidence.GenericEvidenceService(
@@ -1936,9 +2067,9 @@ def test_coverage_v2_expands_every_segment_exactly_once(tmp_path):
 @pytest.mark.parametrize(
     "mutation,expected_category,expected_reason",
     (
-        ("unsupported-proposition", "coverage_incomplete", "independent_fact_count_insufficient"),
-        ("wrong-block", "coverage_incomplete", "independent_fact_count_insufficient"),
-        ("quote-span", "coverage_incomplete", "independent_fact_count_insufficient"),
+        ("out-of-range", "coverage_incomplete", "independent_fact_count_insufficient"),
+        ("wrong-segment", "coverage_incomplete", "independent_fact_count_insufficient"),
+        ("duplicate-span", "coverage_incomplete", "independent_fact_count_insufficient"),
         ("source-binding", "coverage_hard_invalid", "source_or_document_binding_mismatch"),
     ),
 )
@@ -1949,13 +2080,15 @@ def test_coverage_v2_post_extraction_rejection_is_typed_and_product_classified(
     inventory = evidence.build_source_block_inventory(bundle)
     coverage = _coverage_payload(bundle, inventory)
     plan = evidence.parse_coverage_response(coverage, bundle, inventory)
-    extraction = _v3_extraction(bundle, inventory, plan)
-    if mutation == "unsupported-proposition":
-        extraction["facts"][0]["proposition"] = "Unsupported synthesized proposition."
-    elif mutation == "wrong-block":
-        extraction["facts"][0]["ordered_block_refs"] = ["block-unknown"]
-    elif mutation == "quote-span":
-        extraction["facts"][0]["exact_quotes"][0]["byte_end"] -= 1
+    extraction = _span_selection(bundle, plan)
+    if mutation == "out-of-range":
+        extraction["selections"][0]["character_end"] += 1
+    elif mutation == "wrong-segment":
+        extraction["selections"][0]["segment_id"] = "segment-unknown"
+    elif mutation == "duplicate-span":
+        extraction["selections"].append(dict(
+            extraction["selections"][0], selection_id="selection-duplicate",
+        ))
     else:
         extraction["source_identity"] = "0" * 64
     client = FakeEvidenceClient([coverage, extraction])
@@ -1986,7 +2119,7 @@ def test_coverage_v2_post_extraction_rejection_is_typed_and_product_classified(
         assert type(result.fact_relation_summary) is evidence.FactRelationValidationSummary
     assert evidence.coverage_failure_from_payload(failure.safe_payload()) == failure
     encoded = evidence.json.dumps(failure.safe_payload(), ensure_ascii=False)
-    assert "Unsupported synthesized proposition" not in encoded
+    assert "segment-unknown" not in encoded
 
 
 def test_coverage_v2_direct_parser_never_drops_post_extraction_diagnostic(tmp_path):

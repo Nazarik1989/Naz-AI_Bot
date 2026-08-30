@@ -522,22 +522,23 @@ hard-invalid and cannot create a story. The persisted diagnostic contains only s
 field paths, exact type/key inventories, counts, contract identity, binding
 status, and response size—not response values or source content.
 
-## Independent facts and relations (extraction v3)
+## Code-owned facts from exact source spans
 
-`normalizer-evidence-extraction-v3` has two closed arrays: `facts` and
-`relations`. Each atomic fact is independently rebound to its selected block,
-source segment, exact byte/character span, entities, numbers, dates, polarity,
-uncertainty, and privacy classification. A rejected fact does not authorize any
-claim, but it also does not erase other facts that passed every code-owned
-check. A fact containing its own unsupported temporal or causal connector is
-rejected as non-atomic.
+`normalizer-evidence-span-selection-v1` permits the extraction model to return
+only source/bundle/coverage/run bindings and a closed `selections` array. Each
+selection contains exactly `selection_id`, `segment_id`, `character_start`, and
+`character_end`. The schema cannot carry a proposition, fact text, entities,
+numbers, dates, polarity, uncertainty, or temporal/causal relations.
 
-Relations are separate source-supported links between exact fact IDs. The only
-accepted kinds are `temporal_before`, `temporal_after`, `temporal_overlap`,
-`causal`, `enables`, and `contradicts`. Document or segment order is presentation
-order, never chronology proof. A relation is verified only from an exact source
-span with a compatible code-owned marker; otherwise it is counted and omitted
-without invalidating unrelated facts. With at least three independently valid
+For every accepted selection, code verifies that the segment is a public
+`evidence_candidate`, that the offsets stay inside that exact segment, and that
+the selected substring is non-empty, public, and atomic. Code then slices the
+persisted document at those character offsets, derives the corresponding UTF-8
+byte offsets and the factual text, and independently derives supported scalar
+metadata. Relation-bearing spans are rejected; document or segment order is
+presentation order and never chronology proof. A rejected selection does not
+authorize a claim and does not erase unrelated selections that passed every
+code-owned check. With at least three independently valid
 facts the pipeline may generate a non-chronological story. Its generation and
 adjudication requests explicitly prohibit unsupported temporal/causal
 connectors, and the existing code-owned claim validator rejects them again.

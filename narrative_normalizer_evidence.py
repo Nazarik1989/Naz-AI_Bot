@@ -28,6 +28,7 @@ EVIDENCE_EXTRACTION_CONTRACT_VERSION = "normalizer-evidence-extraction-v1"
 EVIDENCE_COVERAGE_CONTRACT_VERSION = "normalizer-evidence-coverage-v2"
 EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION = "normalizer-evidence-extraction-v2"
 EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION = "normalizer-evidence-extraction-v3"
+EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION = "normalizer-evidence-span-selection-v1"
 EVIDENCE_ADJUDICATION_CONTRACT_VERSION = "normalizer-evidence-adjudication-v1"
 VERIFIED_EVIDENCE_CONTRACT_VERSION = "normalizer-verified-evidence-v1"
 VERIFIED_FACT_BINDING_VERSION = "normalizer-verified-fact-binding-v1"
@@ -2252,6 +2253,13 @@ _EXTRACTION_V3_RESPONSE_KEYS = frozenset({
     "schema_version", "source_identity", "document_bundle_digest",
     "coverage_plan_digest", "run_id", "facts", "relations",
 })
+_SPAN_SELECTION_KEYS = frozenset({
+    "selection_id", "segment_id", "character_start", "character_end",
+})
+_SPAN_SELECTION_RESPONSE_KEYS = frozenset({
+    "schema_version", "source_identity", "document_bundle_digest",
+    "coverage_plan_digest", "run_id", "selections",
+})
 _DECISION_KEYS = frozenset({"evidence_id", "evidence_digest", "decision", "reason_codes"})
 _ADJUDICATION_RESPONSE_KEYS = frozenset({
     "schema_version", "source_identity", "extraction_bundle_digest", "run_id", "decisions",
@@ -2310,8 +2318,39 @@ def evidence_model_response_schema(
             EVIDENCE_EXTRACTION_CONTRACT_VERSION,
             EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION,
             EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
+            EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
         }:
             raise ValueError("evidence response schema")
+        if response_schema_version == EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION:
+            if (
+                type(required_block_ids) is not tuple
+                or not required_block_ids
+                or len(required_block_ids) != len(set(required_block_ids))
+                or any(
+                    type(item) is not str or _SAFE_ID.fullmatch(item) is None
+                    for item in required_block_ids
+                )
+            ):
+                raise ValueError("evidence response schema")
+            selection = _closed_object_schema({
+                "selection_id": dict(safe_id),
+                "segment_id": {
+                    "type": "string", "enum": list(required_block_ids),
+                },
+                "character_start": {"type": "integer", "minimum": 0},
+                "character_end": {"type": "integer", "minimum": 1},
+            })
+            return _closed_object_schema({
+                "schema_version": {
+                    "type": "string",
+                    "const": EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
+                },
+                "source_identity": dict(hex64),
+                "document_bundle_digest": dict(hex64),
+                "coverage_plan_digest": dict(hex64),
+                "run_id": dict(safe_id),
+                "selections": {"type": "array", "items": selection},
+            })
         quote = _closed_object_schema({
             "quote_id": dict(safe_id),
             "document_id": dict(safe_id),
@@ -4221,6 +4260,269 @@ def parse_extraction_v3_response(
     return IndependentExtractionResult(extraction, summary)
 
 
+def _span_selection_diagnostic(
+    response: object,
+    bundle: SourceDocumentBundle,
+    stable_subreason: str,
+    field_path: str = "$",
+) -> EvidenceValidationDiagnostic:
+    byte_size, character_size = _diagnostic_dimensions(response)
+    raw: object = response
+    if type(response) is str:
+        try:
+            raw = json.loads(response)
+        except json.JSONDecodeError:
+            raw = None
+    safe_keys = (
+        tuple(sorted(_diagnostic_key(item) for item in raw))
+        if type(raw) is dict
+        else ()
+    )
+    actual = frozenset(raw) if type(raw) is dict else frozenset()
+    version = (
+        _safe_contract_version(
+            raw.get("schema_version"), EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
+        )
+        if type(raw) is dict
+        else "missing"
+    )
+    binding = (
+        "matched"
+        if type(raw) is dict and raw.get("source_identity") == bundle.source_identity
+        else "mismatched"
+        if type(raw) is dict and type(raw.get("source_identity")) is str
+        else "unavailable"
+    )
+    return EvidenceValidationDiagnostic(
+        validation_stage=(
+            "semantic_validation"
+            if stable_subreason.startswith("selection_")
+            else "top_level_schema"
+        ),
+        stable_subreason=stable_subreason,
+        field_path=field_path,
+        response_top_level_exact_type=_diagnostic_type(response),
+        top_level_key_set=safe_keys,
+        missing_keys=tuple(sorted(_SPAN_SELECTION_RESPONSE_KEYS - actual)),
+        extra_keys=tuple(sorted(
+            _diagnostic_key(item)
+            for item in actual - _SPAN_SELECTION_RESPONSE_KEYS
+        )),
+        nested_field_types=(),
+        list_item_counts=(
+            (("$.selections", len(raw["selections"])),)
+            if type(raw) is dict and type(raw.get("selections")) is list
+            else ()
+        ),
+        schema_contract_version=version,
+        span_quote_validation_category=(
+            "rejected" if stable_subreason.startswith("selection_")
+            else "not_applicable"
+        ),
+        source_identity_binding_result=binding,
+        response_byte_size=byte_size,
+        response_character_size=character_size,
+    )
+
+
+def _code_owned_atoms(
+    selection_id: str,
+    quote_id: str,
+    exact_text: str,
+) -> tuple[tuple[EvidenceAtom, ...], tuple[EvidenceAtom, ...]]:
+    numbers = tuple(
+        EvidenceAtom(
+            f"number-{sha256(f'{selection_id}:{index}:number'.encode()).hexdigest()[:24]}",
+            "number",
+            quote_id,
+            match.group(0),
+        )
+        for index, match in enumerate(_NUMBER.finditer(exact_text), start=1)
+    )
+    dates = tuple(
+        EvidenceAtom(
+            f"date-{sha256(f'{selection_id}:{index}:date'.encode()).hexdigest()[:24]}",
+            "date",
+            quote_id,
+            match.group(0),
+        )
+        for index, match in enumerate(_DATE.finditer(exact_text), start=1)
+    )
+    return numbers, dates
+
+
+def parse_span_selection_response(
+    response: Mapping[str, object] | str,
+    bundle: SourceDocumentBundle,
+    inventory: SourceBlockInventory,
+    plan: EvidenceCoveragePlan,
+) -> IndependentExtractionResult:
+    """Turn model-selected offsets into code-owned exact-span facts.
+
+    The model is permitted to select only an existing segment and an absolute
+    character interval.  It never supplies factual prose or semantic fields;
+    every public fact and quote is derived from the persisted source bytes.
+    """
+
+    try:
+        raw = _exact_mapping(
+            _mapping_response(response), _SPAN_SELECTION_RESPONSE_KEYS,
+        )
+        if raw["schema_version"] != EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION:
+            _raise("evidence_schema_invalid")
+        if (
+            raw["source_identity"] != bundle.source_identity
+            or raw["document_bundle_digest"] != bundle.bundle_digest
+            or raw["coverage_plan_digest"] != plan.plan_digest
+        ):
+            _raise("evidence_source_binding_invalid")
+        _safe_id(raw["run_id"], "run_id")
+        selection_values = _exact_list(raw["selections"])
+    except EvidenceContractError as error:
+        if error.diagnostic is None:
+            error.diagnostic = _span_selection_diagnostic(
+                response,
+                bundle,
+                (
+                    "source_or_document_binding_mismatch"
+                    if error.reason_code == "evidence_source_binding_invalid"
+                    else "schema_or_contract_invalid"
+                ),
+            )
+        raise error from None
+    except (TypeError, ValueError):
+        diagnostic = _span_selection_diagnostic(
+            response, bundle, "schema_or_contract_invalid",
+        )
+        raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
+
+    selected_blocks = frozenset(
+        item.block_id for item in plan.ordered_decisions
+        if item.disposition == "evidence_candidate"
+    )
+    allowed_segment_ids = frozenset(
+        segment_id
+        for block in inventory.ordered_blocks
+        if block.block_id in selected_blocks and block.sensitivity_status == "public"
+        for segment_id in block.ordered_segment_ids
+    )
+    segment_by_id = {item.segment_id: item for item in _segments(bundle)}
+    document_by_id = {
+        item.document_id: item for item in bundle.ordered_documents
+    }
+    seen_ids: set[str] = set()
+    seen_spans: set[tuple[str, int, int]] = set()
+    accepted: list[SourceEvidence] = []
+    rejected = 0
+    for value in selection_values:
+        try:
+            selection = _exact_mapping(value, _SPAN_SELECTION_KEYS)
+            selection_id = _safe_id(selection["selection_id"], "selection_id")
+            segment_id = _safe_id(selection["segment_id"], "segment_id")
+            start = _plain_int(selection["character_start"], "character_start")
+            end = _plain_int(selection["character_end"], "character_end", minimum=1)
+        except (EvidenceContractError, TypeError, ValueError):
+            diagnostic = _span_selection_diagnostic(
+                response, bundle, "schema_or_contract_invalid", "$.selections[]",
+            )
+            raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
+        span_key = (segment_id, start, end)
+        segment = segment_by_id.get(segment_id)
+        document = (
+            None if segment is None else document_by_id.get(segment.document_id)
+        )
+        if (
+            selection_id in seen_ids
+            or span_key in seen_spans
+            or segment_id not in allowed_segment_ids
+            or segment is None
+            or document is None
+            or start < segment.character_start
+            or end > segment.character_end
+            or end <= start
+        ):
+            rejected += 1
+            continue
+        seen_ids.add(selection_id)
+        seen_spans.add(span_key)
+        exact_text = document.exact_text[start:end]
+        if (
+            not exact_text
+            or exact_text != exact_text.strip()
+            or _is_sensitive(exact_text)
+            or _atomic_fact_has_relation_claim(exact_text)
+        ):
+            rejected += 1
+            continue
+        byte_start = len(document.exact_text[:start].encode("utf-8"))
+        byte_end = len(document.exact_text[:end].encode("utf-8"))
+        quote_id = (
+            "quote-"
+            + sha256(
+                f"{selection_id}:{segment_id}:{start}:{end}".encode("utf-8")
+            ).hexdigest()[:24]
+        )
+        quote = EvidenceQuote(
+            quote_id,
+            document.document_id,
+            segment_id,
+            byte_start,
+            byte_end,
+            start,
+            end,
+            exact_text,
+        )
+        numbers, dates = _code_owned_atoms(selection_id, quote_id, exact_text)
+        fact = SourceEvidence(
+            evidence_id=selection_id,
+            proposition=exact_text,
+            evidence_kind="observed_fact",
+            ordered_segment_refs=(segment_id,),
+            exact_quotes=(quote,),
+            entities=(),
+            numbers=numbers,
+            dates=dates,
+            polarity="negated" if _NEGATION.search(exact_text) else "affirmed",
+            temporal_relation=None,
+            causal_relation=None,
+            uncertainty=(
+                "uncertain" if _UNCERTAINTY.search(exact_text) else "certain"
+            ),
+            public_safety="safe",
+        )
+        try:
+            _validate_one_atomic_fact(bundle, fact, raw["run_id"])
+        except EvidenceContractError:
+            rejected += 1
+            continue
+        accepted.append(fact)
+
+    dispositions = _fact_dispositions(bundle, tuple(accepted))
+    payload = {
+        "source_identity": bundle.source_identity,
+        "document_bundle_digest": bundle.bundle_digest,
+        "contract_version": EVIDENCE_EXTRACTION_CONTRACT_VERSION,
+        "run_id": raw["run_id"],
+        "ordered_evidence": tuple(accepted),
+        "ordered_segment_dispositions": dispositions,
+    }
+    extraction = EvidenceExtractionBundle(**payload, bundle_digest=_sha(payload))
+    validate_extraction(bundle, extraction)
+    summary = FactRelationValidationSummary(
+        returned_fact_count=len(selection_values),
+        valid_fact_count=len(accepted),
+        rejected_fact_count=rejected,
+        returned_relation_count=0,
+        verified_relation_count=0,
+        rejected_relation_count=0,
+        temporal_conflict_count=0,
+        causal_conflict_count=0,
+        polarity_conflict_count=0,
+        verified_fact_summaries=tuple(item.proposition for item in accepted[:7]),
+    )
+    return IndependentExtractionResult(extraction, summary)
+
+
 class GenericEvidenceService:
     """Legacy evidence flow plus an explicitly enabled coverage-v2 flow."""
 
@@ -4389,18 +4691,24 @@ class GenericEvidenceService:
                 bundle, inventory, selected_block_ids=selected
             )
             extraction_payload.update({
-                "schema_version": EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
+                "schema_version": EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
                 "coverage_plan_digest": plan.plan_digest,
             })
+            allowed_segment_ids = tuple(
+                segment_id
+                for block in inventory.ordered_blocks
+                if block.block_id in selected and block.sensitivity_status == "public"
+                for segment_id in block.ordered_segment_ids
+            )
             extraction_request = EvidenceModelRequest(
                 "evidence_extraction",
                 self.extraction_model,
                 _canonical(extraction_payload).decode("utf-8"),
-                EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
-                tuple(item for item in (block.block_id for block in inventory.ordered_blocks) if item in selected),
+                EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
+                allowed_segment_ids,
             )
             calls += 1
-            independent = parse_extraction_v3_response(
+            independent = parse_span_selection_response(
                 self._client.generate_json(extraction_request), bundle, inventory, plan
             )
             extraction = independent.extraction
@@ -4819,6 +5127,7 @@ __all__ = [
     "EVIDENCE_EXTRACTION_CONTRACT_VERSION",
     "EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION",
     "EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION",
+    "EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION",
     "EVIDENCE_KINDS",
     "EvidenceAdjudicationBundle",
     "EvidenceCoveragePlan",
@@ -4874,6 +5183,7 @@ __all__ = [
     "parse_coverage_response",
     "parse_extraction_v2_response",
     "parse_extraction_v3_response",
+    "parse_span_selection_response",
     "revalidate_verified_bundle",
     "source_identity",
     "validate_extraction",

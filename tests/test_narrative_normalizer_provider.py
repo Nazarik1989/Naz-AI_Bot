@@ -327,34 +327,23 @@ def _generic_v2_responses(documents, propositions):
         },
     }
     plan = evidence.parse_coverage_response(coverage, documents, inventory)
-    block_for_segment = {
-        segment_id: block.block_id
-        for block in inventory.ordered_blocks
-        for segment_id in block.ordered_segment_ids
-    }
     extraction = {
-        "schema_version": evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
+        "schema_version": evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
         "source_identity": documents.source_identity,
         "document_bundle_digest": documents.bundle_digest,
         "coverage_plan_digest": plan.plan_digest,
         "run_id": "extraction-run-v2",
-        "facts": [
-            dict(
-                {
-                    key: value for key, value in item.items()
-                    if key not in {"evidence_id", "temporal_relation", "causal_relation"}
-                },
-                fact_id=item["evidence_id"],
-                ordered_block_refs=list(dict.fromkeys(
-                    block_for_segment[segment_id]
-                    for segment_id in item["ordered_segment_refs"]
-                )),
-            )
+        "selections": [
+            {
+                "selection_id": item["evidence_id"],
+                "segment_id": item["exact_quotes"][0]["segment_id"],
+                "character_start": item["exact_quotes"][0]["character_start"],
+                "character_end": item["exact_quotes"][0]["character_end"],
+            }
             for item in legacy_extraction["evidence"]
         ],
-        "relations": [],
     }
-    parsed = evidence.parse_extraction_v3_response(
+    parsed = evidence.parse_span_selection_response(
         extraction, documents, inventory, plan
     ).extraction
     adjudication = {
@@ -534,6 +523,34 @@ def test_v3_extraction_transport_prompt_separates_atomic_facts_from_relations():
 
     assert "Separate atomic facts from relations" in messages[0]["content"]
     assert "must not assert temporal or causal order" in messages[0]["content"]
+
+
+def test_span_selection_transport_exposes_only_ids_and_offsets():
+    request = evidence.EvidenceModelRequest(
+        "evidence_extraction", CONTENT_MODEL, '{"safe":"payload"}',
+        evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
+        ("segment-001-000001",),
+    )
+
+    _operation, _model, messages, response_format, _digest = (
+        provider._request_payload(request)
+    )
+    schema = response_format["json_schema"]["schema"]
+    selection = schema["properties"]["selections"]["items"]
+
+    assert set(schema["properties"]) == {
+        "schema_version", "source_identity", "document_bundle_digest",
+        "coverage_plan_digest", "run_id", "selections",
+    }
+    assert set(selection["properties"]) == {
+        "selection_id", "segment_id", "character_start", "character_end",
+    }
+    assert schema["additionalProperties"] is False
+    assert selection["additionalProperties"] is False
+    instruction = messages[0]["content"]
+    assert "Return IDs and offsets only" in instruction
+    assert "Do not return factual text" in instruction
+    assert "temporal/causal relations" in instruction
 
 
 @pytest.mark.parametrize(

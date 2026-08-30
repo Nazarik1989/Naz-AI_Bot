@@ -3228,31 +3228,20 @@ def test_post_extraction_rejection_persists_typed_terminal_outcome(
         for segment in document.ordered_segments
         if segment.exact_text.strip()
     )
-    legacy, _ = generic_evidence_responses(documents, (first_segment.exact_text,))
-    block_id = next(
-        block.block_id for block in inventory.ordered_blocks
-        if first_segment.segment_id in block.ordered_segment_ids
-    )
-    source_item = legacy["evidence"][0]
     extraction = {
-        "schema_version": nn.evidence.EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION,
+        "schema_version": nn.evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
         "source_identity": documents.source_identity,
         "document_bundle_digest": documents.bundle_digest,
         "coverage_plan_digest": plan.plan_digest,
         "run_id": "post-extraction-test-run",
-        "facts": [dict(
-            {
-                key: value for key, value in source_item.items()
-                if key not in {"evidence_id", "temporal_relation", "causal_relation"}
-            },
-            fact_id=source_item["evidence_id"],
-            ordered_block_refs=[block_id],
-        )],
-        "relations": [],
+        "selections": [{
+            "selection_id": "selection-001",
+            "segment_id": first_segment.segment_id,
+            "character_start": first_segment.character_start,
+            "character_end": first_segment.character_end,
+        }],
     }
-    if case == "incomplete":
-        extraction["facts"][0]["proposition"] = "Unverified generated summary."
-    else:
+    if case == "hard-invalid":
         extraction["source_identity"] = "0" * 64
     evidence_client.replies.append(extraction)
 

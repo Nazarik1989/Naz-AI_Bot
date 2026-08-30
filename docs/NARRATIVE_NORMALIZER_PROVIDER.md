@@ -315,11 +315,14 @@ boundary.
 
 Only blocks classified as `evidence_candidate` enter the extraction request.
 The production extraction request uses the closed
-`normalizer-evidence-extraction-v3` response schema. Atomic `facts` and typed
-`relations` are separate arrays. Code expands the block plan back to every
-original segment, validates every fact independently, and validates relations
-only from exact source support. A rejected temporal/causal/polarity relation is
-omitted and cannot erase unrelated valid facts. The generic path owns five
+`normalizer-evidence-span-selection-v1` response schema. The provider may return
+only the source/bundle/plan/run bindings plus `selections`; each selection has
+only an ID, an existing public segment ID, and absolute character start/end
+offsets. Factual prose and semantic fields cannot cross this response boundary.
+Code reads the selected substring from the persisted source document, derives
+the exact byte span and factual text, and validates privacy, ownership,
+atomicity, numbers, dates, polarity, and uncertainty. Temporal or causal text is
+rejected rather than accepted as a model-authored relation. The generic path owns five
 non-retryable operation slots: coverage, extraction, evidence adjudication,
 story generation, and story adjudication. Story repair is not available on this
 path.
