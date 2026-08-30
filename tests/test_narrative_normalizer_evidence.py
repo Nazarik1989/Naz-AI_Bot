@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import json
 
 import pytest
 
@@ -1612,6 +1613,7 @@ def test_requested_integration_api_is_exported_exactly() -> None:
     assert tuple(evidence.EvidenceResolution.__dataclass_fields__) == (
         "status", "verified_bundle", "model_call_count", "reason_code", "diagnostic",
         "coverage_summary", "coverage_failure", "fact_relation_summary",
+        "selection_receipt",
     )
     assert isinstance(evidence.GenericEvidenceService, type)
 
@@ -1957,6 +1959,216 @@ def test_span_selection_complete_path_reaches_verified_evidence(tmp_path):
     )
     adjudication_payload = __import__("json").loads(client.requests[2].payload_json)
     assert "relations" not in adjudication_payload["extraction"]
+
+
+def test_e9_extraction_checkpoint_is_persisted_before_adjudication(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nDelta exists."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    extraction_raw = _span_selection(bundle, plan, _all_segments(bundle)[:4])
+    parsed = evidence.parse_span_selection_response(
+        extraction_raw, bundle, inventory, plan,
+    )
+    client = FakeEvidenceClient([
+        coverage, extraction_raw, _adjudication_payload(parsed.extraction),
+    ])
+    stages = []
+
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle, stage_sink=lambda stage, value: stages.append((stage, value)))
+
+    assert result.status == "verified"
+    assert [stage for stage, _value in stages] == [
+        "code_owned_extraction", "adjudication_bundle",
+    ]
+    checkpoint = stages[0][1]
+    assert type(checkpoint) is evidence.CodeOwnedExtractionCheckpoint
+    assert checkpoint.selection_receipt.accepted_code_owned_fact_count == 4
+    assert checkpoint.selection_receipt.returned_selection_count == 4
+    assert checkpoint.selection_receipt.rejected_selection_count == 0
+    adjudication_request = json.loads(client.requests[2].payload_json)
+    assert (
+        adjudication_request["extraction"]["bundle_digest"]
+        == checkpoint.extraction.bundle_digest
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "stage", "path", "counter"),
+    (
+        ("malformed-json", "adjudication_json_parse", "$", None),
+        ("wrong-version", "adjudication_contract_version", "$.schema_version", None),
+        ("wrong-source", "adjudication_source_binding", "$.source_identity", None),
+        ("wrong-bundle", "adjudication_source_binding", "$.extraction_bundle_digest", None),
+        ("missing-decision", "adjudication_decision_binding", "$.decisions", "missing_decision_count"),
+        ("duplicate-decision", "adjudication_decision_binding", "$.decisions", "duplicate_decision_count"),
+        ("unknown-evidence", "adjudication_decision_binding", "$.decisions", "unknown_evidence_id_count"),
+        ("evidence-digest", "adjudication_decision_binding", "$.decisions", "evidence_digest_mismatch_count"),
+    ),
+    ids=lambda value: value if type(value) is str else None,
+)
+def test_e9_adjudication_rejections_are_typed_and_persisted(
+    tmp_path, case, stage, path, counter,
+):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nDelta exists."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    extraction_raw = _span_selection(bundle, plan, _all_segments(bundle)[:4])
+    parsed = evidence.parse_span_selection_response(
+        extraction_raw, bundle, inventory, plan,
+    )
+    response = _adjudication_payload(parsed.extraction)
+    if case == "malformed-json":
+        response = "not-json"
+    elif case == "wrong-version":
+        response["schema_version"] = "normalizer-evidence-adjudication-v99"
+    elif case == "wrong-source":
+        response["source_identity"] = "0" * 64
+    elif case == "wrong-bundle":
+        response["extraction_bundle_digest"] = "0" * 64
+    elif case == "missing-decision":
+        response["decisions"].pop()
+    elif case == "duplicate-decision":
+        response["decisions"].append(dict(response["decisions"][0]))
+    elif case == "unknown-evidence":
+        response["decisions"][0]["evidence_id"] = "unknown-evidence"
+    else:
+        response["decisions"][0]["evidence_digest"] = "0" * 64
+    client = FakeEvidenceClient([coverage, extraction_raw, response])
+    stages = []
+
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle, stage_sink=lambda name, value: stages.append((name, value)))
+
+    assert result.status == "failed"
+    assert type(result.diagnostic) is evidence.AdjudicationValidationDiagnostic
+    assert result.diagnostic.validation_stage == stage
+    assert result.diagnostic.field_path == path
+    assert [name for name, _value in stages] == [
+        "code_owned_extraction", "adjudication_diagnostic",
+    ]
+    assert stages[-1][1] == result.diagnostic
+    if counter is not None:
+        assert getattr(result.diagnostic, counter) >= 1
+    if case == "wrong-bundle":
+        assert result.diagnostic.extraction_bundle_binding_result == "mismatched"
+    assert result.model_call_count == 3
+
+
+@pytest.mark.parametrize("supported_count", (0, 1, 2, 3))
+def test_e9_valid_adjudication_maps_supported_fact_count(
+    tmp_path, supported_count,
+):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nDelta exists."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    extraction_raw = _span_selection(bundle, plan, _all_segments(bundle)[:4])
+    parsed = evidence.parse_span_selection_response(
+        extraction_raw, bundle, inventory, plan,
+    )
+    adjudication = _adjudication_payload(parsed.extraction)
+    for index, decision in enumerate(adjudication["decisions"]):
+        if index >= supported_count:
+            decision["decision"] = "rejected"
+            decision["reason_codes"] = ["unsupported_proposition"]
+    client = FakeEvidenceClient([coverage, extraction_raw, adjudication])
+    stages = []
+
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle, stage_sink=lambda name, value: stages.append((name, value)))
+
+    assert result.status == ("verified" if supported_count >= 3 else "manual_attention")
+    assert result.fact_relation_summary.valid_fact_count == supported_count
+    assert len(result.fact_relation_summary.verified_fact_summaries) == supported_count
+    assert [name for name, _value in stages] == [
+        "code_owned_extraction", "adjudication_bundle",
+    ]
+    assert result.model_call_count == 3
+
+
+def test_e9_verified_bundle_failure_persists_closed_diagnostic(tmp_path, monkeypatch):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    extraction_raw = _span_selection(bundle, plan, _all_segments(bundle)[:3])
+    parsed = evidence.parse_span_selection_response(
+        extraction_raw, bundle, inventory, plan,
+    )
+    client = FakeEvidenceClient([
+        coverage, extraction_raw, _adjudication_payload(parsed.extraction),
+    ])
+    stages = []
+
+    def reject_verified(*_args):
+        raise evidence.EvidenceContractError("evidence_verified_bundle_invalid")
+
+    monkeypatch.setattr(evidence, "_make_verified", reject_verified)
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle, stage_sink=lambda name, value: stages.append((name, value)))
+
+    assert result.status == "failed"
+    assert result.diagnostic.validation_stage == "verified_bundle_validation"
+    assert [name for name, _value in stages] == [
+        "code_owned_extraction", "adjudication_bundle", "adjudication_diagnostic",
+    ]
+
+
+def test_e9_stage_write_failure_stops_before_adjudication(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    extraction_raw = _span_selection(bundle, plan, _all_segments(bundle)[:3])
+    client = FakeEvidenceClient([coverage, extraction_raw])
+
+    def fail_write(_stage, _payload):
+        raise OSError("private persistence failure")
+
+    with pytest.raises(evidence.EvidenceStagePersistenceError):
+        evidence.GenericEvidenceService(
+            client,
+            extraction_model="content-model",
+            adjudication_model="review-model",
+            coverage_v2=True,
+        ).resolve(bundle, stage_sink=fail_write)
+    assert [request.request_kind for request in client.requests] == [
+        "evidence_coverage", "evidence_extraction",
+    ]
 
 
 def test_span_selection_insufficient_facts_yield_useful_manual_attention(tmp_path):

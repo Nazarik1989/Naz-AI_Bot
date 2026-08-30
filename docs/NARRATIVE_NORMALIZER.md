@@ -548,6 +548,26 @@ closed fact/relation counts and up to seven already public-safe verified fact
 summaries. It never becomes ready and creates no Broker, approval, or Reels
 event.
 
+The evidence stage is checkpointed under the private attempt state before the
+adjudication transport is allowed to start. `normalizer-code-owned-extraction-v1`
+stores the exact code-derived evidence bundle and its source/span bindings;
+`normalizer-evidence-selection-receipt-v1` stores only selection and rejection
+counts. Both artifacts are `0600`, append-only for one attempt, byte-idempotent
+on exact replay, and conflicting on a divergent replay. No model response,
+prompt, credential, withheld segment, or provider exception text is stored.
+
+After adjudication starts, every blocked path writes a closed
+`normalizer-adjudication-diagnostic-v1` before the claim may become terminal.
+The diagnostic records only validation stage, stable reason, safe field path,
+exact response type, binding results, decision counts, transport count, and
+whether a response was received. A valid adjudication bundle is persisted
+before story or manual-attention materialization. Zero, one, or two supported
+facts and ambiguous decisions create `normalizer-manual-attention-v4`, which
+adds the safe selection/adjudication counts and contains only supported
+code-owned fact summaries. Malformed schema, source/digest binding failures,
+or verified-bundle revalidation failures produce `blocked_adjudication`; they
+cannot create a draft, Broker event, approval, ready manifest, or Reels work.
+
 `materialize-manual-attention` is the closed zero-provider projection for an
 already terminal hard-invalid attempt whose persisted typed diagnostic is now
 classified as incomplete. It binds the exact source, parent attempt and claim

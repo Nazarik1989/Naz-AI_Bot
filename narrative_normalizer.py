@@ -59,6 +59,11 @@ MANUAL_ATTENTION_MATERIALIZATION_SCHEMA_VERSION = (
     "normalizer-manual-attention-materialization-v1"
 )
 COVERAGE_DIAGNOSTIC_SCHEMA_VERSION = "normalizer-coverage-diagnostic-v1"
+EVIDENCE_STAGE_LAYOUT_VERSION = "normalizer-evidence-stage-v1"
+CODE_OWNED_EXTRACTION_SCHEMA_VERSION = "normalizer-code-owned-extraction-v1"
+EVIDENCE_SELECTION_RECEIPT_SCHEMA_VERSION = "normalizer-evidence-selection-receipt-v1"
+ADJUDICATION_ARTIFACT_SCHEMA_VERSION = "normalizer-adjudication-artifact-v1"
+ADJUDICATION_DIAGNOSTIC_SCHEMA_VERSION = "normalizer-adjudication-diagnostic-v1"
 MANUAL_RETRY_REASON_CODE = "narrative_normalizer_manual_retry_requested"
 MANUAL_ATTENTION_MATERIALIZATION_REASON_CODE = (
     "narrative_normalizer_manual_attention_materialized"
@@ -86,6 +91,7 @@ OUTCOME_EXISTING_DRAFT = "existing_draft"
 OUTCOME_PROCESSING = "processing"
 OUTCOME_FAILED = "failed"
 OUTCOME_UNCERTAIN = "uncertain"
+OUTCOME_BLOCKED_ADJUDICATION = "blocked_adjudication"
 OUTCOME_DRY_RUN = "dry_run"
 # Compatibility aliases for the already-reviewed closed-domain test contract.
 OUTCOME_CREATED = OUTCOME_DRAFT_READY_FOR_REVIEW
@@ -100,6 +106,7 @@ PUBLIC_OUTCOMES = frozenset({
     OUTCOME_PROCESSING,
     OUTCOME_FAILED,
     OUTCOME_UNCERTAIN,
+    OUTCOME_BLOCKED_ADJUDICATION,
 })
 
 CLAIM_PROCESSING = "processing"
@@ -140,6 +147,7 @@ REASON_CODES = frozenset({
     "narrative_normalizer_evidence_invalid",
     "narrative_normalizer_evidence_incomplete",
     "narrative_normalizer_evidence_ambiguous",
+    "narrative_normalizer_adjudication_blocked",
     "narrative_normalizer_manual_attention_package_ready",
     "narrative_normalizer_review_authority_unavailable",
     "narrative_normalizer_trust_unavailable",
@@ -929,6 +937,7 @@ class NormalizationOutcome:
     evidence_path: str | None = None
     evidence_diagnostic: (
         evidence.EvidenceValidationDiagnostic
+        | evidence.AdjudicationValidationDiagnostic
         | evidence.CoverageFailureEvidence
         | None
     ) = None
@@ -958,12 +967,17 @@ class NormalizationOutcome:
             raise ValueError("evidence_path")
         if self.evidence_diagnostic is not None and type(self.evidence_diagnostic) not in {
             evidence.EvidenceValidationDiagnostic,
+            evidence.AdjudicationValidationDiagnostic,
             evidence.CoverageFailureEvidence,
         }:
             raise TypeError("evidence_diagnostic")
         if (
             self.evidence_diagnostic is not None
-            and self.status not in {OUTCOME_FAILED, OUTCOME_MANUAL_ATTENTION_PACKAGE_READY}
+            and self.status not in {
+                OUTCOME_FAILED,
+                OUTCOME_BLOCKED_ADJUDICATION,
+                OUTCOME_MANUAL_ATTENTION_PACKAGE_READY,
+            }
         ):
             raise ValueError("evidence_diagnostic")
 
@@ -1008,6 +1022,7 @@ class BatchResult:
             OUTCOME_PROCESSING: counts.get(OUTCOME_PROCESSING, 0),
             OUTCOME_FAILED: counts.get(OUTCOME_FAILED, 0),
             OUTCOME_UNCERTAIN: counts.get(OUTCOME_UNCERTAIN, 0),
+            OUTCOME_BLOCKED_ADJUDICATION: counts.get(OUTCOME_BLOCKED_ADJUDICATION, 0),
             "items": [
                 {
                     "source_id": item.source_id,
@@ -4499,6 +4514,7 @@ def _write_exclusive_file(path: Path, payload: bytes, *, mode: int = 0o600) -> N
 
 MANUAL_ATTENTION_CONTRACT_VERSION = "normalizer-manual-attention-v2"
 MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION = "normalizer-manual-attention-v3"
+MANUAL_ATTENTION_SELECTION_CONTRACT_VERSION = "normalizer-manual-attention-v4"
 MANUAL_ATTENTION_LOCAL_PROFILE = "normalizer-review-only-v1"
 _MANUAL_ATTENTION_VALIDATION_STAGES = frozenset({
     "coverage_validation", "response_type", "json_parse", "top_level_schema",
@@ -4549,6 +4565,7 @@ def _manual_attention_artifact(
     *,
     parent_attempt_identity: str | None = None,
     fact_relation_summary: evidence.FactRelationValidationSummary | None = None,
+    selection_receipt: evidence.EvidenceSelectionReceipt | None = None,
 ) -> ManualAttentionArtifact:
     if (
         type(attempt_identity) is not str
@@ -4561,6 +4578,10 @@ def _manual_attention_artifact(
         or (
             fact_relation_summary is not None
             and type(fact_relation_summary) is not evidence.FactRelationValidationSummary
+        )
+        or (
+            selection_receipt is not None
+            and type(selection_receipt) is not evidence.EvidenceSelectionReceipt
         )
         or (
             parent_attempt_identity is not None
@@ -4618,6 +4639,18 @@ def _manual_attention_artifact(
             "verified_relations": relation_summary.verified_relation_count,
             "rejected_relations": relation_summary.rejected_relation_count,
         })
+    if selection_receipt is not None:
+        counts.update({
+            "returned_selections": selection_receipt.returned_selection_count,
+            "accepted_code_owned_facts": (
+                selection_receipt.accepted_code_owned_fact_count
+            ),
+            "rejected_selections": selection_receipt.rejected_selection_count,
+            "adjudication_supported_facts": relation_summary.valid_fact_count,
+            "adjudication_rejected_or_ambiguous_facts": (
+                relation_summary.rejected_fact_count
+            ),
+        })
     derived = parent_attempt_identity is not None
     human_actions = (
         [
@@ -4630,7 +4663,9 @@ def _manual_attention_artifact(
     )
     core = {
         "schema_version": (
-            MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION
+            MANUAL_ATTENTION_SELECTION_CONTRACT_VERSION
+            if selection_receipt is not None
+            else MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION
             if fact_relation_summary is not None
             else MANUAL_ATTENTION_CONTRACT_VERSION
         ),
@@ -4686,7 +4721,14 @@ def _manual_attention_artifact(
         f"{summary.conflicting_disposition_count} conflicting, "
         f"{summary.ambiguous_count} ambiguous, {summary.omitted_count} omitted, and "
         f"{summary.sensitive_count} sensitive withheld.\n\n"
-        f"Confirmed safe facts: {relation_summary.valid_fact_count}. "
+        + (
+            f"Span selections: {selection_receipt.returned_selection_count} returned; "
+            f"{selection_receipt.accepted_code_owned_fact_count} accepted by code; "
+            f"{relation_summary.valid_fact_count} supported by adjudication.\n\n"
+            if selection_receipt is not None
+            else ""
+        )
+        + f"Confirmed safe facts: {relation_summary.valid_fact_count}. "
         + (
             "\n".join(
                 f"- {item}" for item in relation_summary.verified_fact_summaries
@@ -4701,6 +4743,32 @@ def _manual_attention_artifact(
         "2. Discuss the ambiguous parts.\n"
         "3. Skip this material.\n"
     )
+    if selection_receipt is not None:
+        supported_lines = (
+            "\n".join(
+                f"- {item}"
+                for item in relation_summary.verified_fact_summaries
+            )
+            if relation_summary.verified_fact_summaries
+            else "- No fact was supported by adjudication."
+        )
+        markdown = (
+            "# Manual attention required\n\n"
+            f"Safe reason: {failure.stable_reason} ({summary.reason_code}).\n\n"
+            f"Span selections: {selection_receipt.returned_selection_count} returned; "
+            f"{selection_receipt.accepted_code_owned_fact_count} accepted by code; "
+            f"{selection_receipt.rejected_selection_count} rejected by code.\n\n"
+            f"Adjudication supported {relation_summary.valid_fact_count} facts and "
+            f"rejected or left ambiguous {relation_summary.rejected_fact_count}.\n\n"
+            "Supported code-owned facts:\n"
+            f"{supported_lines}\n\n"
+            "A complete public story was stopped because adjudication left "
+            "the evidence set insufficient or ambiguous.\n\n"
+            "Choose one action:\n"
+            "1. Use only the supported facts.\n"
+            "2. Review rejected or ambiguous facts.\n"
+            "3. Skip this material.\n"
+        )
     return ManualAttentionArtifact(source_identity_value, payload, markdown)
 
 
@@ -4732,11 +4800,17 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
         "returned_facts", "valid_facts", "rejected_facts",
         "returned_relations", "verified_relations", "rejected_relations",
     })
+    selection_counts = fact_relation_counts | frozenset({
+        "returned_selections", "accepted_code_owned_facts",
+        "rejected_selections", "adjudication_supported_facts",
+        "adjudication_rejected_or_ambiguous_facts",
+    })
     fact_summaries = core.get("verified_candidate_fact_summaries")
     if (
         schema_version not in {
             MANUAL_ATTENTION_CONTRACT_VERSION,
             MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION,
+            MANUAL_ATTENTION_SELECTION_CONTRACT_VERSION,
         }
         or core.get("source_identity") != expected_identity
         or type(core.get("attempt_identity")) is not str
@@ -4751,6 +4825,8 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
         or frozenset(counts) != (
             legacy_counts
             if schema_version == MANUAL_ATTENTION_CONTRACT_VERSION
+            else selection_counts
+            if schema_version == MANUAL_ATTENTION_SELECTION_CONTRACT_VERSION
             else fact_relation_counts
         )
         or any(type(value) is not int or value < 0 for value in counts.values())
@@ -4765,7 +4841,10 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
             and (core.get("confirmed_fact_count") != 0 or fact_summaries != [])
         )
         or (
-            schema_version == MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION
+            schema_version in {
+                MANUAL_ATTENTION_FACT_RELATION_CONTRACT_VERSION,
+                MANUAL_ATTENTION_SELECTION_CONTRACT_VERSION,
+            }
             and (
                 counts["valid_facts"] != core.get("confirmed_fact_count")
                 or counts["valid_evidence"] != counts["valid_facts"]
@@ -4773,6 +4852,18 @@ def _validate_manual_attention_directory(path: Path, expected_identity: str) -> 
                 != counts["returned_facts"]
                 or counts["verified_relations"] + counts["rejected_relations"]
                 != counts["returned_relations"]
+            )
+        )
+        or (
+            schema_version == MANUAL_ATTENTION_SELECTION_CONTRACT_VERSION
+            and (
+                counts["returned_selections"]
+                != counts["accepted_code_owned_facts"] + counts["rejected_selections"]
+                or counts["adjudication_supported_facts"]
+                != core.get("confirmed_fact_count")
+                or counts["adjudication_supported_facts"]
+                + counts["adjudication_rejected_or_ambiguous_facts"]
+                != counts["accepted_code_owned_facts"]
             )
         )
         or core.get("human_actions") not in (
@@ -4987,6 +5078,7 @@ class NarrativeOutboxStore:
             self._state / "manual-attention-materializations-v1"
         )
         self._coverage_diagnostics = self._state / "coverage-diagnostics-v1"
+        self._evidence_stages = self._state / EVIDENCE_STAGE_LAYOUT_VERSION
         self._broker_receipts = self._state / "broker-draft-receipts-v1"
         self._attempt_artifacts = self.root / f".{ATTEMPT_ARTIFACT_LAYOUT_VERSION}"
         self.trust_service = trust_service
@@ -5128,6 +5220,7 @@ class NarrativeOutboxStore:
                 self._attempt_history, self._manual_retry_requests,
                 self._manual_attention_materializations,
                 self._coverage_diagnostics, self._broker_receipts,
+                self._evidence_stages,
                 self._attempt_artifacts,
             ):
                 path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -5140,6 +5233,7 @@ class NarrativeOutboxStore:
             self._claims, self._attempt_history,
             self._manual_retry_requests, self._manual_attention_materializations,
             self._coverage_diagnostics,
+            self._evidence_stages,
             self._broker_receipts,
         ) if self.broker_trust_mode else ()
         for path, mode in (
@@ -5151,6 +5245,7 @@ class NarrativeOutboxStore:
             (self._manual_retry_requests, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._manual_attention_materializations, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._coverage_diagnostics, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
+            (self._evidence_stages, 0o700),
             (self._broker_receipts, 0o700 if self.broker_trust_mode else outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
             (self._attempt_artifacts, outbox_permissions.SHARED_CLAIM_DIRECTORY_MODE),
         ):
@@ -5574,6 +5669,185 @@ class NarrativeOutboxStore:
             "narrative_normalizer_persistence_invalid",
         )
         return self._validate_coverage_diagnostic(payload)
+
+    def _evidence_stage_path(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+        filename: str,
+    ) -> Path:
+        if (
+            type(source_identity_value) is not str
+            or _HEX64.fullmatch(source_identity_value) is None
+            or type(attempt_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+            or filename not in {
+                "code-owned-extraction.json",
+                "selection-receipt.json",
+                "adjudication.json",
+                "adjudication-diagnostic.json",
+            }
+        ):
+            _raise("narrative_normalizer_persistence_invalid")
+        return self._evidence_stages / source_identity_value / attempt_id / filename
+
+    def _persist_evidence_stage_payload(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+        filename: str,
+        core: Mapping[str, object],
+    ) -> dict[str, object]:
+        self._ensure_write_layout()
+        path = self._evidence_stage_path(
+            source_identity_value, attempt_id, filename,
+        )
+        for directory in (path.parent.parent, path.parent):
+            directory.mkdir(mode=0o700, exist_ok=True)
+            if directory.is_symlink() or not directory.is_dir():
+                _raise("narrative_normalizer_persistence_invalid")
+            if os.name != "nt":
+                os.chmod(directory, 0o700)
+        normalized_core = json.loads(_canonical(dict(core)))
+        if type(normalized_core) is not dict:
+            _raise("narrative_normalizer_persistence_invalid")
+        candidate = dict(
+            normalized_core,
+            artifact_digest=_sha(normalized_core),
+        )
+        encoded = _canonical(candidate) + b"\n"
+        if os.path.lexists(path):
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
+                _raise("narrative_normalizer_persistence_conflict")
+        else:
+            _write_exclusive_file(path, encoded, mode=0o600)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        persisted = json.loads(path.read_bytes())
+        if (
+            type(persisted) is not dict
+            or persisted != candidate
+            or persisted.get("artifact_digest") != _sha(normalized_core)
+        ):
+            _raise("narrative_normalizer_persistence_invalid")
+        return persisted
+
+    def persist_code_owned_extraction(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+        run_profile: str,
+        checkpoint: evidence.CodeOwnedExtractionCheckpoint,
+        *,
+        created_at: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if (
+            type(checkpoint) is not evidence.CodeOwnedExtractionCheckpoint
+            or type(run_profile) is not str
+            or not run_profile
+            or type(created_at) is not str
+            or not created_at
+            or checkpoint.extraction.source_identity != source_identity_value
+        ):
+            _raise("narrative_normalizer_persistence_invalid")
+        extraction_core = {
+            "schema_version": CODE_OWNED_EXTRACTION_SCHEMA_VERSION,
+            "source_identity": source_identity_value,
+            "attempt_identity": attempt_id,
+            "run_profile": run_profile,
+            "coverage_plan_digest": checkpoint.coverage_plan_digest,
+            "extraction_contract": evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
+            "extraction_bundle_digest": checkpoint.extraction.bundle_digest,
+            "run_id": checkpoint.extraction.run_id,
+            "code_owned_source_evidence_bundle": asdict(checkpoint.extraction),
+            "created_at": created_at,
+        }
+        receipt_core = {
+            "schema_version": EVIDENCE_SELECTION_RECEIPT_SCHEMA_VERSION,
+            "source_identity": source_identity_value,
+            "attempt_identity": attempt_id,
+            "extraction_bundle_digest": checkpoint.extraction.bundle_digest,
+            **checkpoint.selection_receipt.safe_payload(),
+        }
+        extraction_payload = self._persist_evidence_stage_payload(
+            source_identity_value,
+            attempt_id,
+            "code-owned-extraction.json",
+            extraction_core,
+        )
+        receipt_payload = self._persist_evidence_stage_payload(
+            source_identity_value,
+            attempt_id,
+            "selection-receipt.json",
+            receipt_core,
+        )
+        return extraction_payload, receipt_payload
+
+    def persist_adjudication_bundle(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+        adjudication: evidence.EvidenceAdjudicationBundle,
+    ) -> dict[str, object]:
+        if (
+            type(adjudication) is not evidence.EvidenceAdjudicationBundle
+            or adjudication.source_identity != source_identity_value
+        ):
+            _raise("narrative_normalizer_persistence_invalid")
+        core = {
+            "schema_version": ADJUDICATION_ARTIFACT_SCHEMA_VERSION,
+            "source_identity": source_identity_value,
+            "attempt_identity": attempt_id,
+            "extraction_bundle_digest": adjudication.extraction_bundle_digest,
+            "adjudication_bundle_digest": adjudication.bundle_digest,
+            "adjudication": asdict(adjudication),
+        }
+        return self._persist_evidence_stage_payload(
+            source_identity_value, attempt_id, "adjudication.json", core,
+        )
+
+    def persist_adjudication_diagnostic(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+        diagnostic: evidence.AdjudicationValidationDiagnostic,
+    ) -> dict[str, object]:
+        if type(diagnostic) is not evidence.AdjudicationValidationDiagnostic:
+            _raise("narrative_normalizer_persistence_invalid")
+        core = {
+            "schema_version": ADJUDICATION_DIAGNOSTIC_SCHEMA_VERSION,
+            "source_identity": source_identity_value,
+            "attempt_identity": attempt_id,
+            "diagnostic": diagnostic.safe_payload(),
+        }
+        return self._persist_evidence_stage_payload(
+            source_identity_value,
+            attempt_id,
+            "adjudication-diagnostic.json",
+            core,
+        )
+
+    def read_evidence_stage_artifact(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+        filename: str,
+    ) -> dict[str, object]:
+        path = self._evidence_stage_path(
+            source_identity_value, attempt_id, filename,
+        )
+        if path.is_symlink() or not path.is_file():
+            _raise("narrative_normalizer_persistence_invalid")
+        if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != 0o600:
+            _raise("narrative_normalizer_persistence_invalid")
+        payload = json.loads(path.read_bytes())
+        if type(payload) is not dict:
+            _raise("narrative_normalizer_persistence_invalid")
+        core = dict(payload)
+        digest = core.pop("artifact_digest", None)
+        if type(digest) is not str or digest != _sha(core):
+            _raise("narrative_normalizer_persistence_invalid")
+        return payload
 
     def _manual_attention_materialization_path(
         self, operator_request_id: str,
@@ -8705,6 +8979,8 @@ class NarrativeNormalizerService:
                             "narrative_normalizer_manual_attention_package_ready",
                             "narrative_normalizer_trust_unavailable",
                         }
+                        else OUTCOME_BLOCKED_ADJUDICATION
+                        if reason == "narrative_normalizer_adjudication_blocked"
                         else OUTCOME_FAILED
                     )
                     return self._outcome(source, prior_status, reasons=(reason,))
@@ -8717,9 +8993,72 @@ class NarrativeNormalizerService:
                 claim_started = True
             if not fast_path:
                 assert self.evidence_service is not None
+                evidence_run_profile = (
+                    manual_retry.run_profile
+                    if manual_retry is not None
+                    else MANUAL_ATTENTION_LOCAL_PROFILE
+                )
+
+                def persist_evidence_stage(stage: str, payload: object) -> None:
+                    if stage == "code_owned_extraction":
+                        if type(payload) is not evidence.CodeOwnedExtractionCheckpoint:
+                            raise evidence.EvidenceStagePersistenceError(
+                                "invalid extraction checkpoint"
+                            )
+                        self.store.persist_code_owned_extraction(
+                            identity,
+                            attempt_id,
+                            evidence_run_profile,
+                            payload,
+                            created_at=started_at,
+                        )
+                    elif stage == "adjudication_bundle":
+                        if type(payload) is not evidence.EvidenceAdjudicationBundle:
+                            raise evidence.EvidenceStagePersistenceError(
+                                "invalid adjudication checkpoint"
+                            )
+                        self.store.persist_adjudication_bundle(
+                            identity, attempt_id, payload,
+                        )
+                    elif stage == "adjudication_diagnostic":
+                        if type(payload) is not evidence.AdjudicationValidationDiagnostic:
+                            raise evidence.EvidenceStagePersistenceError(
+                                "invalid adjudication diagnostic"
+                            )
+                        self.store.persist_adjudication_diagnostic(
+                            identity, attempt_id, payload,
+                        )
+                    else:
+                        raise evidence.EvidenceStagePersistenceError(
+                            "unknown evidence stage"
+                        )
+
                 try:
                     with _provider_source_scope(self.generation_service, identity):
-                        resolution = self.evidence_service.resolve(documents)
+                        resolution = self.evidence_service.resolve(
+                            documents,
+                            stage_sink=persist_evidence_stage,
+                        )
+                except evidence.EvidenceStagePersistenceError:
+                    current = self.store.read_claim(
+                        source.source_ref, source.source_digest,
+                    )
+                    if current is None or current["state"] != CLAIM_PROCESSING:
+                        _raise("narrative_normalizer_claim_invalid")
+                    uncertain = dict(
+                        current,
+                        state=CLAIM_UNCERTAIN,
+                        updated_at=_now(self.clock),
+                        reason_code="narrative_normalizer_claim_uncertain",
+                    )
+                    self.store._write_claim_locked(uncertain)
+                    return self._outcome(
+                        source,
+                        OUTCOME_UNCERTAIN,
+                        reasons=("narrative_normalizer_claim_uncertain",),
+                        calls=model_calls,
+                        evidence_path="generic",
+                    )
                 except evidence.EvidenceContractError as error:
                     reason = "narrative_normalizer_evidence_invalid"
                     self._record_failed_claim_locked(
@@ -8746,6 +9085,29 @@ class NarrativeNormalizerService:
                 }
                 if resolution.status != "verified":
                     status = outcome_by_resolution.get(resolution.status, OUTCOME_FAILED)
+                    if type(resolution.diagnostic) is evidence.AdjudicationValidationDiagnostic:
+                        persisted = self.store.read_evidence_stage_artifact(
+                            identity,
+                            attempt_id,
+                            "adjudication-diagnostic.json",
+                        )
+                        if persisted.get("diagnostic") != resolution.diagnostic.safe_payload():
+                            _raise("narrative_normalizer_persistence_invalid")
+                        reason = "narrative_normalizer_adjudication_blocked"
+                        self._record_failed_claim_locked(
+                            source,
+                            attempt_id=attempt_id,
+                            started_at=started_at,
+                            reason_code=reason,
+                        )
+                        return self._outcome(
+                            source,
+                            OUTCOME_BLOCKED_ADJUDICATION,
+                            reasons=(reason,),
+                            calls=model_calls,
+                            evidence_path="generic",
+                            evidence_diagnostic=resolution.diagnostic,
+                        )
                     if resolution.coverage_failure is not None:
                         coverage_outcome = _coverage_failure_outcome(
                             resolution.coverage_failure
@@ -8788,6 +9150,7 @@ class NarrativeNormalizerService:
                             resolution.coverage_summary,
                             resolution.coverage_failure,
                             fact_relation_summary=resolution.fact_relation_summary,
+                            selection_receipt=resolution.selection_receipt,
                             parent_attempt_identity=(
                                 manual_retry.previous_failed_attempt_id
                                 if manual_retry is not None
@@ -8798,7 +9161,10 @@ class NarrativeNormalizerService:
                             artifact,
                             attempt_scoped=(
                                 manual_retry is not None
-                                and os.path.lexists(final)
+                                and (
+                                    resolution.selection_receipt is not None
+                                    or os.path.lexists(final)
+                                )
                             ),
                         )
                         reason = "narrative_normalizer_manual_attention_package_ready"

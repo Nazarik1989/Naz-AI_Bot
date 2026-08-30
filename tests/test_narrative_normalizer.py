@@ -3128,6 +3128,210 @@ def _coverage_only_case(tmp_path, response_builder):
     return record, documents, service, evidence_client, generation_client, registry
 
 
+def _e9_adjudication_case(tmp_path, adjudication_builder):
+    inbox = tmp_path / "inbox"
+    outbox = tmp_path / "outbox"
+    registry = tmp_path / "state" / "registry.json"
+    source_path = inbox / "Evidence-Stage" / "2026-08-30"
+    source_path.mkdir(parents=True)
+    registry.parent.mkdir(parents=True)
+    (source_path / "facts.txt").write_text(
+        "Alpha exists.\nBeta exists.\nGamma exists.\nDelta exists.",
+        encoding="utf-8",
+    )
+    trust_service = nn.trust.NarrativeTrustService(TEST_TRUST_KEY)
+    policy = rq.QuarantinePathPolicy(
+        inbox, registry, outbox, trust_service, tmp_path / "review-authority",
+    )
+    rq.reconcile_complete_backlog(policy, now=NOW)
+    record = rq.read_registry(registry).records[0]
+    documents = nn.read_source_documents(
+        policy, record.source_ref, expected_digest=record.source_digest,
+    )
+    inventory = nn.evidence.build_source_block_inventory(documents)
+    coverage = {
+        "schema_version": nn.evidence.EVIDENCE_COVERAGE_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "inventory_digest": inventory.inventory_digest,
+        "run_id": "e9-coverage-run",
+        "block_dispositions": {
+            block.block_id: "evidence_candidate"
+            for block in inventory.ordered_blocks
+        },
+    }
+    plan = nn.evidence.parse_coverage_response(
+        coverage, documents, inventory,
+    )
+    segments = tuple(
+        segment
+        for document in documents.ordered_documents
+        for segment in document.ordered_segments
+    )
+    selection = {
+        "schema_version": nn.evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "document_bundle_digest": documents.bundle_digest,
+        "coverage_plan_digest": plan.plan_digest,
+        "run_id": "e9-selection-run",
+        "selections": [
+            {
+                "selection_id": f"selection-{index}",
+                "segment_id": segment.segment_id,
+                "character_start": segment.character_start,
+                "character_end": segment.character_end,
+            }
+            for index, segment in enumerate(segments[:4], start=1)
+        ],
+    }
+    parsed = nn.evidence.parse_span_selection_response(
+        selection, documents, inventory, plan,
+    )
+    adjudication = {
+        "schema_version": nn.evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
+        "source_identity": documents.source_identity,
+        "extraction_bundle_digest": parsed.extraction.bundle_digest,
+        "run_id": "e9-adjudication-run",
+        "decisions": [
+            {
+                "evidence_id": item.evidence_id,
+                "evidence_digest": nn.evidence.evidence_digest(item),
+                "decision": "supported",
+                "reason_codes": [],
+            }
+            for item in parsed.extraction.ordered_evidence
+        ],
+    }
+    evidence_client = QueueClient([
+        coverage, selection, adjudication_builder(adjudication),
+    ])
+    generation_client = QueueClient([])
+    service = nn.NarrativeNormalizerService(
+        policy=policy,
+        context_provider=nn.TemplateNarrativeContextProvider(
+            fixture_to_input(load_fixture("quiet_object"))
+        ),
+        generation_service=ng.NarrativeGenerationService(
+            generation_client,
+            generation_model="content-model",
+            adjudication_model="review-model",
+        ),
+        evidence_service=nn.evidence.GenericEvidenceService(
+            evidence_client,
+            extraction_model="content-model",
+            adjudication_model="review-model",
+            coverage_v2=True,
+        ),
+        trust_service=trust_service,
+        clock=lambda: NOW,
+    )
+    return (
+        record, documents, service, evidence_client, generation_client,
+        registry, plan, parsed,
+    )
+
+
+def test_e9_malformed_adjudication_is_durable_before_terminal_claim(tmp_path):
+    (
+        record, documents, service, evidence_client, generation_client,
+        registry, plan, parsed,
+    ) = _e9_adjudication_case(tmp_path, lambda _payload: "not-json")
+
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == nn.OUTCOME_BLOCKED_ADJUDICATION
+    assert outcome.model_call_count == 3
+    assert type(outcome.evidence_diagnostic) is nn.evidence.AdjudicationValidationDiagnostic
+    assert outcome.evidence_diagnostic.validation_stage == "adjudication_json_parse"
+    claim = service.store.read_claim(record.source_ref, record.source_digest)
+    assert claim is not None and claim["state"] == nn.CLAIM_FAILED
+    assert claim["reason_code"] == "narrative_normalizer_adjudication_blocked"
+    attempt_id = claim["attempt_id"]
+    extraction_path = service.store._evidence_stage_path(
+        documents.source_identity, attempt_id, "code-owned-extraction.json",
+    )
+    receipt_path = service.store._evidence_stage_path(
+        documents.source_identity, attempt_id, "selection-receipt.json",
+    )
+    diagnostic_path = service.store._evidence_stage_path(
+        documents.source_identity, attempt_id, "adjudication-diagnostic.json",
+    )
+    assert extraction_path.is_file() and receipt_path.is_file() and diagnostic_path.is_file()
+    receipt = service.store.read_evidence_stage_artifact(
+        documents.source_identity, attempt_id, "selection-receipt.json",
+    )
+    diagnostic = service.store.read_evidence_stage_artifact(
+        documents.source_identity, attempt_id, "adjudication-diagnostic.json",
+    )
+    assert receipt["returned_selection_count"] == 4
+    assert receipt["accepted_code_owned_fact_count"] == 4
+    assert receipt["rejected_selection_count"] == 0
+    assert diagnostic["diagnostic"] == outcome.evidence_diagnostic.safe_payload()
+    persisted_bytes = b"".join(
+        path.read_bytes() for path in (extraction_path, receipt_path, diagnostic_path)
+    )
+    assert b"not-json" not in persisted_bytes
+    assert b"prompt" not in persisted_bytes
+    checkpoint = nn.evidence.CodeOwnedExtractionCheckpoint(
+        plan.plan_digest, parsed.extraction, parsed.selection_receipt,
+    )
+    before = (extraction_path.read_bytes(), receipt_path.read_bytes())
+    created_at = service.store.read_evidence_stage_artifact(
+        documents.source_identity, attempt_id, "code-owned-extraction.json",
+    )["created_at"]
+    service.store.persist_code_owned_extraction(
+        documents.source_identity, attempt_id, nn.MANUAL_ATTENTION_LOCAL_PROFILE,
+        checkpoint, created_at=created_at,
+    )
+    assert before == (extraction_path.read_bytes(), receipt_path.read_bytes())
+    with pytest.raises(
+        nn.NarrativeNormalizerError,
+        match="narrative_normalizer_persistence_conflict",
+    ):
+        service.store.persist_code_owned_extraction(
+            documents.source_identity, attempt_id, nn.MANUAL_ATTENTION_LOCAL_PROFILE,
+            checkpoint, created_at="2099-01-01T00:00:00Z",
+        )
+    assert generation_client.requests == []
+    assert not service.store.draft_path(
+        record.source_digest, source_ref=record.source_ref,
+    ).exists()
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+
+
+def test_e9_zero_supported_adjudication_creates_safe_manual_package(tmp_path):
+    def reject_all(payload):
+        for decision in payload["decisions"]:
+            decision["decision"] = "rejected"
+            decision["reason_codes"] = ["unsupported_proposition"]
+        return payload
+
+    (
+        record, documents, service, evidence_client, generation_client,
+        registry, _plan, _parsed,
+    ) = _e9_adjudication_case(tmp_path, reject_all)
+
+    outcome = service.normalize_source(record.source_ref, record.source_digest)
+
+    assert outcome.status == nn.OUTCOME_MANUAL_ATTENTION_PACKAGE_READY
+    assert outcome.model_call_count == 3
+    package = service.store.draft_path(
+        record.source_digest, source_ref=record.source_ref,
+    )
+    payload = json.loads(
+        (package / "manual-attention.json").read_text(encoding="utf-8")
+    )
+    assert payload["schema_version"] == nn.MANUAL_ATTENTION_SELECTION_CONTRACT_VERSION
+    assert payload["confirmed_fact_count"] == 0
+    assert payload["verified_candidate_fact_summaries"] == []
+    assert payload["coverage_counts"]["returned_selections"] == 4
+    assert payload["coverage_counts"]["accepted_code_owned_facts"] == 4
+    assert payload["coverage_counts"]["adjudication_supported_facts"] == 0
+    assert generation_client.requests == []
+    assert not (tmp_path / "review-authority").exists()
+    assert rq.read_registry(registry).records[0].status == rq.STATUS_NEEDS_NARRATIVE
+
+
 @pytest.mark.parametrize(
     "case",
     ("missing", "duplicate", "conflicting", "ambiguous"),

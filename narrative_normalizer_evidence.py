@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Mapping, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 import json
 import re
 
@@ -30,6 +30,9 @@ EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION = "normalizer-evidence-extraction-v2"
 EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION = "normalizer-evidence-extraction-v3"
 EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION = "normalizer-evidence-span-selection-v1"
 EVIDENCE_ADJUDICATION_CONTRACT_VERSION = "normalizer-evidence-adjudication-v1"
+CODE_OWNED_EXTRACTION_CHECKPOINT_VERSION = "normalizer-code-owned-extraction-v1"
+EVIDENCE_SELECTION_RECEIPT_VERSION = "normalizer-evidence-selection-receipt-v1"
+ADJUDICATION_DIAGNOSTIC_VERSION = "normalizer-adjudication-diagnostic-v1"
 VERIFIED_EVIDENCE_CONTRACT_VERSION = "normalizer-verified-evidence-v1"
 VERIFIED_FACT_BINDING_VERSION = "normalizer-verified-fact-binding-v1"
 
@@ -451,14 +454,21 @@ class EvidenceContractError(ValueError):
     def __init__(
         self,
         reason_code: str,
-        diagnostic: EvidenceValidationDiagnostic | None = None,
+        diagnostic: EvidenceValidationDiagnostic | AdjudicationValidationDiagnostic | None = None,
         *,
         semantic_rejection: str | None = None,
     ):
         code = reason_code if reason_code in REASON_CODES else "evidence_schema_invalid"
         super().__init__(code)
         self.reason_code = code
-        self.diagnostic = diagnostic if type(diagnostic) is EvidenceValidationDiagnostic else None
+        self.diagnostic = (
+            diagnostic
+            if type(diagnostic) in {
+                EvidenceValidationDiagnostic,
+                AdjudicationValidationDiagnostic,
+            }
+            else None
+        )
         self._semantic_rejection = (
             semantic_rejection if semantic_rejection in _SEMANTIC_REJECTIONS else None
         )
@@ -897,6 +907,137 @@ class FactRelationValidationSummary:
             )
             for field in fields(self)
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceSelectionReceipt:
+    """Privacy-safe accounting for model-selected source spans."""
+
+    returned_selection_count: int
+    accepted_code_owned_fact_count: int
+    rejected_selection_count: int
+    unknown_segment_count: int
+    invalid_span_count: int
+    duplicate_count: int
+    overlap_count: int
+    structural_metadata_only_count: int
+    sensitive_count: int
+    relation_bearing_span_count: int
+    too_short_count: int
+    too_long_count: int
+    verified_relation_count: int = 0
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            _plain_int(getattr(self, field.name), field.name)
+        classified = sum((
+            self.unknown_segment_count,
+            self.invalid_span_count,
+            self.duplicate_count,
+            self.overlap_count,
+            self.structural_metadata_only_count,
+            self.sensitive_count,
+            self.relation_bearing_span_count,
+            self.too_short_count,
+            self.too_long_count,
+        ))
+        if (
+            self.accepted_code_owned_fact_count + self.rejected_selection_count
+            != self.returned_selection_count
+            or classified != self.rejected_selection_count
+            or self.verified_relation_count != 0
+        ):
+            raise ValueError("selection receipt counts")
+
+    def safe_payload(self) -> dict[str, int]:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+
+_ADJUDICATION_VALIDATION_STAGES = frozenset({
+    "adjudication_response_type",
+    "adjudication_json_parse",
+    "adjudication_top_level_schema",
+    "adjudication_contract_version",
+    "adjudication_source_binding",
+    "adjudication_decision_binding",
+    "adjudication_semantic_validation",
+    "verified_bundle_validation",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class AdjudicationValidationDiagnostic:
+    """Closed, persisted diagnostic for every post-extraction blocker."""
+
+    category: str
+    stable_reason: str
+    validation_stage: str
+    field_path: str
+    response_exact_type: str
+    schema_version: str
+    source_binding_result: str
+    extraction_bundle_binding_result: str
+    expected_decision_count: int
+    returned_decision_count: int
+    supported_decision_count: int
+    rejected_decision_count: int
+    ambiguous_decision_count: int
+    missing_decision_count: int
+    duplicate_decision_count: int
+    unknown_evidence_id_count: int
+    evidence_digest_mismatch_count: int
+    transport_attempt_count: int
+    response_received: bool
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.category, "category"),
+            (self.stable_reason, "stable_reason"),
+            (self.schema_version, "schema_version"),
+            (self.source_binding_result, "source_binding_result"),
+            (self.extraction_bundle_binding_result, "extraction_bundle_binding_result"),
+        ):
+            if type(value) is not str or _DIAGNOSTIC_KEY.fullmatch(value) is None:
+                raise TypeError(name)
+        if self.validation_stage not in _ADJUDICATION_VALIDATION_STAGES:
+            raise ValueError("validation_stage")
+        if type(self.field_path) is not str or _DIAGNOSTIC_PATH.fullmatch(self.field_path) is None:
+            raise TypeError("field_path")
+        if self.response_exact_type not in _DIAGNOSTIC_TYPE_LABELS:
+            raise ValueError("response_exact_type")
+        if self.source_binding_result not in {"matched", "mismatched", "unavailable"}:
+            raise ValueError("source_binding_result")
+        if self.extraction_bundle_binding_result not in {"matched", "mismatched", "unavailable"}:
+            raise ValueError("extraction_bundle_binding_result")
+        for field in fields(self):
+            if field.name.endswith("_count"):
+                _plain_int(getattr(self, field.name), field.name)
+        if type(self.response_received) is not bool:
+            raise TypeError("response_received")
+
+    def safe_payload(self) -> dict[str, object]:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+
+@dataclass(frozen=True, slots=True)
+class CodeOwnedExtractionCheckpoint:
+    coverage_plan_digest: str
+    extraction: EvidenceExtractionBundle
+    selection_receipt: EvidenceSelectionReceipt
+
+    def __post_init__(self) -> None:
+        _hex64(self.coverage_plan_digest, "coverage_plan_digest")
+        if type(self.extraction) is not EvidenceExtractionBundle:
+            raise TypeError("extraction")
+        if type(self.selection_receipt) is not EvidenceSelectionReceipt:
+            raise TypeError("selection_receipt")
+
+
+class EvidenceStagePersistenceError(RuntimeError):
+    """Signals that durable evidence state could not be written or reread."""
+
+
+EvidenceStageSink = Callable[[str, object], None]
 
 
 _COVERAGE_FAILURE_CATEGORIES = frozenset({
@@ -2171,10 +2312,11 @@ class EvidenceResolution:
     verified_bundle: VerifiedEvidenceBundle | None
     model_call_count: int
     reason_code: str
-    diagnostic: EvidenceValidationDiagnostic | None = None
+    diagnostic: EvidenceValidationDiagnostic | AdjudicationValidationDiagnostic | None = None
     coverage_summary: EvidenceCoverageSummary | None = None
     coverage_failure: CoverageFailureEvidence | None = None
     fact_relation_summary: FactRelationValidationSummary | None = None
+    selection_receipt: EvidenceSelectionReceipt | None = None
 
     def __post_init__(self) -> None:
         _enum(self.status, RESOLUTION_STATUSES, "status")
@@ -2193,7 +2335,10 @@ class EvidenceResolution:
         }.get(self.status)
         if expected_reason is not None and self.reason_code != expected_reason:
             raise ValueError("reason_code")
-        if self.diagnostic is not None and type(self.diagnostic) is not EvidenceValidationDiagnostic:
+        if self.diagnostic is not None and type(self.diagnostic) not in {
+            EvidenceValidationDiagnostic,
+            AdjudicationValidationDiagnostic,
+        }:
             raise TypeError("diagnostic")
         if self.status != "failed" and self.diagnostic is not None:
             raise ValueError("diagnostic")
@@ -2206,6 +2351,11 @@ class EvidenceResolution:
             and type(self.fact_relation_summary) is not FactRelationValidationSummary
         ):
             raise TypeError("fact_relation_summary")
+        if (
+            self.selection_receipt is not None
+            and type(self.selection_receipt) is not EvidenceSelectionReceipt
+        ):
+            raise TypeError("selection_receipt")
         if (
             self.coverage_failure is not None
             and self.coverage_summary is not None
@@ -3291,17 +3441,167 @@ def _decision_from(value: object) -> EvidenceDecision:
         _raise("evidence_schema_invalid")
 
 
+def _adjudication_diagnostic(
+    response: object,
+    extraction: EvidenceExtractionBundle,
+    *,
+    validation_stage: str,
+    stable_reason: str,
+    field_path: str,
+    response_received: bool = True,
+) -> AdjudicationValidationDiagnostic:
+    raw: object = response
+    if type(response) is str:
+        try:
+            raw = json.loads(response)
+        except json.JSONDecodeError:
+            raw = None
+    decisions = raw.get("decisions") if type(raw) is dict else None
+    values = decisions if type(decisions) is list else []
+    expected = {
+        item.evidence_id: evidence_digest(item)
+        for item in extraction.ordered_evidence
+    }
+    ids: list[str] = []
+    supported = rejected = ambiguous = mismatched = unknown = 0
+    for item in values:
+        if type(item) is not dict:
+            continue
+        evidence_id = item.get("evidence_id")
+        decision = item.get("decision")
+        if type(evidence_id) is str:
+            ids.append(evidence_id)
+            if evidence_id not in expected:
+                unknown += 1
+            elif item.get("evidence_digest") != expected[evidence_id]:
+                mismatched += 1
+        if decision == "supported":
+            supported += 1
+        elif decision == "rejected":
+            rejected += 1
+        elif decision == "ambiguous":
+            ambiguous += 1
+    known = {item for item in ids if item in expected}
+    duplicate = len(ids) - len(set(ids))
+    schema_value = raw.get("schema_version") if type(raw) is dict else None
+    return AdjudicationValidationDiagnostic(
+        category="blocked_adjudication",
+        stable_reason=stable_reason,
+        validation_stage=validation_stage,
+        field_path=field_path,
+        response_exact_type=_diagnostic_type(response),
+        schema_version=(
+            schema_value
+            if type(schema_value) is str and _DIAGNOSTIC_KEY.fullmatch(schema_value)
+            else "missing"
+        ),
+        source_binding_result=(
+            "matched"
+            if type(raw) is dict and raw.get("source_identity") == extraction.source_identity
+            else "mismatched"
+            if type(raw) is dict and type(raw.get("source_identity")) is str
+            else "unavailable"
+        ),
+        extraction_bundle_binding_result=(
+            "matched"
+            if type(raw) is dict and raw.get("extraction_bundle_digest") == extraction.bundle_digest
+            else "mismatched"
+            if type(raw) is dict and type(raw.get("extraction_bundle_digest")) is str
+            else "unavailable"
+        ),
+        expected_decision_count=len(expected),
+        returned_decision_count=len(values),
+        supported_decision_count=supported,
+        rejected_decision_count=rejected,
+        ambiguous_decision_count=ambiguous,
+        missing_decision_count=len(set(expected) - known),
+        duplicate_decision_count=duplicate,
+        unknown_evidence_id_count=unknown,
+        evidence_digest_mismatch_count=mismatched,
+        transport_attempt_count=1,
+        response_received=response_received,
+    )
+
+
+def adjudication_transport_diagnostic(
+    error: BaseException,
+    extraction: EvidenceExtractionBundle,
+) -> AdjudicationValidationDiagnostic:
+    safe = getattr(error, "diagnostic", None)
+    category = getattr(safe, "category", None)
+    response_received = getattr(safe, "response_received", False)
+    return _adjudication_diagnostic(
+        None,
+        extraction,
+        validation_stage="adjudication_response_type",
+        stable_reason=(
+            category
+            if type(category) is str and _DIAGNOSTIC_KEY.fullmatch(category)
+            else "provider_transport_failed"
+        ),
+        field_path="$",
+        response_received=bool(response_received),
+    )
+
+
 def parse_adjudication_response(
     response: Mapping[str, object] | str,
     extraction: EvidenceExtractionBundle,
 ) -> EvidenceAdjudicationBundle:
-    raw = _exact_mapping(_mapping_response(response), _ADJUDICATION_RESPONSE_KEYS)
-    if (
-        raw["schema_version"] != EVIDENCE_ADJUDICATION_CONTRACT_VERSION
-        or raw["source_identity"] != extraction.source_identity
-        or raw["extraction_bundle_digest"] != extraction.bundle_digest
-    ):
-        _raise("evidence_adjudication_conflict")
+    if type(response) not in {dict, str}:
+        diagnostic = _adjudication_diagnostic(
+            response, extraction,
+            validation_stage="adjudication_response_type",
+            stable_reason="response_exact_type_invalid",
+            field_path="$",
+        )
+        raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
+    if type(response) is str:
+        try:
+            decoded = json.loads(response)
+        except json.JSONDecodeError:
+            diagnostic = _adjudication_diagnostic(
+                response, extraction,
+                validation_stage="adjudication_json_parse",
+                stable_reason="malformed_json",
+                field_path="$",
+            )
+            raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
+    else:
+        decoded = response
+    if type(decoded) is not dict or frozenset(decoded) != _ADJUDICATION_RESPONSE_KEYS:
+        diagnostic = _adjudication_diagnostic(
+            response, extraction,
+            validation_stage="adjudication_top_level_schema",
+            stable_reason="top_level_schema_invalid",
+            field_path="$",
+        )
+        raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
+    raw = decoded
+    if raw["schema_version"] != EVIDENCE_ADJUDICATION_CONTRACT_VERSION:
+        diagnostic = _adjudication_diagnostic(
+            response, extraction,
+            validation_stage="adjudication_contract_version",
+            stable_reason="contract_version_mismatch",
+            field_path="$.schema_version",
+        )
+        raise EvidenceContractError("evidence_adjudication_conflict", diagnostic) from None
+    if raw["source_identity"] != extraction.source_identity:
+        diagnostic = _adjudication_diagnostic(
+            response, extraction,
+            validation_stage="adjudication_source_binding",
+            stable_reason="source_identity_mismatch",
+            field_path="$.source_identity",
+        )
+        raise EvidenceContractError("evidence_adjudication_conflict", diagnostic) from None
+    if raw["extraction_bundle_digest"] != extraction.bundle_digest:
+        diagnostic = _adjudication_diagnostic(
+            response, extraction,
+            validation_stage="adjudication_source_binding",
+            stable_reason="extraction_bundle_digest_mismatch",
+            field_path="$.extraction_bundle_digest",
+        )
+        raise EvidenceContractError("evidence_adjudication_conflict", diagnostic) from None
     try:
         decisions = tuple(_decision_from(item) for item in _exact_list(raw["decisions"]))
         payload = {
@@ -3313,13 +3613,31 @@ def parse_adjudication_response(
         }
         result = EvidenceAdjudicationBundle(**payload, bundle_digest=_sha(payload))
     except EvidenceContractError:
-        raise
+        diagnostic = _adjudication_diagnostic(
+            response, extraction,
+            validation_stage="adjudication_semantic_validation",
+            stable_reason="decision_schema_invalid",
+            field_path="$.decisions[]",
+        )
+        raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
     except (TypeError, ValueError):
-        _raise("evidence_schema_invalid")
+        diagnostic = _adjudication_diagnostic(
+            response, extraction,
+            validation_stage="adjudication_semantic_validation",
+            stable_reason="decision_schema_invalid",
+            field_path="$.decisions[]",
+        )
+        raise EvidenceContractError("evidence_schema_invalid", diagnostic) from None
     expected = tuple((item.evidence_id, evidence_digest(item)) for item in extraction.ordered_evidence)
     actual = tuple((item.evidence_id, item.evidence_digest) for item in result.ordered_decisions)
     if actual != expected or len(actual) != len(set(item[0] for item in actual)):
-        _raise("evidence_adjudication_incomplete")
+        diagnostic = _adjudication_diagnostic(
+            response, extraction,
+            validation_stage="adjudication_decision_binding",
+            stable_reason="decision_binding_incomplete",
+            field_path="$.decisions",
+        )
+        raise EvidenceContractError("evidence_adjudication_incomplete", diagnostic) from None
     return result
 
 
@@ -3885,12 +4203,18 @@ def parse_extraction_v2_response(
 class IndependentExtractionResult:
     extraction: EvidenceExtractionBundle
     summary: FactRelationValidationSummary
+    selection_receipt: EvidenceSelectionReceipt | None = None
 
     def __post_init__(self) -> None:
         if type(self.extraction) is not EvidenceExtractionBundle:
             raise TypeError("extraction")
         if type(self.summary) is not FactRelationValidationSummary:
             raise TypeError("summary")
+        if (
+            self.selection_receipt is not None
+            and type(self.selection_receipt) is not EvidenceSelectionReceipt
+        ):
+            raise TypeError("selection_receipt")
 
 
 def _v3_diagnostic(
@@ -4412,8 +4736,19 @@ def parse_span_selection_response(
     }
     seen_ids: set[str] = set()
     seen_spans: set[tuple[str, int, int]] = set()
+    accepted_spans: list[tuple[str, int, int]] = []
     accepted: list[SourceEvidence] = []
-    rejected = 0
+    rejection_counts = {
+        "unknown_segment_count": 0,
+        "invalid_span_count": 0,
+        "duplicate_count": 0,
+        "overlap_count": 0,
+        "structural_metadata_only_count": 0,
+        "sensitive_count": 0,
+        "relation_bearing_span_count": 0,
+        "too_short_count": 0,
+        "too_long_count": 0,
+    }
     for value in selection_values:
         try:
             selection = _exact_mapping(value, _SPAN_SELECTION_KEYS)
@@ -4431,28 +4766,45 @@ def parse_span_selection_response(
         document = (
             None if segment is None else document_by_id.get(segment.document_id)
         )
-        if (
-            selection_id in seen_ids
-            or span_key in seen_spans
-            or segment_id not in allowed_segment_ids
-            or segment is None
-            or document is None
-            or start < segment.character_start
-            or end > segment.character_end
-            or end <= start
-        ):
-            rejected += 1
+        if selection_id in seen_ids or span_key in seen_spans:
+            rejection_counts["duplicate_count"] += 1
             continue
         seen_ids.add(selection_id)
         seen_spans.add(span_key)
-        exact_text = document.exact_text[start:end]
+        if segment is None or document is None or segment_id not in allowed_segment_ids:
+            rejection_counts["unknown_segment_count"] += 1
+            continue
         if (
-            not exact_text
-            or exact_text != exact_text.strip()
-            or _is_sensitive(exact_text)
-            or _atomic_fact_has_relation_claim(exact_text)
+            start < segment.character_start
+            or end > segment.character_end
+            or end <= start
         ):
-            rejected += 1
+            rejection_counts["invalid_span_count"] += 1
+            continue
+        if any(
+            prior_segment == segment_id and start < prior_end and end > prior_start
+            for prior_segment, prior_start, prior_end in accepted_spans
+        ):
+            rejection_counts["overlap_count"] += 1
+            continue
+        exact_text = document.exact_text[start:end]
+        if not exact_text or exact_text != exact_text.strip():
+            rejection_counts["invalid_span_count"] += 1
+            continue
+        if len(exact_text) < 3:
+            rejection_counts["too_short_count"] += 1
+            continue
+        if len(exact_text) > 2000:
+            rejection_counts["too_long_count"] += 1
+            continue
+        if segment.segment_kind in {"heading", "email_header"}:
+            rejection_counts["structural_metadata_only_count"] += 1
+            continue
+        if _is_sensitive(exact_text):
+            rejection_counts["sensitive_count"] += 1
+            continue
+        if _atomic_fact_has_relation_claim(exact_text):
+            rejection_counts["relation_bearing_span_count"] += 1
             continue
         byte_start = len(document.exact_text[:start].encode("utf-8"))
         byte_end = len(document.exact_text[:end].encode("utf-8"))
@@ -4493,9 +4845,10 @@ def parse_span_selection_response(
         try:
             _validate_one_atomic_fact(bundle, fact, raw["run_id"])
         except EvidenceContractError:
-            rejected += 1
+            rejection_counts["invalid_span_count"] += 1
             continue
         accepted.append(fact)
+        accepted_spans.append(span_key)
 
     dispositions = _fact_dispositions(bundle, tuple(accepted))
     payload = {
@@ -4508,6 +4861,7 @@ def parse_span_selection_response(
     }
     extraction = EvidenceExtractionBundle(**payload, bundle_digest=_sha(payload))
     validate_extraction(bundle, extraction)
+    rejected = sum(rejection_counts.values())
     summary = FactRelationValidationSummary(
         returned_fact_count=len(selection_values),
         valid_fact_count=len(accepted),
@@ -4520,7 +4874,14 @@ def parse_span_selection_response(
         polarity_conflict_count=0,
         verified_fact_summaries=tuple(item.proposition for item in accepted[:7]),
     )
-    return IndependentExtractionResult(extraction, summary)
+    receipt = EvidenceSelectionReceipt(
+        returned_selection_count=len(selection_values),
+        accepted_code_owned_fact_count=len(accepted),
+        rejected_selection_count=rejected,
+        verified_relation_count=0,
+        **rejection_counts,
+    )
+    return IndependentExtractionResult(extraction, summary, receipt)
 
 
 class GenericEvidenceService:
@@ -4543,11 +4904,35 @@ class GenericEvidenceService:
             raise TypeError("coverage_v2")
         self.coverage_v2 = coverage_v2
 
-    def resolve(self, bundle: SourceDocumentBundle) -> EvidenceResolution:
+    @staticmethod
+    def _persist_stage(
+        stage_sink: EvidenceStageSink | None,
+        stage: str,
+        payload: object,
+    ) -> None:
+        if stage_sink is None:
+            return
+        if not callable(stage_sink):
+            raise TypeError("stage_sink")
+        try:
+            stage_sink(stage, payload)
+        except EvidenceStagePersistenceError:
+            raise
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except Exception as error:
+            raise EvidenceStagePersistenceError("evidence stage persistence") from None
+
+    def resolve(
+        self,
+        bundle: SourceDocumentBundle,
+        *,
+        stage_sink: EvidenceStageSink | None = None,
+    ) -> EvidenceResolution:
         if type(bundle) is not SourceDocumentBundle:
             raise TypeError("bundle")
         if self.coverage_v2:
-            return self._resolve_v2(bundle)
+            return self._resolve_v2(bundle, stage_sink=stage_sink)
         classification = classify_source_bundle(bundle)
         if classification.classification == "insufficient":
             return EvidenceResolution("source_insufficient", None, 0, "evidence_source_insufficient")
@@ -4612,7 +4997,12 @@ class GenericEvidenceService:
             return EvidenceResolution("failed", None, calls, error.reason_code, error.diagnostic)
         return EvidenceResolution("verified", verified, calls, "evidence_verified")
 
-    def _resolve_v2(self, bundle: SourceDocumentBundle) -> EvidenceResolution:
+    def _resolve_v2(
+        self,
+        bundle: SourceDocumentBundle,
+        *,
+        stage_sink: EvidenceStageSink | None = None,
+    ) -> EvidenceResolution:
         classification = classify_source_bundle(bundle)
         if classification.classification == "insufficient":
             return EvidenceResolution("source_insufficient", None, 0, "evidence_source_insufficient")
@@ -4713,6 +5103,19 @@ class GenericEvidenceService:
             )
             extraction = independent.extraction
             fact_relation_summary = independent.summary
+            if independent.selection_receipt is None:
+                raise EvidenceStagePersistenceError("selection receipt missing")
+            self._persist_stage(
+                stage_sink,
+                "code_owned_extraction",
+                CodeOwnedExtractionCheckpoint(
+                    plan.plan_digest,
+                    extraction,
+                    independent.selection_receipt,
+                ),
+            )
+        except EvidenceStagePersistenceError:
+            raise
         except EvidenceContractError as error:
             diagnostic = error.diagnostic
             if type(diagnostic) is not EvidenceValidationDiagnostic:
@@ -4746,6 +5149,7 @@ class GenericEvidenceService:
             return EvidenceResolution(
                 "manual_attention", None, calls, "evidence_manual_attention", None,
                 failure.summary, failure, fact_relation_summary,
+                selection_receipt=independent.selection_receipt,
             )
         try:
             adjudication_payload = {
@@ -4760,28 +5164,77 @@ class GenericEvidenceService:
                 EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
             )
             calls += 1
+            try:
+                adjudication_response = self._client.generate_json(adjudication_request)
+            except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                raise
+            except Exception as error:
+                diagnostic = adjudication_transport_diagnostic(error, extraction)
+                self._persist_stage(stage_sink, "adjudication_diagnostic", diagnostic)
+                return EvidenceResolution(
+                    "failed", None, calls, "evidence_provider_failed", diagnostic,
+                    summary, None, fact_relation_summary,
+                    selection_receipt=independent.selection_receipt,
+                )
             adjudication = parse_adjudication_response(
-                self._client.generate_json(adjudication_request), extraction
+                adjudication_response, extraction
             )
+            self._persist_stage(stage_sink, "adjudication_bundle", adjudication)
+        except EvidenceStagePersistenceError:
+            raise
         except EvidenceContractError as error:
+            diagnostic = error.diagnostic
+            if type(diagnostic) is not AdjudicationValidationDiagnostic:
+                diagnostic = _adjudication_diagnostic(
+                    None,
+                    extraction,
+                    validation_stage="adjudication_semantic_validation",
+                    stable_reason="adjudication_contract_rejected",
+                    field_path="$",
+                    response_received=True,
+                )
+            self._persist_stage(stage_sink, "adjudication_diagnostic", diagnostic)
             return EvidenceResolution(
-                "failed", None, calls, error.reason_code, error.diagnostic, summary,
+                "failed", None, calls, error.reason_code, diagnostic, summary,
                 None, fact_relation_summary,
+                selection_receipt=independent.selection_receipt,
             )
         except Exception:
+            diagnostic = _adjudication_diagnostic(
+                None,
+                extraction,
+                validation_stage="adjudication_semantic_validation",
+                stable_reason="adjudication_internal_rejection",
+                field_path="$",
+                response_received=True,
+            )
+            self._persist_stage(stage_sink, "adjudication_diagnostic", diagnostic)
             return EvidenceResolution(
-                "failed", None, calls, "evidence_provider_failed", None, summary,
+                "failed", None, calls, "evidence_provider_failed", diagnostic, summary,
                 None, fact_relation_summary,
+                selection_receipt=independent.selection_receipt,
             )
         decisions = {item.decision for item in adjudication.ordered_decisions}
-        if not extraction.ordered_evidence or "supported" not in decisions:
-            failure = _coverage_manual_failure(
-                inventory, plan, stable_reason="no_evidence_candidate",
-            )
-            return EvidenceResolution(
-                "manual_attention", None, calls, "evidence_manual_attention", None,
-                failure.summary, failure, fact_relation_summary,
-            )
+        supported_ids = frozenset(
+            item.evidence_id for item in adjudication.ordered_decisions
+            if item.decision == "supported"
+        )
+        supported = tuple(
+            item.proposition for item in extraction.ordered_evidence
+            if item.evidence_id in supported_ids
+        )[:7]
+        supported_summary = FactRelationValidationSummary(
+            returned_fact_count=len(extraction.ordered_evidence),
+            valid_fact_count=len(supported_ids),
+            rejected_fact_count=len(extraction.ordered_evidence) - len(supported_ids),
+            returned_relation_count=0,
+            verified_relation_count=0,
+            rejected_relation_count=0,
+            temporal_conflict_count=0,
+            causal_conflict_count=0,
+            polarity_conflict_count=0,
+            verified_fact_summaries=supported,
+        )
         if "ambiguous" in decisions or any(
             item.evidence_kind == "insufficient_or_ambiguous" or item.uncertainty == "ambiguous"
             for item in extraction.ordered_evidence
@@ -4791,54 +5244,66 @@ class GenericEvidenceService:
             )
             return EvidenceResolution(
                 "manual_attention", None, calls, "evidence_manual_attention", None,
-                failure.summary, failure, fact_relation_summary,
+                failure.summary, failure, supported_summary,
+                selection_receipt=independent.selection_receipt,
             )
-        if "rejected" in decisions and any(
-            "sensitive_content" in item.reason_codes
-            for item in adjudication.ordered_decisions
-        ):
-            return EvidenceResolution(
-                "sensitive_rejected",
-                None,
-                calls,
-                "evidence_sensitive",
-                None,
-                summary, None, fact_relation_summary,
-            )
-        supported_ids = frozenset(
-            item.evidence_id for item in adjudication.ordered_decisions
-            if item.decision == "supported"
-        )
         if len(supported_ids) < MIN_INDEPENDENT_FACTS:
             supported = tuple(
                 item.proposition for item in extraction.ordered_evidence
                 if item.evidence_id in supported_ids
             )[:7]
-            supported_summary = replace(
-                fact_relation_summary,
-                valid_fact_count=len(supported_ids),
-                rejected_fact_count=(
-                    fact_relation_summary.returned_fact_count - len(supported_ids)
-                ),
-                verified_fact_summaries=supported,
-            )
             failure = _coverage_manual_failure(
-                inventory, plan, stable_reason="independent_fact_count_insufficient",
+                inventory,
+                plan,
+                stable_reason=(
+                    "no_evidence_candidate"
+                    if not supported_ids
+                    else "independent_fact_count_insufficient"
+                ),
             )
             return EvidenceResolution(
                 "manual_attention", None, calls, "evidence_manual_attention", None,
                 failure.summary, failure, supported_summary,
+                selection_receipt=independent.selection_receipt,
             )
         try:
             verified = _make_verified(bundle, extraction, adjudication)
         except EvidenceContractError as error:
+            diagnostic = AdjudicationValidationDiagnostic(
+                category="blocked_adjudication",
+                stable_reason="verified_bundle_revalidation_failed",
+                validation_stage="verified_bundle_validation",
+                field_path="$",
+                response_exact_type="dict",
+                schema_version=EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
+                source_binding_result="matched",
+                extraction_bundle_binding_result="matched",
+                expected_decision_count=len(extraction.ordered_evidence),
+                returned_decision_count=len(adjudication.ordered_decisions),
+                supported_decision_count=len(supported_ids),
+                rejected_decision_count=sum(
+                    item.decision == "rejected" for item in adjudication.ordered_decisions
+                ),
+                ambiguous_decision_count=sum(
+                    item.decision == "ambiguous" for item in adjudication.ordered_decisions
+                ),
+                missing_decision_count=0,
+                duplicate_decision_count=0,
+                unknown_evidence_id_count=0,
+                evidence_digest_mismatch_count=0,
+                transport_attempt_count=1,
+                response_received=True,
+            )
+            self._persist_stage(stage_sink, "adjudication_diagnostic", diagnostic)
             return EvidenceResolution(
-                "failed", None, calls, error.reason_code, error.diagnostic, summary,
-                None, fact_relation_summary,
+                "failed", None, calls, error.reason_code, diagnostic, summary,
+                None, supported_summary,
+                selection_receipt=independent.selection_receipt,
             )
         return EvidenceResolution(
             "verified", verified, calls, "evidence_verified", None, summary,
-            None, fact_relation_summary,
+            None, supported_summary,
+            selection_receipt=independent.selection_receipt,
         )
 
 
@@ -5117,6 +5582,7 @@ def verified_fact_binding_from_payload(value: object) -> VerifiedFactBinding:
 
 
 __all__ = [
+    "ADJUDICATION_DIAGNOSTIC_VERSION",
     "ADJUDICATION_REASON_CODES",
     "CAUSAL_RELATIONS",
     "COVERAGE_CLASSIFICATIONS",
@@ -5128,8 +5594,11 @@ __all__ = [
     "EVIDENCE_EXTRACTION_V2_CONTRACT_VERSION",
     "EVIDENCE_EXTRACTION_V3_CONTRACT_VERSION",
     "EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION",
+    "EVIDENCE_SELECTION_RECEIPT_VERSION",
     "EVIDENCE_KINDS",
     "EvidenceAdjudicationBundle",
+    "AdjudicationValidationDiagnostic",
+    "CodeOwnedExtractionCheckpoint",
     "EvidenceCoveragePlan",
     "EvidenceCoverageSummary",
     "FactRelationValidationSummary",
@@ -5145,6 +5614,8 @@ __all__ = [
     "EvidenceQuote",
     "EvidenceRelation",
     "EvidenceResolution",
+    "EvidenceSelectionReceipt",
+    "EvidenceStagePersistenceError",
     "EvidenceValidationDiagnostic",
     "GenericEvidenceService",
     "PUBLIC_SAFETY",
