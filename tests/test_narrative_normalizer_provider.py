@@ -350,11 +350,10 @@ def _generic_v2_responses(documents, propositions):
         "schema_version": evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
         "source_identity": documents.source_identity,
         "extraction_bundle_digest": parsed.bundle_digest,
-        "run_id": "adjudication-run-v2",
+        "run_id": evidence.adjudication_run_id(parsed),
         "decisions": [
             {
                 "evidence_id": item.evidence_id,
-                "evidence_digest": evidence.evidence_digest(item),
                 "decision": "supported",
                 "reason_codes": [],
             }
@@ -477,7 +476,11 @@ def evidence_request(operation: str, model: str):
         model,
         '{"safe":"payload"}',
         version,
-        ("block-0001",) if operation == "evidence_coverage" else (),
+        ("block-0001",)
+        if operation == "evidence_coverage"
+        else ("adjudication-run-binding",)
+        if operation == "evidence_adjudication"
+        else (),
     )
 
 
@@ -509,6 +512,12 @@ def test_evidence_transport_uses_code_owned_strict_closed_schema(operation, mode
     assert set(schema["required"]) == required
     assert set(schema["properties"]) == required
     assert "withheld_segments" not in schema["properties"]
+    if operation == "evidence_adjudication":
+        decision = schema["properties"]["decisions"]["items"]
+        assert set(decision["properties"]) == {
+            "evidence_id", "decision", "reason_codes",
+        }
+        assert schema["properties"]["run_id"]["const"] == "adjudication-run-binding"
     invoke(client, request)
     assert len(transport.calls) == 1
 

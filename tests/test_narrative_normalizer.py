@@ -309,11 +309,10 @@ def generic_evidence_responses(
         "schema_version": nn.evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
         "source_identity": documents.source_identity,
         "extraction_bundle_digest": parsed.bundle_digest,
-        "run_id": "generic-adjudication-run",
+        "run_id": nn.evidence.adjudication_run_id(parsed),
         "decisions": [
             {
                 "evidence_id": item.evidence_id,
-                "evidence_digest": nn.evidence.evidence_digest(item),
                 "decision": "supported",
                 "reason_codes": [],
             }
@@ -3191,11 +3190,10 @@ def _e9_adjudication_case(tmp_path, adjudication_builder):
         "schema_version": nn.evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
         "source_identity": documents.source_identity,
         "extraction_bundle_digest": parsed.extraction.bundle_digest,
-        "run_id": "e9-adjudication-run",
+        "run_id": nn.evidence.adjudication_run_id(parsed.extraction),
         "decisions": [
             {
                 "evidence_id": item.evidence_id,
-                "evidence_digest": nn.evidence.evidence_digest(item),
                 "decision": "supported",
                 "reason_codes": [],
             }
@@ -3275,6 +3273,9 @@ def test_e9_malformed_adjudication_is_durable_before_terminal_claim(tmp_path):
     checkpoint = nn.evidence.CodeOwnedExtractionCheckpoint(
         plan.plan_digest, parsed.extraction, parsed.selection_receipt,
     )
+    assert service.store.read_code_owned_extraction_checkpoint(
+        documents.source_identity, attempt_id,
+    ) == checkpoint
     before = (extraction_path.read_bytes(), receipt_path.read_bytes())
     created_at = service.store.read_evidence_stage_artifact(
         documents.source_identity, attempt_id, "code-owned-extraction.json",
@@ -4308,6 +4309,7 @@ def test_generic_resolution_maps_to_exact_honest_normalizer_outcome(
             heading["disposition"] = "ambiguous"
             parsed = nn.evidence.parse_extraction_response(extraction, documents)
             adjudication["extraction_bundle_digest"] = parsed.bundle_digest
+            adjudication["run_id"] = nn.evidence.adjudication_run_id(parsed)
         elif case == "rejected":
             for decision in adjudication["decisions"]:
                 decision["decision"] = "rejected"

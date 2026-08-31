@@ -23,7 +23,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -5783,6 +5783,69 @@ class NarrativeOutboxStore:
         )
         return extraction_payload, receipt_payload
 
+    def read_code_owned_extraction_checkpoint(
+        self,
+        source_identity_value: str,
+        attempt_id: str,
+    ) -> evidence.CodeOwnedExtractionCheckpoint:
+        """Reread and reconstruct the exact attempt-bound extraction checkpoint."""
+
+        extraction_payload = self.read_evidence_stage_artifact(
+            source_identity_value, attempt_id, "code-owned-extraction.json",
+        )
+        receipt_payload = self.read_evidence_stage_artifact(
+            source_identity_value, attempt_id, "selection-receipt.json",
+        )
+        extraction_keys = frozenset({
+            "schema_version", "source_identity", "attempt_identity", "run_profile",
+            "coverage_plan_digest", "extraction_contract", "extraction_bundle_digest",
+            "run_id", "code_owned_source_evidence_bundle", "created_at", "artifact_digest",
+        })
+        receipt_field_names = tuple(
+            field.name for field in fields(evidence.EvidenceSelectionReceipt)
+        )
+        receipt_keys = frozenset({
+            "schema_version", "source_identity", "attempt_identity",
+            "extraction_bundle_digest", "artifact_digest", *receipt_field_names,
+        })
+        if (
+            frozenset(extraction_payload) != extraction_keys
+            or frozenset(receipt_payload) != receipt_keys
+            or extraction_payload["schema_version"] != CODE_OWNED_EXTRACTION_SCHEMA_VERSION
+            or extraction_payload["source_identity"] != source_identity_value
+            or extraction_payload["attempt_identity"] != attempt_id
+            or extraction_payload["extraction_contract"]
+            != evidence.EVIDENCE_SPAN_SELECTION_CONTRACT_VERSION
+            or receipt_payload["schema_version"] != EVIDENCE_SELECTION_RECEIPT_SCHEMA_VERSION
+            or receipt_payload["source_identity"] != source_identity_value
+            or receipt_payload["attempt_identity"] != attempt_id
+        ):
+            _raise("narrative_normalizer_persistence_invalid")
+        try:
+            extraction_bundle = evidence.extraction_bundle_from_payload(
+                extraction_payload["code_owned_source_evidence_bundle"]
+            )
+            selection_receipt = evidence.EvidenceSelectionReceipt(**{
+                name: receipt_payload[name] for name in receipt_field_names
+            })
+            checkpoint = evidence.CodeOwnedExtractionCheckpoint(
+                coverage_plan_digest=extraction_payload["coverage_plan_digest"],
+                extraction=extraction_bundle,
+                selection_receipt=selection_receipt,
+            )
+        except (evidence.EvidenceContractError, TypeError, ValueError, KeyError):
+            _raise("narrative_normalizer_persistence_invalid")
+        if (
+            checkpoint.extraction.source_identity != source_identity_value
+            or checkpoint.extraction.bundle_digest
+            != extraction_payload["extraction_bundle_digest"]
+            or checkpoint.extraction.bundle_digest
+            != receipt_payload["extraction_bundle_digest"]
+            or checkpoint.extraction.run_id != extraction_payload["run_id"]
+        ):
+            _raise("narrative_normalizer_persistence_invalid")
+        return checkpoint
+
     def persist_adjudication_bundle(
         self,
         source_identity_value: str,
@@ -8999,7 +9062,7 @@ class NarrativeNormalizerService:
                     else MANUAL_ATTENTION_LOCAL_PROFILE
                 )
 
-                def persist_evidence_stage(stage: str, payload: object) -> None:
+                def persist_evidence_stage(stage: str, payload: object) -> object | None:
                     if stage == "code_owned_extraction":
                         if type(payload) is not evidence.CodeOwnedExtractionCheckpoint:
                             raise evidence.EvidenceStagePersistenceError(
@@ -9012,6 +9075,9 @@ class NarrativeNormalizerService:
                             payload,
                             created_at=started_at,
                         )
+                        return self.store.read_code_owned_extraction_checkpoint(
+                            identity, attempt_id,
+                        )
                     elif stage == "adjudication_bundle":
                         if type(payload) is not evidence.EvidenceAdjudicationBundle:
                             raise evidence.EvidenceStagePersistenceError(
@@ -9020,6 +9086,7 @@ class NarrativeNormalizerService:
                         self.store.persist_adjudication_bundle(
                             identity, attempt_id, payload,
                         )
+                        return None
                     elif stage == "adjudication_diagnostic":
                         if type(payload) is not evidence.AdjudicationValidationDiagnostic:
                             raise evidence.EvidenceStagePersistenceError(
@@ -9028,6 +9095,7 @@ class NarrativeNormalizerService:
                         self.store.persist_adjudication_diagnostic(
                             identity, attempt_id, payload,
                         )
+                        return None
                     else:
                         raise evidence.EvidenceStagePersistenceError(
                             "unknown evidence stage"

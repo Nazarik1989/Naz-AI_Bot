@@ -133,11 +133,10 @@ def _adjudication_payload(
         "schema_version": evidence.EVIDENCE_ADJUDICATION_CONTRACT_VERSION,
         "source_identity": extraction.source_identity,
         "extraction_bundle_digest": extraction.bundle_digest,
-        "run_id": "adjudicate-run-1",
+        "run_id": evidence.adjudication_run_id(extraction),
         "decisions": [
             {
                 "evidence_id": item.evidence_id,
-                "evidence_digest": evidence.evidence_digest(item),
                 "decision": decision,
                 "reason_codes": reasons,
             }
@@ -1465,12 +1464,16 @@ def test_nested_diagnostic_reports_only_safe_shape_metadata(tmp_path: Path) -> N
     ids=("extraction", "adjudication"),
 )
 def test_provider_evidence_schema_is_closed_versioned_and_fresh(operation: str, version: str) -> None:
-    first = evidence.evidence_model_response_schema(operation, version)
-    second = evidence.evidence_model_response_schema(operation, version)
+    required_ids = ("adjudication-run-binding",) if operation == "evidence_adjudication" else ()
+    first = evidence.evidence_model_response_schema(operation, version, required_ids)
+    second = evidence.evidence_model_response_schema(operation, version, required_ids)
     assert first == second and first is not second
     assert first["type"] == "object"
     assert first["additionalProperties"] is False
     assert set(first["required"]) == set(first["properties"])
+    if operation == "evidence_adjudication":
+        assert first["properties"]["run_id"]["const"] == required_ids[0]
+        assert "evidence_digest" not in first["properties"]["decisions"]["items"]["properties"]
     first["properties"]["caller_mutation"] = {"type": "string"}
     assert "caller_mutation" not in second["properties"]
 
@@ -1983,7 +1986,13 @@ def test_e9_extraction_checkpoint_is_persisted_before_adjudication(tmp_path):
         extraction_model="content-model",
         adjudication_model="review-model",
         coverage_v2=True,
-    ).resolve(bundle, stage_sink=lambda stage, value: stages.append((stage, value)))
+    ).resolve(
+        bundle,
+        stage_sink=lambda stage, value: (
+            stages.append((stage, value)),
+            value if stage == "code_owned_extraction" else None,
+        )[1],
+    )
 
     assert result.status == "verified"
     assert [stage for stage, _value in stages] == [
@@ -2011,7 +2020,7 @@ def test_e9_extraction_checkpoint_is_persisted_before_adjudication(tmp_path):
         ("missing-decision", "adjudication_decision_binding", "$.decisions", "missing_decision_count"),
         ("duplicate-decision", "adjudication_decision_binding", "$.decisions", "duplicate_decision_count"),
         ("unknown-evidence", "adjudication_decision_binding", "$.decisions", "unknown_evidence_id_count"),
-        ("evidence-digest", "adjudication_decision_binding", "$.decisions", "evidence_digest_mismatch_count"),
+        ("extra-evidence-digest", "adjudication_semantic_validation", "$.decisions", None),
     ),
     ids=lambda value: value if type(value) is str else None,
 )
@@ -2054,7 +2063,13 @@ def test_e9_adjudication_rejections_are_typed_and_persisted(
         extraction_model="content-model",
         adjudication_model="review-model",
         coverage_v2=True,
-    ).resolve(bundle, stage_sink=lambda name, value: stages.append((name, value)))
+    ).resolve(
+        bundle,
+        stage_sink=lambda name, value: (
+            stages.append((name, value)),
+            value if name == "code_owned_extraction" else None,
+        )[1],
+    )
 
     assert result.status == "failed"
     assert type(result.diagnostic) is evidence.AdjudicationValidationDiagnostic
@@ -2068,6 +2083,8 @@ def test_e9_adjudication_rejections_are_typed_and_persisted(
         assert getattr(result.diagnostic, counter) >= 1
     if case == "wrong-bundle":
         assert result.diagnostic.extraction_bundle_binding_result == "mismatched"
+    if case == "extra-evidence-digest":
+        assert result.diagnostic.evidence_digest_mismatch_count == 0
     assert result.model_call_count == 3
 
 
@@ -2099,7 +2116,13 @@ def test_e9_valid_adjudication_maps_supported_fact_count(
         extraction_model="content-model",
         adjudication_model="review-model",
         coverage_v2=True,
-    ).resolve(bundle, stage_sink=lambda name, value: stages.append((name, value)))
+    ).resolve(
+        bundle,
+        stage_sink=lambda name, value: (
+            stages.append((name, value)),
+            value if name == "code_owned_extraction" else None,
+        )[1],
+    )
 
     assert result.status == ("verified" if supported_count >= 3 else "manual_attention")
     assert result.fact_relation_summary.valid_fact_count == supported_count
@@ -2136,7 +2159,13 @@ def test_e9_verified_bundle_failure_persists_closed_diagnostic(tmp_path, monkeyp
         extraction_model="content-model",
         adjudication_model="review-model",
         coverage_v2=True,
-    ).resolve(bundle, stage_sink=lambda name, value: stages.append((name, value)))
+    ).resolve(
+        bundle,
+        stage_sink=lambda name, value: (
+            stages.append((name, value)),
+            value if name == "code_owned_extraction" else None,
+        )[1],
+    )
 
     assert result.status == "failed"
     assert result.diagnostic.validation_stage == "verified_bundle_validation"
@@ -2169,6 +2198,155 @@ def test_e9_stage_write_failure_stops_before_adjudication(tmp_path):
     assert [request.request_kind for request in client.requests] == [
         "evidence_coverage", "evidence_extraction",
     ]
+
+
+def test_e10_v2_attaches_code_owned_digests_in_canonical_order(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists.\nDelta exists."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    plan = evidence.parse_coverage_response(
+        _coverage_payload(bundle, inventory), bundle, inventory,
+    )
+    parsed = evidence.parse_span_selection_response(
+        _span_selection(bundle, plan, _all_segments(bundle)[:4]),
+        bundle,
+        inventory,
+        plan,
+    )
+    response = _adjudication_payload(parsed.extraction)
+    response["decisions"][-1]["decision"] = "rejected"
+    response["decisions"][-1]["reason_codes"] = ["unsupported_proposition"]
+    response["decisions"].reverse()
+
+    adjudication = evidence.parse_adjudication_response(
+        response, parsed.extraction,
+    )
+
+    assert adjudication.contract_version == "normalizer-evidence-adjudication-v2"
+    assert [item.evidence_id for item in adjudication.ordered_decisions] == [
+        item.evidence_id for item in parsed.extraction.ordered_evidence
+    ]
+    assert [item.evidence_digest for item in adjudication.ordered_decisions] == [
+        evidence.evidence_digest(item) for item in parsed.extraction.ordered_evidence
+    ]
+    assert [item.decision for item in adjudication.ordered_decisions].count("supported") == 3
+    assert [item.decision for item in adjudication.ordered_decisions].count("rejected") == 1
+    assert all("evidence_digest" not in item for item in response["decisions"])
+
+
+@pytest.mark.parametrize(
+    ("case", "reason", "stage"),
+    (
+        ("extra-digest", "decision_schema_invalid", "adjudication_semantic_validation"),
+        ("missing", "missing_evidence_id", "adjudication_decision_binding"),
+        ("duplicate", "duplicate_evidence_id", "adjudication_decision_binding"),
+        ("unknown", "unknown_evidence_id", "adjudication_decision_binding"),
+        ("source", "source_identity_mismatch", "adjudication_source_binding"),
+        ("extraction", "extraction_bundle_digest_mismatch", "adjudication_source_binding"),
+        ("version", "contract_version_mismatch", "adjudication_contract_version"),
+        ("decision", "invalid_decision_value", "adjudication_semantic_validation"),
+        ("reason", "invalid_reason_code", "adjudication_semantic_validation"),
+        ("malformed", "malformed_json", "adjudication_json_parse"),
+    ),
+)
+def test_e10_v2_failures_have_closed_typed_diagnostics(tmp_path, case, reason, stage):
+    bundle = _write_bundle(tmp_path, {"facts.txt": "Alpha exists.\nBeta exists."})
+    extraction = _parse_base(bundle)
+    response = _adjudication_payload(extraction)
+    if case == "extra-digest":
+        response["decisions"][0]["evidence_digest"] = "0" * 64
+    elif case == "missing":
+        response["decisions"].pop()
+    elif case == "duplicate":
+        response["decisions"].append(dict(response["decisions"][0]))
+    elif case == "unknown":
+        response["decisions"][0]["evidence_id"] = "unknown-evidence"
+    elif case == "source":
+        response["source_identity"] = "0" * 64
+    elif case == "extraction":
+        response["extraction_bundle_digest"] = "0" * 64
+    elif case == "version":
+        response["schema_version"] = evidence.EVIDENCE_ADJUDICATION_V1_CONTRACT_VERSION
+    elif case == "decision":
+        response["decisions"][0]["decision"] = "maybe"
+    elif case == "reason":
+        response["decisions"][0]["decision"] = "rejected"
+        response["decisions"][0]["reason_codes"] = ["invented_reason"]
+    else:
+        response = "{not-json"
+
+    with pytest.raises(evidence.EvidenceContractError) as caught:
+        evidence.parse_adjudication_response(response, extraction)
+
+    diagnostic = caught.value.diagnostic
+    assert type(diagnostic) is evidence.AdjudicationValidationDiagnostic
+    assert diagnostic.stable_reason == reason
+    assert diagnostic.validation_stage == stage
+    if case != "version":
+        assert diagnostic.evidence_digest_mismatch_count == 0
+
+
+def test_e10_v1_artifact_replays_and_historical_digest_mismatch_is_typed(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    extraction = _parse_base(bundle)
+    response = _adjudication_payload(extraction)
+    response["schema_version"] = evidence.EVIDENCE_ADJUDICATION_V1_CONTRACT_VERSION
+    for decision, item in zip(response["decisions"], extraction.ordered_evidence, strict=True):
+        decision["evidence_digest"] = evidence.evidence_digest(item)
+    adjudication = evidence.parse_adjudication_v1_response(response, extraction)
+    verified = evidence._make_verified(bundle, extraction, adjudication)
+
+    assert evidence.verified_bundle_from_payload(
+        evidence.verified_bundle_to_payload(verified), bundle,
+    ) == verified
+
+    response["decisions"][0]["evidence_digest"] = "0" * 64
+    with pytest.raises(evidence.EvidenceContractError) as caught:
+        evidence.parse_adjudication_v1_response(response, extraction)
+    assert caught.value.diagnostic.stable_reason == "evidence_digest_mismatch"
+    assert caught.value.diagnostic.evidence_digest_mismatch_count == 1
+
+
+def test_e10_adjudication_uses_reread_immutable_checkpoint(tmp_path):
+    bundle = _write_bundle(
+        tmp_path,
+        {"facts.txt": "Alpha exists.\nBeta exists.\nGamma exists."},
+    )
+    inventory = evidence.build_source_block_inventory(bundle)
+    coverage = _coverage_payload(bundle, inventory)
+    plan = evidence.parse_coverage_response(coverage, bundle, inventory)
+    selection = _span_selection(bundle, plan, _all_segments(bundle)[:3])
+    parsed = evidence.parse_span_selection_response(selection, bundle, inventory, plan)
+    client = FakeEvidenceClient([
+        coverage, selection, _adjudication_payload(parsed.extraction),
+    ])
+    identities = []
+
+    def persist_and_reread(stage, value):
+        if stage != "code_owned_extraction":
+            return None
+        reread = evidence.CodeOwnedExtractionCheckpoint(
+            value.coverage_plan_digest,
+            evidence.extraction_bundle_from_payload(
+                evidence._extraction_payload(value.extraction)
+            ),
+            evidence.EvidenceSelectionReceipt(**value.selection_receipt.safe_payload()),
+        )
+        identities.append((id(value), id(reread)))
+        return reread
+
+    result = evidence.GenericEvidenceService(
+        client,
+        extraction_model="content-model",
+        adjudication_model="review-model",
+        coverage_v2=True,
+    ).resolve(bundle, stage_sink=persist_and_reread)
+
+    assert result.status == "verified"
+    assert identities and identities[0][0] != identities[0][1]
+    assert result.verified_bundle.extraction == parsed.extraction
 
 
 def test_span_selection_insufficient_facts_yield_useful_manual_attention(tmp_path):

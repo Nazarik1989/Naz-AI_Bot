@@ -556,6 +556,16 @@ counts. Both artifacts are `0600`, append-only for one attempt, byte-idempotent
 on exact replay, and conflicting on a divergent replay. No model response,
 prompt, credential, withheld segment, or provider exception text is stored.
 
+Before adjudication, the Normalizer rereads that exact attempt-bound extraction
+checkpoint and reconstructs its immutable evidence-ID-to-digest binding.
+`normalizer-evidence-adjudication-v2` lets the model return only the source,
+extraction and run bindings plus closed decisions containing `evidence_id`,
+`decision`, and `reason_codes`. The model cannot return `evidence_digest` or any
+source/fact text. Code validates complete, duplicate-free decision coverage,
+restores canonical extraction order, and attaches every digest from the reread
+checkpoint. Historical v1 adjudication artifacts remain strict-readable for
+audit; new generic runs use v2 and never rewrite an earlier attempt.
+
 After adjudication starts, every blocked path writes a closed
 `normalizer-adjudication-diagnostic-v1` before the claim may become terminal.
 The diagnostic records only validation stage, stable reason, safe field path,
