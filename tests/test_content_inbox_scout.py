@@ -33,7 +33,7 @@ def ranking_wire_format() -> dict:
 
 
 def ready_wire_format() -> dict:
-    return scout.ready_material_response_format(TEST_RUN_ID, TEST_CANDIDATE_IDS[0])
+    return scout.ready_material_response_format(TEST_RUN_ID, TEST_CANDIDATE_IDS[0], 5)
 
 
 def schema_node_keywords(response_format: dict) -> set[str]:
@@ -95,7 +95,6 @@ def ranking_payload(snap: scout.InboxSnapshot, run_id: str) -> dict:
         rows.append(
             {
                 "candidate_id": candidate.candidate_id,
-                "rank": rank,
                 "story_strength_score": 90 - rank,
                 "reel_ease_score": 95 - rank,
                 "clarity_score": 88,
@@ -104,9 +103,6 @@ def ranking_payload(snap: scout.InboxSnapshot, run_id: str) -> dict:
                 "human_title": f"История {rank}",
                 "one_sentence_pitch": "Кнопка выглядела готовой, но одна проверка останавливала сообщение.",
                 "why_it_works": "В истории есть видимый конфликт, простое действие и понятный результат.",
-                "recommended_format": "short_reel",
-                "recommended_duration_seconds": 16,
-                "recommended_scene_count": 5,
                 "editorial_risk": "none",
                 "reason_codes": ["source_grounded", "clear_conflict", "simple_visuals"],
             }
@@ -119,7 +115,20 @@ def ranking_payload(snap: scout.InboxSnapshot, run_id: str) -> dict:
     }
 
 
-def ready_payload(run_id: str, candidate_id: str) -> dict:
+def legacy_ranking_payload(snap: scout.InboxSnapshot, run_id: str) -> dict:
+    value = ranking_payload(snap, run_id)
+    value["schema_version"] = scout.RANKING_SCHEMA_V1
+    for rank, row in enumerate(value["ranked_candidates"], start=1):
+        row.update({
+            "rank": rank,
+            "recommended_format": "short_reel",
+            "recommended_duration_seconds": 99,
+            "recommended_scene_count": 99,
+        })
+    return value
+
+
+def ready_payload(run_id: str, candidate_id: str, scene_count: int = 5) -> dict:
     post = (
         "На экране была обычная кнопка отправки, и всё выглядело готовым. Но сообщение не уходило. "
         "Причина оказалась не в интерфейсе, а в проверке перед отправкой: одна граница считала действие допустимым, другая останавливала его без понятного объяснения. "
@@ -137,19 +146,23 @@ def ready_payload(run_id: str, candidate_id: str) -> dict:
         "hook": "Кнопка была, а отправки не было.",
         "telegram_post": post,
         "reel_voice_over": "Кнопка обещала отправку, но проверка останавливала сообщение. Мы связали правила, и теперь оператор сразу видит понятный результат.",
-        "reel_duration_seconds": 16,
-        "scenes": [
-            {"order": 1, "start_second": 0, "end_second": 3, "screen_text": "Кнопка готова", "visual_brief": "Синтетическая карточка и курсор."},
-            {"order": 2, "start_second": 3, "end_second": 6, "screen_text": "Но тишина", "visual_brief": "Карточка остаётся на месте."},
-            {"order": 3, "start_second": 6, "end_second": 9, "screen_text": "Правила спорят", "visual_brief": "Два простых блока расходятся."},
-            {"order": 4, "start_second": 9, "end_second": 12, "screen_text": "Граница исправлена", "visual_brief": "Блоки соединяются одной линией."},
-            {"order": 5, "start_second": 12, "end_second": 16, "screen_text": "Результат понятен", "visual_brief": "Синтетическое подтверждение на карточке."},
-        ],
+        "scene_contents": {
+            f"scene_{index:02d}": {
+                "screen_text": f"Сцена {index}",
+                "visual_brief": f"Синтетическая карточка и действие {index}.",
+            }
+            for index in range(1, scene_count + 1)
+        },
         "caption": "Интерфейс должен обещать только выполнимое.",
         "cover_text": "КНОПКА БЫЛА. ОТПРАВКИ — НЕТ.",
         "safety_note": "Использовать только синтетический интерфейс.",
         "source_limitations": "Материал описывает только зафиксированный эпизод.",
     }
+
+
+def ready_payload_for(run: scout.ScoutRunResult, candidate_id: str) -> dict:
+    ranking = scout.ranked_for_run(run, candidate_id)
+    return ready_payload(run.run_id, candidate_id, ranking.recommended_scene_count)
 
 
 async def create_run(tmp_path: Path, snap: scout.InboxSnapshot | None = None):
@@ -339,27 +352,30 @@ def test_ranking_rejects_missing_candidate(tmp_path):
         scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
 
 
-@pytest.mark.parametrize("duration,scenes", [(11, 5), (21, 5), (16, 3), (16, 8)])
-def test_short_reel_bounds_closed(tmp_path, duration, scenes):
+@pytest.mark.parametrize("complexity,ease,expected", [
+    (1, 80, (15, 5, False)),
+    (2, 60, (18, 6, False)),
+    (3, 100, (20, 7, True)),
+    (1, 59, (20, 7, True)),
+])
+def test_code_owned_reel_spec_policy(tmp_path, complexity, ease, expected):
+    candidate = snapshot(tmp_path).shortlist[0]
+    features = {**candidate.local_features, "estimated_scene_complexity": complexity}
+    candidate = scout.replace(candidate, local_features=features)
+    assert scout.code_owned_reel_spec(candidate, ease) == expected
+
+
+def test_code_owned_weighted_order_ignores_model_input_order(tmp_path):
     snap = snapshot(tmp_path)
     run_id = "csr-" + "a" * 24
     payload = ranking_payload(snap, run_id)
-    payload["ranked_candidates"][0]["recommended_duration_seconds"] = duration
-    payload["ranked_candidates"][0]["recommended_scene_count"] = scenes
-    with pytest.raises(scout.ScoutError, match="scout_short_reel_bounds_invalid"):
-        scout.parse_ranking(json.dumps(payload), run_id, snap, lambda _: [])
-
-
-def test_code_owned_weighted_order_ignores_model_rank(tmp_path):
-    snap = snapshot(tmp_path)
-    run_id = "csr-" + "a" * 24
-    payload = ranking_payload(snap, run_id)
-    payload["ranked_candidates"][0]["rank"] = 2
-    payload["ranked_candidates"][1]["rank"] = 1
-    payload["ranked_candidates"][0]["story_strength_score"] = 100
-    payload["ranked_candidates"][0]["reel_ease_score"] = 100
+    target = payload["ranked_candidates"][-1]
+    target["story_strength_score"] = 100
+    target["reel_ease_score"] = 100
+    payload["ranked_candidates"].reverse()
     ranked = scout.parse_ranking(json.dumps(payload), run_id, snap, lambda _: [])
-    assert ranked[0].candidate_id == payload["ranked_candidates"][0]["candidate_id"]
+    assert ranked[0].candidate_id == target["candidate_id"]
+    assert [item.rank for item in ranked] == list(range(1, len(ranked) + 1))
 
 
 def test_exact_duplicate_snapshot_uses_zero_calls_and_no_orphan_run(tmp_path):
@@ -404,17 +420,77 @@ def test_refresh_creates_request_bound_new_run(tmp_path):
     first, _ = asyncio.run(create_run(tmp_path, snap))
     calls = []
 
-    async def model(messages, _response_format):
+    async def model(*_args):
         calls.append(1)
-        run_id = json.loads(messages[1]["content"])["scout_run_id"]
-        return json.dumps(ranking_payload(snap, run_id))
+        raise AssertionError("safe persisted response should be salvaged")
 
     refreshed = asyncio.run(scout.rank_snapshot(
         tmp_path / "state", snap, admin_id=ADMIN, expected_admin_id=ADMIN,
         operator_request_id="refresh-ranking-0001", refresh=True, recent_summaries=(),
         risk_detector=lambda _: [], model_call=model,
     ))
-    assert refreshed.run_id != first.run_id and calls == [1]
+    assert refreshed.run_id != first.run_id
+    assert refreshed.model_calls == 0 and calls == []
+    assert (refreshed.run_dir / "ranking-salvage.json").is_file()
+
+
+def test_persisted_v1_ranking_artifact_remains_readable(tmp_path):
+    run, _ = asyncio.run(create_run(tmp_path))
+    path = run.run_dir / "ranking.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["schema_version"] = scout.RANKING_SCHEMA_V1
+    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    loaded = scout.load_run(tmp_path / "state", run.run_id)
+    assert loaded.ranked == run.ranked
+
+
+def test_safe_legacy_response_salvage_is_zero_call_and_append_only(tmp_path):
+    snap = snapshot(tmp_path)
+    prior, _ = asyncio.run(create_run(tmp_path, snap))
+    response_path = prior.run_dir / "provider-ranking-response.json"
+    response_path.write_text(
+        json.dumps(legacy_ranking_payload(snap, prior.run_id), ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    before = file_hashes(prior.run_dir)
+    calls = []
+
+    async def forbidden(*_args):
+        calls.append(1)
+        raise AssertionError("provider called")
+
+    derived = asyncio.run(scout.rank_snapshot(
+        tmp_path / "state", snap, admin_id=ADMIN, expected_admin_id=ADMIN,
+        operator_request_id="refresh-legacy-salvage-01", refresh=True,
+        recent_summaries=(), risk_detector=lambda _: [], model_call=forbidden,
+    ))
+    assert derived.run_id != prior.run_id and derived.model_calls == 0 and calls == []
+    assert file_hashes(prior.run_dir) == before
+    assert all(item.recommended_format == "short_reel" for item in derived.ranked)
+    assert all(12 <= item.recommended_duration_seconds <= 20 for item in derived.ranked)
+    assert all(4 <= item.recommended_scene_count <= 7 for item in derived.ranked)
+
+
+def test_unbound_prior_response_is_not_salvaged_and_refresh_calls_once(tmp_path):
+    snap = snapshot(tmp_path)
+    prior, _ = asyncio.run(create_run(tmp_path, snap))
+    response_path = prior.run_dir / "provider-ranking-response.json"
+    value = json.loads(response_path.read_text(encoding="utf-8"))
+    value["source_snapshot_digest"] = "f" * 64
+    response_path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    calls = []
+
+    async def model(messages, _response_format):
+        calls.append(1)
+        run_id = json.loads(messages[1]["content"])["scout_run_id"]
+        return json.dumps(ranking_payload(snap, run_id), ensure_ascii=False)
+
+    refreshed = asyncio.run(scout.rank_snapshot(
+        tmp_path / "state", snap, admin_id=ADMIN, expected_admin_id=ADMIN,
+        operator_request_id="refresh-unbound-response-01", refresh=True,
+        recent_summaries=(), risk_detector=lambda _: [], model_call=model,
+    ))
+    assert refreshed.model_calls == 1 and calls == [1]
 
 
 def test_details_are_stored_and_zero_call(tmp_path):
@@ -441,7 +517,7 @@ def test_prepare_call_exactly_once_and_selected_candidate_only(tmp_path):
 
     async def model(messages, response_format):
         calls.append((messages, response_format))
-        return json.dumps(ready_payload(run.run_id, selected), ensure_ascii=False)
+        return json.dumps(ready_payload_for(run, selected), ensure_ascii=False)
 
     result = asyncio.run(scout.prepare_candidate(
         tmp_path / "state", run.run_id, selected, admin_id=ADMIN,
@@ -458,7 +534,7 @@ def test_duplicate_prepare_returns_stored_with_zero_calls(tmp_path):
     selected = run.ranked[0].candidate_id
 
     async def model(*_args):
-        return json.dumps(ready_payload(run.run_id, selected), ensure_ascii=False)
+        return json.dumps(ready_payload_for(run, selected), ensure_ascii=False)
 
     asyncio.run(scout.prepare_candidate(tmp_path / "state", run.run_id, selected, admin_id=ADMIN, expected_admin_id=ADMIN, risk_detector=lambda _: [], model_call=model))
 
@@ -472,16 +548,35 @@ def test_duplicate_prepare_returns_stored_with_zero_calls(tmp_path):
 def test_prepared_scene_timings_must_be_contiguous(tmp_path):
     run, _ = asyncio.run(create_run(tmp_path))
     selected = run.ranked[0].candidate_id
-    payload = ready_payload(run.run_id, selected)
-    payload["scenes"][2]["start_second"] = 7
+    payload = ready_payload_for(run, selected)
+    artifact = scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
+    artifact["scenes"][2]["start_second"] += 1
     with pytest.raises(scout.ScoutError, match="scout_ready_scene_timing_invalid"):
-        scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
+        scout._validate_ready_artifact(artifact, run, scout.candidate_for_run(run, selected), lambda _: [])
+
+
+def test_ready_parser_assigns_stored_reel_spec_and_code_owned_timings(tmp_path):
+    run, _ = asyncio.run(create_run(tmp_path))
+    selected = run.ranked[0].candidate_id
+    ranking = scout.ranked_for_run(run, selected)
+    payload = ready_payload_for(run, selected)
+    assert "reel_duration_seconds" not in payload and "scenes" not in payload
+    artifact = scout._parse_ready(
+        json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: []
+    )
+    assert artifact["reel_duration_seconds"] == ranking.recommended_duration_seconds
+    assert len(artifact["scenes"]) == ranking.recommended_scene_count
+    assert [(item["start_second"], item["end_second"]) for item in artifact["scenes"]] == list(
+        scout.code_owned_scene_timings(
+            ranking.recommended_duration_seconds, ranking.recommended_scene_count
+        )
+    )
 
 
 def test_ready_material_rejects_short_telegram_post(tmp_path):
     run, _ = asyncio.run(create_run(tmp_path))
     selected = run.ranked[0].candidate_id
-    payload = ready_payload(run.run_id, selected)
+    payload = ready_payload_for(run, selected)
     payload["telegram_post"] = "too short"
     with pytest.raises(scout.ScoutError, match="scout_ready_text_invalid"):
         scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
@@ -491,20 +586,21 @@ def test_ready_material_rejects_short_telegram_post(tmp_path):
 def test_ready_material_rejects_scene_count_outside_local_bounds(tmp_path, scene_count):
     run, _ = asyncio.run(create_run(tmp_path))
     selected = run.ranked[0].candidate_id
-    payload = ready_payload(run.run_id, selected)
+    payload = ready_payload_for(run, selected)
+    artifact = scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
     if scene_count == 3:
-        payload["scenes"] = payload["scenes"][:3]
+        artifact["scenes"] = artifact["scenes"][:3]
     else:
-        payload["scenes"] = payload["scenes"] + [copy.deepcopy(payload["scenes"][-1]) for _ in range(3)]
+        artifact["scenes"] = artifact["scenes"] + [copy.deepcopy(artifact["scenes"][-1]) for _ in range(8 - len(artifact["scenes"]))]
     with pytest.raises(scout.ScoutError, match="scout_ready_reel_invalid"):
-        scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
+        scout._validate_ready_artifact(artifact, run, scout.candidate_for_run(run, selected), lambda _: [])
 
 
 @pytest.mark.parametrize("bad", ["/opt/private/story.json", "a" * 64, "API_KEY=value"])
 def test_prepared_material_rejects_path_hash_and_secret(tmp_path, bad):
     run, _ = asyncio.run(create_run(tmp_path))
     selected = run.ranked[0].candidate_id
-    payload = ready_payload(run.run_id, selected)
+    payload = ready_payload_for(run, selected)
     payload["safety_note"] = bad
     with pytest.raises(scout.ScoutError, match="scout_ready_text_invalid"):
         scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
@@ -661,7 +757,7 @@ def test_provider_schema_preflight_rejects_property_without_type():
 
 def test_provider_schema_preflight_rejects_open_object():
     value = copy.deepcopy(ready_wire_format())
-    value["json_schema"]["schema"]["properties"]["scenes"]["items"]["additionalProperties"] = True
+    value["json_schema"]["schema"]["properties"]["scene_contents"]["additionalProperties"] = True
     with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
         scout.validate_provider_response_format(value)
 
@@ -682,10 +778,38 @@ def test_ranking_wire_schema_has_dynamic_identity_constraints():
     assert candidate == {"type": "string", "enum": list(TEST_CANDIDATE_IDS)}
 
 
+def test_ranking_v2_omits_model_owned_reel_and_order_fields():
+    item = ranking_wire_format()["json_schema"]["schema"]["properties"]["ranked_candidates"]["items"]
+    assert set(item["properties"]) == {
+        "candidate_id", "story_strength_score", "reel_ease_score", "clarity_score",
+        "novelty_score", "confidence_score", "human_title", "one_sentence_pitch",
+        "why_it_works", "editorial_risk", "reason_codes",
+    }
+    assert not {"rank", "recommended_format", "recommended_duration_seconds", "recommended_scene_count", "final_score"} & set(item["properties"])
+
+
+def test_ranking_v2_score_enums_are_exact_zero_through_one_hundred():
+    properties = ranking_wire_format()["json_schema"]["schema"]["properties"]["ranked_candidates"]["items"]["properties"]
+    for key in ("story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score"):
+        assert properties[key] == {"type": "integer", "enum": list(range(101))}
+        assert 101 not in properties[key]["enum"]
+
+
 def test_ready_wire_schema_has_dynamic_identity_constraints():
     properties = ready_wire_format()["json_schema"]["schema"]["properties"]
     assert properties["scout_run_id"] == {"type": "string", "const": TEST_RUN_ID}
     assert properties["candidate_id"] == {"type": "string", "const": TEST_CANDIDATE_IDS[0]}
+
+
+def test_ready_wire_schema_uses_exact_code_owned_scene_fields_without_timing():
+    properties = ready_wire_format()["json_schema"]["schema"]["properties"]
+    assert "reel_duration_seconds" not in properties and "scenes" not in properties
+    scenes = properties["scene_contents"]
+    assert list(scenes["properties"]) == [f"scene_{index:02d}" for index in range(1, 6)]
+    assert all(
+        set(node["properties"]) == {"screen_text", "visual_brief"}
+        for node in scenes["properties"].values()
+    )
 
 
 @pytest.mark.parametrize("factory", [ranking_wire_format, ready_wire_format])
@@ -716,7 +840,7 @@ def test_provider_schema_preflight_rejects_nonportable_keyword(keyword, value):
         scout.validate_provider_response_format(response_format)
 
 
-def test_duplicate_reason_codes_are_rejected_by_local_parser(tmp_path):
+def test_duplicate_known_reason_codes_are_canonicalized_by_local_parser(tmp_path):
     snap = snapshot(tmp_path)
     payload = ranking_payload(snap, TEST_RUN_ID)
     payload["ranked_candidates"][0]["reason_codes"].append("source_grounded")
@@ -727,8 +851,25 @@ def test_duplicate_reason_codes_are_rejected_by_local_parser(tmp_path):
             tuple(item.candidate_id for item in snap.shortlist),
         )
     )
+    ranked = scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+    selected = next(item for item in ranked if item.candidate_id == payload["ranked_candidates"][0]["candidate_id"])
+    assert selected.reason_codes.count("source_grounded") == 1
+
+
+def test_unknown_reason_code_is_rejected(tmp_path):
+    snap = snapshot(tmp_path)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    payload["ranked_candidates"][0]["reason_codes"] = ["unknown_reason"]
     with pytest.raises(scout.ScoutError, match="scout_ranking_risk_invalid"):
         scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+
+
+@pytest.mark.parametrize("duration,scenes", [(15, 5), (18, 6), (20, 7)])
+def test_code_owned_scene_timings_are_contiguous_and_exact(duration, scenes):
+    timings = scout.code_owned_scene_timings(duration, scenes)
+    assert timings[0][0] == 0 and timings[-1][1] == duration
+    assert all(end - start >= 2 for start, end in timings)
+    assert all(timings[index][1] == timings[index + 1][0] for index in range(len(timings) - 1))
 
 
 def test_invalid_ranking_schema_stops_before_marker_and_provider(tmp_path):
