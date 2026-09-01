@@ -72,6 +72,7 @@ import gaming_vertical
 import naz_editorial_catalog
 import naz_vk_music
 import operator_events
+import operator_content_package
 import scheduled_work
 import semantic_autopost
 import story_production
@@ -221,6 +222,12 @@ AGENT_CONTENT_REUSE_SEEN = env_bool("AGENT_CONTENT_REUSE_SEEN", True)
 AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_content_seen.json").strip())
 NAZ_STORY_PACK_ROOT = Path(
     os.getenv("NAZ_STORY_PACK_ROOT", "/var/lib/naz-ai-bot/story-packs").strip()
+)
+NAZ_OPERATOR_CONTENT_PACKAGE_ROOT = Path(
+    os.getenv(
+        "NAZ_OPERATOR_CONTENT_PACKAGE_ROOT",
+        "/var/lib/naz-ai-bot/operator-content-packages",
+    ).strip()
 )
 NAZ_STORY_RENDER_ENABLED = env_bool("NAZ_STORY_RENDER_ENABLED", False)
 NAZ_STORY_PRIVATE_DELIVERY_ENABLED = env_bool("NAZ_STORY_PRIVATE_DELIVERY_ENABLED", True)
@@ -528,6 +535,58 @@ def reels_plan_keyboard(plan_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     BTN_REELS_STATUS,
                     callback_data=f"reels_status:{plan_id}",
+                )
+            ],
+        ]
+    )
+
+
+def operator_package_preview_keyboard(
+    imported: operator_content_package.ImportedOperatorPackage,
+) -> InlineKeyboardMarkup:
+    """Three actions bound to one exact private operator package."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Собрать Reel",
+                    callback_data=operator_content_package.callback_data(imported, "build"),
+                ),
+                InlineKeyboardButton(
+                    "Показать сценарий",
+                    callback_data=operator_content_package.callback_data(imported, "script"),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Пропустить",
+                    callback_data=operator_content_package.callback_data(imported, "skip"),
+                )
+            ],
+        ]
+    )
+
+
+def operator_package_ready_reel_keyboard(
+    imported: operator_content_package.ImportedOperatorPackage,
+) -> InlineKeyboardMarkup:
+    """A finished private Reel still has no automatic publication path."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Опубликовать",
+                    callback_data=operator_content_package.callback_data(imported, "publish"),
+                ),
+                InlineKeyboardButton(
+                    "Переделать",
+                    callback_data=operator_content_package.callback_data(imported, "remake"),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Отменить",
+                    callback_data=operator_content_package.callback_data(imported, "cancel"),
                 )
             ],
         ]
@@ -6282,6 +6341,132 @@ def reels_action_from_reply(text: str) -> Optional[str]:
     return _REELS_REPLY_ACTIONS.get(normalized)
 
 
+async def operator_content_package_document(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Import one JSON/Markdown package only after the admin identity gate."""
+    if not update.effective_user or not update.message or not update.message.document:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Операторские контент-пакеты доступны только администратору.")
+        return
+    document = update.message.document
+    if document.file_size is not None and document.file_size > operator_content_package.MAX_SOURCE_BYTES:
+        await update.message.reply_text("⚠️ Операторский пакет отклонён: файл превышает закрытый лимит.")
+        return
+    filename = str(document.file_name or "")
+    lowered = filename.casefold()
+    if not lowered.endswith((".md", ".json")):
+        await update.message.reply_text("⚠️ Операторский пакет должен быть UTF-8 Markdown или JSON.")
+        return
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        data = bytes(await telegram_file.download_as_bytearray())
+        if lowered.endswith(".json"):
+            package = operator_content_package.parse_json_package(data)
+        else:
+            unique = str(document.file_unique_id or document.file_id)
+            request_digest = hashlib.sha256(
+                f"{update.effective_user.id}|{update.message.message_id}|{unique}".encode("utf-8")
+            ).hexdigest()[:24]
+            package = operator_content_package.package_from_editorial_markdown(
+                data,
+                f"tg-operator-package-{request_digest}",
+            )
+        imported = await asyncio.to_thread(
+            operator_content_package.import_package,
+            NAZ_OPERATOR_CONTENT_PACKAGE_ROOT,
+            package,
+            operator_id=update.effective_user.id,
+            expected_operator_id=ADMIN_ID,
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=operator_content_package.preview_text(package),
+            reply_markup=operator_package_preview_keyboard(imported),
+        )
+        logger.info(
+            "Operator content package preview delivered | package_id=%s | created=%s",
+            imported.package_id,
+            imported.created,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, TelegramError, operator_content_package.OperatorPackageError) as exc:
+        reason = getattr(exc, "reason_code", type(exc).__name__)
+        logger.warning("Operator content package rejected | reason=%s", reason)
+        await update.message.reply_text(f"⚠️ Операторский пакет отклонён безопасно: {reason}.")
+
+
+async def operator_content_package_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle bound private actions; never publish from the preview boundary."""
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    try:
+        binding = await asyncio.to_thread(
+            operator_content_package.resolve_callback,
+            NAZ_OPERATOR_CONTENT_PACKAGE_ROOT,
+            query.data,
+            operator_id=update.effective_user.id,
+            expected_operator_id=ADMIN_ID,
+        )
+        package = await asyncio.to_thread(
+            operator_content_package.load_bound_package,
+            NAZ_OPERATOR_CONTENT_PACKAGE_ROOT,
+            binding,
+        )
+    except (OSError, ValueError, operator_content_package.OperatorPackageError) as exc:
+        reason = getattr(exc, "reason_code", "operator_callback_rejected")
+        await query.answer(f"Действие отклонено: {reason}", show_alert=True)
+        return
+
+    await query.answer()
+    if binding.action == "script":
+        await send_long_to_chat(
+            context.bot,
+            update.effective_user.id,
+            operator_content_package.script_text(package),
+        )
+        return
+    if binding.action == "build":
+        operator_content_package.assert_no_music(package)
+        if not operator_content_package.media_pipeline_compatible(package):
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=(
+                    "Сборка не запущена: действующий media-production pipeline принимает "
+                    "только 4–7 сцен и Reel 12–20 секунд. Пакет 9 сцен / 47 секунд не будет "
+                    "искажён, обрезан или отправлен провайдеру автоматически."
+                ),
+            )
+            return
+        # The compatibility gate is intentionally closed until a current worker
+        # adapter can preserve every scene and the exact editorial duration.
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Сборка ожидает совместимый media adapter; публикация не выполнялась.",
+        )
+        return
+    if binding.action == "skip":
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Операторский пакет пропущен. Контент и публикационные очереди не изменены.",
+        )
+        return
+    # These controls are emitted only for a finished private Reel.  Even then,
+    # publication stays disabled here and requires another explicit boundary.
+    await context.bot.send_message(
+        chat_id=update.effective_user.id,
+        text=(
+            "Действие принято только как private operator intent. Автоматическая публикация "
+            "для operator-content-package-v1 отключена и требует отдельного подтверждения."
+        ),
+    )
+
+
 async def reels_control_response(
     action: str,
     *,
@@ -9567,6 +9752,12 @@ def build_application() -> Application:
         )
     )
     application.add_handler(
+        CallbackQueryHandler(
+            operator_content_package_callback,
+            pattern=r"^ocp:(?:build|script|skip|publish|remake|cancel):[a-f0-9]{24}$",
+        )
+    )
+    application.add_handler(
         CallbackQueryHandler(generated_revision_callback, pattern=r"^genrev_(?:apply|cancel):[A-Za-z0-9_-]+$")
     )
     application.add_handler(
@@ -9575,6 +9766,9 @@ def build_application() -> Application:
 
     # A shared contact follows /delegate and is used only for this one conversation.
     application.add_handler(MessageHandler(filters.CONTACT, delegation_contact))
+    application.add_handler(
+        MessageHandler(filters.Document.ALL, operator_content_package_document)
+    )
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_instruction))
 
