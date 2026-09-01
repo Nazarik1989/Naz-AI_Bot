@@ -16,8 +16,8 @@ Each private result card provides `Подготовить материал`, `П
 ## Contracts and limits
 
 - Run: `content-inbox-scout-run-v1`
-- Ranking provider response: `content-inbox-scout-ranking-v2`
-- Ranking artifact: `content-inbox-scout-ranking-artifact-v2`
+- Ranking provider response: `content-inbox-scout-ranking-v3`
+- Ranking artifact: `content-inbox-scout-ranking-artifact-v3`
 - Prepared-material provider response: `content-inbox-ready-material-v2`
 - Prepared-material artifact: `content-inbox-ready-material-artifact-v2`
 - Preference: `content-inbox-scout-preference-v1`
@@ -26,9 +26,11 @@ Each private result card provides `Подготовить материал`, `П
 - One preparation call per selected candidate; no retry or repair
 - Code-owned short Reel specifications: 15 seconds/5 scenes, 18 seconds/6 scenes, or 20 seconds/7 scenes
 
-The model supplies editorial scores and safe explanatory text, but it does not supply rank, final score, format, duration, or scene count. Code applies the fixed 35/35/15/10/5 weighting, deterministic penalties, and tie-breakers. For Reel mode it assigns `short_reel` and selects the exact duration/scene policy from local scene complexity and the model's Reel-ease score. Category C is always marked at least `requires_manual_check`. Persisted v1 ranking artifacts remain readable; a separately persisted, exactly bound safe v1 provider response may be projected into a new v2 artifact without another provider call.
+The model supplies editorial scores and safe explanatory text, but it does not supply rank, final score, format, duration, or scene count. Code applies the fixed 35/35/15/10/5 weighting, deterministic penalties, and tie-breakers. For Reel mode it assigns `short_reel` and selects the exact duration/scene policy from local scene complexity and the model's Reel-ease score. Category C is always marked at least `requires_manual_check`. Persisted v1 and v2 ranking artifacts remain readable; a separately persisted, exactly bound safe v1 or v2 provider response may be projected into a new artifact without another provider call.
 
-The provider-facing schemas use only the portable closed subset (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, and `const`). Ranking score enums are the integers 0 through 100. Known duplicate reason codes are canonicalized in first-occurrence order; unknown reason codes fail closed.
+Ranking v3 uses an exact closed `candidate_evaluations` object rather than an array. Code creates one required `candidate_01` through `candidate_N` slot for every deterministic shortlist entry, and each slot binds its own candidate identity with `const`. A missing, extra, duplicated, or swapped candidate therefore fails at the structural boundary. JSON object order has no authority.
+
+The provider-facing schemas use only the portable closed subset (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, and `const`). Ranking score enums are the integers 0 through 100. Known duplicate reason codes are canonicalized in first-occurrence order; unknown reason codes fail closed. Structurally valid candidates whose editorial title, pitch, or explanation fails the privacy-safe local text policy are persisted only as an ineligible code-owned record with a stable reason and blank public text. They cannot appear in cards or enter preparation. A ranking with fewer than three safe candidates (when at least three were shortlisted) fails closed after the single ranking call.
 
 Prepared-material v2 requests expose exactly the code-owned number of named scene-content fields (`scene_01` through `scene_N`). The model supplies only screen text and a visual brief for each scene. Code constructs ordered, contiguous integer timings beginning at zero and ending at the exact stored duration, with every scene lasting at least two seconds. Persisted v1 prepared artifacts remain readable.
 

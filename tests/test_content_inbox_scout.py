@@ -90,42 +90,45 @@ def snapshot(tmp_path: Path, *, sections: int = 3) -> scout.InboxSnapshot:
 
 
 def ranking_payload(snap: scout.InboxSnapshot, run_id: str) -> dict:
-    rows = []
+    evaluations = {}
     for rank, candidate in enumerate(snap.shortlist, start=1):
-        rows.append(
-            {
-                "candidate_id": candidate.candidate_id,
-                "story_strength_score": 90 - rank,
-                "reel_ease_score": 95 - rank,
-                "clarity_score": 88,
-                "novelty_score": 80,
-                "confidence_score": 91,
-                "human_title": f"История {rank}",
-                "one_sentence_pitch": "Кнопка выглядела готовой, но одна проверка останавливала сообщение.",
-                "why_it_works": "В истории есть видимый конфликт, простое действие и понятный результат.",
-                "editorial_risk": "none",
-                "reason_codes": ["source_grounded", "clear_conflict", "simple_visuals"],
-            }
-        )
+        evaluations[f"candidate_{rank:02d}"] = {
+            "candidate_id": candidate.candidate_id,
+            "story_strength_score": 90 - rank,
+            "reel_ease_score": 95 - rank,
+            "clarity_score": 88,
+            "novelty_score": 80,
+            "confidence_score": 91,
+            "human_title": f"История {rank}",
+            "one_sentence_pitch": "Кнопка выглядела готовой, но одна проверка останавливала сообщение.",
+            "why_it_works": "В истории есть видимый конфликт, простое действие и понятный результат.",
+            "editorial_risk": "none",
+            "reason_codes": ["source_grounded", "clear_conflict", "simple_visuals"],
+        }
     return {
         "schema_version": scout.RANKING_SCHEMA,
         "scout_run_id": run_id,
         "source_snapshot_digest": snap.snapshot_digest,
-        "ranked_candidates": rows,
+        "candidate_evaluations": evaluations,
     }
 
 
 def legacy_ranking_payload(snap: scout.InboxSnapshot, run_id: str) -> dict:
-    value = ranking_payload(snap, run_id)
-    value["schema_version"] = scout.RANKING_SCHEMA_V1
-    for rank, row in enumerate(value["ranked_candidates"], start=1):
+    current = ranking_payload(snap, run_id)
+    rows = [dict(row) for row in current["candidate_evaluations"].values()]
+    for rank, row in enumerate(rows, start=1):
         row.update({
             "rank": rank,
             "recommended_format": "short_reel",
             "recommended_duration_seconds": 99,
             "recommended_scene_count": 99,
         })
-    return value
+    return {
+        "schema_version": scout.RANKING_SCHEMA_V1,
+        "scout_run_id": run_id,
+        "source_snapshot_digest": snap.snapshot_digest,
+        "ranked_candidates": rows,
+    }
 
 
 def ready_payload(run_id: str, candidate_id: str, scene_count: int = 5) -> dict:
@@ -322,7 +325,7 @@ def test_ranking_rejects_invalid_score_types(tmp_path, value):
     snap = snapshot(tmp_path)
     run_id = "csr-" + "a" * 24
     payload = ranking_payload(snap, run_id)
-    payload["ranked_candidates"][0]["story_strength_score"] = value
+    payload["candidate_evaluations"]["candidate_01"]["story_strength_score"] = value
     with pytest.raises(scout.ScoutError, match="scout_ranking_score_invalid"):
         scout.parse_ranking(json.dumps(payload), run_id, snap, lambda _: [])
 
@@ -331,25 +334,46 @@ def test_ranking_rejects_unknown_candidate(tmp_path):
     snap = snapshot(tmp_path)
     run_id = "csr-" + "a" * 24
     payload = ranking_payload(snap, run_id)
-    payload["ranked_candidates"][0]["candidate_id"] = "csc-" + "f" * 24
-    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_invalid"):
+    payload["candidate_evaluations"]["candidate_01"]["candidate_id"] = "csc-" + "f" * 24
+    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_binding_invalid"):
         scout.parse_ranking(json.dumps(payload), run_id, snap, lambda _: [])
 
 
 def test_ranking_rejects_duplicate_candidate(tmp_path):
     snap = snapshot(tmp_path)
     payload = ranking_payload(snap, TEST_RUN_ID)
-    payload["ranked_candidates"][1]["candidate_id"] = payload["ranked_candidates"][0]["candidate_id"]
-    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_invalid"):
+    payload["candidate_evaluations"]["candidate_02"]["candidate_id"] = payload["candidate_evaluations"]["candidate_01"]["candidate_id"]
+    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_binding_invalid"):
         scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
 
 
 def test_ranking_rejects_missing_candidate(tmp_path):
     snap = snapshot(tmp_path)
     payload = ranking_payload(snap, TEST_RUN_ID)
-    payload["ranked_candidates"].pop()
-    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_set_invalid"):
+    payload["candidate_evaluations"].pop("candidate_03")
+    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_matrix_invalid"):
         scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+
+
+def test_ranking_rejects_extra_candidate_slot(tmp_path):
+    snap = snapshot(tmp_path)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    payload["candidate_evaluations"]["candidate_04"] = dict(
+        payload["candidate_evaluations"]["candidate_03"]
+    )
+    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_matrix_invalid"):
+        scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+
+
+def test_ranking_matrix_object_order_does_not_affect_result(tmp_path):
+    snap = snapshot(tmp_path)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    first = scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+    payload["candidate_evaluations"] = dict(
+        reversed(list(payload["candidate_evaluations"].items()))
+    )
+    second = scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+    assert second == first
 
 
 @pytest.mark.parametrize("complexity,ease,expected", [
@@ -369,10 +393,10 @@ def test_code_owned_weighted_order_ignores_model_input_order(tmp_path):
     snap = snapshot(tmp_path)
     run_id = "csr-" + "a" * 24
     payload = ranking_payload(snap, run_id)
-    target = payload["ranked_candidates"][-1]
+    target = payload["candidate_evaluations"]["candidate_03"]
     target["story_strength_score"] = 100
     target["reel_ease_score"] = 100
-    payload["ranked_candidates"].reverse()
+    payload["candidate_evaluations"] = dict(reversed(list(payload["candidate_evaluations"].items())))
     ranked = scout.parse_ranking(json.dumps(payload), run_id, snap, lambda _: [])
     assert ranked[0].candidate_id == target["candidate_id"]
     assert [item.rank for item in ranked] == list(range(1, len(ranked) + 1))
@@ -439,6 +463,22 @@ def test_persisted_v1_ranking_artifact_remains_readable(tmp_path):
     path = run.run_dir / "ranking.json"
     value = json.loads(path.read_text(encoding="utf-8"))
     value["schema_version"] = scout.RANKING_SCHEMA_V1
+    for row in value["ranked_candidates"]:
+        row.pop("eligible_for_display")
+        row.pop("display_exclusion_reason")
+    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    loaded = scout.load_run(tmp_path / "state", run.run_id)
+    assert loaded.ranked == run.ranked
+
+
+def test_persisted_v2_ranking_artifact_remains_readable(tmp_path):
+    run, _ = asyncio.run(create_run(tmp_path))
+    path = run.run_dir / "ranking.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["schema_version"] = scout.RANKING_ARTIFACT_SCHEMA_V2
+    for row in value["ranked_candidates"]:
+        row.pop("eligible_for_display")
+        row.pop("display_exclusion_reason")
     path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     loaded = scout.load_run(tmp_path / "state", run.run_id)
     assert loaded.ranked == run.ranked
@@ -772,14 +812,39 @@ def test_provider_schema_preflight_rejects_required_property_mismatch():
 def test_ranking_wire_schema_has_dynamic_identity_constraints():
     schema = ranking_wire_format()["json_schema"]["schema"]
     properties = schema["properties"]
-    candidate = properties["ranked_candidates"]["items"]["properties"]["candidate_id"]
+    matrix = properties["candidate_evaluations"]
     assert properties["scout_run_id"] == {"type": "string", "const": TEST_RUN_ID}
     assert properties["source_snapshot_digest"] == {"type": "string", "const": TEST_SNAPSHOT_DIGEST}
-    assert candidate == {"type": "string", "enum": list(TEST_CANDIDATE_IDS)}
+    assert list(matrix["properties"]) == ["candidate_01", "candidate_02"]
+    assert matrix["required"] == ["candidate_01", "candidate_02"]
+    assert matrix["additionalProperties"] is False
+    for index, candidate_id in enumerate(TEST_CANDIDATE_IDS, start=1):
+        candidate = matrix["properties"][f"candidate_{index:02d}"]["properties"]["candidate_id"]
+        assert candidate == {"type": "string", "const": candidate_id}
 
 
-def test_ranking_v2_omits_model_owned_reel_and_order_fields():
-    item = ranking_wire_format()["json_schema"]["schema"]["properties"]["ranked_candidates"]["items"]
+@pytest.mark.parametrize("size", [1, 3, 12])
+def test_ranking_v3_dynamic_matrix_preflight_accepts_exact_shortlist_sizes(size):
+    candidate_ids = tuple(f"csc-{index:024x}" for index in range(1, size + 1))
+    response_format = scout.ranking_response_format(
+        TEST_RUN_ID, TEST_SNAPSHOT_DIGEST, candidate_ids
+    )
+    scout.validate_provider_response_format(response_format)
+    matrix = response_format["json_schema"]["schema"]["properties"]["candidate_evaluations"]
+    expected_slots = [f"candidate_{index:02d}" for index in range(1, size + 1)]
+    assert matrix["required"] == expected_slots
+    assert list(matrix["properties"]) == expected_slots
+
+
+def test_ranking_v3_uses_closed_candidate_matrix_not_array():
+    matrix = ranking_wire_format()["json_schema"]["schema"]["properties"]["candidate_evaluations"]
+    assert matrix["type"] == "object"
+    assert "items" not in matrix
+    assert matrix["additionalProperties"] is False
+
+
+def test_ranking_v3_omits_model_owned_reel_and_order_fields():
+    item = ranking_wire_format()["json_schema"]["schema"]["properties"]["candidate_evaluations"]["properties"]["candidate_01"]
     assert set(item["properties"]) == {
         "candidate_id", "story_strength_score", "reel_ease_score", "clarity_score",
         "novelty_score", "confidence_score", "human_title", "one_sentence_pitch",
@@ -788,8 +853,8 @@ def test_ranking_v2_omits_model_owned_reel_and_order_fields():
     assert not {"rank", "recommended_format", "recommended_duration_seconds", "recommended_scene_count", "final_score"} & set(item["properties"])
 
 
-def test_ranking_v2_score_enums_are_exact_zero_through_one_hundred():
-    properties = ranking_wire_format()["json_schema"]["schema"]["properties"]["ranked_candidates"]["items"]["properties"]
+def test_ranking_v3_score_enums_are_exact_zero_through_one_hundred():
+    properties = ranking_wire_format()["json_schema"]["schema"]["properties"]["candidate_evaluations"]["properties"]["candidate_01"]["properties"]
     for key in ("story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score"):
         assert properties[key] == {"type": "integer", "enum": list(range(101))}
         assert 101 not in properties[key]["enum"]
@@ -834,7 +899,7 @@ def test_wire_schemas_do_not_use_unique_items(factory):
 ])
 def test_provider_schema_preflight_rejects_nonportable_keyword(keyword, value):
     response_format = ranking_wire_format()
-    node = response_format["json_schema"]["schema"]["properties"]["ranked_candidates"]
+    node = response_format["json_schema"]["schema"]["properties"]["candidate_evaluations"]
     node[keyword] = value
     with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
         scout.validate_provider_response_format(response_format)
@@ -843,7 +908,7 @@ def test_provider_schema_preflight_rejects_nonportable_keyword(keyword, value):
 def test_duplicate_known_reason_codes_are_canonicalized_by_local_parser(tmp_path):
     snap = snapshot(tmp_path)
     payload = ranking_payload(snap, TEST_RUN_ID)
-    payload["ranked_candidates"][0]["reason_codes"].append("source_grounded")
+    payload["candidate_evaluations"]["candidate_01"]["reason_codes"].append("source_grounded")
     assert "uniqueItems" not in schema_node_keywords(
         scout.ranking_response_format(
             TEST_RUN_ID,
@@ -852,15 +917,72 @@ def test_duplicate_known_reason_codes_are_canonicalized_by_local_parser(tmp_path
         )
     )
     ranked = scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
-    selected = next(item for item in ranked if item.candidate_id == payload["ranked_candidates"][0]["candidate_id"])
+    selected = next(item for item in ranked if item.candidate_id == payload["candidate_evaluations"]["candidate_01"]["candidate_id"])
     assert selected.reason_codes.count("source_grounded") == 1
 
 
 def test_unknown_reason_code_is_rejected(tmp_path):
     snap = snapshot(tmp_path)
     payload = ranking_payload(snap, TEST_RUN_ID)
-    payload["ranked_candidates"][0]["reason_codes"] = ["unknown_reason"]
+    payload["candidate_evaluations"]["candidate_01"]["reason_codes"] = ["unknown_reason"]
     with pytest.raises(scout.ScoutError, match="scout_ranking_risk_invalid"):
+        scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+
+
+def test_one_unsafe_candidate_is_excluded_while_three_safe_candidates_remain(tmp_path):
+    snap = snapshot(tmp_path, sections=4)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    payload["candidate_evaluations"]["candidate_01"]["human_title"] = "unsafe-marker"
+    ranked = scout.parse_ranking(
+        json.dumps(payload),
+        TEST_RUN_ID,
+        snap,
+        lambda text: ["private"] if "unsafe-marker" in text else [],
+    )
+    excluded = [item for item in ranked if not item.eligible_for_display]
+    assert len(excluded) == 1
+    assert excluded[0].display_exclusion_reason == "scout_ranking_text_unsafe"
+    assert excluded[0].human_title == excluded[0].one_sentence_pitch == excluded[0].why_it_works == ""
+    run = scout.ScoutRunResult(TEST_RUN_ID, snap, ranked, 1, True, tmp_path / "run")
+    assert len(scout.safe_cards(run, 3)) == 3
+    assert excluded[0] not in scout.safe_cards(run, 3)
+
+
+def test_fewer_than_three_safe_candidates_is_typed_blocker_after_one_call(tmp_path):
+    snap = snapshot(tmp_path)
+    calls = []
+
+    async def model(messages, _response_format):
+        calls.append(1)
+        run_id = json.loads(messages[1]["content"])["scout_run_id"]
+        payload = ranking_payload(snap, run_id)
+        payload["candidate_evaluations"]["candidate_01"]["human_title"] = "unsafe-marker"
+        return json.dumps(payload, ensure_ascii=False)
+
+    with pytest.raises(scout.ScoutError, match="scout_display_candidate_count_insufficient"):
+        asyncio.run(scout.rank_snapshot(
+            tmp_path / "state",
+            snap,
+            admin_id=ADMIN,
+            expected_admin_id=ADMIN,
+            operator_request_id="candidate-local-blocker-01",
+            refresh=True,
+            recent_summaries=(),
+            risk_detector=lambda text: ["private"] if "unsafe-marker" in text else [],
+            model_call=model,
+        ))
+    run_dirs = list((tmp_path / "state" / "runs").iterdir())
+    assert calls == [1] and len(run_dirs) == 1
+    artifact = json.loads((run_dirs[0] / "ranking.json").read_text(encoding="utf-8"))
+    assert sum(row["eligible_for_display"] for row in artifact["ranked_candidates"]) == 2
+    assert not (run_dirs[0] / "provider-ranking-response.json").exists()
+
+
+def test_non_string_editorial_field_is_structural_failure(tmp_path):
+    snap = snapshot(tmp_path)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    payload["candidate_evaluations"]["candidate_01"]["human_title"] = ["wrong"]
+    with pytest.raises(scout.ScoutError, match="scout_ranking_text_type_invalid"):
         scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
 
 

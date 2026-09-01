@@ -19,8 +19,10 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 RUN_SCHEMA = "content-inbox-scout-run-v1"
 RANKING_SCHEMA_V1 = "content-inbox-scout-ranking-v1"
-RANKING_SCHEMA = "content-inbox-scout-ranking-v2"
-RANKING_ARTIFACT_SCHEMA = "content-inbox-scout-ranking-artifact-v2"
+RANKING_SCHEMA_V2 = "content-inbox-scout-ranking-v2"
+RANKING_SCHEMA = "content-inbox-scout-ranking-v3"
+RANKING_ARTIFACT_SCHEMA_V2 = "content-inbox-scout-ranking-artifact-v2"
+RANKING_ARTIFACT_SCHEMA = "content-inbox-scout-ranking-artifact-v3"
 READY_SCHEMA_V1 = "content-inbox-ready-material-v1"
 READY_SCHEMA = "content-inbox-ready-material-v2"
 READY_ARTIFACT_SCHEMA = "content-inbox-ready-material-artifact-v2"
@@ -110,6 +112,8 @@ class RankedCandidate:
     editorial_risk: str
     reason_codes: tuple[str, ...]
     final_score: float
+    eligible_for_display: bool = True
+    display_exclusion_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,31 +499,41 @@ def ranking_response_format(
         or any(type(item) is not str or not CANDIDATE_ID_RE.fullmatch(item) for item in exact_candidate_ids)
     ):
         raise ScoutError("scout_provider_schema_identity_invalid")
-    item_properties: dict[str, Any] = {
-        "candidate_id": {"type": "string", "enum": list(exact_candidate_ids)},
-    }
-    for key in ("story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score"):
-        item_properties[key] = {"type": "integer", "enum": list(range(101))}
-    for key in ("human_title", "one_sentence_pitch", "why_it_works"):
-        item_properties[key] = {"type": "string"}
-    item_properties.update({
-        "editorial_risk": {"type": "string", "enum": sorted(ALLOWED_RISKS)},
-        "reason_codes": {"type": "array", "items": {"type": "string", "enum": sorted(ALLOWED_REASON_CODES)}},
-    })
+    evaluation_properties: dict[str, Any] = {}
+    for index, candidate_id in enumerate(exact_candidate_ids, start=1):
+        item_properties: dict[str, Any] = {
+            "candidate_id": {"type": "string", "const": candidate_id},
+        }
+        for key in ("story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score"):
+            item_properties[key] = {"type": "integer", "enum": list(range(101))}
+        for key in ("human_title", "one_sentence_pitch", "why_it_works"):
+            item_properties[key] = {"type": "string"}
+        item_properties.update({
+            "editorial_risk": {"type": "string", "enum": sorted(ALLOWED_RISKS)},
+            "reason_codes": {"type": "array", "items": {"type": "string", "enum": sorted(ALLOWED_REASON_CODES)}},
+        })
+        evaluation_properties[f"candidate_{index:02d}"] = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": list(item_properties),
+            "properties": item_properties,
+        }
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "content_inbox_scout_ranking_v1", "strict": True,
+            "name": "content_inbox_scout_ranking_v3", "strict": True,
             "schema": {
                 "type": "object", "additionalProperties": False,
-                "required": ["schema_version", "scout_run_id", "source_snapshot_digest", "ranked_candidates"],
+                "required": ["schema_version", "scout_run_id", "source_snapshot_digest", "candidate_evaluations"],
                 "properties": {
                     "schema_version": {"type": "string", "const": RANKING_SCHEMA},
                     "scout_run_id": {"type": "string", "const": run_id},
                     "source_snapshot_digest": {"type": "string", "const": snapshot_digest},
-                    "ranked_candidates": {
-                        "type": "array",
-                        "items": {"type": "object", "additionalProperties": False, "required": list(item_properties), "properties": item_properties},
+                    "candidate_evaluations": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": list(evaluation_properties),
+                        "properties": evaluation_properties,
                     },
                 },
             },
@@ -764,41 +778,60 @@ def parse_ranking(raw: str, run_id: str, snapshot: InboxSnapshot, risk_detector:
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ScoutError("scout_ranking_json_invalid") from exc
-    expected_top = {"schema_version", "scout_run_id", "source_snapshot_digest", "ranked_candidates"}
-    if type(value) is not dict or set(value) != expected_top or value.get("schema_version") != RANKING_SCHEMA or value.get("scout_run_id") != run_id or value.get("source_snapshot_digest") != snapshot.snapshot_digest or type(value.get("ranked_candidates")) is not list:
+    expected_top = {"schema_version", "scout_run_id", "source_snapshot_digest", "candidate_evaluations"}
+    if type(value) is not dict or set(value) != expected_top or value.get("schema_version") != RANKING_SCHEMA or value.get("scout_run_id") != run_id or value.get("source_snapshot_digest") != snapshot.snapshot_digest:
         raise ScoutError("scout_ranking_contract_invalid")
-    by_id = {item.candidate_id: item for item in snapshot.shortlist}
+    evaluations = value.get("candidate_evaluations")
+    expected_slots = [f"candidate_{index:02d}" for index in range(1, len(snapshot.shortlist) + 1)]
+    if type(evaluations) is not dict or set(evaluations) != set(expected_slots):
+        raise ScoutError("scout_ranking_candidate_matrix_invalid")
     expected_item = {"candidate_id", "story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score", "human_title", "one_sentence_pitch", "why_it_works", "editorial_risk", "reason_codes"}
     result: list[RankedCandidate] = []
-    seen_ids: set[str] = set()
-    for row in value["ranked_candidates"]:
+    for slot, candidate in zip(expected_slots, snapshot.shortlist, strict=True):
+        row = evaluations[slot]
         if type(row) is not dict or set(row) != expected_item:
             raise ScoutError("scout_ranking_contract_invalid")
         candidate_id = row.get("candidate_id")
-        if type(candidate_id) is not str or candidate_id not in by_id or candidate_id in seen_ids:
-            raise ScoutError("scout_ranking_candidate_invalid")
+        if type(candidate_id) is not str or candidate_id != candidate.candidate_id:
+            raise ScoutError("scout_ranking_candidate_binding_invalid")
         score_keys = ("story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score")
         if any(type(row.get(key)) is not int or not 0 <= row[key] <= 100 for key in score_keys):
             raise ScoutError("scout_ranking_score_invalid")
-        title = _plain_text(row.get("human_title"), "scout_ranking_text_invalid", maximum=180)
-        pitch = _plain_text(row.get("one_sentence_pitch"), "scout_ranking_text_invalid", maximum=500)
-        why = _plain_text(row.get("why_it_works"), "scout_ranking_text_invalid", maximum=1000)
-        if risk_detector("\n".join((title, pitch, why))):
-            raise ScoutError("scout_ranking_text_unsafe")
+        text_fields = (row.get("human_title"), row.get("one_sentence_pitch"), row.get("why_it_works"))
+        if any(type(item) is not str for item in text_fields):
+            raise ScoutError("scout_ranking_text_type_invalid")
+        exclusion_reason: str | None = None
+        try:
+            title = _plain_text(text_fields[0], "scout_ranking_text_invalid", maximum=180)
+            pitch = _plain_text(text_fields[1], "scout_ranking_text_invalid", maximum=500)
+            why = _plain_text(text_fields[2], "scout_ranking_text_invalid", maximum=1000)
+        except ScoutError:
+            title = pitch = why = ""
+            exclusion_reason = "scout_ranking_text_invalid"
+        if exclusion_reason is None and risk_detector("\n".join((title, pitch, why))):
+            title = pitch = why = ""
+            exclusion_reason = "scout_ranking_text_unsafe"
         if row.get("editorial_risk") not in ALLOWED_RISKS:
             raise ScoutError("scout_ranking_risk_invalid")
         reason_codes = _canonical_reason_codes(row.get("reason_codes"))
-        duration, scenes, manual_risk = code_owned_reel_spec(by_id[candidate_id], row["reel_ease_score"])
+        duration, scenes, manual_risk = code_owned_reel_spec(candidate, row["reel_ease_score"])
         editorial_risk = "requires_manual_check" if manual_risk else row["editorial_risk"]
         normalized_row = {**row, "reason_codes": reason_codes}
         weighted = row["story_strength_score"] * .35 + row["reel_ease_score"] * .35 + row["clarity_score"] * .15 + row["novelty_score"] * .10 + row["confidence_score"] * .05
-        final = round(max(0.0, weighted - _ranking_penalty(normalized_row, by_id[candidate_id])), 3)
-        result.append(RankedCandidate(candidate_id, 0, *(row[key] for key in score_keys), title, pitch, why, "short_reel", duration, scenes, editorial_risk, reason_codes, final))
-        seen_ids.add(candidate_id)
-    if seen_ids != set(by_id):
-        raise ScoutError("scout_ranking_candidate_set_invalid")
+        final = round(max(0.0, weighted - _ranking_penalty(normalized_row, candidate)), 3)
+        result.append(RankedCandidate(
+            candidate_id, 0, *(row[key] for key in score_keys), title, pitch, why,
+            "short_reel", duration, scenes, editorial_risk, reason_codes, final,
+            exclusion_reason is None, exclusion_reason,
+        ))
     ordered = sorted(result, key=lambda item: (-item.final_score, -item.reel_ease_score, -item.story_strength_score, item.candidate_id))
     return tuple(replace(item, rank=index) for index, item in enumerate(ordered, start=1))
+
+
+def _require_display_candidates(ranked: Sequence[RankedCandidate], minimum: int = 3) -> None:
+    required = min(minimum, len(ranked))
+    if sum(item.eligible_for_display for item in ranked) < required:
+        raise ScoutError("scout_display_candidate_count_insufficient")
 
 
 def _run_record(snapshot: InboxSnapshot, run_id: str, request_id: str, admin_id: int, refresh: bool) -> dict[str, Any]:
@@ -864,10 +897,11 @@ def _ranking_record(run_id: str, snapshot_digest: str, ranked: Sequence[RankedCa
 
 def _ranked_from_stored(value: Mapping[str, Any]) -> tuple[RankedCandidate, ...]:
     top_keys = {"schema_version", "scout_run_id", "source_snapshot_digest", "ranked_candidates"}
+    schema_version = value.get("schema_version") if type(value) is dict else None
     if (
         type(value) is not dict
         or set(value) != top_keys
-        or value.get("schema_version") not in {RANKING_SCHEMA_V1, RANKING_ARTIFACT_SCHEMA}
+        or schema_version not in {RANKING_SCHEMA_V1, RANKING_ARTIFACT_SCHEMA_V2, RANKING_ARTIFACT_SCHEMA}
         or type(value.get("scout_run_id")) is not str
         or not RUN_ID_RE.fullmatch(value["scout_run_id"])
         or type(value.get("source_snapshot_digest")) is not str
@@ -876,11 +910,13 @@ def _ranked_from_stored(value: Mapping[str, Any]) -> tuple[RankedCandidate, ...]
     ):
         raise ScoutError("scout_ranking_artifact_invalid")
     item_keys = {field.name for field in RankedCandidate.__dataclass_fields__.values()}
+    legacy_item_keys = item_keys - {"eligible_for_display", "display_exclusion_reason"}
+    expected_item_keys = item_keys if schema_version == RANKING_ARTIFACT_SCHEMA else legacy_item_keys
     score_keys = {"story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score"}
     for item in value["ranked_candidates"]:
         if (
             type(item) is not dict
-            or set(item) != item_keys
+            or set(item) != expected_item_keys
             or type(item.get("candidate_id")) is not str
             or not CANDIDATE_ID_RE.fullmatch(item["candidate_id"])
             or type(item.get("rank")) is not int
@@ -897,10 +933,25 @@ def _ranked_from_stored(value: Mapping[str, Any]) -> tuple[RankedCandidate, ...]
             or type(item.get("final_score")) not in {int, float}
             or isinstance(item.get("final_score"), bool)
             or not 0 <= item["final_score"] <= 100
+            or (
+                schema_version == RANKING_ARTIFACT_SCHEMA
+                and (
+                    type(item.get("eligible_for_display")) is not bool
+                    or item.get("display_exclusion_reason") not in {None, "scout_ranking_text_invalid", "scout_ranking_text_unsafe"}
+                    or (item["eligible_for_display"] != (item["display_exclusion_reason"] is None))
+                )
+            )
         ):
             raise ScoutError("scout_ranking_artifact_invalid")
     try:
-        return tuple(RankedCandidate(**{**item, "reason_codes": tuple(item["reason_codes"])}) for item in value["ranked_candidates"])
+        return tuple(RankedCandidate(**{
+            **item,
+            "reason_codes": tuple(item["reason_codes"]),
+            **({} if schema_version == RANKING_ARTIFACT_SCHEMA else {
+                "eligible_for_display": True,
+                "display_exclusion_reason": None,
+            }),
+        }) for item in value["ranked_candidates"])
     except (KeyError, TypeError) as exc:
         raise ScoutError("scout_ranking_artifact_invalid") from exc
 
@@ -929,20 +980,62 @@ def _parse_legacy_ranking_response(
         or any(type(item) is not dict or set(item) != legacy_item_keys for item in value["ranked_candidates"])
     ):
         raise ScoutError("scout_ranking_salvage_invalid")
+    rows = [
+        {
+            key: item[key]
+            for key in legacy_item_keys
+            if key not in {"rank", "recommended_format", "recommended_duration_seconds", "recommended_scene_count"}
+        }
+        for item in value["ranked_candidates"]
+    ]
+    return _parse_v2_ranking_rows(rows, run_id, snapshot, risk_detector)
+
+
+def _parse_v2_ranking_rows(
+    rows: Any,
+    run_id: str,
+    snapshot: InboxSnapshot,
+    risk_detector: RiskDetector,
+) -> tuple[RankedCandidate, ...]:
+    expected_item = {"candidate_id", "story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score", "human_title", "one_sentence_pitch", "why_it_works", "editorial_risk", "reason_codes"}
+    if type(rows) is not list or any(type(item) is not dict or set(item) != expected_item for item in rows):
+        raise ScoutError("scout_ranking_salvage_invalid")
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for item in rows:
+        candidate_id = item.get("candidate_id")
+        if type(candidate_id) is not str or candidate_id in by_id:
+            raise ScoutError("scout_ranking_salvage_invalid")
+        by_id[candidate_id] = item
+    expected_ids = [item.candidate_id for item in snapshot.shortlist]
+    if set(by_id) != set(expected_ids):
+        raise ScoutError("scout_ranking_salvage_invalid")
     projected = {
         "schema_version": RANKING_SCHEMA,
         "scout_run_id": run_id,
         "source_snapshot_digest": snapshot.snapshot_digest,
-        "ranked_candidates": [
-            {
-                key: item[key]
-                for key in legacy_item_keys
-                if key not in {"rank", "recommended_format", "recommended_duration_seconds", "recommended_scene_count"}
-            }
-            for item in value["ranked_candidates"]
-        ],
+        "candidate_evaluations": {
+            f"candidate_{index:02d}": dict(by_id[candidate_id])
+            for index, candidate_id in enumerate(expected_ids, start=1)
+        },
     }
     return parse_ranking(json.dumps(projected, ensure_ascii=False), run_id, snapshot, risk_detector)
+
+
+def _parse_v2_ranking_response(
+    value: Mapping[str, Any],
+    run_id: str,
+    snapshot: InboxSnapshot,
+    risk_detector: RiskDetector,
+) -> tuple[RankedCandidate, ...]:
+    if (
+        type(value) is not dict
+        or set(value) != {"schema_version", "scout_run_id", "source_snapshot_digest", "ranked_candidates"}
+        or value.get("schema_version") != RANKING_SCHEMA_V2
+        or value.get("scout_run_id") != run_id
+        or value.get("source_snapshot_digest") != snapshot.snapshot_digest
+    ):
+        raise ScoutError("scout_ranking_salvage_invalid")
+    return _parse_v2_ranking_rows(value.get("ranked_candidates"), run_id, snapshot, risk_detector)
 
 
 def _salvage_persisted_ranking_response(
@@ -974,6 +1067,8 @@ def _salvage_persisted_ranking_response(
                 ranked = parse_ranking(
                     json.dumps(value, ensure_ascii=False), prior_run_id, snapshot, risk_detector
                 )
+            elif value.get("schema_version") == RANKING_SCHEMA_V2:
+                ranked = _parse_v2_ranking_response(value, prior_run_id, snapshot, risk_detector)
             elif value.get("schema_version") == RANKING_SCHEMA_V1:
                 ranked = _parse_legacy_ranking_response(value, prior_run_id, snapshot, risk_detector)
             else:
@@ -1042,7 +1137,9 @@ async def rank_snapshot(
         stored = _read_json(ranking_path)
         if stored.get("scout_run_id") != run_id or stored.get("source_snapshot_digest") != snapshot.snapshot_digest:
             raise ScoutError("scout_ranking_artifact_invalid")
-        return _run_from_record(record, run_dir, _ranked_from_stored(stored), 0, False)
+        ranked = _ranked_from_stored(stored)
+        _require_display_candidates(ranked)
+        return _run_from_record(record, run_dir, ranked, 0, False)
     salvaged = _salvage_persisted_ranking_response(
         root, run_id, snapshot, risk_detector
     )
@@ -1064,6 +1161,7 @@ async def rank_snapshot(
             _ranking_record(run_id, snapshot.snapshot_digest, ranked),
             "scout_ranking_conflict",
         )
+        _require_display_candidates(ranked)
         return _run_from_record(record, run_dir, ranked, 0, created)
     response_format = ranking_response_format(
         run_id,
@@ -1082,12 +1180,14 @@ async def rank_snapshot(
         {"role": "user", "content": prompt},
     ], response_format)
     ranked = parse_ranking(raw, run_id, snapshot, risk_detector)
-    _write_exact(
-        run_dir / "provider-ranking-response.json",
-        json.loads(raw),
-        "scout_provider_ranking_response_conflict",
-    )
+    if all(item.eligible_for_display for item in ranked):
+        _write_exact(
+            run_dir / "provider-ranking-response.json",
+            json.loads(raw),
+            "scout_provider_ranking_response_conflict",
+        )
     _write_exact(ranking_path, _ranking_record(run_id, snapshot.snapshot_digest, ranked), "scout_ranking_conflict")
+    _require_display_candidates(ranked)
     return _run_from_record(record, run_dir, ranked, 1, created)
 
 
@@ -1117,6 +1217,8 @@ def ranked_for_run(run: ScoutRunResult, candidate_id: str) -> RankedCandidate:
     matches = [item for item in run.ranked if item.candidate_id == candidate_id]
     if len(matches) != 1:
         raise ScoutError("scout_candidate_not_ranked")
+    if not matches[0].eligible_for_display:
+        raise ScoutError("scout_candidate_not_display_eligible")
     return matches[0]
 
 
@@ -1332,7 +1434,11 @@ def safe_cards(run: ScoutRunResult, count: int, hidden: Iterable[str] = ()) -> t
     if type(count) is not int or not 1 <= count <= MAX_REQUESTED:
         raise ScoutError("scout_count_invalid")
     hidden_set = set(hidden)
-    return tuple(item for item in run.ranked if item.candidate_id not in hidden_set)[:count]
+    return tuple(
+        item
+        for item in run.ranked
+        if item.eligible_for_display and item.candidate_id not in hidden_set
+    )[:count]
 
 
 def format_label(value: str) -> str:
