@@ -19,6 +19,36 @@ import main
 
 PROJECT = "Naz_AI_Bot_clean"
 ADMIN = 42
+TEST_RUN_ID = "csr-" + "a" * 24
+TEST_SNAPSHOT_DIGEST = "b" * 64
+TEST_CANDIDATE_IDS = ("csc-" + "c" * 24, "csc-" + "d" * 24)
+
+
+def ranking_wire_format() -> dict:
+    return scout.ranking_response_format(
+        TEST_RUN_ID,
+        TEST_SNAPSHOT_DIGEST,
+        TEST_CANDIDATE_IDS,
+    )
+
+
+def ready_wire_format() -> dict:
+    return scout.ready_material_response_format(TEST_RUN_ID, TEST_CANDIDATE_IDS[0])
+
+
+def schema_node_keywords(response_format: dict) -> set[str]:
+    found: set[str] = set()
+
+    def visit(node: dict) -> None:
+        found.update(node)
+        if node.get("type") == "object":
+            for child in node["properties"].values():
+                visit(child)
+        elif node.get("type") == "array":
+            visit(node["items"])
+
+    visit(response_format["json_schema"]["schema"])
+    return found
 
 
 def episode(label: str, *, extra: str = "") -> str:
@@ -293,6 +323,22 @@ def test_ranking_rejects_unknown_candidate(tmp_path):
         scout.parse_ranking(json.dumps(payload), run_id, snap, lambda _: [])
 
 
+def test_ranking_rejects_duplicate_candidate(tmp_path):
+    snap = snapshot(tmp_path)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    payload["ranked_candidates"][1]["candidate_id"] = payload["ranked_candidates"][0]["candidate_id"]
+    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_invalid"):
+        scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+
+
+def test_ranking_rejects_missing_candidate(tmp_path):
+    snap = snapshot(tmp_path)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    payload["ranked_candidates"].pop()
+    with pytest.raises(scout.ScoutError, match="scout_ranking_candidate_set_invalid"):
+        scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+
+
 @pytest.mark.parametrize("duration,scenes", [(11, 5), (21, 5), (16, 3), (16, 8)])
 def test_short_reel_bounds_closed(tmp_path, duration, scenes):
     snap = snapshot(tmp_path)
@@ -432,6 +478,28 @@ def test_prepared_scene_timings_must_be_contiguous(tmp_path):
         scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
 
 
+def test_ready_material_rejects_short_telegram_post(tmp_path):
+    run, _ = asyncio.run(create_run(tmp_path))
+    selected = run.ranked[0].candidate_id
+    payload = ready_payload(run.run_id, selected)
+    payload["telegram_post"] = "too short"
+    with pytest.raises(scout.ScoutError, match="scout_ready_text_invalid"):
+        scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
+
+
+@pytest.mark.parametrize("scene_count", [3, 8])
+def test_ready_material_rejects_scene_count_outside_local_bounds(tmp_path, scene_count):
+    run, _ = asyncio.run(create_run(tmp_path))
+    selected = run.ranked[0].candidate_id
+    payload = ready_payload(run.run_id, selected)
+    if scene_count == 3:
+        payload["scenes"] = payload["scenes"][:3]
+    else:
+        payload["scenes"] = payload["scenes"] + [copy.deepcopy(payload["scenes"][-1]) for _ in range(3)]
+    with pytest.raises(scout.ScoutError, match="scout_ready_reel_invalid"):
+        scout._parse_ready(json.dumps(payload), run, scout.candidate_for_run(run, selected), lambda _: [])
+
+
 @pytest.mark.parametrize("bad", ["/opt/private/story.json", "a" * 64, "API_KEY=value"])
 def test_prepared_material_rejects_path_hash_and_secret(tmp_path, bad):
     run, _ = asyncio.run(create_run(tmp_path))
@@ -563,51 +631,109 @@ def test_details_callback_uses_stored_result_and_zero_provider_calls(tmp_path):
 
 
 def test_ranking_schema_version_has_explicit_string_type_and_const():
-    node = scout.ranking_response_format()["json_schema"]["schema"]["properties"]["schema_version"]
+    node = ranking_wire_format()["json_schema"]["schema"]["properties"]["schema_version"]
     assert node == {"type": "string", "const": scout.RANKING_SCHEMA}
 
 
 def test_ready_schema_version_has_explicit_string_type_and_const():
-    node = scout.ready_material_response_format()["json_schema"]["schema"]["properties"]["schema_version"]
+    node = ready_wire_format()["json_schema"]["schema"]["properties"]["schema_version"]
     assert node == {"type": "string", "const": scout.READY_SCHEMA}
 
 
-@pytest.mark.parametrize("factory", [scout.ranking_response_format, scout.ready_material_response_format])
+@pytest.mark.parametrize("factory", [ranking_wire_format, ready_wire_format])
 def test_recursive_provider_schema_preflight_accepts_real_contracts(factory):
     scout.validate_provider_response_format(factory())
 
 
 def test_provider_schema_preflight_rejects_const_only_property():
-    value = copy.deepcopy(scout.ranking_response_format())
+    value = copy.deepcopy(ranking_wire_format())
     value["json_schema"]["schema"]["properties"]["schema_version"] = {"const": scout.RANKING_SCHEMA}
     with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
         scout.validate_provider_response_format(value)
 
 
 def test_provider_schema_preflight_rejects_property_without_type():
-    value = copy.deepcopy(scout.ranking_response_format())
+    value = copy.deepcopy(ranking_wire_format())
     value["json_schema"]["schema"]["properties"]["scout_run_id"].pop("type")
     with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
         scout.validate_provider_response_format(value)
 
 
 def test_provider_schema_preflight_rejects_open_object():
-    value = copy.deepcopy(scout.ready_material_response_format())
+    value = copy.deepcopy(ready_wire_format())
     value["json_schema"]["schema"]["properties"]["scenes"]["items"]["additionalProperties"] = True
     with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
         scout.validate_provider_response_format(value)
 
 
 def test_provider_schema_preflight_rejects_required_property_mismatch():
-    value = copy.deepcopy(scout.ranking_response_format())
+    value = copy.deepcopy(ranking_wire_format())
     value["json_schema"]["schema"]["required"].remove("source_snapshot_digest")
     with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
         scout.validate_provider_response_format(value)
 
 
+def test_ranking_wire_schema_has_dynamic_identity_constraints():
+    schema = ranking_wire_format()["json_schema"]["schema"]
+    properties = schema["properties"]
+    candidate = properties["ranked_candidates"]["items"]["properties"]["candidate_id"]
+    assert properties["scout_run_id"] == {"type": "string", "const": TEST_RUN_ID}
+    assert properties["source_snapshot_digest"] == {"type": "string", "const": TEST_SNAPSHOT_DIGEST}
+    assert candidate == {"type": "string", "enum": list(TEST_CANDIDATE_IDS)}
+
+
+def test_ready_wire_schema_has_dynamic_identity_constraints():
+    properties = ready_wire_format()["json_schema"]["schema"]["properties"]
+    assert properties["scout_run_id"] == {"type": "string", "const": TEST_RUN_ID}
+    assert properties["candidate_id"] == {"type": "string", "const": TEST_CANDIDATE_IDS[0]}
+
+
+@pytest.mark.parametrize("factory", [ranking_wire_format, ready_wire_format])
+def test_wire_schemas_use_only_portable_keywords(factory):
+    assert schema_node_keywords(factory()) <= {
+        "type", "properties", "required", "additionalProperties", "items", "enum", "const", "description",
+    }
+
+
+@pytest.mark.parametrize("factory", [ranking_wire_format, ready_wire_format])
+def test_wire_schemas_do_not_use_unique_items(factory):
+    assert "uniqueItems" not in schema_node_keywords(factory())
+
+
+@pytest.mark.parametrize("keyword,value", [
+    ("uniqueItems", True),
+    ("pattern", "^x$"),
+    ("minLength", 1),
+    ("minimum", 0),
+    ("minItems", 1),
+    ("unknownKeyword", True),
+])
+def test_provider_schema_preflight_rejects_nonportable_keyword(keyword, value):
+    response_format = ranking_wire_format()
+    node = response_format["json_schema"]["schema"]["properties"]["ranked_candidates"]
+    node[keyword] = value
+    with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
+        scout.validate_provider_response_format(response_format)
+
+
+def test_duplicate_reason_codes_are_rejected_by_local_parser(tmp_path):
+    snap = snapshot(tmp_path)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    payload["ranked_candidates"][0]["reason_codes"].append("source_grounded")
+    assert "uniqueItems" not in schema_node_keywords(
+        scout.ranking_response_format(
+            TEST_RUN_ID,
+            snap.snapshot_digest,
+            tuple(item.candidate_id for item in snap.shortlist),
+        )
+    )
+    with pytest.raises(scout.ScoutError, match="scout_ranking_risk_invalid"):
+        scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+
+
 def test_invalid_ranking_schema_stops_before_marker_and_provider(tmp_path):
     snap = snapshot(tmp_path)
-    invalid = copy.deepcopy(scout.ranking_response_format())
+    invalid = copy.deepcopy(ranking_wire_format())
     invalid["json_schema"]["schema"]["properties"]["schema_version"].pop("type")
     calls = []
 
@@ -630,7 +756,7 @@ def test_invalid_ranking_schema_stops_before_marker_and_provider(tmp_path):
 def test_invalid_ready_schema_stops_before_marker_and_provider(tmp_path):
     run, _ = asyncio.run(create_run(tmp_path))
     candidate_id = run.ranked[0].candidate_id
-    invalid = copy.deepcopy(scout.ready_material_response_format())
+    invalid = copy.deepcopy(ready_wire_format())
     invalid["json_schema"]["schema"]["properties"]["schema_version"].pop("type")
     calls = []
 

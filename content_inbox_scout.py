@@ -472,21 +472,39 @@ def discover_candidates(
     return InboxSnapshot(project, snapshot_digest, discovered, len(candidates), tuple(candidates), shortlist)
 
 
-def ranking_response_format() -> dict[str, Any]:
+def ranking_response_format(
+    run_id: str,
+    snapshot_digest: str,
+    candidate_ids: Sequence[str],
+) -> dict[str, Any]:
+    if type(run_id) is not str or not RUN_ID_RE.fullmatch(run_id):
+        raise ScoutError("scout_provider_schema_identity_invalid")
+    if type(snapshot_digest) is not str or not DIGEST_RE.fullmatch(snapshot_digest):
+        raise ScoutError("scout_provider_schema_identity_invalid")
+    if type(candidate_ids) not in {list, tuple}:
+        raise ScoutError("scout_provider_schema_identity_invalid")
+    exact_candidate_ids = tuple(candidate_ids)
+    if (
+        not exact_candidate_ids
+        or len(exact_candidate_ids) > MAX_SHORTLIST
+        or len(set(exact_candidate_ids)) != len(exact_candidate_ids)
+        or any(type(item) is not str or not CANDIDATE_ID_RE.fullmatch(item) for item in exact_candidate_ids)
+    ):
+        raise ScoutError("scout_provider_schema_identity_invalid")
     item_properties: dict[str, Any] = {
-        "candidate_id": {"type": "string", "pattern": r"^csc-[a-f0-9]{24}$"},
-        "rank": {"type": "integer", "minimum": 1, "maximum": MAX_SHORTLIST},
+        "candidate_id": {"type": "string", "enum": list(exact_candidate_ids)},
+        "rank": {"type": "integer"},
     }
     for key in ("story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score"):
-        item_properties[key] = {"type": "integer", "minimum": 0, "maximum": 100}
+        item_properties[key] = {"type": "integer"}
     for key in ("human_title", "one_sentence_pitch", "why_it_works"):
-        item_properties[key] = {"type": "string", "minLength": 1, "maxLength": 1200}
+        item_properties[key] = {"type": "string"}
     item_properties.update({
         "recommended_format": {"type": "string", "enum": sorted(ALLOWED_FORMATS)},
-        "recommended_duration_seconds": {"type": "integer", "minimum": 0, "maximum": 180},
-        "recommended_scene_count": {"type": "integer", "minimum": 0, "maximum": 20},
+        "recommended_duration_seconds": {"type": "integer"},
+        "recommended_scene_count": {"type": "integer"},
         "editorial_risk": {"type": "string", "enum": sorted(ALLOWED_RISKS)},
-        "reason_codes": {"type": "array", "items": {"type": "string", "enum": sorted(ALLOWED_REASON_CODES)}, "uniqueItems": True},
+        "reason_codes": {"type": "array", "items": {"type": "string", "enum": sorted(ALLOWED_REASON_CODES)}},
     })
     return {
         "type": "json_schema",
@@ -497,10 +515,10 @@ def ranking_response_format() -> dict[str, Any]:
                 "required": ["schema_version", "scout_run_id", "source_snapshot_digest", "ranked_candidates"],
                 "properties": {
                     "schema_version": {"type": "string", "const": RANKING_SCHEMA},
-                    "scout_run_id": {"type": "string", "pattern": r"^csr-[a-f0-9]{24}$"},
-                    "source_snapshot_digest": {"type": "string", "pattern": r"^[a-f0-9]{64}$"},
+                    "scout_run_id": {"type": "string", "const": run_id},
+                    "source_snapshot_digest": {"type": "string", "const": snapshot_digest},
                     "ranked_candidates": {
-                        "type": "array", "minItems": 1, "maxItems": MAX_SHORTLIST,
+                        "type": "array",
                         "items": {"type": "object", "additionalProperties": False, "required": list(item_properties), "properties": item_properties},
                     },
                 },
@@ -509,53 +527,110 @@ def ranking_response_format() -> dict[str, Any]:
     }
 
 
-def ready_material_response_format() -> dict[str, Any]:
+def ready_material_response_format(run_id: str, candidate_id: str) -> dict[str, Any]:
+    if (
+        type(run_id) is not str
+        or not RUN_ID_RE.fullmatch(run_id)
+        or type(candidate_id) is not str
+        or not CANDIDATE_ID_RE.fullmatch(candidate_id)
+    ):
+        raise ScoutError("scout_provider_schema_identity_invalid")
     scene = {
-        "order": {"type": "integer", "minimum": 1, "maximum": 7},
-        "start_second": {"type": "integer", "minimum": 0, "maximum": 20},
-        "end_second": {"type": "integer", "minimum": 1, "maximum": 20},
-        "screen_text": {"type": "string", "minLength": 1, "maxLength": 180},
-        "visual_brief": {"type": "string", "minLength": 1, "maxLength": 500},
+        "order": {"type": "integer"},
+        "start_second": {"type": "integer"},
+        "end_second": {"type": "integer"},
+        "screen_text": {"type": "string"},
+        "visual_brief": {"type": "string"},
     }
     properties = {
         "schema_version": {"type": "string", "const": READY_SCHEMA},
-        "scout_run_id": {"type": "string", "pattern": r"^csr-[a-f0-9]{24}$"},
-        "candidate_id": {"type": "string", "pattern": r"^csc-[a-f0-9]{24}$"},
-        "title": {"type": "string", "minLength": 1, "maxLength": 180},
-        "hook": {"type": "string", "minLength": 1, "maxLength": 300},
-        "telegram_post": {"type": "string", "minLength": 600, "maxLength": 1100},
-        "reel_voice_over": {"type": "string", "minLength": 80, "maxLength": 1000},
-        "reel_duration_seconds": {"type": "integer", "minimum": 12, "maximum": 20},
-        "scenes": {"type": "array", "minItems": 4, "maxItems": 7, "items": {"type": "object", "additionalProperties": False, "required": list(scene), "properties": scene}},
-        "caption": {"type": "string", "minLength": 1, "maxLength": 1000},
-        "cover_text": {"type": "string", "minLength": 1, "maxLength": 160},
-        "safety_note": {"type": "string", "minLength": 1, "maxLength": 600},
-        "source_limitations": {"type": "string", "minLength": 1, "maxLength": 600},
+        "scout_run_id": {"type": "string", "const": run_id},
+        "candidate_id": {"type": "string", "const": candidate_id},
+        "title": {"type": "string"},
+        "hook": {"type": "string"},
+        "telegram_post": {"type": "string"},
+        "reel_voice_over": {"type": "string"},
+        "reel_duration_seconds": {"type": "integer"},
+        "scenes": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": list(scene), "properties": scene}},
+        "caption": {"type": "string"},
+        "cover_text": {"type": "string"},
+        "safety_note": {"type": "string"},
+        "source_limitations": {"type": "string"},
     }
     return {"type": "json_schema", "json_schema": {"name": "content_inbox_ready_material_v1", "strict": True, "schema": {"type": "object", "additionalProperties": False, "required": list(properties), "properties": properties}}}
 
 
 def validate_provider_response_format(response_format: Mapping[str, Any]) -> None:
     """Validate the closed provider schema locally, without constructing a client."""
-    if type(response_format) is not dict or response_format.get("type") != "json_schema":
+    if (
+        type(response_format) is not dict
+        or set(response_format) != {"type", "json_schema"}
+        or type(response_format.get("type")) is not str
+        or response_format["type"] != "json_schema"
+    ):
         raise ScoutError("scout_provider_schema_invalid")
     envelope = response_format.get("json_schema")
-    if type(envelope) is not dict or envelope.get("strict") is not True:
+    if (
+        type(envelope) is not dict
+        or set(envelope) != {"name", "strict", "schema"}
+        or type(envelope.get("name")) is not str
+        or not envelope["name"]
+        or envelope.get("strict") is not True
+    ):
         raise ScoutError("scout_provider_schema_invalid")
     root = envelope.get("schema")
     if type(root) is not dict or root.get("type") != "object":
         raise ScoutError("scout_provider_schema_invalid")
 
     allowed_types = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
+    allowed_keywords = frozenset({"type", "properties", "required", "additionalProperties", "items", "enum", "const", "description"})
+
+    def value_matches_type(value: Any, declared_type: str) -> bool:
+        if declared_type == "string":
+            return type(value) is str
+        if declared_type == "integer":
+            return type(value) is int
+        if declared_type == "number":
+            return type(value) in {int, float}
+        if declared_type == "boolean":
+            return type(value) is bool
+        if declared_type == "null":
+            return value is None
+        if declared_type == "object":
+            return type(value) is dict
+        if declared_type == "array":
+            return type(value) is list
+        return False
 
     def validate_node(node: Any) -> None:
         if type(node) is not dict:
             raise ScoutError("scout_provider_schema_invalid")
+        if not set(node).issubset(allowed_keywords):
+            raise ScoutError("scout_provider_schema_invalid")
         node_type = node.get("type")
         if type(node_type) is not str or node_type not in allowed_types:
             raise ScoutError("scout_provider_schema_invalid")
-        if "const" in node and "type" not in node:
+        type_keywords = {"type", "enum", "const", "description"}
+        if node_type == "object":
+            type_keywords.update({"properties", "required", "additionalProperties"})
+        elif node_type == "array":
+            type_keywords.add("items")
+        if not set(node).issubset(type_keywords):
             raise ScoutError("scout_provider_schema_invalid")
+        if "description" in node and type(node["description"]) is not str:
+            raise ScoutError("scout_provider_schema_invalid")
+        if "const" in node and not value_matches_type(node["const"], node_type):
+            raise ScoutError("scout_provider_schema_invalid")
+        if "enum" in node:
+            values = node["enum"]
+            if (
+                type(values) is not list
+                or not values
+                or node_type in {"object", "array"}
+                or any(not value_matches_type(value, node_type) for value in values)
+                or len({(type(value).__name__, value) for value in values}) != len(values)
+            ):
+                raise ScoutError("scout_provider_schema_invalid")
         if node_type == "object":
             properties = node.get("properties")
             required = node.get("required")
@@ -853,7 +928,11 @@ async def rank_snapshot(
         if stored.get("scout_run_id") != run_id or stored.get("source_snapshot_digest") != snapshot.snapshot_digest:
             raise ScoutError("scout_ranking_artifact_invalid")
         return _run_from_record(record, run_dir, _ranked_from_stored(stored), 0, False)
-    response_format = ranking_response_format()
+    response_format = ranking_response_format(
+        run_id,
+        snapshot.snapshot_digest,
+        tuple(item.candidate_id for item in snapshot.shortlist),
+    )
     validate_provider_response_format(response_format)
     marker_path = run_dir / "ranking-requested.json"
     marker = {"schema_version": RANKING_REQUEST_SCHEMA, "run_id": run_id, "source_snapshot_digest": snapshot.snapshot_digest, "model_call_budget": 1}
@@ -999,7 +1078,7 @@ async def prepare_candidate(
         stored = _read_json(ready_path)
         material = _parse_ready(json.dumps(stored, ensure_ascii=False), run, candidate, risk_detector)
         return ReadyMaterialResult(run_id, candidate_id, material, 0, False)
-    response_format = ready_material_response_format()
+    response_format = ready_material_response_format(run_id, candidate_id)
     validate_provider_response_format(response_format)
     marker_path = run.run_dir / "prepared" / candidate_id / "prepare-requested.json"
     marker = {"schema_version": PREPARE_REQUEST_SCHEMA, "run_id": run_id, "candidate_id": candidate_id, "admin_id": admin_id, "model_call_budget": 1}
