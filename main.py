@@ -73,6 +73,7 @@ import naz_editorial_catalog
 import naz_vk_music
 import operator_events
 import operator_content_package
+import content_inbox_scout
 import scheduled_work
 import semantic_autopost
 import story_production
@@ -185,6 +186,12 @@ MONITORED_SOURCES_FILE = Path(os.getenv("MONITORED_SOURCES_FILE", "monitored_sou
 SOURCE_SEEN_FILE = Path(os.getenv("SOURCE_SEEN_FILE", ".source_seen.json").strip())
 AGENT_CONTENT_INBOX = Path(os.getenv("AGENT_CONTENT_INBOX", "content_inbox/agent_content").strip())
 AGENT_CONTENT_PROJECT = os.getenv("AGENT_CONTENT_PROJECT", "Naz_AI_Bot_clean").strip()
+NAZ_CONTENT_INBOX_SCOUT_ROOT = Path(
+    os.getenv(
+        "NAZ_CONTENT_INBOX_SCOUT_ROOT",
+        "/var/lib/naz-ai-bot/content-inbox-scout",
+    ).strip()
+)
 NAZ_OPERATOR_EVENT_ROOT = Path(
     os.getenv("NAZ_OPERATOR_EVENT_ROOT", "content_inbox/operator_events").strip()
 )
@@ -396,6 +403,14 @@ BTN_REELS_STATUS = "🔄 Обновить статус"
 BTN_PLAN = "📅 Контент-план"
 BTN_HOOKS = "🎯 Заголовки"
 BTN_IMAGE = "🖼 Картинка"
+BTN_INBOX_SCOUT = "🔥 Лучшее из Inbox"
+INBOX_SCOUT_ALIASES = frozenset(
+    {
+        "принеси лучшее из контент-инбокса",
+        "найди идеи для рилс из инбокса",
+        "покажи самые сильные материалы из инбокса",
+    }
+)
 
 BTN_STATS = "📈 Статистика"
 BTN_MEMORY = "🧠 Память"
@@ -510,6 +525,9 @@ GOAL_KEYBOARD = make_keyboard([
     [BTN_BACK],
 ])
 CONTENT_KEYBOARD = make_keyboard([[BTN_POST, BTN_VIRAL], [BTN_REELS, BTN_PLAN], [BTN_HOOKS, BTN_IMAGE], [BTN_BACK]])
+ADMIN_CONTENT_KEYBOARD = make_keyboard(
+    [[BTN_POST, BTN_VIRAL], [BTN_REELS, BTN_PLAN], [BTN_HOOKS, BTN_IMAGE], [BTN_INBOX_SCOUT], [BTN_BACK]]
+)
 REELS_KEYBOARD = make_keyboard(
     [[BTN_REELS_CONFIRM, BTN_REELS_VARIANT], [BTN_REELS_STATUS], [BTN_BACK]]
 )
@@ -4367,6 +4385,283 @@ async def agent_content_command(update: Update, context: ContextTypes.DEFAULT_TY
         await reply_long(update, f"⚠️ Не смог собрать редакторский пакет. Причина: {exc}", CONTROL_KEYBOARD)
 
 
+def normalize_inbox_scout_alias(text: str) -> str:
+    normalized = " ".join(text.strip().casefold().split())
+    normalized = normalized.strip("«»\"' ")
+    return normalized.rstrip(".!?").strip()
+
+
+def parse_inbox_scout_args(args: Iterable[str]) -> Tuple[int, str]:
+    values = [str(item).strip().casefold() for item in args if str(item).strip()]
+    count = 3
+    format_hint = ""
+    if values and values[0].isdigit():
+        count = int(values.pop(0))
+    if values:
+        if len(values) != 1 or values[0] != "reel":
+            raise content_inbox_scout.ScoutError("scout_command_arguments_invalid")
+        format_hint = "reel"
+    if not 1 <= count <= content_inbox_scout.MAX_REQUESTED:
+        raise content_inbox_scout.ScoutError("scout_count_invalid")
+    return count, format_hint
+
+
+def recent_inbox_scout_summaries(admin_id: int) -> Tuple[str, ...]:
+    summaries: List[str] = []
+    for post in memory.get_recent_generated_posts(admin_id, limit=12):
+        topic = re.sub(r"\s+", " ", str(post.get("topic", ""))).strip()
+        content = extract_telegram_post_from_package(str(post.get("content", "")))
+        compact = re.sub(r"\s+", " ", content).strip()
+        safe = redact_sensitive_text(" · ".join(part for part in (topic, compact[:360]) if part))
+        if safe and not detect_content_risks(safe):
+            summaries.append(safe[:500])
+    return tuple(summaries)
+
+
+async def _inbox_scout_model_call(
+    messages: Iterable[Mapping[str, str]], response_format: Mapping[str, Any]
+) -> str:
+    return await call_gpt(
+        [dict(item) for item in messages],
+        max_tokens=6000,
+        temperature=0.1,
+        model=CONTENT_MODEL_NAME,
+        response_format=response_format,
+    )
+
+
+def inbox_scout_keyboard(
+    run_id: str, candidate_id: str, *, prepared: bool = False
+) -> InlineKeyboardMarkup:
+    if prepared:
+        rows = [
+            [InlineKeyboardButton("Выбрать", callback_data=content_inbox_scout.callback_data("select", run_id, candidate_id))],
+            [InlineKeyboardButton("Другой из TOP", callback_data=content_inbox_scout.callback_data("other", run_id, candidate_id))],
+            [InlineKeyboardButton("Пропустить", callback_data=content_inbox_scout.callback_data("skip", run_id, candidate_id))],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton("Подготовить материал", callback_data=content_inbox_scout.callback_data("prepare", run_id, candidate_id))],
+            [InlineKeyboardButton("Подробнее", callback_data=content_inbox_scout.callback_data("details", run_id, candidate_id))],
+            [InlineKeyboardButton("Скрыть", callback_data=content_inbox_scout.callback_data("hide", run_id, candidate_id))],
+        ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _inbox_scout_cards(
+    run: content_inbox_scout.ScoutRunResult,
+    count: int,
+    hidden: Iterable[str],
+    format_hint: str,
+) -> Tuple[content_inbox_scout.RankedCandidate, ...]:
+    available = content_inbox_scout.safe_cards(run, content_inbox_scout.MAX_REQUESTED, hidden)
+    if format_hint == "reel":
+        reel = tuple(item for item in available if item.recommended_format in {"short_reel", "long_reel"})
+        other = tuple(item for item in available if item.recommended_format not in {"short_reel", "long_reel"})
+        available = reel + other
+    return available[:count]
+
+
+async def send_inbox_scout_cards(
+    bot: Any,
+    admin_id: int,
+    run: content_inbox_scout.ScoutRunResult,
+    *,
+    count: int,
+    format_hint: str,
+) -> Tuple[content_inbox_scout.RankedCandidate, ...]:
+    hidden = await asyncio.to_thread(
+        content_inbox_scout.hidden_candidate_ids, NAZ_CONTENT_INBOX_SCOUT_ROOT, admin_id
+    )
+    cards = _inbox_scout_cards(run, count, hidden, format_hint)
+    if not cards:
+        raise content_inbox_scout.ScoutError("scout_no_visible_candidates")
+    for position, item in enumerate(cards, start=1):
+        await bot.send_message(
+            chat_id=admin_id,
+            text=content_inbox_scout.card_text(item, position),
+            reply_markup=inbox_scout_keyboard(run.run_id, item.candidate_id),
+            disable_web_page_preview=True,
+        )
+    return cards
+
+
+async def run_content_inbox_scout(
+    bot: Any,
+    admin_id: int,
+    *,
+    count: int = 3,
+    format_hint: str = "",
+    refresh: bool = False,
+    operator_request_id: str = "",
+) -> Dict[str, Any]:
+    if not is_admin(admin_id):
+        raise content_inbox_scout.ScoutError("scout_admin_required")
+    protected_roots = [
+        Path(__file__).resolve().parent,
+        AGENT_CONTENT_INBOX,
+        reels_failure_quarantine.default_registry_path().parent,
+        reels_failure_quarantine.default_narrative_outbox_path(),
+    ]
+    review_authority_root = reels_failure_quarantine.default_review_authority_path()
+    if review_authority_root is not None:
+        protected_roots.append(review_authority_root)
+    content_inbox_scout.assert_private_state_location(
+        NAZ_CONTENT_INBOX_SCOUT_ROOT, protected_roots
+    )
+    recent = await asyncio.to_thread(recent_inbox_scout_summaries, admin_id)
+    snapshot = await asyncio.to_thread(
+        content_inbox_scout.discover_candidates,
+        AGENT_CONTENT_INBOX,
+        AGENT_CONTENT_PROJECT,
+        risk_detector=detect_content_risks,
+        redactor=redact_sensitive_text,
+        recent_summaries=recent,
+    )
+    request_id = operator_request_id or f"inbox-best-{snapshot.snapshot_digest[:24]}"
+    run = await content_inbox_scout.rank_snapshot(
+        NAZ_CONTENT_INBOX_SCOUT_ROOT,
+        snapshot,
+        admin_id=admin_id,
+        expected_admin_id=ADMIN_ID,
+        operator_request_id=request_id,
+        refresh=refresh,
+        recent_summaries=recent,
+        risk_detector=detect_content_risks,
+        model_call=_inbox_scout_model_call,
+    )
+    cards = await send_inbox_scout_cards(
+        bot, admin_id, run, count=count, format_hint=format_hint
+    )
+    return {
+        "schema_version": "content-inbox-scout-delivery-v1",
+        "run_id": run.run_id,
+        "source_snapshot_digest": snapshot.snapshot_digest,
+        "discovered_count": snapshot.discovered_count,
+        "deduplicated_count": snapshot.deduplicated_count,
+        "shortlist_count": len(snapshot.shortlist),
+        "ranking_model_calls": run.model_calls,
+        "card_count": len(cards),
+        "cards": [
+            {
+                "title": item.human_title,
+                "story_strength_score": item.story_strength_score,
+                "reel_ease_score": item.reel_ease_score,
+                "duration_seconds": item.recommended_duration_seconds,
+                "scene_count": item.recommended_scene_count,
+            }
+            for item in cards
+        ],
+    }
+
+
+async def _inbox_scout_request(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, refresh: bool
+) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        await reply_long(update, "🔒 Content Inbox Scout доступен только админу.", MAIN_KEYBOARD)
+        return
+    try:
+        count, format_hint = parse_inbox_scout_args(getattr(context, "args", ()) or ())
+        suffix = str(getattr(update.message, "message_id", 0) or 0)
+        request_id = (
+            f"inbox-best-refresh-{update.effective_user.id}-{suffix}"
+            if refresh
+            else ""
+        )
+        await run_content_inbox_scout(
+            context.bot,
+            update.effective_user.id,
+            count=count,
+            format_hint=format_hint,
+            refresh=refresh,
+            operator_request_id=request_id,
+        )
+    except content_inbox_scout.ScoutError as exc:
+        await reply_long(update, f"⚠️ Scout остановлен: {exc.reason_code}", CONTENT_KEYBOARD)
+    except Exception:  # noqa: BLE001
+        logger.exception("content inbox scout failed")
+        await reply_long(update, "⚠️ Scout остановлен: scout_runtime_failure", CONTENT_KEYBOARD)
+
+
+async def inbox_best_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _inbox_scout_request(update, context, refresh=False)
+
+
+async def inbox_best_refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _inbox_scout_request(update, context, refresh=True)
+
+
+async def content_inbox_scout_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user or not query.data:
+        return
+    if not is_admin(update.effective_user.id):
+        await query.answer("Content Inbox Scout доступен только администратору.", show_alert=True)
+        return
+    try:
+        action, run_id, candidate_id = content_inbox_scout.parse_callback(query.data)
+        run = await asyncio.to_thread(
+            content_inbox_scout.load_run, NAZ_CONTENT_INBOX_SCOUT_ROOT, run_id
+        )
+        candidate = content_inbox_scout.ranked_for_run(run, candidate_id)
+        await query.answer()
+        if action == "details":
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=content_inbox_scout.details_text(candidate),
+                disable_web_page_preview=True,
+            )
+            return
+        if action in {"hide", "skip", "select"}:
+            preference = {"hide": "hidden", "skip": "skipped", "select": "selected"}[action]
+            await asyncio.to_thread(
+                content_inbox_scout.store_preference,
+                NAZ_CONTENT_INBOX_SCOUT_ROOT,
+                run,
+                candidate_id,
+                ADMIN_ID,
+                preference,
+            )
+            label = {"hide": "Скрыто из следующих подборок.", "skip": "Материал пропущен.", "select": "Материал выбран для дальнейшей ручной работы."}[action]
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"✅ {label}")
+            return
+        if action == "other":
+            await send_inbox_scout_cards(context.bot, ADMIN_ID, run, count=3, format_hint="reel")
+            return
+        if action == "prepare":
+            ready = await content_inbox_scout.prepare_candidate(
+                NAZ_CONTENT_INBOX_SCOUT_ROOT,
+                run_id,
+                candidate_id,
+                admin_id=ADMIN_ID,
+                expected_admin_id=ADMIN_ID,
+                risk_detector=detect_content_risks,
+                model_call=_inbox_scout_model_call,
+            )
+            chunks = split_telegram_text(content_inbox_scout.ready_material_text(ready.material))
+            for index, chunk in enumerate(chunks):
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=chunk,
+                    reply_markup=inbox_scout_keyboard(run_id, candidate_id, prepared=True)
+                    if index == len(chunks) - 1
+                    else None,
+                    disable_web_page_preview=True,
+                )
+            return
+        raise content_inbox_scout.ScoutError("scout_callback_invalid")
+    except content_inbox_scout.ScoutError as exc:
+        await query.answer(f"Scout остановлен: {exc.reason_code}", show_alert=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("content inbox scout callback failed")
+        await query.answer("Scout остановлен: scout_runtime_failure", show_alert=True)
+
+
 async def publish_agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -6705,7 +7000,14 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return True
 
     if text == BTN_CONTENT:
-        await update.message.reply_text("🚀 Выбери, что собрать:", reply_markup=CONTENT_KEYBOARD)
+        await update.message.reply_text(
+            "🚀 Выбери, что собрать:",
+            reply_markup=ADMIN_CONTENT_KEYBOARD if is_admin(user_id) else CONTENT_KEYBOARD,
+        )
+        return True
+
+    if text == BTN_INBOX_SCOUT:
+        await _inbox_scout_request(update, context, refresh=False)
         return True
 
     if text == BTN_REELS:
@@ -7736,6 +8038,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = update.effective_user.id
     text = update.message.text.strip()
+
+    if normalize_inbox_scout_alias(text) in INBOX_SCOUT_ALIASES:
+        await _inbox_scout_request(update, context, refresh=False)
+        return
 
     if await handle_delegated_reply(update, context, text):
         return
@@ -9710,6 +10016,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("scan_sources", scan_sources_command))
     application.add_handler(CommandHandler("publish_source", publish_source_command))
     application.add_handler(CommandHandler("agent_content", agent_content_command))
+    application.add_handler(CommandHandler("inbox_best", inbox_best_command))
+    application.add_handler(CommandHandler("inbox_best_refresh", inbox_best_refresh_command))
     application.add_handler(CommandHandler("sync_agent_content", sync_agent_content_command))
     application.add_handler(
         CommandHandler(
@@ -9742,6 +10050,12 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("contacts", contacts_command))
     application.add_handler(CommandHandler("contact_candidates", contact_candidates_command))
     application.add_handler(CommandHandler("contact_add", contact_add_command))
+    application.add_handler(
+        CallbackQueryHandler(
+            content_inbox_scout_callback,
+            pattern=r"^scout:(?:prepare|details|hide|select|other|skip):[a-f0-9]{24}:[a-f0-9]{24}$",
+        )
+    )
     application.add_handler(
         CallbackQueryHandler(contact_message_callback, pattern=r"^contact_(?:send|cancel):\d+$")
     )
