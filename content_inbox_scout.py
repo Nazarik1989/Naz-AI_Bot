@@ -496,7 +496,7 @@ def ranking_response_format() -> dict[str, Any]:
                 "type": "object", "additionalProperties": False,
                 "required": ["schema_version", "scout_run_id", "source_snapshot_digest", "ranked_candidates"],
                 "properties": {
-                    "schema_version": {"const": RANKING_SCHEMA},
+                    "schema_version": {"type": "string", "const": RANKING_SCHEMA},
                     "scout_run_id": {"type": "string", "pattern": r"^csr-[a-f0-9]{24}$"},
                     "source_snapshot_digest": {"type": "string", "pattern": r"^[a-f0-9]{64}$"},
                     "ranked_candidates": {
@@ -518,7 +518,7 @@ def ready_material_response_format() -> dict[str, Any]:
         "visual_brief": {"type": "string", "minLength": 1, "maxLength": 500},
     }
     properties = {
-        "schema_version": {"const": READY_SCHEMA},
+        "schema_version": {"type": "string", "const": READY_SCHEMA},
         "scout_run_id": {"type": "string", "pattern": r"^csr-[a-f0-9]{24}$"},
         "candidate_id": {"type": "string", "pattern": r"^csc-[a-f0-9]{24}$"},
         "title": {"type": "string", "minLength": 1, "maxLength": 180},
@@ -533,6 +533,51 @@ def ready_material_response_format() -> dict[str, Any]:
         "source_limitations": {"type": "string", "minLength": 1, "maxLength": 600},
     }
     return {"type": "json_schema", "json_schema": {"name": "content_inbox_ready_material_v1", "strict": True, "schema": {"type": "object", "additionalProperties": False, "required": list(properties), "properties": properties}}}
+
+
+def validate_provider_response_format(response_format: Mapping[str, Any]) -> None:
+    """Validate the closed provider schema locally, without constructing a client."""
+    if type(response_format) is not dict or response_format.get("type") != "json_schema":
+        raise ScoutError("scout_provider_schema_invalid")
+    envelope = response_format.get("json_schema")
+    if type(envelope) is not dict or envelope.get("strict") is not True:
+        raise ScoutError("scout_provider_schema_invalid")
+    root = envelope.get("schema")
+    if type(root) is not dict or root.get("type") != "object":
+        raise ScoutError("scout_provider_schema_invalid")
+
+    allowed_types = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
+
+    def validate_node(node: Any) -> None:
+        if type(node) is not dict:
+            raise ScoutError("scout_provider_schema_invalid")
+        node_type = node.get("type")
+        if type(node_type) is not str or node_type not in allowed_types:
+            raise ScoutError("scout_provider_schema_invalid")
+        if "const" in node and "type" not in node:
+            raise ScoutError("scout_provider_schema_invalid")
+        if node_type == "object":
+            properties = node.get("properties")
+            required = node.get("required")
+            if (
+                type(properties) is not dict
+                or type(required) is not list
+                or node.get("additionalProperties") is not False
+                or any(type(key) is not str for key in properties)
+                or any(type(key) is not str for key in required)
+                or len(set(required)) != len(required)
+                or set(required) != set(properties)
+            ):
+                raise ScoutError("scout_provider_schema_invalid")
+            for property_node in properties.values():
+                validate_node(property_node)
+        elif node_type == "array":
+            items = node.get("items")
+            if type(items) is not dict or type(items.get("type")) is not str:
+                raise ScoutError("scout_provider_schema_invalid")
+            validate_node(items)
+
+    validate_node(root)
 
 
 def _candidate_record(candidate: Candidate) -> dict[str, Any]:
@@ -808,6 +853,8 @@ async def rank_snapshot(
         if stored.get("scout_run_id") != run_id or stored.get("source_snapshot_digest") != snapshot.snapshot_digest:
             raise ScoutError("scout_ranking_artifact_invalid")
         return _run_from_record(record, run_dir, _ranked_from_stored(stored), 0, False)
+    response_format = ranking_response_format()
+    validate_provider_response_format(response_format)
     marker_path = run_dir / "ranking-requested.json"
     marker = {"schema_version": RANKING_REQUEST_SCHEMA, "run_id": run_id, "source_snapshot_digest": snapshot.snapshot_digest, "model_call_budget": 1}
     if marker_path.exists():
@@ -817,7 +864,7 @@ async def rank_snapshot(
     raw = await model_call([
         {"role": "system", "content": "Rank only supplied privacy-safe candidates. Return the closed JSON schema exactly; invent no facts or metrics."},
         {"role": "user", "content": prompt},
-    ], ranking_response_format())
+    ], response_format)
     ranked = parse_ranking(raw, run_id, snapshot, risk_detector)
     _write_exact(ranking_path, _ranking_record(run_id, snapshot.snapshot_digest, ranked), "scout_ranking_conflict")
     return _run_from_record(record, run_dir, ranked, 1, created)
@@ -952,6 +999,8 @@ async def prepare_candidate(
         stored = _read_json(ready_path)
         material = _parse_ready(json.dumps(stored, ensure_ascii=False), run, candidate, risk_detector)
         return ReadyMaterialResult(run_id, candidate_id, material, 0, False)
+    response_format = ready_material_response_format()
+    validate_provider_response_format(response_format)
     marker_path = run.run_dir / "prepared" / candidate_id / "prepare-requested.json"
     marker = {"schema_version": PREPARE_REQUEST_SCHEMA, "run_id": run_id, "candidate_id": candidate_id, "admin_id": admin_id, "model_call_budget": 1}
     if marker_path.exists():
@@ -971,7 +1020,7 @@ async def prepare_candidate(
     raw = await model_call([
         {"role": "system", "content": "Prepare one source-grounded private material. Use only supplied candidate facts. Return the closed JSON schema exactly. No publication or media calls."},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))},
-    ], ready_material_response_format())
+    ], response_format)
     material = _parse_ready(raw, run, candidate, risk_detector)
     _write_exact(ready_path, material, "scout_ready_material_conflict")
     return ReadyMaterialResult(run_id, candidate_id, material, 1, True)

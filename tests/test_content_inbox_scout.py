@@ -560,3 +560,126 @@ def test_details_callback_uses_stored_result_and_zero_provider_calls(tmp_path):
     provider.assert_not_awaited()
     bot.send_message.assert_awaited_once()
     assert candidate.human_title in bot.send_message.await_args.kwargs["text"]
+
+
+def test_ranking_schema_version_has_explicit_string_type_and_const():
+    node = scout.ranking_response_format()["json_schema"]["schema"]["properties"]["schema_version"]
+    assert node == {"type": "string", "const": scout.RANKING_SCHEMA}
+
+
+def test_ready_schema_version_has_explicit_string_type_and_const():
+    node = scout.ready_material_response_format()["json_schema"]["schema"]["properties"]["schema_version"]
+    assert node == {"type": "string", "const": scout.READY_SCHEMA}
+
+
+@pytest.mark.parametrize("factory", [scout.ranking_response_format, scout.ready_material_response_format])
+def test_recursive_provider_schema_preflight_accepts_real_contracts(factory):
+    scout.validate_provider_response_format(factory())
+
+
+def test_provider_schema_preflight_rejects_const_only_property():
+    value = copy.deepcopy(scout.ranking_response_format())
+    value["json_schema"]["schema"]["properties"]["schema_version"] = {"const": scout.RANKING_SCHEMA}
+    with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
+        scout.validate_provider_response_format(value)
+
+
+def test_provider_schema_preflight_rejects_property_without_type():
+    value = copy.deepcopy(scout.ranking_response_format())
+    value["json_schema"]["schema"]["properties"]["scout_run_id"].pop("type")
+    with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
+        scout.validate_provider_response_format(value)
+
+
+def test_provider_schema_preflight_rejects_open_object():
+    value = copy.deepcopy(scout.ready_material_response_format())
+    value["json_schema"]["schema"]["properties"]["scenes"]["items"]["additionalProperties"] = True
+    with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
+        scout.validate_provider_response_format(value)
+
+
+def test_provider_schema_preflight_rejects_required_property_mismatch():
+    value = copy.deepcopy(scout.ranking_response_format())
+    value["json_schema"]["schema"]["required"].remove("source_snapshot_digest")
+    with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
+        scout.validate_provider_response_format(value)
+
+
+def test_invalid_ranking_schema_stops_before_marker_and_provider(tmp_path):
+    snap = snapshot(tmp_path)
+    invalid = copy.deepcopy(scout.ranking_response_format())
+    invalid["json_schema"]["schema"]["properties"]["schema_version"].pop("type")
+    calls = []
+
+    async def model(*_args):
+        calls.append(1)
+        return "{}"
+
+    with patch.object(scout, "ranking_response_format", return_value=invalid):
+        with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
+            asyncio.run(scout.rank_snapshot(
+                tmp_path / "state", snap, admin_id=ADMIN, expected_admin_id=ADMIN,
+                operator_request_id="invalid-schema-ranking-01", refresh=True,
+                recent_summaries=(), risk_detector=lambda _: [], model_call=model,
+            ))
+    assert calls == []
+    assert list((tmp_path / "state").rglob("ranking-requested.json")) == []
+    assert list((tmp_path / "state").rglob("ranking.json")) == []
+
+
+def test_invalid_ready_schema_stops_before_marker_and_provider(tmp_path):
+    run, _ = asyncio.run(create_run(tmp_path))
+    candidate_id = run.ranked[0].candidate_id
+    invalid = copy.deepcopy(scout.ready_material_response_format())
+    invalid["json_schema"]["schema"]["properties"]["schema_version"].pop("type")
+    calls = []
+
+    async def model(*_args):
+        calls.append(1)
+        return "{}"
+
+    with patch.object(scout, "ready_material_response_format", return_value=invalid):
+        with pytest.raises(scout.ScoutError, match="scout_provider_schema_invalid"):
+            asyncio.run(scout.prepare_candidate(
+                tmp_path / "state", run.run_id, candidate_id, admin_id=ADMIN,
+                expected_admin_id=ADMIN, risk_detector=lambda _: [], model_call=model,
+            ))
+    assert calls == []
+    assert list((tmp_path / "state").rglob("prepare-requested.json")) == []
+    assert list((tmp_path / "state").rglob("ready-material.json")) == []
+
+
+def test_interrupted_run_is_immutable_and_refresh_uses_new_run(tmp_path):
+    snap = snapshot(tmp_path)
+    state = tmp_path / "state"
+    failed_calls = []
+
+    async def invalid_model(*_args):
+        failed_calls.append(1)
+        return "not-json"
+
+    with pytest.raises(scout.ScoutError, match="scout_ranking_json_invalid"):
+        asyncio.run(scout.rank_snapshot(
+            state, snap, admin_id=ADMIN, expected_admin_id=ADMIN,
+            operator_request_id="production-style-failed-01", refresh=False,
+            recent_summaries=(), risk_detector=lambda _: [], model_call=invalid_model,
+        ))
+    old_run_dirs = list((state / "runs").iterdir())
+    assert len(old_run_dirs) == 1
+    old_run = old_run_dirs[0]
+    before = file_hashes(old_run)
+    refresh_calls = []
+
+    async def valid_model(messages, _response_format):
+        refresh_calls.append(1)
+        run_id = json.loads(messages[1]["content"])["scout_run_id"]
+        return json.dumps(ranking_payload(snap, run_id), ensure_ascii=False)
+
+    refreshed = asyncio.run(scout.rank_snapshot(
+        state, snap, admin_id=ADMIN, expected_admin_id=ADMIN,
+        operator_request_id="production-refresh-schema-01", refresh=True,
+        recent_summaries=(), risk_detector=lambda _: [], model_call=valid_model,
+    ))
+    assert refreshed.run_dir != old_run
+    assert file_hashes(old_run) == before
+    assert failed_calls == [1] and refresh_calls == [1]
