@@ -1370,6 +1370,39 @@ def load_run(state_root: Path, run_id: str) -> ScoutRunResult:
     return _run_from_record(record, run_dir, ranking, 0, False)
 
 
+def load_ready_material(
+    state_root: Path,
+    run_id: str,
+    candidate_id: str,
+    *,
+    risk_detector: RiskDetector,
+    require_current_russian: bool = True,
+) -> tuple[ScoutRunResult, Candidate, dict[str, Any], Path]:
+    """Load one already persisted ready material without invoking a provider."""
+    run = load_run(state_root, run_id)
+    candidate = candidate_for_run(run, candidate_id)
+    ranked_for_run(run, candidate_id)
+    ready_path = run.run_dir / "prepared" / candidate_id / "ready-material.json"
+    if not ready_path.is_file():
+        raise ScoutError("scout_ready_material_missing")
+    stored = _read_json(ready_path)
+    if require_current_russian:
+        if (
+            run.output_language != OUTPUT_LANGUAGE
+            or run.ranking_contract != RANKING_SCHEMA
+            or stored.get("schema_version") != READY_ARTIFACT_SCHEMA
+            or stored.get("output_language") != OUTPUT_LANGUAGE
+        ):
+            raise ScoutError("scout_ready_language_contract_invalid")
+    if stored.get("schema_version") == READY_SCHEMA_V1:
+        material = _validate_legacy_ready_raw(
+            json.dumps(stored, ensure_ascii=False), run, candidate, risk_detector
+        )
+    else:
+        material = _validate_ready_artifact(stored, run, candidate, risk_detector)
+    return run, candidate, material, ready_path
+
+
 def candidate_for_run(run: ScoutRunResult, candidate_id: str) -> Candidate:
     matches = [item for item in run.snapshot.candidates if item.candidate_id == candidate_id]
     if len(matches) != 1:

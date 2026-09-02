@@ -74,6 +74,7 @@ import naz_vk_music
 import operator_events
 import operator_content_package
 import content_inbox_scout
+import content_inbox_scout_reel
 import scheduled_work
 import semantic_autopost
 import story_production
@@ -192,6 +193,7 @@ NAZ_CONTENT_INBOX_SCOUT_ROOT = Path(
         "/var/lib/naz-ai-bot/content-inbox-scout",
     ).strip()
 )
+NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT = NAZ_CONTENT_INBOX_SCOUT_ROOT / "reel-production"
 NAZ_OPERATOR_EVENT_ROOT = Path(
     os.getenv("NAZ_OPERATOR_EVENT_ROOT", "content_inbox/operator_events").strip()
 )
@@ -4435,7 +4437,7 @@ def inbox_scout_keyboard(
 ) -> InlineKeyboardMarkup:
     if prepared:
         rows = [
-            [InlineKeyboardButton("Выбрать", callback_data=content_inbox_scout.callback_data("select", run_id, candidate_id))],
+            [InlineKeyboardButton("Выбрать для Reel", callback_data=content_inbox_scout.callback_data("select", run_id, candidate_id))],
             [InlineKeyboardButton("Другой из TOP", callback_data=content_inbox_scout.callback_data("other", run_id, candidate_id))],
             [InlineKeyboardButton("Пропустить", callback_data=content_inbox_scout.callback_data("skip", run_id, candidate_id))],
         ]
@@ -4446,6 +4448,27 @@ def inbox_scout_keyboard(
             [InlineKeyboardButton("Скрыть", callback_data=content_inbox_scout.callback_data("hide", run_id, candidate_id))],
         ]
     return InlineKeyboardMarkup(rows)
+
+
+def inbox_scout_selected_keyboard(
+    selected: content_inbox_scout_reel.SelectedMaterial,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Собрать Reel", callback_data=content_inbox_scout_reel.callback_data("build", selected.selection_id))],
+        [InlineKeyboardButton("Показать материал", callback_data=content_inbox_scout_reel.callback_data("show", selected.selection_id))],
+        [InlineKeyboardButton("Другой из TOP", callback_data=content_inbox_scout_reel.callback_data("other", selected.selection_id))],
+        [InlineKeyboardButton("Отменить", callback_data=content_inbox_scout_reel.callback_data("cancel", selected.selection_id))],
+    ])
+
+
+def inbox_scout_preview_keyboard(
+    selected: content_inbox_scout_reel.SelectedMaterial,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Опубликовать", callback_data=content_inbox_scout_reel.callback_data("publish", selected.selection_id))],
+        [InlineKeyboardButton("Переделать", callback_data=content_inbox_scout_reel.callback_data("remake", selected.selection_id))],
+        [InlineKeyboardButton("Отменить", callback_data=content_inbox_scout_reel.callback_data("cancel", selected.selection_id))],
+    ])
 
 
 def _inbox_scout_cards(
@@ -4486,17 +4509,7 @@ async def send_inbox_scout_cards(
     return cards
 
 
-async def run_content_inbox_scout(
-    bot: Any,
-    admin_id: int,
-    *,
-    count: int = 3,
-    format_hint: str = "",
-    refresh: bool = False,
-    operator_request_id: str = "",
-) -> Dict[str, Any]:
-    if not is_admin(admin_id):
-        raise content_inbox_scout.ScoutError("scout_admin_required")
+def assert_content_inbox_scout_private_state() -> None:
     protected_roots = [
         Path(__file__).resolve().parent,
         AGENT_CONTENT_INBOX,
@@ -4509,6 +4522,23 @@ async def run_content_inbox_scout(
     content_inbox_scout.assert_private_state_location(
         NAZ_CONTENT_INBOX_SCOUT_ROOT, protected_roots
     )
+    content_inbox_scout.assert_private_state_location(
+        NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT, protected_roots
+    )
+
+
+async def run_content_inbox_scout(
+    bot: Any,
+    admin_id: int,
+    *,
+    count: int = 3,
+    format_hint: str = "",
+    refresh: bool = False,
+    operator_request_id: str = "",
+) -> Dict[str, Any]:
+    if not is_admin(admin_id):
+        raise content_inbox_scout.ScoutError("scout_admin_required")
+    assert_content_inbox_scout_private_state()
     recent = await asyncio.to_thread(recent_inbox_scout_summaries, admin_id)
     snapshot = await asyncio.to_thread(
         content_inbox_scout.discover_candidates,
@@ -4617,8 +4647,8 @@ async def content_inbox_scout_callback(
                 disable_web_page_preview=True,
             )
             return
-        if action in {"hide", "skip", "select"}:
-            preference = {"hide": "hidden", "skip": "skipped", "select": "selected"}[action]
+        if action in {"hide", "skip"}:
+            preference = {"hide": "hidden", "skip": "skipped"}[action]
             await asyncio.to_thread(
                 content_inbox_scout.store_preference,
                 NAZ_CONTENT_INBOX_SCOUT_ROOT,
@@ -4627,8 +4657,35 @@ async def content_inbox_scout_callback(
                 ADMIN_ID,
                 preference,
             )
-            label = {"hide": "Скрыто из следующих подборок.", "skip": "Материал пропущен.", "select": "Материал выбран для дальнейшей ручной работы."}[action]
+            label = {"hide": "Скрыто из следующих подборок.", "skip": "Материал пропущен."}[action]
             await context.bot.send_message(chat_id=ADMIN_ID, text=f"✅ {label}")
+            return
+        if action == "select":
+            await asyncio.to_thread(assert_content_inbox_scout_private_state)
+            selected, _material, _created = await asyncio.to_thread(
+                content_inbox_scout_reel.promote_selection,
+                NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT,
+                NAZ_CONTENT_INBOX_SCOUT_ROOT,
+                run_id,
+                candidate_id,
+                admin_id=update.effective_user.id,
+                expected_admin_id=ADMIN_ID,
+                selection_request_id=f"scout-select-{run_id[4:]}-{candidate_id[4:]}",
+                risk_detector=detect_content_risks,
+            )
+            await asyncio.to_thread(
+                content_inbox_scout.store_preference,
+                NAZ_CONTENT_INBOX_SCOUT_ROOT,
+                run,
+                candidate_id,
+                ADMIN_ID,
+                "selected",
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=content_inbox_scout_reel.selection_card_text(selected),
+                reply_markup=inbox_scout_selected_keyboard(selected),
+            )
             return
         if action == "other":
             await send_inbox_scout_cards(context.bot, ADMIN_ID, run, count=3, format_hint="reel")
@@ -4657,9 +4714,147 @@ async def content_inbox_scout_callback(
         raise content_inbox_scout.ScoutError("scout_callback_invalid")
     except content_inbox_scout.ScoutError as exc:
         await query.answer(f"Scout остановлен: {exc.reason_code}", show_alert=True)
+    except content_inbox_scout_reel.ScoutReelError as exc:
+        await query.answer(f"Reel остановлен: {exc.reason_code}", show_alert=True)
     except Exception:  # noqa: BLE001
         logger.exception("content inbox scout callback failed")
         await query.answer("Scout остановлен: scout_runtime_failure", show_alert=True)
+
+
+async def _synthesize_scout_reel_voice(text: str) -> bytes:
+    if type(text) is not str or not text.strip() or text != text.strip():
+        raise content_inbox_scout_reel.ScoutReelError("content_scout_reel_voice_invalid")
+
+    def _request() -> bytes:
+        response = ensure_voice_openai_client().audio.speech.create(
+            model=OPENAI_TTS_MODEL,
+            voice=OPENAI_TTS_VOICE,
+            input=text,
+            instructions=(
+                "Speak the supplied Russian voice-over exactly as written, naturally and clearly. "
+                "Do not add, omit, paraphrase, or translate words. This is an AI-generated voice."
+            ),
+            response_format="opus",
+        )
+        content = response.read() if hasattr(response, "read") else getattr(response, "content", b"")
+        return bytes(content or b"")
+
+    audio = await asyncio.to_thread(_request)
+    if not audio:
+        raise content_inbox_scout_reel.ScoutReelError("content_scout_reel_tts_failed")
+    return audio
+
+
+async def _render_and_deliver_scout_reel(
+    bot: Any,
+    selected: content_inbox_scout_reel.SelectedMaterial,
+    material: Mapping[str, Any],
+) -> None:
+    try:
+        rendered = await content_inbox_scout_reel.render_job(
+            NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT,
+            selected,
+            material,
+            tts_call=_synthesize_scout_reel_voice,
+        )
+        with rendered.output_path.open("rb") as video:
+            await bot.send_video(
+                chat_id=ADMIN_ID,
+                video=video,
+                caption="Приватное превью · 15 секунд · 5 сцен · без музыки",
+                reply_markup=inbox_scout_preview_keyboard(selected),
+            )
+    except content_inbox_scout_reel.ScoutReelError as exc:
+        logger.warning("Scout Reel build stopped | reason=%s", exc.reason_code)
+        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Сборка остановлена: {exc.reason_code}")
+    except Exception:  # noqa: BLE001
+        logger.exception("Scout Reel build failed")
+        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Сборка остановлена: content_scout_reel_runtime_failure")
+
+
+async def content_inbox_scout_reel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user or not query.data:
+        return
+    if not is_admin(update.effective_user.id):
+        await query.answer("Scout Reel доступен только администратору.", show_alert=True)
+        return
+    try:
+        await asyncio.to_thread(assert_content_inbox_scout_private_state)
+        action, selection_id = content_inbox_scout_reel.parse_callback(query.data)
+        selected = await asyncio.to_thread(
+            content_inbox_scout_reel.load_selection,
+            NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT,
+            selection_id,
+            admin_id=update.effective_user.id,
+            expected_admin_id=ADMIN_ID,
+        )
+        run, material = await asyncio.to_thread(
+            content_inbox_scout_reel.load_selected_ready_material,
+            NAZ_CONTENT_INBOX_SCOUT_ROOT,
+            selected,
+            risk_detector=detect_content_risks,
+        )
+        await query.answer()
+        if action == "show":
+            chunks = split_telegram_text(content_inbox_scout.ready_material_text(material))
+            for chunk in chunks:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=chunk,
+                    disable_web_page_preview=True,
+                )
+            return
+        if action == "other":
+            await send_inbox_scout_cards(context.bot, ADMIN_ID, run, count=3, format_hint="reel")
+            return
+        if action == "cancel":
+            await asyncio.to_thread(
+                content_inbox_scout_reel.cancel_selection,
+                NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT,
+                selection_id,
+                admin_id=update.effective_user.id,
+                expected_admin_id=ADMIN_ID,
+            )
+            await context.bot.send_message(chat_id=ADMIN_ID, text="✅ Приватный черновик отменён.")
+            return
+        if action in {"publish", "remake"}:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "🔒 Публикация требует отдельного подтверждения администратора."
+                    if action == "publish"
+                    else "🔒 Переделка требует отдельного действия администратора."
+                ),
+            )
+            return
+        if action == "build":
+            await asyncio.to_thread(
+                content_inbox_scout_reel.reserve_job,
+                NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT,
+                selected,
+                material,
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="🎬 Сборка началась\n\n15 секунд · 5 сцен · без музыки",
+            )
+            coroutine = _render_and_deliver_scout_reel(context.bot, selected, material)
+            application = getattr(context, "application", None)
+            if application is not None and hasattr(application, "create_task"):
+                application.create_task(coroutine, name=f"scout-reel-{selection_id}")
+            else:
+                asyncio.create_task(coroutine, name=f"scout-reel-{selection_id}")
+            return
+        raise content_inbox_scout_reel.ScoutReelError("content_scout_reel_callback_invalid")
+    except (content_inbox_scout.ScoutError, content_inbox_scout_reel.ScoutReelError) as exc:
+        reason = getattr(exc, "reason_code", "content_scout_reel_runtime_failure")
+        await query.answer(f"Reel остановлен: {reason}", show_alert=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("content inbox scout Reel callback failed")
+        await query.answer("Reel остановлен: content_scout_reel_runtime_failure", show_alert=True)
 
 
 async def publish_agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10054,6 +10249,12 @@ def build_application() -> Application:
         CallbackQueryHandler(
             content_inbox_scout_callback,
             pattern=r"^scout:(?:prepare|details|hide|select|other|skip):[a-f0-9]{24}:[a-f0-9]{24}$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            content_inbox_scout_reel_callback,
+            pattern=r"^scoutreel:(?:build|show|other|cancel|publish|remake):[a-f0-9]{24}$",
         )
     )
     application.add_handler(
