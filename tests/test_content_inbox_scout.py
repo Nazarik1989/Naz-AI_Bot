@@ -107,6 +107,7 @@ def ranking_payload(snap: scout.InboxSnapshot, run_id: str) -> dict:
         }
     return {
         "schema_version": scout.RANKING_SCHEMA,
+        "output_language": scout.OUTPUT_LANGUAGE,
         "scout_run_id": run_id,
         "source_snapshot_digest": snap.snapshot_digest,
         "candidate_evaluations": evaluations,
@@ -143,6 +144,7 @@ def ready_payload(run_id: str, candidate_id: str, scene_count: int = 5) -> dict:
     assert 600 <= len(post) <= 1100
     return {
         "schema_version": scout.READY_SCHEMA,
+        "output_language": scout.OUTPUT_LANGUAGE,
         "scout_run_id": run_id,
         "candidate_id": candidate_id,
         "title": "Сообщение, которое остановила проверка",
@@ -152,13 +154,13 @@ def ready_payload(run_id: str, candidate_id: str, scene_count: int = 5) -> dict:
         "scene_contents": {
             f"scene_{index:02d}": {
                 "screen_text": f"Сцена {index}",
-                "visual_brief": f"Синтетическая карточка и действие {index}.",
+                "visual_brief": f"Синтетическая карточка показывает понятное действие {index}.",
             }
             for index in range(1, scene_count + 1)
         },
         "caption": "Интерфейс должен обещать только выполнимое.",
         "cover_text": "КНОПКА БЫЛА. ОТПРАВКИ — НЕТ.",
-        "safety_note": "Использовать только синтетический интерфейс.",
+        "safety_note": "Использовать только безопасный синтетический интерфейс без данных.",
         "source_limitations": "Материал описывает только зафиксированный эпизод.",
     }
 
@@ -463,9 +465,14 @@ def test_persisted_v1_ranking_artifact_remains_readable(tmp_path):
     path = run.run_dir / "ranking.json"
     value = json.loads(path.read_text(encoding="utf-8"))
     value["schema_version"] = scout.RANKING_SCHEMA_V1
+    value.pop("output_language")
+    value.pop("ranking_contract")
     for row in value["ranked_candidates"]:
         row.pop("eligible_for_display")
         row.pop("display_exclusion_reason")
+        row.pop("display_exclusion_field")
+        row.pop("language_cyrillic_token_count")
+        row.pop("language_natural_token_count")
     path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     loaded = scout.load_run(tmp_path / "state", run.run_id)
     assert loaded.ranked == run.ranked
@@ -476,15 +483,20 @@ def test_persisted_v2_ranking_artifact_remains_readable(tmp_path):
     path = run.run_dir / "ranking.json"
     value = json.loads(path.read_text(encoding="utf-8"))
     value["schema_version"] = scout.RANKING_ARTIFACT_SCHEMA_V2
+    value.pop("output_language")
+    value.pop("ranking_contract")
     for row in value["ranked_candidates"]:
         row.pop("eligible_for_display")
         row.pop("display_exclusion_reason")
+        row.pop("display_exclusion_field")
+        row.pop("language_cyrillic_token_count")
+        row.pop("language_natural_token_count")
     path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     loaded = scout.load_run(tmp_path / "state", run.run_id)
     assert loaded.ranked == run.ranked
 
 
-def test_safe_legacy_response_salvage_is_zero_call_and_append_only(tmp_path):
+def test_legacy_english_response_is_not_salvaged_into_russian_run(tmp_path):
     snap = snapshot(tmp_path)
     prior, _ = asyncio.run(create_run(tmp_path, snap))
     response_path = prior.run_dir / "provider-ranking-response.json"
@@ -495,17 +507,19 @@ def test_safe_legacy_response_salvage_is_zero_call_and_append_only(tmp_path):
     before = file_hashes(prior.run_dir)
     calls = []
 
-    async def forbidden(*_args):
+    async def model(messages, _response_format):
         calls.append(1)
-        raise AssertionError("provider called")
+        run_id = json.loads(messages[1]["content"])["scout_run_id"]
+        return json.dumps(ranking_payload(snap, run_id), ensure_ascii=False)
 
     derived = asyncio.run(scout.rank_snapshot(
         tmp_path / "state", snap, admin_id=ADMIN, expected_admin_id=ADMIN,
         operator_request_id="refresh-legacy-salvage-01", refresh=True,
-        recent_summaries=(), risk_detector=lambda _: [], model_call=forbidden,
+        recent_summaries=(), risk_detector=lambda _: [], model_call=model,
     ))
-    assert derived.run_id != prior.run_id and derived.model_calls == 0 and calls == []
+    assert derived.run_id != prior.run_id and derived.model_calls == 1 and calls == [1]
     assert file_hashes(prior.run_dir) == before
+    assert not (derived.run_dir / "ranking-salvage.json").exists()
     assert all(item.recommended_format == "short_reel" for item in derived.ranked)
     assert all(12 <= item.recommended_duration_seconds <= 20 for item in derived.ranked)
     assert all(4 <= item.recommended_scene_count <= 7 for item in derived.ranked)
@@ -1072,3 +1086,192 @@ def test_interrupted_run_is_immutable_and_refresh_uses_new_run(tmp_path):
     assert refreshed.run_dir != old_run
     assert file_hashes(old_run) == before
     assert failed_calls == [1] and refresh_calls == [1]
+
+
+def test_ranking_v4_and_ready_v3_bind_russian_output_language():
+    ranking = ranking_wire_format()["json_schema"]["schema"]
+    ready = ready_wire_format()["json_schema"]["schema"]
+    assert scout.RANKING_SCHEMA == "content-inbox-scout-ranking-v4"
+    assert scout.READY_SCHEMA == "content-inbox-ready-material-v3"
+    assert ranking["properties"]["output_language"] == {"type": "string", "const": "ru"}
+    assert ready["properties"]["output_language"] == {"type": "string", "const": "ru"}
+    assert "output_language" in ranking["required"] and "output_language" in ready["required"]
+
+
+def test_ranking_and_preparation_prompts_explicitly_require_russian(tmp_path):
+    run, ranking_calls = asyncio.run(create_run(tmp_path))
+    ranking_messages = ranking_calls[0][0]
+    assert "русск" in ranking_messages[0]["content"].casefold()
+    assert json.loads(ranking_messages[1]["content"])["output_language"] == "ru"
+    selected = run.ranked[0].candidate_id
+    preparation_calls = []
+
+    async def model(messages, _response_format):
+        preparation_calls.append(messages)
+        return json.dumps(ready_payload_for(run, selected), ensure_ascii=False)
+
+    asyncio.run(scout.prepare_candidate(
+        tmp_path / "state", run.run_id, selected, admin_id=ADMIN,
+        expected_admin_id=ADMIN, risk_detector=lambda _: [], model_call=model,
+    ))
+    assert "русск" in preparation_calls[0][0]["content"].casefold()
+    assert json.loads(preparation_calls[0][1]["content"])["output_language"] == "ru"
+
+
+@pytest.mark.parametrize("text,short", [
+    ("A completely English editorial title", True),
+    ("This candidate has a clear conflict and a useful visible outcome", False),
+])
+def test_russian_validator_rejects_english_editorial_prose(text, short):
+    result = scout.validate_russian_editorial_text(text, short=short)
+    assert result.valid is False and result.cyrillic_tokens == 0
+
+
+@pytest.mark.parametrize("text,short", [
+    ("История SQLite", True),
+    ("Naz показывает историю: `internal_contract` и get_history() остаются точными, а всё пояснение написано понятными русскими словами.", False),
+])
+def test_russian_validator_accepts_allowed_technical_identifiers(text, short):
+    assert scout.validate_russian_editorial_text(text, short=short).valid is True
+
+
+@pytest.mark.parametrize("field", ["human_title", "one_sentence_pitch", "why_it_works"])
+def test_english_ranking_field_is_excluded_without_persisting_text(tmp_path, field):
+    snap = snapshot(tmp_path, sections=4)
+    payload = ranking_payload(snap, TEST_RUN_ID)
+    payload["candidate_evaluations"]["candidate_01"][field] = "This is an ordinary English sentence with no Russian editorial prose"
+    ranked = scout.parse_ranking(json.dumps(payload), TEST_RUN_ID, snap, lambda _: [])
+    excluded = next(item for item in ranked if item.display_exclusion_reason == "scout_ranking_language_invalid")
+    assert excluded.display_exclusion_field == field
+    assert excluded.language_cyrillic_token_count == 0
+    assert excluded.human_title == excluded.one_sentence_pitch == excluded.why_it_works == ""
+    assert len(scout.safe_cards(scout.ScoutRunResult(TEST_RUN_ID, snap, ranked, 1, True, tmp_path), 3)) == 3
+
+
+def test_fewer_than_three_russian_candidates_blocks_after_one_ranking_call(tmp_path):
+    snap = snapshot(tmp_path)
+    calls = []
+
+    async def model(messages, _response_format):
+        calls.append(1)
+        run_id = json.loads(messages[1]["content"])["scout_run_id"]
+        payload = ranking_payload(snap, run_id)
+        payload["candidate_evaluations"]["candidate_01"]["human_title"] = "English only title"
+        return json.dumps(payload, ensure_ascii=False)
+
+    with pytest.raises(scout.ScoutError, match="scout_display_candidate_count_insufficient"):
+        asyncio.run(scout.rank_snapshot(
+            tmp_path / "state", snap, admin_id=ADMIN, expected_admin_id=ADMIN,
+            operator_request_id="russian-count-blocker-01", refresh=True,
+            recent_summaries=(), risk_detector=lambda _: [], model_call=model,
+        ))
+    assert calls == [1]
+    artifact = next((tmp_path / "state" / "runs").glob("*/ranking.json"))
+    stored = json.loads(artifact.read_text(encoding="utf-8"))
+    rejected = next(item for item in stored["ranked_candidates"] if not item["eligible_for_display"])
+    assert rejected["display_exclusion_reason"] == "scout_ranking_language_invalid"
+    assert rejected["human_title"] == ""
+
+
+@pytest.mark.parametrize("field", ["telegram_post", "reel_voice_over", "caption", "safety_note", "source_limitations"])
+def test_english_ready_long_field_is_rejected_before_artifact_save(tmp_path, field):
+    run, _ = asyncio.run(create_run(tmp_path))
+    selected = run.ranked[0].candidate_id
+
+    async def model(*_args):
+        payload = ready_payload_for(run, selected)
+        english = "This is a complete English editorial sentence that must never be saved or shown. "
+        payload[field] = english * (10 if field == "telegram_post" else 2)
+        return json.dumps(payload, ensure_ascii=False)
+
+    with pytest.raises(scout.ScoutError, match="scout_ready_language_invalid"):
+        asyncio.run(scout.prepare_candidate(
+            tmp_path / "state", run.run_id, selected, admin_id=ADMIN,
+            expected_admin_id=ADMIN, risk_detector=lambda _: [], model_call=model,
+        ))
+    assert not (run.run_dir / "prepared" / selected / "ready-material.json").exists()
+
+
+def test_english_ready_visual_brief_is_rejected(tmp_path):
+    run, _ = asyncio.run(create_run(tmp_path))
+    selected = run.ranked[0].candidate_id
+
+    async def model(*_args):
+        payload = ready_payload_for(run, selected)
+        payload["scene_contents"]["scene_01"]["visual_brief"] = "Show a clean interface with one button and a visible result"
+        return json.dumps(payload, ensure_ascii=False)
+
+    with pytest.raises(scout.ScoutError, match="scout_ready_language_invalid"):
+        asyncio.run(scout.prepare_candidate(
+            tmp_path / "state", run.run_id, selected, admin_id=ADMIN,
+            expected_admin_id=ADMIN, risk_detector=lambda _: [], model_call=model,
+        ))
+    assert not (run.run_dir / "prepared" / selected / "ready-material.json").exists()
+
+
+def test_russian_ready_material_passes_and_duplicate_is_zero_call(tmp_path):
+    run, _ = asyncio.run(create_run(tmp_path))
+    selected = run.ranked[0].candidate_id
+    calls = []
+
+    async def model(*_args):
+        calls.append(1)
+        return json.dumps(ready_payload_for(run, selected), ensure_ascii=False)
+
+    first = asyncio.run(scout.prepare_candidate(
+        tmp_path / "state", run.run_id, selected, admin_id=ADMIN,
+        expected_admin_id=ADMIN, risk_detector=lambda _: [], model_call=model,
+    ))
+    second = asyncio.run(scout.prepare_candidate(
+        tmp_path / "state", run.run_id, selected, admin_id=ADMIN,
+        expected_admin_id=ADMIN, risk_detector=lambda _: [],
+        model_call=lambda *_args: (_ for _ in ()).throw(AssertionError("provider called")),
+    ))
+    assert first.material["output_language"] == "ru"
+    assert first.created is True and second.created is False and second.model_calls == 0 and calls == [1]
+
+
+def test_locale_aware_snapshot_index_ignores_legacy_index_and_reuses_ru_run(tmp_path):
+    snap = snapshot(tmp_path)
+    state = tmp_path / "state"
+    legacy_index = state / "snapshots" / f"{snap.snapshot_digest}.json"
+    legacy_index.parent.mkdir(parents=True)
+    legacy_bytes = b'{"schema_version":"content-inbox-scout-snapshot-index-v1"}\n'
+    legacy_index.write_bytes(legacy_bytes)
+    calls = []
+
+    async def model(messages, _response_format):
+        calls.append(1)
+        run_id = json.loads(messages[1]["content"])["scout_run_id"]
+        return json.dumps(ranking_payload(snap, run_id), ensure_ascii=False)
+
+    refreshed = asyncio.run(scout.rank_snapshot(
+        state, snap, admin_id=ADMIN, expected_admin_id=ADMIN,
+        operator_request_id="ru-refresh-index-0001", refresh=True,
+        recent_summaries=(), risk_detector=lambda _: [], model_call=model,
+    ))
+    reused = asyncio.run(scout.rank_snapshot(
+        state, snap, admin_id=ADMIN, expected_admin_id=ADMIN,
+        operator_request_id="ru-default-index-0001", refresh=False,
+        recent_summaries=(), risk_detector=lambda _: [],
+        model_call=lambda *_args: (_ for _ in ()).throw(AssertionError("provider called")),
+    ))
+    assert legacy_index.read_bytes() == legacy_bytes
+    assert refreshed.run_id == reused.run_id and reused.model_calls == 0 and calls == [1]
+    index = next((state / "snapshots-v2").glob("*.json"))
+    assert json.loads(index.read_text(encoding="utf-8"))["output_language"] == "ru"
+
+
+def test_user_facing_labels_and_reason_codes_are_russian(tmp_path):
+    run, _ = asyncio.run(create_run(tmp_path))
+    details = scout.details_text(run.ranked[0])
+    ready = scout.ready_material_text({
+        **ready_payload_for(run, run.ranked[0].candidate_id),
+        "reel_duration_seconds": 15,
+        "scenes": [{"order": 1, "start_second": 0, "end_second": 15, "screen_text": "Экран", "visual_brief": "Понятное безопасное изображение показывает результат действия."}],
+    })
+    assert "source_grounded" not in details and "опирается на исходный материал" in details
+    assert "Voice-over" not in ready and "Caption" not in ready and "Safety note" not in ready
+    assert "Текст озвучки:" in ready and "Подпись к ролику:" in ready and "Примечание по безопасности:" in ready
+    assert scout.format_label("short_reel") == "короткий ролик"
+    assert scout.reason_label("unknown_code") == "внутренняя редакционная отметка"

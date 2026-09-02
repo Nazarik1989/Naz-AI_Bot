@@ -17,18 +17,26 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 
-RUN_SCHEMA = "content-inbox-scout-run-v1"
+RUN_SCHEMA_V1 = "content-inbox-scout-run-v1"
+RUN_SCHEMA = "content-inbox-scout-run-v2"
 RANKING_SCHEMA_V1 = "content-inbox-scout-ranking-v1"
 RANKING_SCHEMA_V2 = "content-inbox-scout-ranking-v2"
-RANKING_SCHEMA = "content-inbox-scout-ranking-v3"
+RANKING_SCHEMA_V3 = "content-inbox-scout-ranking-v3"
+RANKING_SCHEMA = "content-inbox-scout-ranking-v4"
 RANKING_ARTIFACT_SCHEMA_V2 = "content-inbox-scout-ranking-artifact-v2"
-RANKING_ARTIFACT_SCHEMA = "content-inbox-scout-ranking-artifact-v3"
+RANKING_ARTIFACT_SCHEMA_V3 = "content-inbox-scout-ranking-artifact-v3"
+RANKING_ARTIFACT_SCHEMA = "content-inbox-scout-ranking-artifact-v4"
 READY_SCHEMA_V1 = "content-inbox-ready-material-v1"
-READY_SCHEMA = "content-inbox-ready-material-v2"
-READY_ARTIFACT_SCHEMA = "content-inbox-ready-material-artifact-v2"
+READY_SCHEMA_V2 = "content-inbox-ready-material-v2"
+READY_SCHEMA = "content-inbox-ready-material-v3"
+READY_ARTIFACT_SCHEMA_V2 = "content-inbox-ready-material-artifact-v2"
+READY_ARTIFACT_SCHEMA = "content-inbox-ready-material-artifact-v3"
 PREFERENCE_SCHEMA = "content-inbox-scout-preference-v1"
-RANKING_REQUEST_SCHEMA = "content-inbox-scout-ranking-request-v1"
-PREPARE_REQUEST_SCHEMA = "content-inbox-scout-prepare-request-v1"
+RANKING_REQUEST_SCHEMA = "content-inbox-scout-ranking-request-v2"
+PREPARE_REQUEST_SCHEMA = "content-inbox-scout-prepare-request-v2"
+OPERATOR_REQUEST_SCHEMA = "content-inbox-scout-operator-request-v2"
+SNAPSHOT_INDEX_SCHEMA = "content-inbox-scout-snapshot-index-v2"
+OUTPUT_LANGUAGE = "ru"
 SCOUT_CALLBACK_PREFIX = "scout"
 MAX_FILE_BYTES = 256 * 1024
 MAX_AGGREGATE_BYTES = 2 * 1024 * 1024
@@ -114,6 +122,9 @@ class RankedCandidate:
     final_score: float
     eligible_for_display: bool = True
     display_exclusion_reason: str | None = None
+    display_exclusion_field: str | None = None
+    language_cyrillic_token_count: int | None = None
+    language_natural_token_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +135,16 @@ class ScoutRunResult:
     model_calls: int
     created: bool
     run_dir: Path
+    output_language: str | None = None
+    ranking_contract: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RussianTextValidation:
+    valid: bool
+    reason: str | None
+    cyrillic_tokens: int
+    natural_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +177,44 @@ def _plain_text(value: Any, reason: str, *, minimum: int = 1, maximum: int = 120
     if re.search(r"(?:[A-Za-z]:\\|/(?:home|opt|var|etc|root)/|\b[a-f0-9]{40,64}\b|(?:TOKEN|API_KEY|PASSWORD)\s*=)", text, re.I):
         raise ScoutError(reason)
     return text
+
+
+_TECHNICAL_NAMES = frozenset({"naz", "telegram", "sqlite", "python", "api", "json", "markdown"})
+_FUNCTION_IDENTIFIERS = frozenset({"get_history", "generate_answer", "build_chat_messages"})
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_WORD_RE = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*", re.UNICODE)
+
+
+def validate_russian_editorial_text(value: Any, *, short: bool) -> RussianTextValidation:
+    """Validate natural Russian prose while ignoring closed technical identifiers."""
+    if type(value) is not str:
+        return RussianTextValidation(False, "exact_string_required", 0, 0)
+    cleaned = re.sub(r"`[^`\r\n]*`", " ", value)
+    cleaned = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\(\)", " ", cleaned)
+    cleaned = re.sub(r"\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b", " ", cleaned)
+    cleaned = re.sub(r"\b[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+\b", " ", cleaned)
+    tokens: list[str] = []
+    for token in _WORD_RE.findall(cleaned):
+        if token.casefold() in _TECHNICAL_NAMES or token.casefold() in _FUNCTION_IDENTIFIERS:
+            continue
+        tokens.append(token)
+    cyrillic = sum(bool(_CYRILLIC_RE.search(token)) and not bool(_LATIN_RE.search(token)) for token in tokens)
+    natural = sum(bool(_CYRILLIC_RE.search(token) or _LATIN_RE.search(token)) for token in tokens)
+    longest_latin_run = current_latin_run = 0
+    for token in tokens:
+        if _LATIN_RE.search(token) and not _CYRILLIC_RE.search(token):
+            current_latin_run += 1
+            longest_latin_run = max(longest_latin_run, current_latin_run)
+        else:
+            current_latin_run = 0
+    if cyrillic < (1 if short else 5):
+        return RussianTextValidation(False, "cyrillic_token_count_invalid", cyrillic, natural)
+    if not short and (natural == 0 or cyrillic / natural < 0.60):
+        return RussianTextValidation(False, "cyrillic_ratio_invalid", cyrillic, natural)
+    if longest_latin_run >= 3:
+        return RussianTextValidation(False, "english_prose_sequence_invalid", cyrillic, natural)
+    return RussianTextValidation(True, None, cyrillic, natural)
 
 
 def _private_dir(path: Path) -> None:
@@ -521,12 +580,13 @@ def ranking_response_format(
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "content_inbox_scout_ranking_v3", "strict": True,
+            "name": "content_inbox_scout_ranking_v4", "strict": True,
             "schema": {
                 "type": "object", "additionalProperties": False,
-                "required": ["schema_version", "scout_run_id", "source_snapshot_digest", "candidate_evaluations"],
+                "required": ["schema_version", "output_language", "scout_run_id", "source_snapshot_digest", "candidate_evaluations"],
                 "properties": {
                     "schema_version": {"type": "string", "const": RANKING_SCHEMA},
+                    "output_language": {"type": "string", "const": OUTPUT_LANGUAGE},
                     "scout_run_id": {"type": "string", "const": run_id},
                     "source_snapshot_digest": {"type": "string", "const": snapshot_digest},
                     "candidate_evaluations": {
@@ -566,6 +626,7 @@ def ready_material_response_format(run_id: str, candidate_id: str, scene_count: 
     }
     properties = {
         "schema_version": {"type": "string", "const": READY_SCHEMA},
+        "output_language": {"type": "string", "const": OUTPUT_LANGUAGE},
         "scout_run_id": {"type": "string", "const": run_id},
         "candidate_id": {"type": "string", "const": candidate_id},
         "title": {"type": "string"},
@@ -583,7 +644,7 @@ def ready_material_response_format(run_id: str, candidate_id: str, scene_count: 
         "safety_note": {"type": "string"},
         "source_limitations": {"type": "string"},
     }
-    return {"type": "json_schema", "json_schema": {"name": "content_inbox_ready_material_v1", "strict": True, "schema": {"type": "object", "additionalProperties": False, "required": list(properties), "properties": properties}}}
+    return {"type": "json_schema", "json_schema": {"name": "content_inbox_ready_material_v3", "strict": True, "schema": {"type": "object", "additionalProperties": False, "required": list(properties), "properties": properties}}}
 
 
 def validate_provider_response_format(response_format: Mapping[str, Any]) -> None:
@@ -716,6 +777,7 @@ def _candidate_from_record(value: Mapping[str, Any]) -> Candidate:
 def _ranking_prompt(run_id: str, snapshot: InboxSnapshot, recent: Sequence[str]) -> str:
     payload = {
         "schema_version": RANKING_SCHEMA,
+        "output_language": OUTPUT_LANGUAGE,
         "scout_run_id": run_id,
         "source_snapshot_digest": snapshot.snapshot_digest,
         "candidates": [
@@ -723,6 +785,14 @@ def _ranking_prompt(run_id: str, snapshot: InboxSnapshot, recent: Sequence[str])
             for item in snapshot.shortlist
         ],
         "recent_topic_style_summaries": [" ".join(item.split())[:500] for item in recent[:12]],
+        "editorial_language_rules": [
+            "Весь пользовательский редакционный текст должен быть на естественном русском языке.",
+            "Поясняйте материал человеку без знания внутренней архитектуры.",
+            "Переводите англоязычный технический источник на русский язык.",
+            "Не превращайте карточку в отчёт разработчика и не используйте кальку с английского.",
+            "Не оставляйте полный английский заголовок или предложение.",
+            "Технические названия и точные идентификаторы можно сохранить в исходном написании.",
+        ],
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -778,8 +848,8 @@ def parse_ranking(raw: str, run_id: str, snapshot: InboxSnapshot, risk_detector:
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ScoutError("scout_ranking_json_invalid") from exc
-    expected_top = {"schema_version", "scout_run_id", "source_snapshot_digest", "candidate_evaluations"}
-    if type(value) is not dict or set(value) != expected_top or value.get("schema_version") != RANKING_SCHEMA or value.get("scout_run_id") != run_id or value.get("source_snapshot_digest") != snapshot.snapshot_digest:
+    expected_top = {"schema_version", "output_language", "scout_run_id", "source_snapshot_digest", "candidate_evaluations"}
+    if type(value) is not dict or set(value) != expected_top or value.get("schema_version") != RANKING_SCHEMA or value.get("output_language") != OUTPUT_LANGUAGE or value.get("scout_run_id") != run_id or value.get("source_snapshot_digest") != snapshot.snapshot_digest:
         raise ScoutError("scout_ranking_contract_invalid")
     evaluations = value.get("candidate_evaluations")
     expected_slots = [f"candidate_{index:02d}" for index in range(1, len(snapshot.shortlist) + 1)]
@@ -801,6 +871,9 @@ def parse_ranking(raw: str, run_id: str, snapshot: InboxSnapshot, risk_detector:
         if any(type(item) is not str for item in text_fields):
             raise ScoutError("scout_ranking_text_type_invalid")
         exclusion_reason: str | None = None
+        exclusion_field: str | None = None
+        language_cyrillic_tokens: int | None = None
+        language_natural_tokens: int | None = None
         try:
             title = _plain_text(text_fields[0], "scout_ranking_text_invalid", maximum=180)
             pitch = _plain_text(text_fields[1], "scout_ranking_text_invalid", maximum=500)
@@ -811,6 +884,20 @@ def parse_ranking(raw: str, run_id: str, snapshot: InboxSnapshot, risk_detector:
         if exclusion_reason is None and risk_detector("\n".join((title, pitch, why))):
             title = pitch = why = ""
             exclusion_reason = "scout_ranking_text_unsafe"
+        if exclusion_reason is None:
+            for field, text, short in (
+                ("human_title", title, True),
+                ("one_sentence_pitch", pitch, False),
+                ("why_it_works", why, False),
+            ):
+                language = validate_russian_editorial_text(text, short=short)
+                if not language.valid:
+                    title = pitch = why = ""
+                    exclusion_reason = "scout_ranking_language_invalid"
+                    exclusion_field = field
+                    language_cyrillic_tokens = language.cyrillic_tokens
+                    language_natural_tokens = language.natural_tokens
+                    break
         if row.get("editorial_risk") not in ALLOWED_RISKS:
             raise ScoutError("scout_ranking_risk_invalid")
         reason_codes = _canonical_reason_codes(row.get("reason_codes"))
@@ -822,7 +909,8 @@ def parse_ranking(raw: str, run_id: str, snapshot: InboxSnapshot, risk_detector:
         result.append(RankedCandidate(
             candidate_id, 0, *(row[key] for key in score_keys), title, pitch, why,
             "short_reel", duration, scenes, editorial_risk, reason_codes, final,
-            exclusion_reason is None, exclusion_reason,
+            exclusion_reason is None, exclusion_reason, exclusion_field,
+            language_cyrillic_tokens, language_natural_tokens,
         ))
     ordered = sorted(result, key=lambda item: (-item.final_score, -item.reel_ease_score, -item.story_strength_score, item.candidate_id))
     return tuple(replace(item, rank=index) for index, item in enumerate(ordered, start=1))
@@ -838,6 +926,7 @@ def _run_record(snapshot: InboxSnapshot, run_id: str, request_id: str, admin_id:
     return {
         "schema_version": RUN_SCHEMA, "run_id": run_id, "operator_request_id": request_id,
         "admin_id": admin_id, "project": snapshot.project, "source_snapshot_digest": snapshot.snapshot_digest,
+        "output_language": OUTPUT_LANGUAGE, "ranking_contract": RANKING_SCHEMA,
         "refresh": refresh, "discovered_count": snapshot.discovered_count,
         "deduplicated_count": snapshot.deduplicated_count,
         "candidates": [_candidate_record(item) for item in snapshot.candidates],
@@ -846,15 +935,18 @@ def _run_record(snapshot: InboxSnapshot, run_id: str, request_id: str, admin_id:
 
 
 def _run_from_record(record: Mapping[str, Any], run_dir: Path, ranked: tuple[RankedCandidate, ...], model_calls: int, created: bool) -> ScoutRunResult:
-    expected = {
+    legacy_expected = {
         "schema_version", "run_id", "operator_request_id", "admin_id", "project",
         "source_snapshot_digest", "refresh", "discovered_count",
         "deduplicated_count", "candidates", "shortlist_ids",
     }
+    current_expected = legacy_expected | {"output_language", "ranking_contract"}
+    schema_version = record.get("schema_version") if type(record) is dict else None
     if (
         type(record) is not dict
-        or set(record) != expected
-        or record.get("schema_version") != RUN_SCHEMA
+        or set(record) != (current_expected if schema_version == RUN_SCHEMA else legacy_expected)
+        or schema_version not in {RUN_SCHEMA_V1, RUN_SCHEMA}
+        or (schema_version == RUN_SCHEMA and (record.get("output_language") != OUTPUT_LANGUAGE or record.get("ranking_contract") != RANKING_SCHEMA))
         or type(record.get("run_id")) is not str
         or not RUN_ID_RE.fullmatch(record["run_id"])
         or type(record.get("operator_request_id")) is not str
@@ -883,7 +975,10 @@ def _run_from_record(record: Mapping[str, Any], run_dir: Path, ranked: tuple[Ran
     if len(shortlist) > MAX_SHORTLIST or len(set(record["shortlist_ids"])) != len(shortlist):
         raise ScoutError("scout_run_artifact_invalid")
     snapshot = InboxSnapshot(record["project"], record["source_snapshot_digest"], record["discovered_count"], record["deduplicated_count"], candidates, shortlist)
-    return ScoutRunResult(record["run_id"], snapshot, ranked, model_calls, created, run_dir)
+    return ScoutRunResult(
+        record["run_id"], snapshot, ranked, model_calls, created, run_dir,
+        record.get("output_language"), record.get("ranking_contract"),
+    )
 
 
 def _ranking_record(run_id: str, snapshot_digest: str, ranked: Sequence[RankedCandidate]) -> dict[str, Any]:
@@ -892,16 +987,25 @@ def _ranking_record(run_id: str, snapshot_digest: str, ranked: Sequence[RankedCa
         row = asdict(item)
         row["reason_codes"] = list(item.reason_codes)
         rows.append(row)
-    return {"schema_version": RANKING_ARTIFACT_SCHEMA, "scout_run_id": run_id, "source_snapshot_digest": snapshot_digest, "ranked_candidates": rows}
+    return {
+        "schema_version": RANKING_ARTIFACT_SCHEMA,
+        "output_language": OUTPUT_LANGUAGE,
+        "ranking_contract": RANKING_SCHEMA,
+        "scout_run_id": run_id,
+        "source_snapshot_digest": snapshot_digest,
+        "ranked_candidates": rows,
+    }
 
 
 def _ranked_from_stored(value: Mapping[str, Any]) -> tuple[RankedCandidate, ...]:
-    top_keys = {"schema_version", "scout_run_id", "source_snapshot_digest", "ranked_candidates"}
+    legacy_top_keys = {"schema_version", "scout_run_id", "source_snapshot_digest", "ranked_candidates"}
+    current_top_keys = legacy_top_keys | {"output_language", "ranking_contract"}
     schema_version = value.get("schema_version") if type(value) is dict else None
     if (
         type(value) is not dict
-        or set(value) != top_keys
-        or schema_version not in {RANKING_SCHEMA_V1, RANKING_ARTIFACT_SCHEMA_V2, RANKING_ARTIFACT_SCHEMA}
+        or set(value) != (current_top_keys if schema_version == RANKING_ARTIFACT_SCHEMA else legacy_top_keys)
+        or schema_version not in {RANKING_SCHEMA_V1, RANKING_ARTIFACT_SCHEMA_V2, RANKING_ARTIFACT_SCHEMA_V3, RANKING_ARTIFACT_SCHEMA}
+        or (schema_version == RANKING_ARTIFACT_SCHEMA and (value.get("output_language") != OUTPUT_LANGUAGE or value.get("ranking_contract") != RANKING_SCHEMA))
         or type(value.get("scout_run_id")) is not str
         or not RUN_ID_RE.fullmatch(value["scout_run_id"])
         or type(value.get("source_snapshot_digest")) is not str
@@ -910,8 +1014,12 @@ def _ranked_from_stored(value: Mapping[str, Any]) -> tuple[RankedCandidate, ...]
     ):
         raise ScoutError("scout_ranking_artifact_invalid")
     item_keys = {field.name for field in RankedCandidate.__dataclass_fields__.values()}
-    legacy_item_keys = item_keys - {"eligible_for_display", "display_exclusion_reason"}
-    expected_item_keys = item_keys if schema_version == RANKING_ARTIFACT_SCHEMA else legacy_item_keys
+    legacy_item_keys = item_keys - {
+        "eligible_for_display", "display_exclusion_reason", "display_exclusion_field",
+        "language_cyrillic_token_count", "language_natural_token_count",
+    }
+    v3_item_keys = legacy_item_keys | {"eligible_for_display", "display_exclusion_reason"}
+    expected_item_keys = item_keys if schema_version == RANKING_ARTIFACT_SCHEMA else (v3_item_keys if schema_version == RANKING_ARTIFACT_SCHEMA_V3 else legacy_item_keys)
     score_keys = {"story_strength_score", "reel_ease_score", "clarity_score", "novelty_score", "confidence_score"}
     for item in value["ranked_candidates"]:
         if (
@@ -934,23 +1042,50 @@ def _ranked_from_stored(value: Mapping[str, Any]) -> tuple[RankedCandidate, ...]
             or isinstance(item.get("final_score"), bool)
             or not 0 <= item["final_score"] <= 100
             or (
-                schema_version == RANKING_ARTIFACT_SCHEMA
+                schema_version in {RANKING_ARTIFACT_SCHEMA_V3, RANKING_ARTIFACT_SCHEMA}
                 and (
                     type(item.get("eligible_for_display")) is not bool
-                    or item.get("display_exclusion_reason") not in {None, "scout_ranking_text_invalid", "scout_ranking_text_unsafe"}
+                    or item.get("display_exclusion_reason") not in {None, "scout_ranking_text_invalid", "scout_ranking_text_unsafe", "scout_ranking_language_invalid"}
                     or (item["eligible_for_display"] != (item["display_exclusion_reason"] is None))
+                )
+            )
+            or (
+                schema_version == RANKING_ARTIFACT_SCHEMA
+                and (
+                    item.get("display_exclusion_field") not in {None, "human_title", "one_sentence_pitch", "why_it_works"}
+                    or type(item.get("language_cyrillic_token_count")) not in {int, type(None)}
+                    or type(item.get("language_natural_token_count")) not in {int, type(None)}
                 )
             )
         ):
             raise ScoutError("scout_ranking_artifact_invalid")
+        if schema_version == RANKING_ARTIFACT_SCHEMA:
+            if item["eligible_for_display"]:
+                if not all((
+                    validate_russian_editorial_text(item["human_title"], short=True).valid,
+                    validate_russian_editorial_text(item["one_sentence_pitch"], short=False).valid,
+                    validate_russian_editorial_text(item["why_it_works"], short=False).valid,
+                )):
+                    raise ScoutError("scout_ranking_artifact_invalid")
+            elif any(item[field] for field in ("human_title", "one_sentence_pitch", "why_it_works")):
+                raise ScoutError("scout_ranking_artifact_invalid")
     try:
         return tuple(RankedCandidate(**{
             **item,
             "reason_codes": tuple(item["reason_codes"]),
-            **({} if schema_version == RANKING_ARTIFACT_SCHEMA else {
-                "eligible_for_display": True,
-                "display_exclusion_reason": None,
-            }),
+            **({} if schema_version == RANKING_ARTIFACT_SCHEMA else (
+                {
+                    "display_exclusion_field": None,
+                    "language_cyrillic_token_count": None,
+                    "language_natural_token_count": None,
+                } if schema_version == RANKING_ARTIFACT_SCHEMA_V3 else {
+                    "eligible_for_display": True,
+                    "display_exclusion_reason": None,
+                    "display_exclusion_field": None,
+                    "language_cyrillic_token_count": None,
+                    "language_natural_token_count": None,
+                }
+            )),
         }) for item in value["ranked_candidates"])
     except (KeyError, TypeError) as exc:
         raise ScoutError("scout_ranking_artifact_invalid") from exc
@@ -1011,6 +1146,7 @@ def _parse_v2_ranking_rows(
         raise ScoutError("scout_ranking_salvage_invalid")
     projected = {
         "schema_version": RANKING_SCHEMA,
+        "output_language": OUTPUT_LANGUAGE,
         "scout_run_id": run_id,
         "source_snapshot_digest": snapshot.snapshot_digest,
         "candidate_evaluations": {
@@ -1060,6 +1196,8 @@ def _salvage_persisted_ranking_response(
                 record.get("run_id") != prior_run_id
                 or record.get("source_snapshot_digest") != snapshot.snapshot_digest
                 or record.get("shortlist_ids") != expected_ids
+                or record.get("output_language") != OUTPUT_LANGUAGE
+                or record.get("ranking_contract") != RANKING_SCHEMA
             ):
                 continue
             value = _read_json(response_path)
@@ -1067,10 +1205,6 @@ def _salvage_persisted_ranking_response(
                 ranked = parse_ranking(
                     json.dumps(value, ensure_ascii=False), prior_run_id, snapshot, risk_detector
                 )
-            elif value.get("schema_version") == RANKING_SCHEMA_V2:
-                ranked = _parse_v2_ranking_response(value, prior_run_id, snapshot, risk_detector)
-            elif value.get("schema_version") == RANKING_SCHEMA_V1:
-                ranked = _parse_legacy_ranking_response(value, prior_run_id, snapshot, risk_detector)
             else:
                 continue
             safe_matches.append((ranked, prior_run_id, _digest_bytes(_read_bytes(response_path))))
@@ -1098,26 +1232,46 @@ async def rank_snapshot(
     if not snapshot.shortlist:
         raise ScoutError("scout_no_candidates")
     root = _safe_root(state_root)
-    identity = f"{admin_id}|{snapshot.snapshot_digest}|{operator_request_id if refresh else 'default'}|{int(refresh)}"
+    identity = f"{admin_id}|{snapshot.snapshot_digest}|{OUTPUT_LANGUAGE}|{RANKING_SCHEMA}|{operator_request_id if refresh else 'default'}|{int(refresh)}"
     run_id = "csr-" + _digest_bytes(identity.encode("utf-8"))[:24]
-    index_path = _safe_child(root, "snapshots", f"{snapshot.snapshot_digest}.json")
+    index_path = _safe_child(root, "snapshots-v2", f"{snapshot.snapshot_digest}.{OUTPUT_LANGUAGE}.ranking-v4.json")
+    index = {
+        "schema_version": SNAPSHOT_INDEX_SCHEMA,
+        "source_snapshot_digest": snapshot.snapshot_digest,
+        "admin_id": admin_id,
+        "output_language": OUTPUT_LANGUAGE,
+        "ranking_contract": RANKING_SCHEMA,
+        "run_id": run_id,
+    }
     if not refresh and index_path.exists():
         existing = _read_json(index_path)
         existing_run = existing.get("run_id")
-        expected_index_keys = {"schema_version", "source_snapshot_digest", "admin_id", "run_id"}
+        expected_index_keys = {"schema_version", "source_snapshot_digest", "admin_id", "output_language", "ranking_contract", "run_id"}
         if (
             set(existing) != expected_index_keys
-            or existing.get("schema_version") != "content-inbox-scout-snapshot-index-v1"
+            or existing.get("schema_version") != SNAPSHOT_INDEX_SCHEMA
             or existing.get("source_snapshot_digest") != snapshot.snapshot_digest
             or existing.get("admin_id") != admin_id
+            or existing.get("output_language") != OUTPUT_LANGUAGE
+            or existing.get("ranking_contract") != RANKING_SCHEMA
             or type(existing_run) is not str
             or not RUN_ID_RE.fullmatch(existing_run)
         ):
             raise ScoutConflict("scout_snapshot_index_conflict")
         run_id = existing_run
-    request_key = _digest_bytes(operator_request_id.encode("utf-8"))
+        index = dict(existing)
+    request_key = _digest_bytes(f"{operator_request_id}|{OUTPUT_LANGUAGE}|{RANKING_SCHEMA}".encode("utf-8"))
     request_path = _safe_child(root, "requests", f"{request_key}.json")
-    request_record = {"schema_version": "content-inbox-scout-operator-request-v1", "operator_request_id": operator_request_id, "admin_id": admin_id, "run_id": run_id, "source_snapshot_digest": snapshot.snapshot_digest, "refresh": refresh}
+    request_record = {
+        "schema_version": OPERATOR_REQUEST_SCHEMA,
+        "operator_request_id": operator_request_id,
+        "admin_id": admin_id,
+        "run_id": run_id,
+        "source_snapshot_digest": snapshot.snapshot_digest,
+        "output_language": OUTPUT_LANGUAGE,
+        "ranking_contract": RANKING_SCHEMA,
+        "refresh": refresh,
+    }
     if request_path.exists() and _read_bytes(request_path) != _canonical(request_record):
         raise ScoutConflict("scout_request_conflict")
     run_dir = _safe_child(root, "runs", run_id)
@@ -1128,9 +1282,6 @@ async def rank_snapshot(
     else:
         record = _run_record(snapshot, run_id, operator_request_id, admin_id, refresh)
         created = _write_exact(run_path, record, "scout_run_conflict")
-    if not refresh and not index_path.exists():
-        index = {"schema_version": "content-inbox-scout-snapshot-index-v1", "source_snapshot_digest": snapshot.snapshot_digest, "admin_id": admin_id, "run_id": run_id}
-        _write_exact(index_path, index, "scout_snapshot_index_conflict")
     _write_exact(request_path, request_record, "scout_request_conflict")
     ranking_path = run_dir / "ranking.json"
     if ranking_path.is_file():
@@ -1139,6 +1290,8 @@ async def rank_snapshot(
             raise ScoutError("scout_ranking_artifact_invalid")
         ranked = _ranked_from_stored(stored)
         _require_display_candidates(ranked)
+        if not index_path.exists():
+            _write_exact(index_path, index, "scout_snapshot_index_conflict")
         return _run_from_record(record, run_dir, ranked, 0, False)
     salvaged = _salvage_persisted_ranking_response(
         root, run_id, snapshot, risk_detector
@@ -1162,6 +1315,8 @@ async def rank_snapshot(
             "scout_ranking_conflict",
         )
         _require_display_candidates(ranked)
+        if not index_path.exists():
+            _write_exact(index_path, index, "scout_snapshot_index_conflict")
         return _run_from_record(record, run_dir, ranked, 0, created)
     response_format = ranking_response_format(
         run_id,
@@ -1170,13 +1325,20 @@ async def rank_snapshot(
     )
     validate_provider_response_format(response_format)
     marker_path = run_dir / "ranking-requested.json"
-    marker = {"schema_version": RANKING_REQUEST_SCHEMA, "run_id": run_id, "source_snapshot_digest": snapshot.snapshot_digest, "model_call_budget": 1}
+    marker = {
+        "schema_version": RANKING_REQUEST_SCHEMA,
+        "run_id": run_id,
+        "source_snapshot_digest": snapshot.snapshot_digest,
+        "output_language": OUTPUT_LANGUAGE,
+        "ranking_contract": RANKING_SCHEMA,
+        "model_call_budget": 1,
+    }
     if marker_path.exists():
         raise ScoutError("scout_ranking_interrupted")
     _write_exact(marker_path, marker, "scout_ranking_request_conflict")
     prompt = _ranking_prompt(run_id, snapshot, recent_summaries)
     raw = await model_call([
-        {"role": "system", "content": "Rank only supplied privacy-safe candidates. Return the closed JSON schema exactly; invent no facts or metrics."},
+        {"role": "system", "content": "Оцени только предоставленных безопасных кандидатов. Весь пользовательский редакционный текст верни на естественном русском языке. Технические названия и точные идентификаторы можно сохранить в исходном написании, но пояснения вокруг них должны быть русскими. Не выдумывай факты и метрики. Верни закрытую JSON-схему точно."},
         {"role": "user", "content": prompt},
     ], response_format)
     ranked = parse_ranking(raw, run_id, snapshot, risk_detector)
@@ -1188,6 +1350,8 @@ async def rank_snapshot(
         )
     _write_exact(ranking_path, _ranking_record(run_id, snapshot.snapshot_digest, ranked), "scout_ranking_conflict")
     _require_display_candidates(ranked)
+    if not index_path.exists():
+        _write_exact(index_path, index, "scout_snapshot_index_conflict")
     return _run_from_record(record, run_dir, ranked, 1, created)
 
 
@@ -1324,13 +1488,32 @@ def _validate_ready_artifact(
     candidate: Candidate,
     risk_detector: RiskDetector,
 ) -> dict[str, Any]:
-    if type(value) is not dict or value.get("schema_version") != READY_ARTIFACT_SCHEMA:
+    if type(value) is not dict or value.get("schema_version") not in {READY_ARTIFACT_SCHEMA_V2, READY_ARTIFACT_SCHEMA}:
         raise ScoutError("scout_ready_contract_invalid")
-    legacy = {**value, "schema_version": READY_SCHEMA_V1}
+    is_current = value.get("schema_version") == READY_ARTIFACT_SCHEMA
+    if is_current and value.get("output_language") != OUTPUT_LANGUAGE:
+        raise ScoutError("scout_ready_contract_invalid")
+    legacy = {key: item for key, item in value.items() if key != "output_language"}
+    legacy["schema_version"] = READY_SCHEMA_V1
     validated = _validate_legacy_ready_raw(
         json.dumps(legacy, ensure_ascii=False), run, candidate, risk_detector
     )
-    validated["schema_version"] = READY_ARTIFACT_SCHEMA
+    if is_current:
+        fields = {
+            "title": True, "hook": True, "telegram_post": False,
+            "reel_voice_over": False, "caption": False, "cover_text": True,
+            "safety_note": False, "source_limitations": False,
+        }
+        for field, short in fields.items():
+            if not validate_russian_editorial_text(validated[field], short=short).valid:
+                raise ScoutError("scout_ready_language_invalid")
+        for scene in validated["scenes"]:
+            if not validate_russian_editorial_text(scene["screen_text"], short=True).valid:
+                raise ScoutError("scout_ready_language_invalid")
+            if not validate_russian_editorial_text(scene["visual_brief"], short=False).valid:
+                raise ScoutError("scout_ready_language_invalid")
+        validated["output_language"] = OUTPUT_LANGUAGE
+    validated["schema_version"] = value["schema_version"]
     return validated
 
 
@@ -1339,8 +1522,8 @@ def _parse_ready(raw: str, run: ScoutRunResult, candidate: Candidate, risk_detec
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ScoutError("scout_ready_json_invalid") from exc
-    expected = {"schema_version", "scout_run_id", "candidate_id", "title", "hook", "telegram_post", "reel_voice_over", "scene_contents", "caption", "cover_text", "safety_note", "source_limitations"}
-    if type(value) is not dict or set(value) != expected or value.get("schema_version") != READY_SCHEMA or value.get("scout_run_id") != run.run_id or value.get("candidate_id") != candidate.candidate_id:
+    expected = {"schema_version", "output_language", "scout_run_id", "candidate_id", "title", "hook", "telegram_post", "reel_voice_over", "scene_contents", "caption", "cover_text", "safety_note", "source_limitations"}
+    if type(value) is not dict or set(value) != expected or value.get("schema_version") != READY_SCHEMA or value.get("output_language") != OUTPUT_LANGUAGE or value.get("scout_run_id") != run.run_id or value.get("candidate_id") != candidate.candidate_id:
         raise ScoutError("scout_ready_contract_invalid")
     ranking = ranked_for_run(run, candidate.candidate_id)
     scene_contents = value.get("scene_contents")
@@ -1401,17 +1584,27 @@ async def prepare_candidate(
         else:
             material = _validate_ready_artifact(stored, run, candidate, risk_detector)
         return ReadyMaterialResult(run_id, candidate_id, material, 0, False)
+    if run.output_language != OUTPUT_LANGUAGE or run.ranking_contract != RANKING_SCHEMA:
+        raise ScoutError("scout_ready_language_contract_invalid")
     response_format = ready_material_response_format(
         run_id, candidate_id, ranking.recommended_scene_count
     )
     validate_provider_response_format(response_format)
     marker_path = run.run_dir / "prepared" / candidate_id / "prepare-requested.json"
-    marker = {"schema_version": PREPARE_REQUEST_SCHEMA, "run_id": run_id, "candidate_id": candidate_id, "admin_id": admin_id, "model_call_budget": 1}
+    marker = {
+        "schema_version": PREPARE_REQUEST_SCHEMA,
+        "run_id": run_id,
+        "candidate_id": candidate_id,
+        "admin_id": admin_id,
+        "output_language": OUTPUT_LANGUAGE,
+        "ready_contract": READY_SCHEMA,
+        "model_call_budget": 1,
+    }
     if marker_path.exists():
         raise ScoutError("scout_prepare_interrupted")
     _write_exact(marker_path, marker, "scout_prepare_request_conflict")
     payload = {
-        "schema_version": READY_SCHEMA, "scout_run_id": run_id,
+        "schema_version": READY_SCHEMA, "output_language": OUTPUT_LANGUAGE, "scout_run_id": run_id,
         "candidate_id": candidate_id, "safe_candidate_text": candidate.safe_text,
         "stored_ranking_context": {
             "human_title": ranking.human_title, "one_sentence_pitch": ranking.one_sentence_pitch,
@@ -1422,7 +1615,7 @@ async def prepare_candidate(
         },
     }
     raw = await model_call([
-        {"role": "system", "content": "Prepare one source-grounded private material. Use only supplied candidate facts. Return the closed JSON schema exactly. No publication or media calls."},
+        {"role": "system", "content": "Подготовь один материал на естественном русском языке, используя только факты выбранного кандидата. Точные идентификаторы кода сохраняй, но поясняй по-русски. Пост, текст озвучки, сцены, подпись, обложка, примечание по безопасности и ограничения источника должны быть русскими. Не публикуй материал и не запускай медиаконвейер. Верни закрытую JSON-схему точно."},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))},
     ], response_format)
     material = _parse_ready(raw, run, candidate, risk_detector)
@@ -1442,7 +1635,26 @@ def safe_cards(run: ScoutRunResult, count: int, hidden: Iterable[str] = ()) -> t
 
 
 def format_label(value: str) -> str:
-    return {"short_reel": "короткий Reel", "post": "пост", "carousel": "карусель", "long_reel": "длинный Reel"}[value]
+    return {"short_reel": "короткий ролик", "post": "пост", "carousel": "карусель", "long_reel": "длинный ролик"}[value]
+
+
+def reason_label(value: str) -> str:
+    return {
+        "source_grounded": "опирается на исходный материал",
+        "clear_conflict": "есть понятный конфликт",
+        "clear_change": "есть заметное изменение",
+        "clear_result": "есть конкретный результат",
+        "clear_consequence": "есть понятное последствие",
+        "simple_visuals": "легко показать визуально",
+        "fresh_topic": "свежая тема",
+        "low_privacy_risk": "низкий риск для приватности",
+        "technical_jargon": "много технических терминов",
+        "duplicate_recent_topic": "похоже на недавнюю тему",
+        "requires_private_screenshot": "нужна приватная иллюстрация",
+        "unverifiable_user_impact": "влияние на пользователя требует проверки",
+        "duration_outside_short_form": "не подходит для короткого формата",
+        "manual_check": "нужна ручная проверка",
+    }.get(value, "внутренняя редакционная отметка")
 
 
 def card_text(item: RankedCandidate, position: int) -> str:
@@ -1450,7 +1662,7 @@ def card_text(item: RankedCandidate, position: int) -> str:
     return (
         f"🔥 Вариант {position} — {item.human_title}\n\n"
         f"Сила истории: {item.story_strength_score}/100\n"
-        f"Простота Reel: {item.reel_ease_score}/100\n"
+        f"Простота ролика: {item.reel_ease_score}/100\n"
         f"Ясность: {item.clarity_score}/100\n"
         f"Новизна: {item.novelty_score}/100\n\n"
         f"Формат: {format_label(item.recommended_format)}\n"
@@ -1464,12 +1676,12 @@ def card_text(item: RankedCandidate, position: int) -> str:
 def details_text(item: RankedCandidate) -> str:
     return (
         f"Подробнее · {item.human_title}\n\n"
-        f"Итоговая code-owned оценка: {item.final_score:.1f}/100\n"
+        f"Итоговая оценка по правилам кода: {item.final_score:.1f}/100\n"
         f"Уверенность: {item.confidence_score}/100\n"
         f"Формат: {format_label(item.recommended_format)}\n"
         f"Хронометраж: {item.recommended_duration_seconds} секунд · {item.recommended_scene_count} сцен\n\n"
         f"Суть: {item.one_sentence_pitch}\n\nПочему: {item.why_it_works}\n\n"
-        f"Коды решения: {', '.join(item.reason_codes) or 'нет'}"
+        f"Редакционные отметки: {', '.join(reason_label(code) for code in item.reason_codes) or 'нет'}"
     )
 
 
@@ -1480,8 +1692,8 @@ def ready_material_text(material: Mapping[str, Any]) -> str:
     )
     return (
         f"✅ Материал готов\n\n{material['title']}\n\nХук:\n{material['hook']}\n\n"
-        f"Telegram-пост:\n{material['telegram_post']}\n\nVoice-over:\n{material['reel_voice_over']}\n\n"
+        f"Telegram-пост:\n{material['telegram_post']}\n\nТекст озвучки:\n{material['reel_voice_over']}\n\n"
         f"Сцен-план ({material['reel_duration_seconds']} секунд):\n{scenes}\n\n"
-        f"Caption:\n{material['caption']}\n\nОбложка:\n{material['cover_text']}\n\n"
-        f"Safety note:\n{material['safety_note']}\n\nОграничения источника:\n{material['source_limitations']}"
+        f"Подпись к ролику:\n{material['caption']}\n\nОбложка:\n{material['cover_text']}\n\n"
+        f"Примечание по безопасности:\n{material['safety_note']}\n\nОграничения источника:\n{material['source_limitations']}"
     )
