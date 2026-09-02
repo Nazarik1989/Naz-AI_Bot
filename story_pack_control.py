@@ -180,6 +180,116 @@ def _reference_keyframe_retry_candidates(payload: Mapping[str, Any]) -> list[dic
     return candidates
 
 
+def _current_frontal_reference_retry_candidates(
+    payload: Mapping[str, Any], *, pack_dir: Path | None = None
+) -> list[dict[str, Any]]:
+    """Find first-attempt current ``gen4_image`` reference failures.
+
+    This is deliberately separate from the legacy Turbo migration predicates.
+    A downloaded keyframe, a started video, or any previous approval makes the
+    scene ineligible.  When ``pack_dir`` is supplied, an unrecorded keyframe
+    file also closes the recovery path.
+    """
+    candidates: list[dict[str, Any]] = []
+    for job in payload.get("scene_jobs", []):
+        if not isinstance(job, dict):
+            continue
+        intent = job.get("keyframe_submit_intent")
+        route = job.get("model_route")
+        if (
+            bool(job.get("requires_naz_reference"))
+            and job.get("reference_role") == "three_quarter_identity"
+            and job.get("state") == "terminal_failed"
+            and job.get("failure_code") == "provider_terminal_failure"
+            and job.get("keyframe_state") == "terminal_failed"
+            and job.get("keyframe_failure_code") == "provider_terminal_failure"
+            and job.get("keyframe_provider_status") == "terminal_failed"
+            and int(job.get("keyframe_attempts", 0)) == 1
+            and isinstance(intent, Mapping)
+            and intent.get("model") == "gen4_image"
+            and intent.get("state") == "accepted"
+            and intent.get("approval_scope") is None
+            and bool(job.get("keyframe_external_job_id"))
+            and intent.get("external_job_id") == job.get("keyframe_external_job_id")
+            and not job.get("keyframe_checksum")
+            and int(job.get("attempts", 0)) == 0
+            and not job.get("external_job_id")
+            and not job.get("clean_checksum")
+            and not job.get("story_checksum")
+            and isinstance(route, Mapping)
+            and route.get("selected_model") == "gen4.5"
+            and not job.get("keyframe_current_frontal_retry_approved_at")
+            and not job.get("keyframe_retry_approved_at")
+            and not job.get("keyframe_frontal_retry_approved_at")
+        ):
+            if pack_dir is not None:
+                relative = str(job.get("keyframe_path") or "")
+                candidate = (pack_dir / relative).resolve()
+                if pack_dir.resolve() not in candidate.parents or candidate.exists():
+                    continue
+            candidates.append(job)
+    return candidates
+
+
+def current_frontal_reference_retry_plan(root: Path, plan_id: str) -> dict[str, Any]:
+    """Return a detached, read-only recovery summary for an approval card."""
+    path = manifest_path(root, plan_id)
+    payload = story_production.read_manifest(path)
+    if not story_production.manifest_has_current_production_contract(payload):
+        raise story_production.StoryPlanError("story_manifest_contract_stale")
+    if str(payload.get("approval", {}).get("status")) != "approved":
+        raise story_production.StoryPlanError("story pack is not approved")
+    candidates = _current_frontal_reference_retry_candidates(
+        payload, pack_dir=path.parent
+    )
+    if not candidates or len(candidates) > 4:
+        raise story_production.StoryPlanError(
+            "current frontal reference retry unavailable"
+        )
+    completed = tuple(
+        str(job.get("scene_id"))
+        for job in payload.get("scene_jobs", [])
+        if isinstance(job, Mapping) and job.get("state") == "completed"
+    )
+    scene_ids = tuple(str(job.get("scene_id")) for job in candidates)
+    video_credits = sum(
+        int(job.get("planned_duration_seconds", 0))
+        * story_production.RUNWAY_VIDEO_CREDITS_PER_SECOND["gen4.5"]
+        for job in candidates
+    )
+    return {
+        "plan_id": plan_id,
+        "completed_scene_ids": completed,
+        "retry_scene_ids": scene_ids,
+        "scene_total": len(payload.get("scene_jobs", [])),
+        "keyframe_jobs": len(candidates),
+        "video_jobs": len(candidates),
+        "reference_role": "frontal_identity",
+        "keyframe_model": "gen4_image",
+        "video_model": "gen4.5",
+        "additional_credits": 5 * len(candidates) + video_credits,
+    }
+
+
+def current_frontal_reference_retry_card(root: Path, plan_id: str) -> str:
+    """Build the closed admin recovery card without mutating the pack."""
+    plan = current_frontal_reference_retry_plan(root, plan_id)
+    scene_numbers = ", ".join(
+        scene_id.split("_", 1)[0].lstrip("0") or "0"
+        for scene_id in plan["retry_scene_ids"]
+    )
+    return (
+        "⚠️ Runway recovery готов к отдельному подтверждению\n\n"
+        f"Готовые сцены: {len(plan['completed_scene_ids'])}/{plan['scene_total']} — сохраняются без изменений.\n"
+        f"Повторить сцены: {scene_numbers}.\n\n"
+        f"Максимум новых keyframes: {plan['keyframe_jobs']} ({plan['keyframe_model']}).\n"
+        f"Максимум новых video jobs: {plan['video_jobs']} ({plan['video_model']}).\n"
+        f"Референс: {plan['reference_role']}.\n"
+        f"Дополнительная оценка: около {plan['additional_credits']} Runway credits.\n\n"
+        "Платные вызовы начнутся только после нажатия отдельной кнопки ниже."
+    )
+
+
 def _frontal_reference_retry_candidates(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Find explicitly approved legacy retries that have not used the frontal reference."""
     candidates: list[dict[str, Any]] = []
@@ -383,6 +493,87 @@ def approve_frontal_reference_retry(root: Path, plan_id: str) -> str:
         payload["updated_at"] = confirmed_at
         story_production.atomic_json(path, payload)
         return "frontal_reference_keyframes_retry_approved"
+
+
+def approve_current_frontal_reference_retry(
+    root: Path,
+    plan_id: str,
+    *,
+    admin_id: int,
+    expected_admin_id: int,
+) -> str:
+    """Approve only current ``gen4_image`` failures for a frontal retry.
+
+    This boundary is provider-free.  It archives the completed submit records
+    and queues only the exact eligible scenes; the one-shot worker owns all
+    later provider transport.
+    """
+    if (
+        type(admin_id) is not int
+        or type(expected_admin_id) is not int
+        or not expected_admin_id
+        or admin_id != expected_admin_id
+    ):
+        raise story_production.StoryPlanError(
+            "current frontal reference retry admin required"
+        )
+    path = manifest_path(root, plan_id)
+    with _manifest_lock(path):
+        payload = story_production.read_manifest(path)
+        if not story_production.manifest_has_current_production_contract(payload):
+            raise story_production.StoryPlanError("story_manifest_contract_stale")
+        if str(payload.get("approval", {}).get("status")) != "approved":
+            raise story_production.StoryPlanError("story pack is not approved")
+        candidates = _current_frontal_reference_retry_candidates(
+            payload, pack_dir=path.parent
+        )
+        if not candidates:
+            if any(
+                isinstance(job, Mapping)
+                and job.get("keyframe_current_frontal_retry_approved_at")
+                for job in payload.get("scene_jobs", [])
+            ):
+                return "already_approved"
+            raise story_production.StoryPlanError(
+                "current frontal reference retry unavailable"
+            )
+        if len(candidates) > 4:
+            raise story_production.StoryPlanError(
+                "current frontal reference retry limit exceeded"
+            )
+        confirmed_at = _now()
+        for job in candidates:
+            external_id = str(job.get("keyframe_external_job_id") or "")
+            provider_history = job.setdefault("keyframe_provider_job_history", [])
+            if external_id not in provider_history:
+                provider_history.append(external_id)
+            intent = job.get("keyframe_submit_intent")
+            intent_history = job.setdefault("keyframe_submit_intent_history", [])
+            archived_intent = dict(intent) if isinstance(intent, Mapping) else None
+            if archived_intent is not None and archived_intent not in intent_history:
+                intent_history.append(archived_intent)
+            job.update({
+                "state": "queued",
+                "failure_code": None,
+                "provider_status": None,
+                "keyframe_state": "queued",
+                "keyframe_external_job_id": None,
+                "keyframe_submitted_at": None,
+                "keyframe_provider_status": None,
+                "keyframe_failure_code": None,
+                "keyframe_submit_intent": None,
+                "keyframe_retry_model": "gen4_image",
+                "keyframe_retry_phase": "reference_quality",
+                "keyframe_retry_reference_role": "frontal_identity",
+                "keyframe_retry_reason_code": "provider_terminal_failure",
+                "keyframe_retry_approved_at": confirmed_at,
+                "keyframe_frontal_retry_approved_at": confirmed_at,
+                "keyframe_current_frontal_retry_approved_at": confirmed_at,
+            })
+        payload["pack_status"] = "queued"
+        payload["updated_at"] = confirmed_at
+        story_production.atomic_json(path, payload)
+        return "current_frontal_reference_keyframes_retry_approved"
 
 
 def approve_concise_identity_retry(root: Path, plan_id: str) -> str:

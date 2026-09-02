@@ -34,6 +34,66 @@ def runway_pack(tmp_path: Path):
     return selected, material, pack
 
 
+def current_frontal_recovery_pack(tmp_path: Path):
+    _selected, _material, pack = runway_pack(tmp_path)
+    story_pack_control.confirm_generation(tmp_path / "story-packs", pack.plan_id)
+    payload = story_production.read_manifest(pack.manifest_path)
+    failed_indexes = {0, 1, 4}
+    for index, (scene, job) in enumerate(zip(payload["scenes"], payload["scene_jobs"])):
+        reference_role = (
+            "three_quarter_identity" if index in failed_indexes else "frontal_identity"
+        )
+        scene["reference_role"] = reference_role
+        job["reference_role"] = reference_role
+        job["keyframe_attempts"] = 1
+        job["keyframe_submit_intent"] = {
+            "intent_id": f"current-keyframe-intent-{index}",
+            "model": "gen4_image",
+            "created_at": "2026-09-02T20:00:00+00:00",
+            "state": "accepted",
+            "external_job_id": f"current-keyframe-task-{index}",
+            "failure_code": None,
+        }
+        job["keyframe_external_job_id"] = f"current-keyframe-task-{index}"
+        if index in failed_indexes:
+            job.update({
+                "state": "terminal_failed",
+                "failure_code": "provider_terminal_failure",
+                "keyframe_state": "terminal_failed",
+                "keyframe_provider_status": "terminal_failed",
+                "keyframe_failure_code": "provider_terminal_failure",
+            })
+            continue
+        keyframe = pack.manifest_path.parent / job["keyframe_path"]
+        clean = pack.manifest_path.parent / job["clean_path"]
+        story = pack.manifest_path.parent / job["story_path"]
+        for artifact, content in (
+            (keyframe, f"keyframe-{index}".encode()),
+            (clean, f"clean-{index}".encode()),
+            (story, f"story-{index}".encode()),
+        ):
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_bytes(content)
+        job.update({
+            "state": "completed",
+            "attempts": 1,
+            "external_job_id": f"current-video-task-{index}",
+            "provider_status": "completed",
+            "failure_code": None,
+            "keyframe_state": "ready",
+            "keyframe_provider_status": "completed",
+            "keyframe_failure_code": None,
+            "keyframe_checksum": hashlib.sha256(keyframe.read_bytes()).hexdigest(),
+            "clean_checksum": hashlib.sha256(clean.read_bytes()).hexdigest(),
+            "story_checksum": hashlib.sha256(story.read_bytes()).hexdigest(),
+        })
+    payload["pack_status"] = "partially_blocked"
+    payload["immutable_plan_fingerprint"] = story_production._immutable_plan_fingerprint(payload)
+    story_production.atomic_json(pack.manifest_path, payload)
+    assert story_production.manifest_has_current_production_contract(payload)
+    return pack
+
+
 def test_default_build_is_runway_and_local_storyboard_is_secondary():
     selected = SimpleNamespace(selection_id="css-" + "a" * 24)
     labels = button_texts(main.inbox_scout_selected_keyboard(selected))
@@ -235,3 +295,175 @@ def test_scout_delivery_returns_only_final_reel(tmp_path):
     reel_path.write_bytes(b"reel")
     story_production.atomic_json(pack.manifest_path, payload)
     assert story_pack_control.delivery_files(pack.manifest_path) == [reel_path.resolve()]
+
+
+def test_current_gen4_image_frontal_recovery_plan_is_exact_and_provider_free(tmp_path):
+    pack = current_frontal_recovery_pack(tmp_path)
+    before = pack.manifest_path.read_bytes()
+    plan = story_pack_control.current_frontal_reference_retry_plan(
+        tmp_path / "story-packs", pack.plan_id
+    )
+    assert plan == {
+        "plan_id": pack.plan_id,
+        "completed_scene_ids": ("03_test", "04_result"),
+        "retry_scene_ids": ("01_hook", "02_problem", "05_conclusion"),
+        "scene_total": 5,
+        "keyframe_jobs": 3,
+        "video_jobs": 3,
+        "reference_role": "frontal_identity",
+        "keyframe_model": "gen4_image",
+        "video_model": "gen4.5",
+        "additional_credits": 195,
+    }
+    card = story_pack_control.current_frontal_reference_retry_card(
+        tmp_path / "story-packs", pack.plan_id
+    )
+    assert "Готовые сцены: 2/5" in card
+    assert "Повторить сцены: 1, 2, 5" in card
+    assert "около 195 Runway credits" in card
+    assert pack.manifest_path.read_bytes() == before
+    labels = button_texts(main.inbox_scout_runway_recovery_keyboard(pack.plan_id))
+    assert labels == ["Повторить 3 кадра с фронтальным референсом"]
+
+
+def test_current_frontal_retry_archives_failed_tasks_and_preserves_completed_scenes(tmp_path):
+    pack = current_frontal_recovery_pack(tmp_path)
+    before = story_production.read_manifest(pack.manifest_path)
+    completed_before = {
+        job["scene_id"]: json.loads(json.dumps(job, sort_keys=True))
+        for job in before["scene_jobs"]
+        if job["state"] == "completed"
+    }
+    asset_hashes = {
+        relative: hashlib.sha256((pack.manifest_path.parent / relative).read_bytes()).hexdigest()
+        for job in before["scene_jobs"]
+        if job["state"] == "completed"
+        for relative in (job["keyframe_path"], job["clean_path"], job["story_path"])
+    }
+    generic_before = pack.manifest_path.read_bytes()
+    assert story_pack_control.confirm_generation(
+        tmp_path / "story-packs", pack.plan_id
+    ) == "already_approved"
+    assert pack.manifest_path.read_bytes() == generic_before
+
+    result = story_pack_control.approve_current_frontal_reference_retry(
+        tmp_path / "story-packs",
+        pack.plan_id,
+        admin_id=ADMIN,
+        expected_admin_id=ADMIN,
+    )
+    assert result == "current_frontal_reference_keyframes_retry_approved"
+    current = story_production.read_manifest(pack.manifest_path)
+    assert story_production.manifest_has_current_production_contract(current)
+    assert current["pack_status"] == "queued"
+    for job in current["scene_jobs"]:
+        if job["scene_id"] in {"01_hook", "02_problem", "05_conclusion"}:
+            index = int(job["scene_id"].split("_", 1)[0]) - 1
+            assert job["state"] == job["keyframe_state"] == "queued"
+            assert job["keyframe_attempts"] == 1 and job["attempts"] == 0
+            assert job["keyframe_external_job_id"] is None
+            assert job["keyframe_submit_intent"] is None
+            assert job["keyframe_retry_model"] == "gen4_image"
+            assert job["keyframe_retry_phase"] == "reference_quality"
+            assert job["keyframe_retry_reference_role"] == "frontal_identity"
+            assert job["model_route"]["selected_model"] == "gen4.5"
+            assert f"current-keyframe-task-{index}" in job["keyframe_provider_job_history"]
+            assert job["keyframe_submit_intent_history"][-1]["intent_id"] == (
+                f"current-keyframe-intent-{index}"
+            )
+            assert job["keyframe_current_frontal_retry_approved_at"]
+        else:
+            assert job == completed_before[job["scene_id"]]
+    for relative, expected in asset_hashes.items():
+        assert hashlib.sha256((pack.manifest_path.parent / relative).read_bytes()).hexdigest() == expected
+    assert story_pack_control.approve_current_frontal_reference_retry(
+        tmp_path / "story-packs",
+        pack.plan_id,
+        admin_id=ADMIN,
+        expected_admin_id=ADMIN,
+    ) == "already_approved"
+
+
+def test_current_frontal_retry_fails_closed_for_wrong_shape_and_orphan_keyframe(tmp_path):
+    mutations = {
+        "model": lambda job: job["keyframe_submit_intent"].update(model="gen4_image_turbo"),
+        "attempts": lambda job: job.update(keyframe_attempts=2),
+        "reference": lambda job: job.update(reference_role="frontal_identity"),
+        "failure": lambda job: job.update(keyframe_failure_code="provider_timeout"),
+        "downloaded": lambda job: job.update(keyframe_checksum="a" * 64),
+        "video_started": lambda job: job.update(attempts=1),
+    }
+    for name, mutate in mutations.items():
+        root = tmp_path / name
+        pack = current_frontal_recovery_pack(root)
+        payload = story_production.read_manifest(pack.manifest_path)
+        mutate(payload["scene_jobs"][0])
+        story_production.atomic_json(pack.manifest_path, payload)
+        candidates = story_pack_control._current_frontal_reference_retry_candidates(payload)
+        assert {job["scene_id"] for job in candidates} == {"02_problem", "05_conclusion"}
+
+    root = tmp_path / "orphan"
+    pack = current_frontal_recovery_pack(root)
+    payload = story_production.read_manifest(pack.manifest_path)
+    first = payload["scene_jobs"][0]
+    keyframe = pack.manifest_path.parent / first["keyframe_path"]
+    keyframe.parent.mkdir(parents=True, exist_ok=True)
+    keyframe.write_bytes(b"unrecorded-keyframe")
+    candidates = story_pack_control._current_frontal_reference_retry_candidates(
+        payload, pack_dir=pack.manifest_path.parent
+    )
+    assert {job["scene_id"] for job in candidates} == {"02_problem", "05_conclusion"}
+
+
+def test_current_frontal_retry_requires_exact_admin_before_state_access(tmp_path):
+    pack = current_frontal_recovery_pack(tmp_path)
+    before = pack.manifest_path.read_bytes()
+    for admin_id in (ADMIN + 1, True):
+        try:
+            story_pack_control.approve_current_frontal_reference_retry(
+                tmp_path / "story-packs",
+                pack.plan_id,
+                admin_id=admin_id,
+                expected_admin_id=ADMIN,
+            )
+        except story_production.StoryPlanError as exc:
+            assert str(exc) == "current frontal reference retry admin required"
+        else:
+            raise AssertionError("non-admin current frontal retry accepted")
+        assert pack.manifest_path.read_bytes() == before
+
+
+def test_frontal_recovery_callback_uses_dedicated_control_without_tts(tmp_path):
+    pack = current_frontal_recovery_pack(tmp_path)
+    query = SimpleNamespace(
+        data=f"scoutrw:frontal:{pack.plan_id}", answer=AsyncMock()
+    )
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=ADMIN)
+    )
+    bot = SimpleNamespace(send_message=AsyncMock())
+    context = SimpleNamespace(bot=bot)
+    with (
+        patch.object(main, "ADMIN_ID", ADMIN),
+        patch.object(main, "NAZ_STORY_PACK_ROOT", tmp_path / "story-packs"),
+        patch.object(main, "NAZ_STORY_RENDER_ENABLED", True),
+        patch.object(
+            story_pack_control,
+            "approve_current_frontal_reference_retry",
+            return_value="current_frontal_reference_keyframes_retry_approved",
+        ) as approve,
+        patch.object(story_pack_control, "confirm_generation") as generic,
+        patch.object(bridge, "reserve_voice_call") as voice,
+        patch.object(main, "_synthesize_scout_reel_voice", new=AsyncMock()) as tts,
+    ):
+        asyncio.run(main.content_inbox_scout_runway_callback(update, context))
+    approve.assert_called_once_with(
+        tmp_path / "story-packs",
+        pack.plan_id,
+        admin_id=ADMIN,
+        expected_admin_id=ADMIN,
+    )
+    generic.assert_not_called()
+    voice.assert_not_called()
+    tts.assert_not_awaited()
+    assert "только сцены 1, 2 и 5" in bot.send_message.await_args.kwargs["text"]

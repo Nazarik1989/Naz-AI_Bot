@@ -4473,6 +4473,17 @@ def inbox_scout_runway_keyboard(plan_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def inbox_scout_runway_recovery_keyboard(plan_id: str) -> InlineKeyboardMarkup:
+    if not re.fullmatch(r"[a-f0-9]{24}", plan_id):
+        raise ValueError("invalid Scout Runway plan_id")
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Повторить 3 кадра с фронтальным референсом",
+            callback_data=f"scoutrw:frontal:{plan_id}",
+        )
+    ]])
+
+
 def inbox_scout_preview_keyboard(
     selected: content_inbox_scout_reel.SelectedMaterial,
 ) -> InlineKeyboardMarkup:
@@ -4894,7 +4905,9 @@ async def content_inbox_scout_runway_callback(
     query = update.callback_query
     if not query or not update.effective_user or not query.data:
         return
-    match = re.fullmatch(r"scoutrw:(confirm|variant|cancel):([a-f0-9]{24})", query.data)
+    match = re.fullmatch(
+        r"scoutrw:(confirm|variant|cancel|frontal):([a-f0-9]{24})", query.data
+    )
     if match is None:
         await query.answer("Недействительная команда Scout Runway.", show_alert=True)
         return
@@ -4905,6 +4918,24 @@ async def content_inbox_scout_runway_callback(
     await query.answer()
     try:
         content_inbox_scout_runway.load_bridge_for_plan(NAZ_STORY_PACK_ROOT, plan_id)
+        if action == "frontal":
+            if not NAZ_STORY_RENDER_ENABLED:
+                raise content_inbox_scout_runway.ScoutRunwayError("content_scout_runway_render_disabled")
+            result = await asyncio.to_thread(
+                story_pack_control.approve_current_frontal_reference_retry,
+                NAZ_STORY_PACK_ROOT,
+                plan_id,
+                admin_id=update.effective_user.id,
+                expected_admin_id=ADMIN_ID,
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"✅ Фронтальный повтор подтверждён: {result}. "
+                    "В очередь поставлены только сцены 1, 2 и 5; готовые сцены 3 и 4 сохранены."
+                ),
+            )
+            return
         if action == "confirm":
             if not NAZ_STORY_RENDER_ENABLED:
                 raise content_inbox_scout_runway.ScoutRunwayError("content_scout_runway_render_disabled")
@@ -10397,7 +10428,7 @@ def build_application() -> Application:
     application.add_handler(
         CallbackQueryHandler(
             content_inbox_scout_runway_callback,
-            pattern=r"^scoutrw:(?:confirm|variant|cancel):[a-f0-9]{24}$",
+            pattern=r"^scoutrw:(?:confirm|variant|cancel|frontal):[a-f0-9]{24}$",
         )
     )
     application.add_handler(

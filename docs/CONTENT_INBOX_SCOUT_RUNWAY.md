@@ -55,3 +55,17 @@ python tools/create_content_inbox_scout_runway_pack.py \
 
 The command creates/reuses the exact pack and sends its approval card. It does
 not approve it and cannot start paid generation.
+
+## Current Gen-4 Image frontal recovery
+
+A first-attempt `gen4_image` terminal failure with a
+`three_quarter_identity` reference is not routed through the legacy generic
+confirmation control. The closed current-contract predicate also requires no
+downloaded keyframe, zero video attempts, and an unchanged `gen4.5` video
+route.
+
+The admin receives a separate recovery card and the button
+`Повторить 3 кадра с фронтальным референсом`. Its provider-free approval
+archives the old task identity and submit intent, then queues only the eligible
+scenes with runtime reference role `frontal_identity`. Completed scene assets
+remain immutable. The story worker owns all later Runway transport.
