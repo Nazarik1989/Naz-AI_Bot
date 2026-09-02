@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,6 +69,9 @@ def test_select_creates_one_immutable_exactly_bound_artifact_without_provider(tm
     assert selected.voice_over_digest == hashlib.sha256(material["reel_voice_over"].encode()).hexdigest()
     assert selected.duration_seconds == 15 and selected.scene_count == 5
     assert list(selected.selection_dir.glob("selection.json"))
+    if os.name != "nt":
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o700 for path in (tmp_path / "reels").rglob("*") if path.is_dir())
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in (tmp_path / "reels").rglob("*") if path.is_file())
 
 
 def test_duplicate_select_is_byte_idempotent(tmp_path):

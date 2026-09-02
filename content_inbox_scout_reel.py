@@ -179,16 +179,42 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _prepare_private_directory(directory: Path) -> None:
+    missing: list[Path] = []
+    cursor = directory
+    while not cursor.exists():
+        missing.append(cursor)
+        if cursor == cursor.parent:
+            raise ScoutReelError("content_scout_reel_path_invalid")
+        cursor = cursor.parent
+    if cursor.is_symlink() or not cursor.is_dir():
+        raise ScoutReelError("content_scout_reel_symlink_forbidden")
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        if directory.is_symlink() or not directory.is_dir():
+            raise ScoutReelError("content_scout_reel_symlink_forbidden")
+        os.chmod(directory, 0o700)
+    if cursor.is_symlink() or not cursor.is_dir():
+        raise ScoutReelError("content_scout_reel_symlink_forbidden")
+    if directory.is_symlink() or not directory.is_dir():
+        raise ScoutReelError("content_scout_reel_symlink_forbidden")
+    os.chmod(directory, 0o700)
+
+
+def _prepare_private_parent(path: Path) -> None:
+    _prepare_private_directory(path.parent)
+
+
 def _write_exact(path: Path, value: Mapping[str, Any], conflict: str) -> bool:
     data = _canonical(value)
     if path.exists():
         if path.is_symlink() or _read_bytes(path, max(len(data), 1)) != data:
             raise ScoutReelConflict(conflict)
         return False
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.parent.is_symlink():
-        raise ScoutReelError("content_scout_reel_symlink_forbidden")
-    os.chmod(path.parent, 0o700)
+    _prepare_private_parent(path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = os.open(path, flags, 0o600)
     try:
@@ -212,8 +238,7 @@ def _write_binary_exact(path: Path, data: bytes, conflict: str) -> bool:
         if path.is_symlink() or _read_bytes(path, max(len(data), 1)) != data:
             raise ScoutReelConflict(conflict)
         return False
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    _prepare_private_parent(path)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(data)
@@ -320,6 +345,8 @@ def promote_selection(
     }
     selection_id = "css-" + _digest_bytes(_canonical(identity))[:24]
     root = _ensure_private_root(state_root)
+    _prepare_private_directory(_child(root, "requests"))
+    _prepare_private_directory(_child(root, "selections"))
     directory = _child(root, "selections", selection_id)
     request_key = _digest_text(selection_request_id)
     request = {
@@ -573,6 +600,7 @@ def reserve_job(state_root: Path, selected: SelectedMaterial, material: Mapping[
         raise ScoutReelError("content_scout_reel_voice_binding_invalid")
     job_id = "csj-" + _digest_text(f"{selected.selection_id}|{selected.ready_material_artifact_digest}|{RENDER_PROFILE}")[:24]
     root = _ensure_private_root(state_root)
+    _prepare_private_directory(_child(root, "jobs"))
     directory = _child(root, "jobs", job_id)
     record = {
         "schema_version": JOB_SCHEMA,
