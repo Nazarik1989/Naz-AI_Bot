@@ -397,6 +397,8 @@ def _set_pack_status(payload: dict[str, Any]) -> None:
                 delivery["status"] = "ready"
         elif "blocked_music" in reels:
             payload["pack_status"] = "blocked_music"
+        elif "blocked_voice" in reels:
+            payload["pack_status"] = "blocked_voice"
         else:
             payload["pack_status"] = "composing_reels"
     elif any(
@@ -1372,6 +1374,59 @@ def _align_shots(shots: list[dict[str, Any]], beat_grid: tuple[float, ...], payl
 
 def _compose_reels(payload: dict[str, Any], manifest: Path, config: WorkerConfig, composer: MediaComposer) -> None:
     if not payload.get("scene_jobs") or not all(row.get("state") == "completed" for row in payload["scene_jobs"]):
+        return
+    composition = payload.get("scout_composition")
+    if isinstance(composition, dict) and composition.get("mode") == "voice_over_only":
+        voice = payload.get("voice_over_plan")
+        reels = payload.get("reel_jobs", [])
+        edits = {str(row["edit_id"]): row for row in payload.get("reel_edits", [])}
+        if (
+            composition.get("schema_version") != "content-inbox-scout-voice-composition-v1"
+            or composition.get("duration_seconds") != 15
+            or composition.get("scene_count") != 5
+            or composition.get("music_present") is not False
+            or not isinstance(voice, dict)
+            or voice.get("schema_version") != "content-inbox-scout-voice-over-v1"
+            or voice.get("music_present") is not False
+            or voice.get("calls") != 1
+        ):
+            raise MediaError("voice_over_contract_invalid")
+        if voice.get("status") != "ready" or not isinstance(voice.get("audio_digest"), str):
+            for reel in reels:
+                if reel.get("state") != "completed":
+                    reel.update({"state": "blocked_voice", "failure_code": "voice_over_unavailable"})
+            _set_pack_status(payload)
+            _write(manifest, payload)
+            return
+        voice_path = (manifest.parent / str(voice.get("path", ""))).resolve()
+        if manifest.parent.resolve() not in voice_path.parents or checksum(voice_path) != voice["audio_digest"]:
+            raise MediaError("voice_over_invalid")
+        for reel in reels:
+            if reel.get("state") == "completed":
+                continue
+            try:
+                edit = edits[str(reel["edit_id"])]
+                destination = composer.safe_output(manifest.parent, str(reel["path"]))
+                probe = composer.compose_voice_reel(
+                    pack_root=manifest.parent,
+                    shots=[dict(row) for row in edit["shots"]],
+                    destination=destination,
+                    voice_path=voice_path,
+                    target_duration_seconds=15.0,
+                )
+                reel.update({
+                    "state": "completed",
+                    "actual_edl": [dict(row) for row in edit["shots"]],
+                    "media_probe": probe.to_dict(),
+                    "checksum": checksum(destination),
+                    "failure_code": None,
+                    "audio_present": True,
+                    "music_present": False,
+                })
+            except MediaError as exc:
+                reel.update({"state": "blocked_voice", "failure_code": _failure_code(exc)})
+            _set_pack_status(payload)
+            _write(manifest, payload)
         return
     tracks = load_music_library(config.music_library_path, pack_root=config.pack_root) if config.music_library_path else []
     if not tracks:

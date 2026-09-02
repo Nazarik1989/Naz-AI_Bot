@@ -3306,7 +3306,7 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     for job in reel_jobs:
         edit_id = str(job.get("edit_id", ""))
         if (
-            str(job.get("state", "")) not in {"planned", "blocked_music", "completed"}
+            str(job.get("state", "")) not in {"planned", "blocked_music", "blocked_voice", "completed"}
             or str(job.get("path", "")) != f"reels/{edit_id}.mp4"
             or not {"media_probe", "checksum", "failure_code"}.issubset(job)
         ):

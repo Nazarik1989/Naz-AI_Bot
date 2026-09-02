@@ -75,6 +75,7 @@ import operator_events
 import operator_content_package
 import content_inbox_scout
 import content_inbox_scout_reel
+import content_inbox_scout_runway
 import scheduled_work
 import semantic_autopost
 import story_production
@@ -4454,10 +4455,21 @@ def inbox_scout_selected_keyboard(
     selected: content_inbox_scout_reel.SelectedMaterial,
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Собрать Reel", callback_data=content_inbox_scout_reel.callback_data("build", selected.selection_id))],
+        [InlineKeyboardButton("Собрать в Runway", callback_data=content_inbox_scout_reel.callback_data("build", selected.selection_id))],
         [InlineKeyboardButton("Показать материал", callback_data=content_inbox_scout_reel.callback_data("show", selected.selection_id))],
+        [InlineKeyboardButton("Показать технический сториборд", callback_data=content_inbox_scout_reel.callback_data("storyboard", selected.selection_id))],
         [InlineKeyboardButton("Другой из TOP", callback_data=content_inbox_scout_reel.callback_data("other", selected.selection_id))],
         [InlineKeyboardButton("Отменить", callback_data=content_inbox_scout_reel.callback_data("cancel", selected.selection_id))],
+    ])
+
+
+def inbox_scout_runway_keyboard(plan_id: str) -> InlineKeyboardMarkup:
+    if not re.fullmatch(r"[a-f0-9]{24}", plan_id):
+        raise ValueError("invalid Scout Runway plan_id")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Подтвердить генерацию", callback_data=f"scoutrw:confirm:{plan_id}")],
+        [InlineKeyboardButton("Другой визуальный вариант", callback_data=f"scoutrw:variant:{plan_id}")],
+        [InlineKeyboardButton("Отменить", callback_data=f"scoutrw:cancel:{plan_id}")],
     ])
 
 
@@ -4807,6 +4819,25 @@ async def content_inbox_scout_reel_callback(
                     disable_web_page_preview=True,
                 )
             return
+        if action == "storyboard":
+            storyboard = await asyncio.to_thread(
+                content_inbox_scout_reel.existing_local_storyboard,
+                NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT,
+                selected,
+            )
+            if storyboard is None:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text="Черновой локальный сториборд ещё не создан. Это не Runway-видео и не финальный Reel.",
+                )
+            else:
+                with storyboard.open("rb") as video:
+                    await context.bot.send_video(
+                        chat_id=ADMIN_ID,
+                        video=video,
+                        caption="Черновой локальный сториборд. Это не Runway-видео и не финальный Reel.",
+                    )
+            return
         if action == "other":
             await send_inbox_scout_cards(context.bot, ADMIN_ID, run, count=3, format_hint="reel")
             return
@@ -4831,22 +4862,22 @@ async def content_inbox_scout_reel_callback(
             )
             return
         if action == "build":
-            await asyncio.to_thread(
-                content_inbox_scout_reel.reserve_job,
+            pack = await asyncio.to_thread(
+                content_inbox_scout_runway.create_runway_pack,
                 NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT,
-                selected,
-                material,
+                NAZ_CONTENT_INBOX_SCOUT_ROOT,
+                NAZ_STORY_PACK_ROOT,
+                selection_id,
+                admin_id=update.effective_user.id,
+                expected_admin_id=ADMIN_ID,
+                bridge_request_id=f"scout-runway-{selection_id[4:]}",
+                risk_detector=detect_content_risks,
             )
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text="🎬 Сборка началась\n\n15 секунд · 5 сцен · без музыки",
+                text=content_inbox_scout_runway.approval_card_text(pack),
+                reply_markup=inbox_scout_runway_keyboard(pack.plan_id),
             )
-            coroutine = _render_and_deliver_scout_reel(context.bot, selected, material)
-            application = getattr(context, "application", None)
-            if application is not None and hasattr(application, "create_task"):
-                application.create_task(coroutine, name=f"scout-reel-{selection_id}")
-            else:
-                asyncio.create_task(coroutine, name=f"scout-reel-{selection_id}")
             return
         raise content_inbox_scout_reel.ScoutReelError("content_scout_reel_callback_invalid")
     except (content_inbox_scout.ScoutError, content_inbox_scout_reel.ScoutReelError) as exc:
@@ -4855,6 +4886,92 @@ async def content_inbox_scout_reel_callback(
     except Exception:  # noqa: BLE001
         logger.exception("content inbox scout Reel callback failed")
         await query.answer("Reel остановлен: content_scout_reel_runtime_failure", show_alert=True)
+
+
+async def content_inbox_scout_runway_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user or not query.data:
+        return
+    match = re.fullmatch(r"scoutrw:(confirm|variant|cancel):([a-f0-9]{24})", query.data)
+    if match is None:
+        await query.answer("Недействительная команда Scout Runway.", show_alert=True)
+        return
+    if not is_admin(update.effective_user.id):
+        await query.answer("Scout Runway доступен только администратору.", show_alert=True)
+        return
+    action, plan_id = match.groups()
+    await query.answer()
+    try:
+        content_inbox_scout_runway.load_bridge_for_plan(NAZ_STORY_PACK_ROOT, plan_id)
+        if action == "confirm":
+            if not NAZ_STORY_RENDER_ENABLED:
+                raise content_inbox_scout_runway.ScoutRunwayError("content_scout_runway_render_disabled")
+            result = await asyncio.to_thread(
+                story_pack_control.confirm_generation, NAZ_STORY_PACK_ROOT, plan_id
+            )
+            reservation = await asyncio.to_thread(
+                content_inbox_scout_runway.reserve_voice_call,
+                NAZ_STORY_PACK_ROOT,
+                plan_id,
+            )
+            if reservation is not None:
+                text, expected_digest = reservation
+                if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_digest:
+                    raise content_inbox_scout_runway.ScoutRunwayError("content_scout_runway_voice_invalid")
+                audio = await _synthesize_scout_reel_voice(text)
+                await asyncio.to_thread(
+                    content_inbox_scout_runway.complete_voice_call,
+                    NAZ_STORY_PACK_ROOT,
+                    plan_id,
+                    audio,
+                )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"✅ Runway-генерация подтверждена: {result}. Озвучка зарезервирована не более одного раза.",
+            )
+            return
+        if action == "variant":
+            payload = await asyncio.to_thread(
+                story_production.read_manifest,
+                story_pack_control.manifest_path(NAZ_STORY_PACK_ROOT, plan_id),
+            )
+            editorial = payload.get("editorial_plan")
+            facts = payload.get("safe_facts")
+            if not isinstance(editorial, Mapping) or not isinstance(facts, list):
+                raise content_inbox_scout_runway.ScoutRunwayError("content_scout_runway_variant_invalid")
+            variant_index = int(payload.get("variant_index", 0)) + 1
+            plan = editorial_orchestrator.EditorialPlan.from_dict(editorial)
+            treatment = await generate_reels_director_treatment(
+                plan,
+                tuple(str(item) for item in facts),
+                variant_index=variant_index,
+            )
+            variant = await asyncio.to_thread(
+                content_inbox_scout_runway.create_variant,
+                NAZ_CONTENT_INBOX_SCOUT_REEL_ROOT,
+                NAZ_CONTENT_INBOX_SCOUT_ROOT,
+                NAZ_STORY_PACK_ROOT,
+                plan_id,
+                admin_id=update.effective_user.id,
+                expected_admin_id=ADMIN_ID,
+                risk_detector=detect_content_risks,
+                director_treatment=treatment,
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=content_inbox_scout_runway.approval_card_text(variant),
+                reply_markup=inbox_scout_runway_keyboard(variant.plan_id),
+            )
+            return
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text="✅ Runway-пакет оставлен без подтверждения; платные вызовы не выполнялись.",
+        )
+    except (OSError, RuntimeError, ValueError, story_production.StoryPlanError, content_inbox_scout_runway.ScoutRunwayError) as exc:
+        reason = getattr(exc, "reason_code", "content_scout_runway_runtime_failure")
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Scout Runway остановлен: {reason}")
 
 
 async def publish_agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9696,10 +9813,30 @@ async def story_private_delivery_job(context: ContextTypes.DEFAULT_TYPE) -> None
             if filename in sent:
                 continue
             with media_path.open("rb") as media:
+                bridge = payload.get("scout_runway_bridge")
+                scout_selection_id = (
+                    str(bridge.get("selection_id", ""))
+                    if isinstance(bridge, Mapping)
+                    else ""
+                )
+                scout_markup = (
+                    InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Опубликовать", callback_data=content_inbox_scout_reel.callback_data("publish", scout_selection_id))],
+                        [InlineKeyboardButton("Переделать", callback_data=content_inbox_scout_reel.callback_data("remake", scout_selection_id))],
+                        [InlineKeyboardButton("Отменить", callback_data=content_inbox_scout_reel.callback_data("cancel", scout_selection_id))],
+                    ])
+                    if re.fullmatch(r"css-[a-f0-9]{24}", scout_selection_id)
+                    else None
+                )
                 await context.bot.send_video(
                     chat_id=ADMIN_ID,
                     video=media,
-                    caption=f"🎬 Reels Maker · {media_path.stem}",
+                    caption=(
+                        "Приватное Runway-превью · 15 секунд · 5 сцен · с озвучкой · без музыки"
+                        if scout_markup is not None
+                        else f"🎬 Reels Maker · {media_path.stem}"
+                    ),
+                    reply_markup=scout_markup,
                 )
             await asyncio.to_thread(
                 story_pack_control.mark_delivery_file_sent, manifest, filename,
@@ -10254,7 +10391,13 @@ def build_application() -> Application:
     application.add_handler(
         CallbackQueryHandler(
             content_inbox_scout_reel_callback,
-            pattern=r"^scoutreel:(?:build|show|other|cancel|publish|remake):[a-f0-9]{24}$",
+            pattern=r"^scoutreel:(?:build|show|storyboard|other|cancel|publish|remake):[a-f0-9]{24}$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            content_inbox_scout_runway_callback,
+            pattern=r"^scoutrw:(?:confirm|variant|cancel):[a-f0-9]{24}$",
         )
     )
     application.add_handler(

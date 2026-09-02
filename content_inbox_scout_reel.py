@@ -33,7 +33,7 @@ REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,95}$")
 DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
 SELECTION_STATES = frozenset({"selected", "build_reserved", "rendering", "preview_ready", "cancelled", "failed"})
 JOB_STATES = frozenset({"reserved", "rendering", "preview_ready", "failed", "cancelled"})
-CALLBACK_ACTIONS = frozenset({"build", "show", "other", "cancel", "publish", "remake"})
+CALLBACK_ACTIONS = frozenset({"build", "show", "storyboard", "other", "cancel", "publish", "remake"})
 TtsCall = Callable[[str], Awaitable[bytes]]
 
 
@@ -547,7 +547,7 @@ def callback_data(action: str, selection_id: str) -> str:
 def parse_callback(value: Any) -> tuple[str, str]:
     if type(value) is not str:
         raise ScoutReelError("content_scout_reel_callback_invalid")
-    match = re.fullmatch(r"scoutreel:(build|show|other|cancel|publish|remake):([a-f0-9]{24})", value)
+    match = re.fullmatch(r"scoutreel:(build|show|storyboard|other|cancel|publish|remake):([a-f0-9]{24})", value)
     if match is None:
         raise ScoutReelError("content_scout_reel_callback_invalid")
     return match.group(1), "css-" + match.group(2)
@@ -620,6 +620,28 @@ def reserve_job(state_root: Path, selected: SelectedMaterial, material: Mapping[
     job = _job_from_record(record if created else _read_json(directory / "job.json"), directory)
     _state_event(selected.selection_dir, SELECTION_STATE_SCHEMA, "selection_id", selected.selection_id, "build_reserved")
     return job, created
+
+
+def existing_local_storyboard(state_root: Path, selected: SelectedMaterial) -> Path | None:
+    """Return an already-rendered immutable technical storyboard; never create one."""
+    job_id = "csj-" + _digest_text(
+        f"{selected.selection_id}|{selected.ready_material_artifact_digest}|{RENDER_PROFILE}"
+    )[:24]
+    root = state_root.absolute()
+    job_path = root / "jobs" / job_id / "job.json"
+    output = root / "jobs" / job_id / "preview.mp4"
+    receipt = root / "jobs" / job_id / "receipt.json"
+    if not (job_path.is_file() and output.is_file() and receipt.is_file()):
+        return None
+    job = _job_from_record(_read_json(job_path), job_path.parent)
+    payload = _read_json(receipt)
+    if (
+        job.selection_id != selected.selection_id
+        or payload.get("render_profile") != RENDER_PROFILE
+        or payload.get("output_sha256") != _digest_bytes(_read_bytes(output, 64 * 1024 * 1024))
+    ):
+        raise ScoutReelError("content_scout_reel_receipt_invalid")
+    return output
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:

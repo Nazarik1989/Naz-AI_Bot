@@ -20,6 +20,7 @@ PACK_STATUS_RU = {
     "in_progress": "создаётся",
     "composing_reels": "собираются Reels",
     "blocked_music": "Stories готовы, нужна лицензированная музыка",
+    "blocked_voice": "Stories готовы, озвучка требует внимания",
     "partially_blocked": "часть сцен заблокирована",
     "awaiting_secondary_approval": "нужно подтверждение повтора в Gen-4.5",
     "completed": "готов",
@@ -562,6 +563,7 @@ def _current_story_stage(payload: Mapping[str, Any], progress: Mapping[str, Any]
     terminal_pack_labels = {
         "completed": "всё готово",
         "blocked_music": "Stories готовы, подбор музыки заблокирован",
+        "blocked_voice": "Stories готовы, озвучка требует внимания",
         "partially_blocked": "одна или несколько сцен требуют внимания",
         "awaiting_secondary_approval": "нужно подтверждение повтора проблемной сцены",
         "superseded": "этот вариант заменён новым",
@@ -775,15 +777,20 @@ def delivery_files(manifest: Path) -> list[Path]:
     if payload.get("pack_status") != "completed":
         return []
     root = manifest.parent.resolve()
-    relative_paths = [
-        str(job.get("story_path", ""))
-        for job in payload.get("scene_jobs", [])
-        if job.get("state") == "completed"
-    ] + [
+    reel_paths = [
         str(job.get("path", ""))
         for job in payload.get("reel_jobs", [])
         if job.get("state") == "completed"
     ]
+    relative_paths = (
+        reel_paths
+        if isinstance(payload.get("scout_runway_bridge"), Mapping)
+        else [
+            str(job.get("story_path", ""))
+            for job in payload.get("scene_jobs", [])
+            if job.get("state") == "completed"
+        ] + reel_paths
+    )
     files: list[Path] = []
     for relative in relative_paths:
         candidate = (root / relative).resolve()

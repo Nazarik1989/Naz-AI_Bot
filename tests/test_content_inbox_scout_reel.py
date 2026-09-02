@@ -141,7 +141,10 @@ def test_ready_card_has_build_path_and_no_manual_work_dead_end(tmp_path):
     text = reel.selection_card_text(selected)
     labels = button_texts(main.inbox_scout_selected_keyboard(selected))
     assert "готов к сборке" in text and "ручной работы" not in text
-    assert labels == ["Собрать Reel", "Показать материал", "Другой из TOP", "Отменить"]
+    assert labels == [
+        "Собрать в Runway", "Показать материал", "Показать технический сториборд",
+        "Другой из TOP", "Отменить",
+    ]
 
 
 def test_select_callback_promotes_prepared_material_with_zero_new_model_calls(tmp_path):
@@ -174,7 +177,7 @@ def test_select_callback_promotes_prepared_material_with_zero_new_model_calls(tm
     assert bot.send_message.await_count == 1
     sent = bot.send_message.await_args.kwargs
     assert "готов к сборке" in sent["text"] and "ручной работы" not in sent["text"]
-    assert button_texts(sent["reply_markup"])[0] == "Собрать Reel"
+    assert button_texts(sent["reply_markup"])[0] == "Собрать в Runway"
     assert len(list((tmp_path / "reels" / "selections").glob("css-*/selection.json"))) == 1
 
 
@@ -198,7 +201,7 @@ def test_stored_selection_navigation_is_zero_provider(action, tmp_path):
         assert bot.send_message.await_count == min(3, len(run.ranked))
 
 
-@pytest.mark.parametrize("action", ["build", "show", "other", "cancel", "publish", "remake"])
+@pytest.mark.parametrize("action", ["build", "show", "storyboard", "other", "cancel", "publish", "remake"])
 def test_non_admin_reel_action_is_rejected_before_state_or_provider(action, tmp_path):
     query = SimpleNamespace(data=f"scoutreel:{action}:{'a' * 24}", answer=AsyncMock())
     update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=999))

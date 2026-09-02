@@ -283,6 +283,86 @@ class MediaComposer:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def compose_voice_reel(
+        self,
+        *,
+        pack_root: Path,
+        shots: Sequence[Mapping[str, Any]],
+        destination: Path,
+        voice_path: Path,
+        target_duration_seconds: float,
+    ) -> MediaProbe:
+        """Compose approved CLEAN masters with one voice track and no music."""
+        if not shots or not voice_path.is_file() or voice_path.is_symlink():
+            raise MediaError("voice_over_invalid")
+        if not 14.8 <= target_duration_seconds <= 15.2:
+            raise MediaError("voice_over_duration_invalid")
+        voice_probe = self._run([
+            self.ffprobe, "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "format=duration", "-of", "json", str(voice_path),
+        ])
+        try:
+            voice_duration = float(json.loads(voice_probe.stdout)["format"]["duration"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise MediaError("voice_over_invalid") from exc
+        if voice_duration <= 0 or voice_duration > target_duration_seconds * 1.12:
+            raise MediaError("voice_over_duration_invalid")
+        inputs: list[str] = []
+        filters: list[str] = []
+        total = 0.0
+        for index, shot in enumerate(shots):
+            duration = float(shot["duration_seconds"])
+            start = float(shot.get("in_seconds", 0))
+            if not 0.4 <= duration <= 2.0:
+                raise MediaError("reel_fragment_duration_invalid")
+            source = self.safe_output(pack_root, str(shot["source"]))
+            probe = self.probe(source)
+            if start < 0 or start + duration > probe.duration_seconds + 0.02:
+                raise MediaError("reel_fragment_out_of_source")
+            inputs.extend(["-i", str(source)])
+            crop = str(shot.get("reel_crop", ""))
+            zoom = {"tight-center": 1.18, "left-detail": 1.12, "right-detail": 1.12, "wide-center": 1.04}.get(crop)
+            if zoom is None:
+                raise MediaError("reel_crop_missing")
+            x = "0" if crop == "left-detail" else "iw-1080" if crop == "right-detail" else "(iw-1080)/2"
+            filters.append(
+                f"[{index}:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS,"
+                f"scale=ceil(iw*{zoom}/2)*2:ceil(ih*{zoom}/2)*2,"
+                f"crop=1080:1920:{x}:(ih-1920)/2,setsar=1,fps=30[v{index}]"
+            )
+            total += duration
+        if not 14.8 <= total <= 15.2:
+            raise MediaError("voice_over_duration_invalid")
+        filters.append("".join(f"[v{i}]" for i in range(len(shots))) + f"concat=n={len(shots)}:v=1:a=0[outv]")
+        audio_index = len(shots)
+        tempo = voice_duration / target_duration_seconds if voice_duration > target_duration_seconds else 1.0
+        filters.append(
+            f"[{audio_index}:a]atempo={tempo:.6f},apad,atrim=duration={target_duration_seconds:.3f}[outa]"
+        )
+        temporary = self._temporary(destination)
+        try:
+            self._run([
+                self.ffmpeg, "-nostdin", "-y", "-v", "error", *inputs,
+                "-i", str(voice_path), "-filter_complex", ";".join(filters),
+                "-map", "[outv]", "-map", "[outa]", "-t", f"{target_duration_seconds:.3f}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-movflags", "+faststart", str(temporary),
+            ])
+            probe = self.probe(temporary, require_story_duration=False)
+            if not 14.8 <= probe.duration_seconds <= 15.2:
+                raise MediaError("voice_over_duration_invalid")
+            audio_check = self._run([
+                self.ffprobe, "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name", "-of", "json", str(temporary),
+            ])
+            streams = json.loads(audio_check.stdout).get("streams", [])
+            if not streams or streams[0].get("codec_name") != "aac":
+                raise MediaError("voice_over_invalid")
+            os.replace(temporary, destination)
+            return probe
+        finally:
+            temporary.unlink(missing_ok=True)
+
 
 def load_music_library(path: Path, *, pack_root: Path | None = None) -> list[LicensedTrack]:
     if path.is_dir():
