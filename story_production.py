@@ -1714,6 +1714,7 @@ def semantic_preflight_reason_codes(
     *,
     plan: EditorialPlan,
     variant_index: int = 0,
+    _binding_story_schema: str = STORY_SCHEMA,
 ) -> tuple[str, ...]:
     """Deterministically reject ungrounded semantic plans before persistence.
 
@@ -1725,7 +1726,9 @@ def semantic_preflight_reason_codes(
     count = max(4, min(7, len(facts)))
     allowed_refs = _fact_ids(count)
     facts_by_ref = dict(zip(allowed_refs, facts[:count]))
-    story_plan_id = _variant_plan_id(plan.plan_id, variant_index)
+    story_plan_id = _variant_plan_id(
+        plan.plan_id, variant_index, story_schema=_binding_story_schema
+    )
     expected_roles = _roles(story_plan_id, count)
     expected_beats = _beat_ids(story_plan_id, count)
     errors: list[str] = []
@@ -2321,10 +2324,14 @@ def _reel_edit(plan: EditorialPlan, scenes: tuple[ScenePlan, ...], *, short: boo
     )
 
 
-def _variant_plan_id(base_plan_id: str, variant_index: int) -> str:
+def _variant_plan_id(
+    base_plan_id: str, variant_index: int, *, story_schema: str = STORY_SCHEMA
+) -> str:
+    if story_schema not in SUPPORTED_STORY_SCHEMAS:
+        raise StoryPlanError("story_schema_invalid")
     return hashlib.sha256(
         (
-            f"{base_plan_id}|{STORY_SCHEMA}|{DIRECTOR_VERSION}|"
+            f"{base_plan_id}|{story_schema}|{DIRECTOR_VERSION}|"
             f"{MOTION_CONTRACT_VERSION}|story-variant|{variant_index}"
         ).encode("utf-8")
     ).hexdigest()[:24]
@@ -2980,7 +2987,9 @@ def manifest_has_previous_production_contract(payload: Mapping[str, Any]) -> boo
                 ),
             })
         upgraded["immutable_plan_fingerprint"] = _immutable_plan_fingerprint(upgraded)
-        return manifest_has_current_production_contract(upgraded)
+        return _manifest_has_production_contract(
+            upgraded, binding_story_schema=PREVIOUS_STORY_SCHEMA
+        )
     except (AttributeError, TypeError, ValueError):
         return False
 
@@ -2993,14 +3002,19 @@ def _duration_in_range(value: Any, minimum: float, maximum: float) -> bool:
     return minimum <= duration <= maximum
 
 
-def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool:
+def _manifest_has_production_contract(
+    payload: Mapping[str, Any], *, binding_story_schema: str
+) -> bool:
     """Return whether a semantic-v8/v7 manifest is safe for the paid worker.
 
     This deliberately checks the persisted production envelope, not just the
     editorial plan.  Older manifests can still be inspected or repaired by a
     dry-run, but cannot be approved or reach a provider accidentally.
     """
-    if payload.get("schema") != STORY_SCHEMA:
+    if (
+        payload.get("schema") != STORY_SCHEMA
+        or binding_story_schema not in {STORY_SCHEMA, PREVIOUS_STORY_SCHEMA}
+    ):
         return False
     required_top_level_strings = (
         "plan_id", "base_plan_id", "director_version", "central_thesis",
@@ -3322,6 +3336,7 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             tuple(str(item) for item in safe_facts),
             plan=editorial_plan,
             variant_index=int(payload.get("variant_index", 0)),
+            _binding_story_schema=binding_story_schema,
         ):
             return False
         for scene in scenes:
@@ -3479,6 +3494,12 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         ):
             return False
     return True
+
+
+def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool:
+    return _manifest_has_production_contract(
+        payload, binding_story_schema=STORY_SCHEMA
+    )
 
 
 def _manifest_has_current_reel_contract(payload: Mapping[str, Any]) -> bool:
