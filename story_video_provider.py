@@ -15,6 +15,8 @@ from typing import Any, Mapping, Protocol
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from runway_reference_health import classify_provider_failure_code
+
 
 RUNWAY_API_VERSION = "2024-11-06"
 DEFAULT_RUNWAY_BASE_URL = "https://api.dev.runwayml.com/v1"
@@ -63,6 +65,13 @@ class ProviderJob:
     status: str
     output_url: str | None = None
     failure_code: str | None = None
+    provider_failure_code: str | None = None
+    failure_category: str | None = None
+    automatic_retry_allowed: bool = False
+    same_input_retry_allowed: bool = False
+    delayed_retry_eligible: bool = False
+    input_repair_required: bool = False
+    corrected_input_required: bool = False
 
 
 class VideoProvider(Protocol):
@@ -375,7 +384,22 @@ class RunwayVideoProvider:
                 raise ProviderError("provider_output_url_missing", retryable=True)
             return ProviderJob(external_job_id, "completed", output_url=url)
         if raw_status in TERMINAL_FAILURES:
-            return ProviderJob(external_job_id, "terminal_failed", failure_code="provider_terminal_failure")
+            # ``failureCode`` is the only provider diagnostic allowed across
+            # this boundary.  The free-form ``failure`` field can contain
+            # prompt/source material and is deliberately ignored.
+            decision = classify_provider_failure_code(result.get("failureCode"))
+            return ProviderJob(
+                external_job_id,
+                "terminal_failed",
+                failure_code=decision.normalized_category,
+                provider_failure_code=decision.safe_provider_failure_code,
+                failure_category=decision.normalized_category,
+                automatic_retry_allowed=decision.automatic_retry,
+                same_input_retry_allowed=decision.same_input_retry,
+                delayed_retry_eligible=decision.delayed_retry_eligible,
+                input_repair_required=decision.input_repair_required,
+                corrected_input_required=decision.corrected_input_required,
+            )
         raise ProviderError("provider_status_unknown", retryable=True)
 
     def download(self, job: ProviderJob, destination: Path) -> None:

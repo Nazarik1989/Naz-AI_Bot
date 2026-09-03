@@ -20,6 +20,17 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import story_production
+from runway_reference_health import (
+    FAILURE_CATEGORIES,
+    HEALTH_POLICY_VERSION,
+    PROMPT_POLICY_VERSION,
+    REFERENCE_PROFILE_VERSION,
+    ReferenceHealthError,
+    ReferenceHealthRegistry,
+    ReferenceRoute,
+    reference_set_digest,
+    sha256_file,
+)
 from story_audio_evidence import eligible_segment_starts
 from story_media_composer import MediaComposer, MediaError, checksum, load_music_library
 from story_pack_lock import AdvisoryFileLock, StoryPackLock, StoryPackLockError, ensure_private_group_access
@@ -64,6 +75,8 @@ SAFE_FAILURE_CODES = {
     "video_duration_unsupported", "video_model_priority_invalid",
     "video_model_route_mismatch", "video_model_unsupported", "video_prompt_image_required",
     "story_manifest_contract_stale", "provider_submit_outcome_ambiguous",
+    *FAILURE_CATEGORIES,
+    "reference_health_state_invalid", "reference_health_write_failed",
 }
 CANONICAL_PRIMARY_MODEL = "gen4_turbo"
 CANONICAL_SECONDARY_MODEL = "gen4.5"
@@ -137,6 +150,7 @@ class WorkerConfig:
     auto_fallback: bool = False
     music_rotation_state_path: Path | None = None
     daily_keyframe_limit: int = 7
+    reference_health_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +210,12 @@ def load_config(env: Mapping[str, str] | None = None) -> WorkerConfig:
             Path(music_rotation).expanduser().resolve() if music_rotation else None
         ),
         daily_keyframe_limit=_int(values, "NAZ_KEYFRAME_DAILY_JOB_LIMIT", 7, 1, 7),
+        reference_health_root=Path(
+            values.get(
+                "NAZ_RUNWAY_REFERENCE_HEALTH_ROOT",
+                "/var/lib/naz-ai-bot/runway-reference-health",
+            )
+        ).expanduser().resolve(),
     )
 
 
@@ -240,6 +260,11 @@ def check_config(config: WorkerConfig, env: Mapping[str, str] | None = None) -> 
     )
     if config.reference_path and (config.reference_path == PROJECT_ROOT or PROJECT_ROOT in config.reference_path.parents):
         issues.append("approved_reference_inside_repository")
+    if config.reference_health_root and (
+        config.reference_health_root == PROJECT_ROOT
+        or PROJECT_ROOT in config.reference_health_root.parents
+    ):
+        issues.append("reference_health_inside_repository")
     return {
         "ok": not issues, "render_enabled": config.render_enabled,
         "provider": config.provider_name, "model": config.model,
@@ -531,18 +556,60 @@ def _reference_catalog(path: Path | None) -> dict[str, ReferenceSelection]:
 
 
 def _identity_reference_set(
-    catalog: Mapping[str, ReferenceSelection], preferred_role: str,
+    catalog: Mapping[str, ReferenceSelection],
+    preferred_role: str = "frontal_identity",
+    *,
+    registry: ReferenceHealthRegistry | None = None,
 ) -> tuple[ReferenceSelection, ...]:
-    """Return one ordered, de-duplicated Naz character plate with at most three views."""
-    roles = (
+    """Return the canonical frontal-first identity plate.
+
+    ``preferred_role`` is retained only for callers reading legacy manifests;
+    camera direction never changes the canonical anchor.  Quarantined
+    auxiliaries are removed before a provider intent is persisted.
+    """
+    del preferred_role
+    roles = ("frontal_identity", "three_quarter_identity", "full_body_identity")
+    selected: list[ReferenceSelection] = []
+    seen: set[Path] = set()
+    for role in roles:
+        reference = catalog.get(role)
+        if reference is None or reference.path in seen:
+            continue
+        if role != "frontal_identity" and registry is not None:
+            reference_digest = sha256_file(reference.path)
+            proposed = tuple(selected) + (reference,)
+            proposed_rows = tuple(
+                (item.role, sha256_file(item.path)) for item in proposed
+            )
+            route = ReferenceRoute(
+                provider_name="runway",
+                keyframe_model="gen4_image",
+                reference_profile_version=REFERENCE_PROFILE_VERSION,
+                prompt_policy_version=PROMPT_POLICY_VERSION,
+                reference_role=role,
+                reference_digest=reference_digest,
+                reference_set_digest=reference_set_digest(proposed_rows),
+            )
+            if registry.role_is_quarantined(route):
+                continue
+        selected.append(reference)
+        seen.add(reference.path)
+        if len(selected) == 3:
+            break
+    return tuple(selected)
+
+
+def _legacy_identity_reference_set(
+    catalog: Mapping[str, ReferenceSelection], preferred_role: str
+) -> tuple[ReferenceSelection, ...]:
+    selected: list[ReferenceSelection] = []
+    seen: set[Path] = set()
+    for role in (
         preferred_role,
         "frontal_identity",
         "three_quarter_identity",
         "full_body_identity",
-    )
-    selected: list[ReferenceSelection] = []
-    seen: set[Path] = set()
-    for role in roles:
+    ):
         reference = catalog.get(role)
         if reference is None or reference.path in seen:
             continue
@@ -551,6 +618,68 @@ def _identity_reference_set(
         if len(selected) == 3:
             break
     return tuple(selected)
+
+
+def _reference_route(
+    references: tuple[ReferenceSelection, ...], *, observed_role: str
+) -> ReferenceRoute:
+    rows = tuple((item.role, sha256_file(item.path)) for item in references)
+    digest_by_role = dict(rows)
+    observed_digest = digest_by_role.get(observed_role)
+    if observed_digest is None:
+        raise ReferenceHealthError("reference_health_route_invalid")
+    return ReferenceRoute(
+        provider_name="runway",
+        keyframe_model="gen4_image",
+        reference_profile_version=REFERENCE_PROFILE_VERSION,
+        prompt_policy_version=PROMPT_POLICY_VERSION,
+        reference_role=observed_role,
+        reference_digest=observed_digest,
+        reference_set_digest=reference_set_digest(rows),
+    )
+
+
+def _registry(config: WorkerConfig) -> ReferenceHealthRegistry | None:
+    if config.reference_health_root is None:
+        return None
+    if (
+        config.reference_health_root == PROJECT_ROOT
+        or PROJECT_ROOT in config.reference_health_root.parents
+    ):
+        raise ReferenceHealthError("reference_health_root_invalid")
+    return ReferenceHealthRegistry(config.reference_health_root)
+
+
+def _migrated_legacy_contract(
+    payload: Mapping[str, Any], *, health_root: Path | None
+) -> bool:
+    if (
+        payload.get("schema") != story_production.PREVIOUS_STORY_SCHEMA
+        or payload.get("director_version") != story_production.DIRECTOR_VERSION
+        or not story_production.manifest_has_previous_production_contract(payload)
+        or health_root is None
+    ):
+        return False
+    try:
+        binding = ReferenceHealthRegistry(health_root).migration(
+            str(payload.get("plan_id", ""))
+        )
+    except ReferenceHealthError:
+        return False
+    return bool(
+        isinstance(binding, dict)
+        and binding.get("policy_version") == HEALTH_POLICY_VERSION
+        and binding.get("immutable_plan_fingerprint")
+        == payload.get("immutable_plan_fingerprint")
+    )
+
+
+def _paid_manifest_contract(payload: Mapping[str, Any], config: WorkerConfig) -> bool:
+    return story_production.manifest_has_current_production_contract(
+        payload
+    ) or _migrated_legacy_contract(
+        payload, health_root=config.reference_health_root
+    )
 
 
 def _identity_reference_guidance(references: tuple[ReferenceSelection, ...]) -> str:
@@ -734,6 +863,95 @@ def _mark_keyframe_ambiguous(
     _write(manifest, payload)
 
 
+def _automatic_fallback_contract(payload: Mapping[str, Any]) -> bool:
+    policy = payload.get("reference_recovery_policy")
+    return (
+        payload.get("schema") == story_production.STORY_SCHEMA
+        and isinstance(policy, Mapping)
+        and policy.get("version") == HEALTH_POLICY_VERSION
+        and policy.get("maximum_keyframe_fallbacks_per_identity_scene") == 1
+        and policy.get("maximum_total_automatic_keyframe_attempts") == 2
+        and policy.get("fallback_keyframe_model") == "gen4_image"
+        and policy.get("fallback_reference_roles") == ["frontal_identity"]
+        and policy.get("delayed_retry_failure_categories") == [
+            "provider_preprocessing_internal",
+            "provider_dependency_unavailable",
+        ]
+        and policy.get("corrected_input_failure_categories") == ["bad_output"]
+        and policy.get("same_input_retry_allowed") is False
+        and policy.get("automatic_video_fallback") is False
+        and str(payload.get("approval", {}).get("status")) == "approved"
+    )
+
+
+def _queue_automatic_fallback(
+    job: dict[str, Any], *, reason: str, retry_phase: str
+) -> bool:
+    if (
+        job.get("state") != "terminal_failed"
+        or job.get("keyframe_state") != "terminal_failed"
+        or int(job.get("keyframe_attempts", 0)) != 1
+        or int(job.get("keyframe_automatic_fallbacks", 0)) != 0
+        or int(job.get("attempts", 0)) != 0
+        or job.get("keyframe_checksum")
+        or job.get("clean_checksum")
+        or job.get("story_checksum")
+    ):
+        return False
+    external_id = str(job.get("keyframe_external_job_id") or "")
+    if external_id:
+        history = job.setdefault("keyframe_provider_job_history", [])
+        if external_id not in history:
+            history.append(external_id)
+    previous = job.get("keyframe_submit_intent")
+    if isinstance(previous, dict):
+        history = job.setdefault("keyframe_submit_intent_history", [])
+        if previous not in history:
+            history.append(dict(previous))
+    job.update({
+        "state": "queued",
+        "failure_code": None,
+        "keyframe_state": "queued",
+        "keyframe_external_job_id": None,
+        "keyframe_submitted_at": None,
+        "keyframe_provider_status": None,
+        "keyframe_failure_code": None,
+        "keyframe_submit_intent": None,
+        "keyframe_retry_model": "gen4_image",
+        "keyframe_retry_phase": retry_phase,
+        "keyframe_retry_reference_role": (
+            "frontal_identity" if bool(job.get("requires_naz_reference")) else "none"
+        ),
+        "keyframe_retry_reason_code": reason,
+        "keyframe_retry_approved_at": str(job.get("keyframe_submitted_at") or "preapproved"),
+        "keyframe_automatic_fallbacks": 1,
+        "keyframe_fallback_state": "running",
+        "keyframe_retry_not_before": (
+            (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+            if retry_phase == "automatic_delayed"
+            else None
+        ),
+    })
+    return True
+
+
+def _route_from_intent(intent: object) -> ReferenceRoute | None:
+    if not isinstance(intent, Mapping):
+        return None
+    try:
+        return ReferenceRoute(
+            provider_name=str(intent.get("reference_provider", "")),
+            keyframe_model=str(intent.get("model", "")),
+            reference_profile_version=str(intent.get("reference_profile_version", "")),
+            prompt_policy_version=str(intent.get("prompt_policy_version", "")),
+            reference_role=str(intent.get("observed_reference_role", "")),
+            reference_digest=str(intent.get("observed_reference_digest", "")),
+            reference_set_digest=str(intent.get("reference_set_digest", "")),
+        )
+    except ReferenceHealthError:
+        return None
+
+
 def _process_keyframe(
     *, payload: dict[str, Any], job: dict[str, Any], scene: Mapping[str, Any],
     manifest: Path, config: WorkerConfig, provider: VideoProvider,
@@ -763,6 +981,9 @@ def _process_keyframe(
         legacy_retry = reference_retry and retry_phase == "legacy_model"
         frontal_retry = reference_retry and retry_phase == "reference_quality"
         concise_retry = reference_retry and retry_phase == "concise_identity"
+        automatic_frontal_retry = reference_retry and retry_phase == "automatic_frontal"
+        automatic_delayed_retry = reference_retry and retry_phase == "automatic_delayed"
+        automatic_retry = automatic_frontal_retry or automatic_delayed_retry
         valid_legacy_retry = legacy_retry and attempts_before_submit == 1
         valid_frontal_retry = (
             frontal_retry
@@ -776,10 +997,23 @@ def _process_keyframe(
             and job.get("keyframe_retry_reference_role") == "frontal_identity"
             and bool(job.get("keyframe_concise_retry_approved_at"))
         )
+        valid_automatic_retry = (
+            automatic_retry
+            and attempts_before_submit == 1
+            and job.get("keyframe_retry_reference_role")
+            == ("frontal_identity" if scene.get("requires_naz_reference") else "none")
+            and int(job.get("keyframe_automatic_fallbacks", 0)) == 1
+            and job.get("keyframe_fallback_state") == "running"
+            and _automatic_fallback_contract(payload)
+        )
         if reference_retry and not (
-            bool(scene.get("requires_naz_reference"))
-            and job.get("keyframe_retry_model") == "gen4_image"
-            and (valid_legacy_retry or valid_frontal_retry or valid_concise_retry)
+            job.get("keyframe_retry_model") == "gen4_image"
+            and (
+                valid_legacy_retry
+                or valid_frontal_retry
+                or valid_concise_retry
+                or valid_automatic_retry
+            )
         ):
             job.update({
                 "state": "terminal_failed",
@@ -790,7 +1024,14 @@ def _process_keyframe(
             _set_pack_status(payload)
             _write(manifest, payload)
             return None
-        if concise_retry:
+        if automatic_retry:
+            retry_scope = (
+                "automatic_delayed_fallback"
+                if automatic_delayed_retry
+                else "automatic_frontal_fallback"
+            )
+            retry_limit = config.daily_keyframe_limit
+        elif concise_retry:
             retry_scope = "concise_identity_retry"
             retry_limit = CONCISE_IDENTITY_RETRY_DAILY_LIMIT
         elif frontal_retry:
@@ -805,6 +1046,11 @@ def _process_keyframe(
             job["keyframe_failure_code"] = "daily_keyframe_limit_reached"
             _write(manifest, payload)
             return None
+        if automatic_delayed_retry:
+            not_before = _utc(job.get("keyframe_retry_not_before"))
+            if not_before is None or datetime.now(timezone.utc) < not_before:
+                _write(manifest, payload)
+                return None
         if not reference_retry and (
             _keyframe_budget_usage(config.pack_root) >= config.daily_keyframe_limit
         ):
@@ -817,7 +1063,7 @@ def _process_keyframe(
             role = str(scene.get("reference_role") or "frontal_identity")
             selected_role = (
                 str(job.get("keyframe_retry_reference_role"))
-                if frontal_retry or concise_retry else role
+                if frontal_retry or concise_retry or automatic_frontal_retry else role
             )
             catalog = _reference_catalog(config.reference_path)
             original = catalog.get(selected_role)
@@ -830,7 +1076,20 @@ def _process_keyframe(
                 _set_pack_status(payload)
                 _write(manifest, payload)
                 return None
-            identity_references = _identity_reference_set(catalog, selected_role)
+            registry = _registry(config)
+            identity_references = (
+                (original,)
+                if frontal_retry or concise_retry or automatic_frontal_retry
+                else _legacy_identity_reference_set(catalog, selected_role)
+                if legacy_retry
+                else _identity_reference_set(
+                    catalog,
+                    selected_role,
+                    registry=registry,
+                )
+            )
+            if not legacy_retry:
+                original = identity_references[0] if identity_references else None
             if not identity_references:
                 job.update({
                     "keyframe_state": "terminal_failed",
@@ -847,6 +1106,11 @@ def _process_keyframe(
                 str(scene.get("keyframe_prompt", ""))
             )
         )
+        if automatic_delayed_retry:
+            prompt_source = (
+                f"{prompt_source} Render a fresh independent composition; "
+                "do not reuse a previous latent arrangement."
+            )
         identity_guidance = _identity_reference_guidance(identity_references)
         if identity_guidance:
             prompt_source = f"{identity_guidance} {prompt_source}"
@@ -879,6 +1143,48 @@ def _process_keyframe(
         }
         if reference_retry:
             submit_intent["approval_scope"] = retry_scope
+        if identity_references:
+            desired_view = str(scene.get("desired_view_role") or "frontal")
+            observed_role = "frontal_identity"
+            if (
+                not (frontal_retry or concise_retry or automatic_frontal_retry)
+                and desired_view == "three_quarter"
+                and any(
+                    item.role == "three_quarter_identity"
+                    for item in identity_references
+                )
+            ):
+                observed_role = "three_quarter_identity"
+            route = _reference_route(identity_references, observed_role=observed_role)
+            submit_intent.update({
+                "reference_provider": route.provider_name,
+                "reference_profile_version": route.reference_profile_version,
+                "prompt_policy_version": route.prompt_policy_version,
+                "identity_anchor_role": "frontal_identity",
+                "desired_view_role": desired_view,
+                "auxiliary_reference_roles": [
+                    item.role for item in identity_references[1:]
+                ],
+                "quarantined_reference_roles": [
+                    role
+                    for role in ("three_quarter_identity", "full_body_identity")
+                    if role in catalog
+                    and role not in {item.role for item in identity_references}
+                ],
+                "observed_reference_role": route.reference_role,
+                "observed_reference_digest": route.reference_digest,
+                "reference_set_digest": route.reference_set_digest,
+                "reference_health_policy_version": HEALTH_POLICY_VERSION,
+                "reference_routing_decision": (
+                    "automatic_delayed_corrected_prompt"
+                    if automatic_delayed_retry
+                    else "automatic_frontal_only"
+                    if automatic_frontal_retry
+                    else "explicit_frontal_only"
+                    if frontal_retry or concise_retry
+                    else "frontal_first_health_filtered"
+                ),
+            })
         job.update({
             "keyframe_state": "submitting", "keyframe_attempts": attempt,
             "keyframe_external_job_id": None, "keyframe_submitted_at": created_at,
@@ -959,11 +1265,63 @@ def _process_keyframe(
             _write(manifest, payload)
             return None
         if current.status == "terminal_failed":
-            code = current.failure_code or "provider_terminal_failure"
+            category = (
+                current.failure_category
+                if current.failure_category in FAILURE_CATEGORIES
+                else current.failure_code
+                if current.failure_code in FAILURE_CATEGORIES
+                else "unknown_terminal"
+            )
+            manifest_failure_code = (
+                "provider_terminal_failure"
+                if current.failure_code == "provider_terminal_failure"
+                and current.provider_failure_code is None
+                else category
+            )
             job.update({
-                "keyframe_state": "terminal_failed", "keyframe_failure_code": code,
-                "state": "terminal_failed", "failure_code": code,
+                "keyframe_state": "terminal_failed",
+                "keyframe_failure_code": manifest_failure_code,
+                "keyframe_provider_failure_code": current.provider_failure_code,
+                "keyframe_failure_category": category,
+                "keyframe_retry_policy": {
+                    "automatic_retry": bool(current.automatic_retry_allowed),
+                    "same_input_retry": bool(current.same_input_retry_allowed),
+                    "delayed_retry_eligible": bool(current.delayed_retry_eligible),
+                    "input_repair_required": bool(current.input_repair_required),
+                    "corrected_input_required": bool(current.corrected_input_required),
+                },
+                "state": "terminal_failed",
+                "failure_code": manifest_failure_code,
             })
+            route = _route_from_intent(job.get("keyframe_submit_intent"))
+            registry = _registry(config)
+            if route is not None and registry is not None:
+                try:
+                    registry.record_terminal(
+                        route,
+                        plan_id=str(payload.get("plan_id")),
+                        scene_id=str(job.get("scene_id")),
+                        category=category,
+                    )
+                    quarantined = registry.role_is_quarantined(route)
+                except ReferenceHealthError:
+                    quarantined = False
+                if (
+                    _automatic_fallback_contract(payload)
+                    and quarantined
+                    and route.reference_role != "frontal_identity"
+                ):
+                    _queue_automatic_fallback(
+                        job,
+                        reason="reference_route_quarantined",
+                        retry_phase="automatic_frontal",
+                    )
+            if _automatic_fallback_contract(payload) and current.delayed_retry_eligible:
+                _queue_automatic_fallback(
+                    job,
+                    reason=category,
+                    retry_phase="automatic_delayed",
+                )
             _set_pack_status(payload)
             _write(manifest, payload)
             return None
@@ -981,6 +1339,24 @@ def _process_keyframe(
             "keyframe_state": "ready", "keyframe_checksum": checksum(destination),
             "keyframe_failure_code": None, "keyframe_provider_status": "completed",
         })
+        route = _route_from_intent(job.get("keyframe_submit_intent"))
+        registry = _registry(config)
+        if route is not None and registry is not None:
+            try:
+                registry.record_success(
+                    route,
+                    plan_id=str(payload.get("plan_id")),
+                    scene_id=str(job.get("scene_id")),
+                )
+                if int(job.get("keyframe_automatic_fallbacks", 0)) == 1:
+                    job["keyframe_fallback_state"] = "completed"
+            except ReferenceHealthError:
+                job.update({
+                    "keyframe_state": "terminal_failed",
+                    "keyframe_failure_code": "reference_health_write_failed",
+                    "state": "terminal_failed",
+                    "failure_code": "reference_health_write_failed",
+                })
         _write(manifest, payload)
     except ProviderError as exc:
         job["keyframe_failure_code"] = _failure_code(exc)
@@ -1521,9 +1897,19 @@ def process_pack(
         raise RuntimeError("video_auto_fallback_forbidden")
     with PackLock(pack_dir):
         payload = story_production.read_manifest(manifest)
-        if payload.get("schema") != story_production.STORY_SCHEMA:
+        if payload.get("schema") not in {
+            story_production.STORY_SCHEMA,
+            story_production.PREVIOUS_STORY_SCHEMA,
+        }:
             return "legacy_manifest_read_only"
-        if not story_production.manifest_has_current_production_contract(payload):
+        if (
+            payload.get("schema") == story_production.PREVIOUS_STORY_SCHEMA
+            and not _migrated_legacy_contract(
+                payload, health_root=config.reference_health_root
+            )
+        ):
+            return "legacy_manifest_read_only"
+        if not _paid_manifest_contract(payload, config):
             raise RuntimeError("story_manifest_contract_stale")
         if str(payload.get("approval", {}).get("status")) != "approved":
             return "awaiting_approval"
@@ -1569,7 +1955,9 @@ def process_pack(
         return str(payload.get("pack_status"))
 
 
-def _queued_plan_ids(root: Path) -> list[str]:
+def _queued_plan_ids(
+    root: Path, *, reference_health_root: Path | None = None
+) -> list[str]:
     result = []
     if not root.is_dir():
         return result
@@ -1578,7 +1966,12 @@ def _queued_plan_ids(root: Path) -> list[str]:
             payload = story_production.read_manifest(manifest)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if not story_production.manifest_has_current_production_contract(payload):
+        if not (
+            story_production.manifest_has_current_production_contract(payload)
+            or _migrated_legacy_contract(
+                payload, health_root=reference_health_root
+            )
+        ):
             continue
         if str(payload.get("approval", {}).get("status")) != "approved":
             continue
@@ -1631,7 +2024,10 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
     if args.check_config:
         print(json.dumps(check_config(config, env), ensure_ascii=False, sort_keys=True))
         return 0
-    plan_ids = [args.plan_id] if args.plan_id else _queued_plan_ids(config.pack_root)[:1]
+    plan_ids = [args.plan_id] if args.plan_id else _queued_plan_ids(
+        config.pack_root,
+        reference_health_root=config.reference_health_root,
+    )[:1]
     if args.dry_run:
         print(json.dumps({"live_api_called": False, "plan_ids": plan_ids}, ensure_ascii=False))
         return 0

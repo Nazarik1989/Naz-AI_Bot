@@ -20,20 +20,15 @@ administrator's private chat automatically; there is no manual download step.
 - The worker only reads `NAZ_VIDEO_API_KEY`; it never falls back to
   `OPENAI_API_KEY`, voice, Voice Hub, or realtime credentials.
 - `--check-config` and `--dry-run` make no provider calls.
-- One scene is active per worker invocation. Limits are at most seven scenes,
-  two video retries, seven initial keyframes, seven paid video jobs and 56
-  generated seconds per UTC day by default. A legacy identity keyframe that
-  failed on the old Turbo route may be retried once through `gen4_image` only
-  after explicit confirmation; these migrations have a separate four-per-day
-  ceiling. If that retry returns `INTERNAL.BAD_OUTPUT` and a private reference
-  review identifies the off-axis input as the likely cause, an operator-only
-  control may retarget at most four unfinished jobs to the approved frontal
-  identity reference. That quality retry has its own four-per-day ceiling and
-  cannot be triggered by an accidental second Telegram button press. If the
-  provider returns the same `INTERNAL.BAD_OUTPUT` for both reviewed references,
-  a final operator-only recovery may replace only the runtime keyframe prompt
-  with a short prompt rebuilt from the immutable setting, action, end state and
-  shot fields. It also has an independent four-per-day ceiling.
+- One scene is active per worker invocation. New packs allow one primary
+  keyframe attempt and at most one policy-controlled automatic fallback;
+  automatic attempt three is impossible. `INTERNAL.BAD_OUTPUT.*` never repeats
+  unchanged input and requires a separately reviewed corrected-input scene
+  revision. Provider preprocessing/dependency failures may receive one delayed,
+  changed-prompt fallback. A quarantined auxiliary route may receive one
+  frontal-only corrected route. Safety, asset-invalid and unknown failures do
+  not retry automatically. Legacy explicit controls remain readable, but none
+  can match the audited current plan's completed scene or two-attempt failures.
 - `NAZ_VIDEO_AUTO_FALLBACK=true` is rejected. Legacy plans submit Gen-4.5 only
   after the administrator confirms the pending escalation with the existing
   `Подтвердить генерацию` button.

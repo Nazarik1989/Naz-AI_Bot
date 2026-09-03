@@ -808,12 +808,12 @@ class WorkerTests(unittest.TestCase):
                 provider=provider, composer=DummyComposer(),
             )
             request = provider.keyframe_submissions[0]
-            self.assertEqual(request.reference_path, (ref_dir / "naz-secondary.jpg").resolve())
+            self.assertEqual(request.reference_path, (ref_dir / "naz-primary.jpg").resolve())
             self.assertEqual(
                 request.reference_paths,
                 (
-                    (ref_dir / "naz-secondary.jpg").resolve(),
                     (ref_dir / "naz-primary.jpg").resolve(),
+                    (ref_dir / "naz-secondary.jpg").resolve(),
                 ),
             )
             self.assertIn("@NazView2", request.prompt)
@@ -876,7 +876,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(
                 request.reference_paths,
                 tuple((ref_dir / names[role]).resolve() for role in (
-                    "three_quarter_identity", "frontal_identity", "full_body_identity"
+                    "frontal_identity", "three_quarter_identity", "full_body_identity"
                 )),
             )
             self.assertIn("@NazView2", request.prompt)

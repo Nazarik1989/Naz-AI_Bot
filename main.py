@@ -233,6 +233,12 @@ AGENT_CONTENT_STATE_FILE = Path(os.getenv("AGENT_CONTENT_STATE_FILE", ".agent_co
 NAZ_STORY_PACK_ROOT = Path(
     os.getenv("NAZ_STORY_PACK_ROOT", "/var/lib/naz-ai-bot/story-packs").strip()
 )
+NAZ_RUNWAY_REFERENCE_HEALTH_ROOT = Path(
+    os.getenv(
+        "NAZ_RUNWAY_REFERENCE_HEALTH_ROOT",
+        "/var/lib/naz-ai-bot/runway-reference-health",
+    ).strip()
+)
 NAZ_OPERATOR_CONTENT_PACKAGE_ROOT = Path(
     os.getenv(
         "NAZ_OPERATOR_CONTENT_PACKAGE_ROOT",
@@ -4478,10 +4484,30 @@ def inbox_scout_runway_recovery_keyboard(plan_id: str) -> InlineKeyboardMarkup:
         raise ValueError("invalid Scout Runway plan_id")
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(
-            "Повторить 3 кадра с фронтальным референсом",
+            "Завершить текущий Reel с фронтальным референсом",
             callback_data=f"scoutrw:frontal:{plan_id}",
         )
     ]])
+
+
+def inbox_scout_runway_failure_keyboard(plan_id: str) -> InlineKeyboardMarkup:
+    """Provider-free controls for the classified current-plan decision."""
+    if not re.fullmatch(r"[a-f0-9]{24}", plan_id):
+        raise ValueError("invalid Scout Runway plan_id")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "Подготовить план замены 2 сцен",
+            callback_data=f"scoutrw:revision:{plan_id}",
+        )],
+        [InlineKeyboardButton(
+            "Обновить статус",
+            callback_data=f"scoutrw:status:{plan_id}",
+        )],
+        [InlineKeyboardButton(
+            "Отменить текущий план",
+            callback_data=f"scoutrw:cancel:{plan_id}",
+        )],
+    ])
 
 
 def inbox_scout_preview_keyboard(
@@ -4906,7 +4932,7 @@ async def content_inbox_scout_runway_callback(
     if not query or not update.effective_user or not query.data:
         return
     match = re.fullmatch(
-        r"scoutrw:(confirm|variant|cancel|frontal):([a-f0-9]{24})", query.data
+        r"scoutrw:(confirm|variant|cancel|frontal|status|revision):([a-f0-9]{24})", query.data
     )
     if match is None:
         await query.answer("Недействительная команда Scout Runway.", show_alert=True)
@@ -4918,6 +4944,37 @@ async def content_inbox_scout_runway_callback(
     await query.answer()
     try:
         content_inbox_scout_runway.load_bridge_for_plan(NAZ_STORY_PACK_ROOT, plan_id)
+        if action == "status":
+            text = await asyncio.to_thread(
+                story_pack_control.current_runway_failure_decision_card,
+                NAZ_STORY_PACK_ROOT,
+                plan_id,
+                health_root=NAZ_RUNWAY_REFERENCE_HEALTH_ROOT,
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=text,
+                reply_markup=inbox_scout_runway_failure_keyboard(plan_id),
+            )
+            return
+        if action == "revision":
+            proposal = await asyncio.to_thread(
+                story_pack_control.propose_current_runway_scene_revisions,
+                NAZ_STORY_PACK_ROOT,
+                plan_id,
+                health_root=NAZ_RUNWAY_REFERENCE_HEALTH_ROOT,
+                admin_id=update.effective_user.id,
+                expected_admin_id=ADMIN_ID,
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "🧾 План замены сцен 2 и 5 подготовлен без вызовов Runway. "
+                    f"Оценка: около {proposal['additional_credits']} credits. "
+                    "Для генерации потребуется отдельное подтверждение стоимости."
+                ),
+            )
+            return
         if action == "frontal":
             if not NAZ_STORY_RENDER_ENABLED:
                 raise content_inbox_scout_runway.ScoutRunwayError("content_scout_runway_render_disabled")
@@ -4927,6 +4984,7 @@ async def content_inbox_scout_runway_callback(
                 plan_id,
                 admin_id=update.effective_user.id,
                 expected_admin_id=ADMIN_ID,
+                health_root=NAZ_RUNWAY_REFERENCE_HEALTH_ROOT,
             )
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -10428,7 +10486,7 @@ def build_application() -> Application:
     application.add_handler(
         CallbackQueryHandler(
             content_inbox_scout_runway_callback,
-            pattern=r"^scoutrw:(?:confirm|variant|cancel|frontal):[a-f0-9]{24}$",
+            pattern=r"^scoutrw:(?:confirm|variant|cancel|frontal|status|revision):[a-f0-9]{24}$",
         )
     )
     application.add_handler(

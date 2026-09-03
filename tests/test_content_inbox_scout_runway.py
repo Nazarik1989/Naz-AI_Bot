@@ -318,12 +318,13 @@ def test_current_gen4_image_frontal_recovery_plan_is_exact_and_provider_free(tmp
     card = story_pack_control.current_frontal_reference_retry_card(
         tmp_path / "story-packs", pack.plan_id
     )
+    assert "Причина повторения устранена системно" in card
     assert "Готовые сцены: 2/5" in card
     assert "Повторить сцены: 1, 2, 5" in card
     assert "около 195 Runway credits" in card
     assert pack.manifest_path.read_bytes() == before
     labels = button_texts(main.inbox_scout_runway_recovery_keyboard(pack.plan_id))
-    assert labels == ["Повторить 3 кадра с фронтальным референсом"]
+    assert labels == ["Завершить текущий Reel с фронтальным референсом"]
 
 
 def test_current_frontal_retry_archives_failed_tasks_and_preserves_completed_scenes(tmp_path):
@@ -446,6 +447,7 @@ def test_frontal_recovery_callback_uses_dedicated_control_without_tts(tmp_path):
     with (
         patch.object(main, "ADMIN_ID", ADMIN),
         patch.object(main, "NAZ_STORY_PACK_ROOT", tmp_path / "story-packs"),
+        patch.object(main, "NAZ_RUNWAY_REFERENCE_HEALTH_ROOT", tmp_path / "health"),
         patch.object(main, "NAZ_STORY_RENDER_ENABLED", True),
         patch.object(
             story_pack_control,
@@ -462,6 +464,7 @@ def test_frontal_recovery_callback_uses_dedicated_control_without_tts(tmp_path):
         pack.plan_id,
         admin_id=ADMIN,
         expected_admin_id=ADMIN,
+        health_root=tmp_path / "health",
     )
     generic.assert_not_called()
     voice.assert_not_called()

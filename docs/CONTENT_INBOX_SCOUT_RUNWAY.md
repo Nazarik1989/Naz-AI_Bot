@@ -56,16 +56,22 @@ python tools/create_content_inbox_scout_runway_pack.py \
 The command creates/reuses the exact pack and sends its approval card. It does
 not approve it and cannot start paid generation.
 
-## Current Gen-4 Image frontal recovery
+## Current-plan failure decision
 
-A first-attempt `gen4_image` terminal failure with a
-`three_quarter_identity` reference is not routed through the legacy generic
-confirmation control. The closed current-contract predicate also requires no
-downloaded keyframe, zero video attempts, and an unchanged `gen4.5` video
-route.
+The provider adapter retains only Runway's allowlisted `failureCode`, a closed
+internal category, and a finite retry decision; free-form provider failure text
+is discarded. Historical `provider_terminal_failure` manifests remain
+readable as `unknown_terminal` and are never rewritten.
 
-The admin receives a separate recovery card and the button
-`Повторить 3 кадра с фронтальным референсом`. Its provider-free approval
-archives the old task identity and submit intent, then queues only the eligible
-scenes with runtime reference role `frontal_identity`. Completed scene assets
-remain immutable. The story worker owns all later Runway transport.
+The current plan is bound read-only to three audited task-identity digests.
+Scenes 01, 03 and 04 are complete and immutable. Scenes 02 and 05 have two
+terminal keyframe attempts and cannot receive an automatic third attempt.
+`INTERNAL.BAD_OUTPUT.*` permits only an immutable corrected-input scene
+proposal, still gated by a later separate cost approval. Its decision card has
+provider-free status, cancel, and proposal controls.
+
+For future packs, `frontal_identity` is the first canonical identity anchor;
+camera angle is independent and off-axis/full-body references are auxiliary.
+Health is bound to provider, model, reference-set digest and prompt-policy
+version. The states are unknown, healthy, degraded, quarantined and
+revalidation-required. Object/mechanism scenes receive no Naz reference.

@@ -19,15 +19,17 @@ from typing import Any, Callable, Mapping, Sequence
 
 from editorial_orchestrator import EditorialPlan
 from story_pack_lock import ensure_private_group_access
+from runway_reference_health import HEALTH_POLICY_VERSION
 from story_video_provider import ProviderError, compact_runway_prompt
 
 
-STORY_SCHEMA = "naz-story-pack-v7"
-PREVIOUS_STORY_SCHEMA = "naz-story-pack-v6"
-OLDER_STORY_SCHEMA = "naz-story-pack-v5"
-LEGACY_STORY_SCHEMA = "naz-story-pack-v4"
-ANCIENT_STORY_SCHEMA = "naz-story-pack-v3"
-FIRST_STORY_SCHEMA = "naz-story-pack-v2"
+STORY_SCHEMA = "naz-story-pack-v8"
+PREVIOUS_STORY_SCHEMA = "naz-story-pack-v7"
+OLDER_STORY_SCHEMA = "naz-story-pack-v6"
+LEGACY_STORY_SCHEMA = "naz-story-pack-v5"
+ANCIENT_STORY_SCHEMA = "naz-story-pack-v4"
+FIRST_STORY_SCHEMA = "naz-story-pack-v3"
+SECOND_STORY_SCHEMA = "naz-story-pack-v2"
 ORIGINAL_STORY_SCHEMA = "naz-story-pack-v1"
 SUPPORTED_STORY_SCHEMAS = (
     STORY_SCHEMA,
@@ -36,6 +38,7 @@ SUPPORTED_STORY_SCHEMAS = (
     LEGACY_STORY_SCHEMA,
     ANCIENT_STORY_SCHEMA,
     FIRST_STORY_SCHEMA,
+    SECOND_STORY_SCHEMA,
     ORIGINAL_STORY_SCHEMA,
 )
 DIRECTOR_VERSION = "reels-semantic-director-v8"
@@ -51,6 +54,11 @@ DRAMATURGIC_ROLES = (
 )
 SHOT_SIZES = ("wide", "medium", "close", "macro")
 REFERENCE_ROLES = ("none", "frontal_identity", "three_quarter_identity")
+IDENTITY_ANCHOR_ROLES = ("none", "frontal_identity")
+DESIRED_VIEW_ROLES = (
+    "none", "frontal", "three_quarter", "profile", "full_body", "rear_three_quarter",
+)
+AUXILIARY_REFERENCE_ROLES = ("three_quarter_identity", "full_body_identity")
 REEL_CROPS = ("tight-center", "left-detail", "right-detail", "wide-center")
 CAMERA_MOTIONS = ("slow push", "controlled pan", "handheld follow", "locked with real subject motion")
 CAMERA_MOTION_PROMPTS = {
@@ -533,6 +541,9 @@ class ScenePlan:
     suggested_interactive_sticker: str
     requires_naz_reference: bool
     reference_role: str
+    identity_anchor_role: str
+    desired_view_role: str
+    auxiliary_reference_roles: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -579,6 +590,7 @@ class StoryPackPlan:
     safety_flags: tuple[str, ...]
     copyright_flags: tuple[str, ...]
     policy_versions: Mapping[str, str]
+    reference_recovery_policy: Mapping[str, Any]
     renderer: str = RENDERER_UNAVAILABLE
     schema: str = STORY_SCHEMA
 
@@ -2243,7 +2255,19 @@ def _scene(
         footage_type="generative",
         continuity_constraints=continuity, secret_warning=False, copyright_warning=False,
         suggested_interactive_sticker="question" if role in {"hypothesis", "test"} else "none",
-        requires_naz_reference=requires_reference, reference_role=reference_role,
+        requires_naz_reference=requires_reference,
+        reference_role=reference_role,
+        identity_anchor_role="frontal_identity" if requires_reference else "none",
+        desired_view_role=(
+            "three_quarter"
+            if reference_role == "three_quarter_identity"
+            else "frontal"
+            if reference_role == "frontal_identity"
+            else "none"
+        ),
+        auxiliary_reference_roles=(
+            AUXILIARY_REFERENCE_ROLES if requires_reference else ()
+        ),
     )
 
 
@@ -2507,6 +2531,21 @@ def plan_story_pack(
             "orchestrator": plan.orchestrator_version, "content": plan.content_policy_version,
             "visual": plan.visual_policy_version, "music": plan.music_policy_version,
             "semantic": SEMANTIC_CONTRACT_VERSION,
+        },
+        reference_recovery_policy={
+            "version": HEALTH_POLICY_VERSION,
+            "identity_anchor_role": "frontal_identity",
+            "maximum_keyframe_fallbacks_per_identity_scene": 1,
+            "fallback_keyframe_model": "gen4_image",
+            "fallback_reference_roles": ["frontal_identity"],
+            "delayed_retry_failure_categories": [
+                "provider_preprocessing_internal",
+                "provider_dependency_unavailable",
+            ],
+            "corrected_input_failure_categories": ["bad_output"],
+            "same_input_retry_allowed": False,
+            "maximum_total_automatic_keyframe_attempts": 2,
+            "automatic_video_fallback": False,
         },
         renderer=renderer_status(),
     )
@@ -2839,7 +2878,8 @@ _IMMUTABLE_PLAN_FIELDS = (
     "story_spine", "story_arc", "continuity_anchor", "initial_state_code", "goal_state_code",
     "admin_concept_ru", "director_version",
     "scene_count", "scenes", "reel_edits", "caption_plan",
-    "safety_flags", "copyright_flags", "policy_versions", "schema",
+    "safety_flags", "copyright_flags", "policy_versions",
+    "reference_recovery_policy", "schema",
 )
 _IMMUTABLE_MUSIC_PLAN_FIELDS = (
     "tags", "allowlist_required", "consume_publication_rotation",
@@ -2864,6 +2904,85 @@ def _immutable_plan_fingerprint(payload: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _immutable_plan_fingerprint_v7(payload: Mapping[str, Any]) -> str:
+    immutable = {
+        field: payload.get(field)
+        for field in _IMMUTABLE_PLAN_FIELDS
+        if field != "reference_recovery_policy"
+    }
+    music_plan = payload.get("music_plan")
+    immutable["music_plan"] = (
+        {
+            field: music_plan.get(field)
+            for field in _IMMUTABLE_MUSIC_PLAN_FIELDS
+        }
+        if isinstance(music_plan, Mapping)
+        else None
+    )
+    canonical = json.dumps(
+        immutable, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def manifest_has_previous_production_contract(payload: Mapping[str, Any]) -> bool:
+    """Validate a v7 plan by upgrading a detached copy to the v8 envelope."""
+    if payload.get("schema") != PREVIOUS_STORY_SCHEMA:
+        return False
+    try:
+        if payload.get("immutable_plan_fingerprint") != _immutable_plan_fingerprint_v7(payload):
+            return False
+        upgraded = json.loads(json.dumps(payload, ensure_ascii=False))
+        upgraded["schema"] = STORY_SCHEMA
+        upgraded["reference_recovery_policy"] = {
+            "version": HEALTH_POLICY_VERSION,
+            "identity_anchor_role": "frontal_identity",
+            "maximum_keyframe_fallbacks_per_identity_scene": 1,
+            "fallback_keyframe_model": "gen4_image",
+            "fallback_reference_roles": ["frontal_identity"],
+            "delayed_retry_failure_categories": [
+                "provider_preprocessing_internal",
+                "provider_dependency_unavailable",
+            ],
+            "corrected_input_failure_categories": ["bad_output"],
+            "same_input_retry_allowed": False,
+            "maximum_total_automatic_keyframe_attempts": 2,
+            "automatic_video_fallback": False,
+        }
+        scenes = upgraded.get("scenes", [])
+        jobs = upgraded.get("scene_jobs", [])
+        for scene in scenes:
+            role = str(scene.get("reference_role", "none"))
+            requires = bool(scene.get("requires_naz_reference"))
+            scene.update({
+                "identity_anchor_role": "frontal_identity" if requires else "none",
+                "desired_view_role": (
+                    "three_quarter" if role == "three_quarter_identity"
+                    else "frontal" if role == "frontal_identity" else "none"
+                ),
+                "auxiliary_reference_roles": (
+                    list(AUXILIARY_REFERENCE_ROLES) if requires else []
+                ),
+            })
+        scenes_by_id = {str(scene.get("scene_id")): scene for scene in scenes}
+        for job in jobs:
+            scene = scenes_by_id.get(str(job.get("scene_id")), {})
+            job.update({
+                "identity_anchor_role": scene.get("identity_anchor_role"),
+                "desired_view_role": scene.get("desired_view_role"),
+                "auxiliary_reference_roles": scene.get("auxiliary_reference_roles"),
+                "reference_health_policy_version": HEALTH_POLICY_VERSION,
+                "keyframe_automatic_fallbacks": 0,
+                "keyframe_fallback_state": (
+                    "available" if job.get("requires_naz_reference") else "not_applicable"
+                ),
+            })
+        upgraded["immutable_plan_fingerprint"] = _immutable_plan_fingerprint(upgraded)
+        return manifest_has_current_production_contract(upgraded)
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _duration_in_range(value: Any, minimum: float, maximum: float) -> bool:
@@ -2919,6 +3038,7 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     reel_jobs = payload.get("reel_jobs")
     model_policy = payload.get("model_policy")
     visual_strategy = payload.get("visual_strategy")
+    recovery_policy = payload.get("reference_recovery_policy")
     if not all(isinstance(value, list) for value in (scenes, edits, scene_jobs, reel_jobs)):
         return False
     director_version = payload["director_version"]
@@ -2968,6 +3088,22 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
     hybrid_policy = model_policy.get("scene_route_policy") == HYBRID_MODEL_ROUTE
     if not hybrid_policy:
         return False
+    if not isinstance(recovery_policy, dict) or recovery_policy != {
+        "version": HEALTH_POLICY_VERSION,
+        "identity_anchor_role": "frontal_identity",
+        "maximum_keyframe_fallbacks_per_identity_scene": 1,
+        "fallback_keyframe_model": "gen4_image",
+        "fallback_reference_roles": ["frontal_identity"],
+        "delayed_retry_failure_categories": [
+            "provider_preprocessing_internal",
+            "provider_dependency_unavailable",
+        ],
+        "corrected_input_failure_categories": ["bad_output"],
+        "same_input_retry_allowed": False,
+        "maximum_total_automatic_keyframe_attempts": 2,
+        "automatic_video_fallback": False,
+    }:
+        return False
     if not isinstance(visual_strategy, dict) or (
         visual_strategy.get("planner") != "reels-maker-directed-scenes-v1"
         or visual_strategy.get("keyframe_required") is not True
@@ -3007,6 +3143,9 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             return False
         requires_reference = scene.get("requires_naz_reference")
         role = str(scene.get("reference_role", ""))
+        identity_anchor_role = str(scene.get("identity_anchor_role", ""))
+        desired_view_role = str(scene.get("desired_view_role", ""))
+        auxiliary_roles = scene.get("auxiliary_reference_roles")
         shot_size = str(scene.get("shot_size", ""))
         subject_kind = str(scene.get("subject_kind", ""))
         subject = str(scene.get("subject", ""))
@@ -3018,6 +3157,9 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             or not _duration_in_range(scene.get("duration_seconds"), 5, 5)
             or not isinstance(requires_reference, bool)
             or role not in REFERENCE_ROLES
+            or identity_anchor_role not in IDENTITY_ANCHOR_ROLES
+            or desired_view_role not in DESIRED_VIEW_ROLES
+            or not isinstance(auxiliary_roles, list)
             or subject_kind not in DIRECTOR_SUBJECT_KINDS
             or not action
             or not start_state
@@ -3037,6 +3179,20 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
         if (
             requires_reference and role not in {"frontal_identity", "three_quarter_identity"}
         ) or (not requires_reference and role != "none"):
+            return False
+        if requires_reference:
+            if (
+                identity_anchor_role != "frontal_identity"
+                or desired_view_role
+                != ("three_quarter" if role == "three_quarter_identity" else "frontal")
+                or auxiliary_roles != list(AUXILIARY_REFERENCE_ROLES)
+            ):
+                return False
+        elif (
+            identity_anchor_role != "none"
+            or desired_view_role != "none"
+            or auxiliary_roles
+        ):
             return False
         if director_version == DIRECTOR_VERSION:
             recipe_name, expected_end_state_code = arc_steps[scene_index]
@@ -3226,6 +3382,17 @@ def manifest_has_current_production_contract(payload: Mapping[str, Any]) -> bool
             or not _duration_in_range(job.get("planned_duration_seconds"), 5, 5)
             or job.get("requires_naz_reference") is not scene["requires_naz_reference"]
             or str(job.get("reference_role", "")) != str(scene["reference_role"])
+            or str(job.get("identity_anchor_role", ""))
+            != str(scene["identity_anchor_role"])
+            or str(job.get("desired_view_role", ""))
+            != str(scene["desired_view_role"])
+            or job.get("auxiliary_reference_roles")
+            != scene["auxiliary_reference_roles"]
+            or job.get("reference_health_policy_version") != HEALTH_POLICY_VERSION
+            or type(job.get("keyframe_automatic_fallbacks")) is not int
+            or not 0 <= job["keyframe_automatic_fallbacks"] <= 1
+            or job.get("keyframe_fallback_state")
+            not in {"available", "running", "completed", "blocked", "not_applicable"}
             or str(job.get("clean_path", "")) != f"stories/{scene_id}_clean.mp4"
             or str(job.get("story_path", "")) != f"stories/{scene_id}_story.mp4"
             or str(job.get("keyframe_path", "")) != f"keyframes/{scene_id}.jpg"
@@ -3381,6 +3548,12 @@ def _production_payload(pack: StoryPackPlan) -> dict[str, Any]:
         "visual_identity_qa": {"status": "not_run", "blocking": False},
         "failure_code": None, "requires_naz_reference": scene.requires_naz_reference,
         "reference_role": scene.reference_role,
+        "identity_anchor_role": scene.identity_anchor_role,
+        "desired_view_role": scene.desired_view_role,
+        "auxiliary_reference_roles": list(scene.auxiliary_reference_roles),
+        "reference_health_policy_version": HEALTH_POLICY_VERSION,
+        "keyframe_automatic_fallbacks": 0,
+        "keyframe_fallback_state": "available" if scene.requires_naz_reference else "not_applicable",
         "keyframe_path": f"keyframes/{scene.scene_id}.jpg",
         "keyframe_state": "planned", "keyframe_external_job_id": None,
         "keyframe_attempts": 0, "keyframe_submitted_at": None,

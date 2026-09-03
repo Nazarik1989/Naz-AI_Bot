@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -9,6 +11,16 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from editorial_orchestrator import EditorialPlan
+from runway_reference_health import (
+    HEALTH_POLICY_VERSION,
+    PROMPT_POLICY_VERSION,
+    REFERENCE_PROFILE_VERSION,
+    ReferenceHealthError,
+    ReferenceHealthRegistry,
+    ReferenceRoute,
+    reference_set_digest,
+    sha256_file,
+)
 import story_production
 from story_pack_lock import StoryPackLock, StoryPackLockError
 
@@ -231,11 +243,296 @@ def _current_frontal_reference_retry_candidates(
     return candidates
 
 
-def current_frontal_reference_retry_plan(root: Path, plan_id: str) -> dict[str, Any]:
+def _current_recovery_manifest_supported(payload: Mapping[str, Any]) -> bool:
+    return story_production.manifest_has_current_production_contract(
+        payload
+    ) or story_production.manifest_has_previous_production_contract(payload)
+
+
+def _migration_binding(
+    registry: ReferenceHealthRegistry,
+    *,
+    plan_id: str,
+    manifest: Path,
+) -> dict[str, Any] | None:
+    binding = registry.migration(plan_id)
+    payload = story_production.read_manifest(manifest)
+    if (
+        isinstance(binding, dict)
+        and binding.get("policy_version") == HEALTH_POLICY_VERSION
+        and binding.get("manifest_digest") == sha256_file(manifest)
+        and binding.get("immutable_plan_fingerprint")
+        == payload.get("immutable_plan_fingerprint")
+    ):
+        return binding
+    return None
+
+
+def import_current_plan_reference_health(
+    root: Path,
+    plan_id: str,
+    *,
+    health_root: Path,
+    references: Mapping[str, Path],
+    audited_tasks: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Import exact current-plan evidence without mutating it or calling Runway."""
+    path = manifest_path(root, plan_id)
+    before = path.read_bytes()
+    payload = story_production.read_manifest(path)
+    if not _current_recovery_manifest_supported(payload):
+        raise story_production.StoryPlanError("story_manifest_contract_stale")
+    completed_scene_ids = ("01_hook", "03_test", "04_result")
+    retry_scene_ids = ("02_problem", "05_conclusion")
+    jobs_by_id = {
+        str(job.get("scene_id")): job
+        for job in payload.get("scene_jobs", [])
+        if isinstance(job, Mapping)
+    }
+    if set(jobs_by_id) != {
+        "01_hook", "02_problem", "03_test", "04_result", "05_conclusion"
+    }:
+        raise story_production.StoryPlanError("current reference evidence mismatch")
+    for scene_id in completed_scene_ids:
+        job = jobs_by_id[scene_id]
+        if (
+            job.get("state") != "completed"
+            or job.get("keyframe_state") != "ready"
+            or int(job.get("attempts", 0)) != 1
+        ):
+            raise story_production.StoryPlanError("current reference evidence mismatch")
+        for path_field, digest_field in (
+            ("keyframe_path", "keyframe_checksum"),
+            ("clean_path", "clean_checksum"),
+            ("story_path", "story_checksum"),
+        ):
+            relative = str(job.get(path_field, ""))
+            artifact = (path.parent / relative).resolve()
+            if (
+                path.parent.resolve() not in artifact.parents
+                or sha256_file(artifact, maximum_bytes=1024 * 1024 * 1024)
+                != job.get(digest_field)
+            ):
+                raise story_production.StoryPlanError(
+                    "current completed scene evidence invalid"
+                )
+    for scene_id in retry_scene_ids:
+        job = jobs_by_id[scene_id]
+        if (
+            job.get("state") != "terminal_failed"
+            or job.get("keyframe_state") != "terminal_failed"
+            or int(job.get("keyframe_attempts", 0)) != 2
+            or int(job.get("attempts", 0)) != 0
+            or job.get("keyframe_checksum")
+            or job.get("clean_checksum")
+            or job.get("story_checksum")
+        ):
+            raise story_production.StoryPlanError("current reference evidence mismatch")
+    required = ("frontal_identity", "three_quarter_identity")
+    if any(role not in references for role in required):
+        raise story_production.StoryPlanError("current reference evidence unavailable")
+    digests = {role: sha256_file(Path(value)) for role, value in references.items()}
+    frontal_rows = (("frontal_identity", digests["frontal_identity"]),)
+    three_quarter_rows = (("three_quarter_identity", digests["three_quarter_identity"]),)
+    frontal_route = ReferenceRoute(
+        "runway", "gen4_image", REFERENCE_PROFILE_VERSION, PROMPT_POLICY_VERSION,
+        "frontal_identity", digests["frontal_identity"],
+        reference_set_digest(frontal_rows),
+    )
+    three_quarter_route = ReferenceRoute(
+        "runway", "gen4_image", REFERENCE_PROFILE_VERSION, PROMPT_POLICY_VERSION,
+        "three_quarter_identity", digests["three_quarter_identity"],
+        reference_set_digest(three_quarter_rows),
+    )
+    manifest_digest = sha256_file(path)
+    registry = ReferenceHealthRegistry(health_root)
+    registry.import_route_evidence(
+        frontal_route,
+        successful_count=3,
+        terminal_count=2,
+        consecutive_terminal_count=2,
+        last_failure_category="bad_output",
+        health_state="degraded",
+        evidence_id=hashlib.sha256(
+            f"{manifest_digest}|frontal|3|2|bad_output".encode("ascii")
+        ).hexdigest(),
+    )
+    registry.import_route_evidence(
+        three_quarter_route,
+        successful_count=0,
+        terminal_count=3,
+        consecutive_terminal_count=3,
+        last_failure_category="unknown_terminal",
+        health_state="quarantined",
+        evidence_id=hashlib.sha256(
+            f"{manifest_digest}|three-quarter|3".encode("ascii")
+        ).hexdigest(),
+    )
+    registry.bind_migration(
+        plan_id=plan_id,
+        manifest_digest=manifest_digest,
+        immutable_plan_fingerprint=str(payload.get("immutable_plan_fingerprint", "")),
+        completed_scene_ids=completed_scene_ids,
+        retry_scene_ids=retry_scene_ids,
+        task_audit=audited_tasks,
+    )
+    if path.read_bytes() != before:
+        raise story_production.StoryPlanError("current plan changed during health import")
+    return {
+        "plan_id": plan_id,
+        "policy_version": HEALTH_POLICY_VERSION,
+        "frontal_route_state": registry.health_state(frontal_route),
+        "three_quarter_route_state": registry.health_state(three_quarter_route),
+        "completed_scene_ids": completed_scene_ids,
+        "retry_scene_ids": retry_scene_ids,
+        "provider_calls": 0,
+    }
+
+
+def current_runway_failure_decision(
+    root: Path, plan_id: str, *, health_root: Path
+) -> dict[str, Any]:
+    """Return the evidence-bound current-plan decision without provider access."""
+    path = manifest_path(root, plan_id)
+    payload = story_production.read_manifest(path)
+    if not _current_recovery_manifest_supported(payload):
+        raise story_production.StoryPlanError("story_manifest_contract_stale")
+    binding = _migration_binding(
+        ReferenceHealthRegistry(health_root), plan_id=plan_id, manifest=path
+    )
+    if (
+        binding is None
+        or binding.get("completed_scene_ids") != ["01_hook", "03_test", "04_result"]
+        or binding.get("retry_scene_ids") != ["02_problem", "05_conclusion"]
+        or type(binding.get("task_audit")) is not dict
+    ):
+        raise story_production.StoryPlanError("current failure evidence unavailable")
+    audit = binding["task_audit"]
+    if (
+        audit.get("01_hook", {}).get("status") != "SUCCEEDED"
+        or audit.get("02_problem", {}).get("failure_category") != "bad_output"
+        or audit.get("05_conclusion", {}).get("failure_category") != "bad_output"
+    ):
+        raise story_production.StoryPlanError("current failure evidence unavailable")
+    return {
+        "plan_id": plan_id,
+        "completed_scene_ids": ("01_hook", "03_test", "04_result"),
+        "blocked_scene_ids": ("02_problem", "05_conclusion"),
+        "scene_total": 5,
+        "control_status": "SUCCEEDED",
+        "scene_failures": {
+            scene_id: {
+                "safe_provider_failure_code": audit[scene_id][
+                    "safe_provider_failure_code"
+                ],
+                "failure_category": audit[scene_id]["failure_category"],
+                "automatic_retry": False,
+                "same_input_retry": False,
+                "recommended_action": "corrected_input_scene_revision",
+            }
+            for scene_id in ("02_problem", "05_conclusion")
+        },
+        "frontal_route_state": "degraded",
+        "three_quarter_primary_route_state": "quarantined",
+        "corrected_input_proposal_available": True,
+        "maximum_new_keyframes": 2,
+        "maximum_new_videos": 2,
+        "additional_credits": 130,
+        "provider_calls": 0,
+    }
+
+
+def current_runway_failure_decision_card(
+    root: Path, plan_id: str, *, health_root: Path
+) -> str:
+    decision = current_runway_failure_decision(
+        root, plan_id, health_root=health_root
+    )
+    scene_2 = decision["scene_failures"]["02_problem"]
+    scene_5 = decision["scene_failures"]["05_conclusion"]
+    return (
+        "⚠️ Runway: точная причина двух сцен определена\n\n"
+        f"План:\n{plan_id}\n\n"
+        "Готово:\n3/5 сцен\n\n"
+        "Сохранены:\n1, 3 и 4\n\n"
+        f"Сцена 2:\n{scene_2['safe_provider_failure_code']} → bad_output\n"
+        "Нужна новая неизменяемая ревизия сцены с упрощённым visual prompt, "
+        "без читаемого текста/UI; object-only — если смысл это допускает.\n\n"
+        f"Сцена 5:\n{scene_5['safe_provider_failure_code']} → bad_output\n"
+        "Нужна новая неизменяемая ревизия сцены с упрощённым visual prompt, "
+        "без читаемого текста/UI; object-only — если смысл это допускает.\n\n"
+        "Сцены 1, 3 и 4 останутся без изменений. Подготовка плана замены "
+        "не запускает Runway; стоимость потребует отдельного подтверждения.\n\n"
+        "Новых генераций не выполнялось."
+    )
+
+
+def propose_current_runway_scene_revisions(
+    root: Path,
+    plan_id: str,
+    *,
+    health_root: Path,
+    admin_id: int,
+    expected_admin_id: int,
+) -> dict[str, Any]:
+    """Create one immutable, provider-free proposal for the two blocked scenes."""
+    if type(admin_id) is not int or admin_id != expected_admin_id:
+        raise story_production.StoryPlanError("story recovery admin required")
+    decision = current_runway_failure_decision(root, plan_id, health_root=health_root)
+    canonical = json.dumps(
+        {
+            "schema": "naz-runway-corrected-scene-proposal-v1",
+            "plan_id": plan_id,
+            "scene_ids": list(decision["blocked_scene_ids"]),
+            "failure_category": "bad_output",
+            "revision_rules": [
+                "simplify_visual_prompt",
+                "remove_readable_text_and_ui",
+                "prefer_object_only_when_semantically_valid",
+                "preserve_completed_scenes",
+            ],
+            "maximum_new_keyframes": 2,
+            "maximum_new_videos": 2,
+            "additional_credits": 130,
+            "generation_authorized": False,
+            "separate_cost_approval_required": True,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    proposal_id = hashlib.sha256(canonical).hexdigest()[:24]
+    proposal_path = _safe_pack_dir(root, plan_id) / "recovery-proposals" / f"{proposal_id}.json"
+    proposal_path.parent.mkdir(parents=True, exist_ok=True)
+    if proposal_path.exists():
+        if proposal_path.read_bytes() != canonical:
+            raise story_production.StoryPlanError("story recovery proposal conflict")
+    else:
+        try:
+            with proposal_path.open("xb") as target:
+                target.write(canonical)
+        except FileExistsError:
+            if proposal_path.read_bytes() != canonical:
+                raise story_production.StoryPlanError("story recovery proposal conflict")
+    return {
+        "proposal_id": proposal_id,
+        "scene_ids": decision["blocked_scene_ids"],
+        "additional_credits": 130,
+        "separate_cost_approval_required": True,
+        "provider_calls": 0,
+    }
+
+
+def current_frontal_reference_retry_plan(
+    root: Path,
+    plan_id: str,
+    *,
+    health_root: Path | None = None,
+) -> dict[str, Any]:
     """Return a detached, read-only recovery summary for an approval card."""
     path = manifest_path(root, plan_id)
     payload = story_production.read_manifest(path)
-    if not story_production.manifest_has_current_production_contract(payload):
+    if not _current_recovery_manifest_supported(payload):
         raise story_production.StoryPlanError("story_manifest_contract_stale")
     if str(payload.get("approval", {}).get("status")) != "approved":
         raise story_production.StoryPlanError("story pack is not approved")
@@ -257,7 +554,7 @@ def current_frontal_reference_retry_plan(root: Path, plan_id: str) -> dict[str, 
         * story_production.RUNWAY_VIDEO_CREDITS_PER_SECOND["gen4.5"]
         for job in candidates
     )
-    return {
+    result = {
         "plan_id": plan_id,
         "completed_scene_ids": completed,
         "retry_scene_ids": scene_ids,
@@ -269,24 +566,45 @@ def current_frontal_reference_retry_plan(root: Path, plan_id: str) -> dict[str, 
         "video_model": "gen4.5",
         "additional_credits": 5 * len(candidates) + video_credits,
     }
+    if health_root is not None:
+        registry = ReferenceHealthRegistry(health_root)
+        binding = _migration_binding(
+            registry, plan_id=plan_id, manifest=path
+        )
+        if binding is None or binding.get("retry_scene_ids") != list(scene_ids):
+            raise story_production.StoryPlanError(
+                "current reference health policy unavailable"
+            )
+        result["health_policy_version"] = HEALTH_POLICY_VERSION
+    return result
 
 
-def current_frontal_reference_retry_card(root: Path, plan_id: str) -> str:
+def current_frontal_reference_retry_card(
+    root: Path,
+    plan_id: str,
+    *,
+    health_root: Path | None = None,
+) -> str:
     """Build the closed admin recovery card without mutating the pack."""
-    plan = current_frontal_reference_retry_plan(root, plan_id)
+    plan = current_frontal_reference_retry_plan(
+        root, plan_id, health_root=health_root
+    )
     scene_numbers = ", ".join(
         scene_id.split("_", 1)[0].lstrip("0") or "0"
         for scene_id in plan["retry_scene_ids"]
     )
     return (
-        "⚠️ Runway recovery готов к отдельному подтверждению\n\n"
+        "⚠️ Причина повторения устранена системно\n\n"
+        "frontal_identity теперь главный identity anchor.\n"
+        "three_quarter route помещён в карантин; будущие queued-сцены не пойдут по этому маршруту.\n\n"
         f"Готовые сцены: {len(plan['completed_scene_ids'])}/{plan['scene_total']} — сохраняются без изменений.\n"
         f"Повторить сцены: {scene_numbers}.\n\n"
         f"Максимум новых keyframes: {plan['keyframe_jobs']} ({plan['keyframe_model']}).\n"
         f"Максимум новых video jobs: {plan['video_jobs']} ({plan['video_model']}).\n"
         f"Референс: {plan['reference_role']}.\n"
         f"Дополнительная оценка: около {plan['additional_credits']} Runway credits.\n\n"
-        "Платные вызовы начнутся только после нажатия отдельной кнопки ниже."
+        "Текущие сцены можно один раз восстановить с фронтальным референсом.\n"
+        "Платные вызовы начнутся только после отдельного подтверждения ниже."
     )
 
 
@@ -501,6 +819,7 @@ def approve_current_frontal_reference_retry(
     *,
     admin_id: int,
     expected_admin_id: int,
+    health_root: Path | None = None,
 ) -> str:
     """Approve only current ``gen4_image`` failures for a frontal retry.
 
@@ -520,8 +839,14 @@ def approve_current_frontal_reference_retry(
     path = manifest_path(root, plan_id)
     with _manifest_lock(path):
         payload = story_production.read_manifest(path)
-        if not story_production.manifest_has_current_production_contract(payload):
+        if not _current_recovery_manifest_supported(payload):
             raise story_production.StoryPlanError("story_manifest_contract_stale")
+        if health_root is not None and _migration_binding(
+            ReferenceHealthRegistry(health_root), plan_id=plan_id, manifest=path
+        ) is None:
+            raise story_production.StoryPlanError(
+                "current reference health policy unavailable"
+            )
         if str(payload.get("approval", {}).get("status")) != "approved":
             raise story_production.StoryPlanError("story pack is not approved")
         candidates = _current_frontal_reference_retry_candidates(
@@ -804,6 +1129,30 @@ def safe_progress_summary(payload: Mapping[str, Any]) -> str:
     scene_total = len(progress["scene_jobs"])
     reel_total = len(progress["reel_jobs"])
     pack_status = str(payload.get("pack_status", "unknown"))
+    primary_attempts = sum(
+        min(int(job.get("keyframe_attempts", 0)), 1)
+        for job in progress["scene_jobs"]
+        if isinstance(job, Mapping)
+    )
+    automatic_recoveries = sum(
+        int(job.get("keyframe_automatic_fallbacks", 0))
+        for job in progress["scene_jobs"]
+        if isinstance(job, Mapping)
+    )
+    quarantined_routes = {
+        role
+        for job in progress["scene_jobs"]
+        if isinstance(job, Mapping)
+        for intent in (job.get("keyframe_submit_intent"),)
+        if isinstance(intent, Mapping)
+        for role in intent.get("quarantined_reference_roles", [])
+        if isinstance(role, str)
+    }
+    terminal_scenes = sum(
+        str(job.get("state")) in {"terminal_failed", "blocked_reference", "submit_ambiguous"}
+        for job in progress["scene_jobs"]
+        if isinstance(job, Mapping)
+    )
     return (
         "🎬 Reels Maker · прогресс\n\n"
         f"План: {str(payload.get('plan_id', ''))[:24]}\n"
@@ -812,6 +1161,11 @@ def safe_progress_summary(payload: Mapping[str, Any]) -> str:
         f"Ключевые кадры: {progress['keyframes_ready']}/{scene_total}\n"
         f"Видео сцен: {progress['videos_ready']}/{scene_total}\n"
         f"Готовые Reels: {progress['reels_ready']}/{reel_total}\n\n"
+        f"Основные попытки: {primary_attempts}\n"
+        f"Автоматические восстановления: {automatic_recoveries}\n"
+        f"Маршруты в карантине: {len(quarantined_routes)}\n"
+        f"Готовые сцены: {progress['videos_ready']}\n"
+        f"Терминальные сцены: {terminal_scenes}\n\n"
         f"Сейчас: {_current_story_stage(payload, progress)}."
     )
 
@@ -858,6 +1212,13 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
     model_mix = (
         f"Gen-4.5 {model_seconds['gen4.5']}s + Turbo {model_seconds['gen4_turbo']}s"
     )
+    fallback_keyframes = sum(
+        bool(scene.get("requires_naz_reference"))
+        for scene in directed
+        if isinstance(scene, Mapping)
+    )
+    primary_credits = keyframe_credits + video_credits
+    maximum_credits = primary_credits + 5 * fallback_keyframes
     concept = _safe_admin_semantic_text(payload, payload.get("visual_concept"))
     admin_concept = _safe_admin_semantic_text(payload, payload.get("admin_concept_ru"))
     concept_label = admin_concept if re.search(r"[А-Яа-яЁё]", admin_concept) else ""
@@ -957,7 +1318,12 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
         f"Сцен с Naz: {references}\n\n{statuses}\n\n"
         "Режиссёрский план:\n" + ("\n".join(treatment) or "—")
         + f"\n\nОценка Runway: keyframes {keyframe_credits} + video {video_credits} "
-        f"= {keyframe_credits + video_credits} кредитов.\n"
+        f"= {primary_credits} кредитов.\n"
+        f"Основной лимит: {len(directed)} keyframes + {len(jobs)} video jobs.\n"
+        f"Максимальный лимит: +{fallback_keyframes} fallback keyframes, "
+        f"+0 fallback video jobs, до {maximum_credits} кредитов.\n"
+        "Политика: не более одного автоматического fallback на identity-сцену; "
+        "только gen4_image с frontal_identity, без video-model fallback.\n"
         f"Модели: {model_mix}.\n"
         "Аватар используется только для внешности; фон, поза и постановка создаются заново."
     )
