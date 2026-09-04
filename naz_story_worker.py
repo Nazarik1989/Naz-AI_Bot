@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import story_production
+import story_pack_control
 from runway_reference_health import (
     FAILURE_CATEGORIES,
     HEALTH_POLICY_VERSION,
@@ -293,15 +294,29 @@ def _utc(value: str | None) -> datetime | None:
         return None
 
 
+def _worker_payloads(root: Path) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for manifest in root.glob("*/story_manifest.json"):
+        try:
+            payloads.append(story_production.read_manifest(manifest))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    for runtime in root.glob("*/revision-runtime.json"):
+        try:
+            payloads.append(story_pack_control.read_corrected_scene_runtime(runtime))
+        except (OSError, ValueError, json.JSONDecodeError, story_production.StoryPlanError):
+            continue
+    return payloads
+
+
 def _budget_usage(root: Path) -> tuple[int, int]:
     now = datetime.now(timezone.utc).date()
     jobs = seconds = 0
-    for manifest in root.glob("*/story_manifest.json"):
-        try:
-            payload = story_production.read_manifest(manifest)
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-        if payload.get("schema") != story_production.STORY_SCHEMA:
+    for payload in _worker_payloads(root):
+        if payload.get("schema") not in {
+            story_production.STORY_SCHEMA,
+            story_pack_control.CORRECTED_SCENE_RUNTIME_SCHEMA,
+        }:
             continue
         for job in payload.get("scene_jobs", []):
             history = job.get("submit_intent_history")
@@ -328,11 +343,7 @@ def _budget_usage(root: Path) -> tuple[int, int]:
 def _keyframe_budget_usage(root: Path) -> int:
     now = datetime.now(timezone.utc).date()
     jobs = 0
-    for manifest in root.glob("*/story_manifest.json"):
-        try:
-            payload = story_production.read_manifest(manifest)
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
+    for payload in _worker_payloads(root):
         for job in payload.get("scene_jobs", []):
             history = job.get("keyframe_submit_intent_history")
             intents = list(history) if isinstance(history, list) else []
@@ -351,11 +362,7 @@ def _keyframe_budget_usage(root: Path) -> int:
 def _keyframe_retry_budget_usage(root: Path, approval_scope: str) -> int:
     now = datetime.now(timezone.utc).date()
     jobs = 0
-    for manifest in root.glob("*/story_manifest.json"):
-        try:
-            payload = story_production.read_manifest(manifest)
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
+    for payload in _worker_payloads(root):
         for job in payload.get("scene_jobs", []):
             history = job.get("keyframe_submit_intent_history")
             intents = list(history) if isinstance(history, list) else []
@@ -375,7 +382,10 @@ def _keyframe_retry_budget_usage(root: Path, approval_scope: str) -> int:
 
 def _write(manifest: Path, payload: dict[str, Any]) -> None:
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-    story_production.atomic_json(manifest, payload)
+    if payload.get("schema") == story_pack_control.CORRECTED_SCENE_RUNTIME_SCHEMA:
+        story_pack_control.write_corrected_scene_runtime(manifest, payload)
+    else:
+        story_production.atomic_json(manifest, payload)
 
 
 def _scene_plan(payload: Mapping[str, Any], scene_id: str) -> Mapping[str, Any]:
@@ -813,6 +823,11 @@ def _mark_failure(job: dict[str, Any], exc: BaseException, config: WorkerConfig)
     code = _failure_code(exc)
     retryable = bool(getattr(exc, "retryable", isinstance(exc, MediaError)))
     job["failure_code"] = code
+    if job.get("corrected_revision_id"):
+        # The cost approval authorizes one new video task for this new input,
+        # never another paid submit hidden behind the worker's legacy retry.
+        job["state"] = "terminal_failed"
+        return
     if retryable and int(job.get("attempts", 0)) <= config.max_retries:
         job["state"] = "retryable_failed"
         job["external_job_id"] = None
@@ -1877,6 +1892,76 @@ def _compose_reels(payload: dict[str, Any], manifest: Path, config: WorkerConfig
         _write(manifest, payload)
 
 
+def _process_corrected_scene_revision(
+    revision_plan_id: str, *, config: WorkerConfig,
+    provider: VideoProvider | None = None,
+    composer: MediaComposer | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resume one separately approved corrected-input child plan."""
+    child_dir = (config.pack_root / revision_plan_id).resolve()
+    if config.pack_root not in child_dir.parents:
+        raise RuntimeError("unsafe_plan_id")
+    with PackLock(child_dir):
+        _plan, payload, runtime_path = (
+            story_pack_control.validate_corrected_scene_revision_for_worker(
+                config.pack_root, revision_plan_id
+            )
+        )
+        if payload.get("pack_status") == "completed":
+            return "completed"
+        if len(payload.get("scene_jobs", [])) != 5:
+            raise RuntimeError("corrected_scene_runtime_invalid")
+        corrected_jobs = [
+            job for job in payload.get("scene_jobs", [])
+            if job.get("corrected_revision_id")
+        ]
+        if (
+            [job.get("scene_id") for job in corrected_jobs]
+            != list(story_pack_control.CORRECTED_SCENE_IDS)
+            or any(int(job.get("keyframe_attempts", 0)) > 1 for job in corrected_jobs)
+            or any(int(job.get("attempts", 0)) > 1 for job in corrected_jobs)
+        ):
+            raise RuntimeError("corrected_scene_runtime_invalid")
+        for job in payload.get("scene_jobs", []):
+            state = str(job.get("state", ""))
+            if state == "submitting":
+                _mark_submit_ambiguous(job, payload, runtime_path)
+                return "submit_ambiguous"
+            if state not in story_production.TERMINAL_SCENE_STATES:
+                model = _selected_model(job, config)
+                if model != "gen4_turbo":
+                    raise RuntimeError("video_model_route_mismatch")
+                active_provider = provider or provider_from_environment(
+                    env, model_override=model
+                )
+                if active_provider.name == "runway" and active_provider.model != model:
+                    raise RuntimeError("video_model_route_mismatch")
+                media = composer or MediaComposer(
+                    ffmpeg=config.ffmpeg,
+                    ffprobe=config.ffprobe,
+                    font_path=config.font_path,
+                    timeout_seconds=config.media_timeout_seconds,
+                )
+                _process_scene(
+                    payload=payload,
+                    job=job,
+                    manifest=runtime_path,
+                    config=config,
+                    provider=active_provider,
+                    composer=media,
+                )
+                return str(job.get("state"))
+        media = composer or MediaComposer(
+            ffmpeg=config.ffmpeg,
+            ffprobe=config.ffprobe,
+            font_path=config.font_path,
+            timeout_seconds=config.media_timeout_seconds,
+        )
+        _compose_reels(payload, runtime_path, config, media)
+        return str(payload.get("pack_status"))
+
+
 def process_pack(
     plan_id: str, *, config: WorkerConfig, provider: VideoProvider | None = None,
     composer: MediaComposer | None = None, env: Mapping[str, str] | None = None,
@@ -1895,6 +1980,14 @@ def process_pack(
     manifest = pack_dir / "story_manifest.json"
     if config.auto_fallback:
         raise RuntimeError("video_auto_fallback_forbidden")
+    if (pack_dir / "revision-plan.json").is_file():
+        return _process_corrected_scene_revision(
+            plan_id,
+            config=config,
+            provider=provider,
+            composer=composer,
+            env=env,
+        )
     with PackLock(pack_dir):
         payload = story_production.read_manifest(manifest)
         if payload.get("schema") not in {
@@ -2005,6 +2098,11 @@ def _queued_plan_ids(
         if scene_jobs and all(job.get("state") == "completed" for job in scene_jobs):
             if any(job.get("state") != "completed" for job in payload.get("reel_jobs", [])):
                 result.append(str(payload.get("plan_id")))
+    result.extend(
+        revision_plan_id
+        for revision_plan_id in story_pack_control.queued_corrected_scene_revision_ids(root)
+        if revision_plan_id not in result
+    )
     return result
 
 

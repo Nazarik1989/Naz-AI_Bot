@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,10 +25,22 @@ from runway_reference_health import (
     sha256_file,
 )
 import story_production
-from story_pack_lock import StoryPackLock, StoryPackLockError
+from story_pack_lock import (
+    StoryPackLock,
+    StoryPackLockError,
+    ensure_private_group_access,
+)
 
 
 _PLAN_ID_RE = re.compile(r"^[a-f0-9]{24}$")
+CORRECTED_SCENE_PROPOSAL_SCHEMA = "naz-runway-corrected-scene-proposal-v1"
+CORRECTED_SCENE_REVISION_SCHEMA = "naz-runway-corrected-scene-revision-v1"
+CORRECTED_SCENE_APPROVAL_SCHEMA = "naz-runway-corrected-scene-approval-v1"
+CORRECTED_SCENE_RUNTIME_SCHEMA = "naz-runway-corrected-scene-runtime-v1"
+CORRECTED_SCENE_CANCEL_SCHEMA = "naz-runway-corrected-scene-cancel-v1"
+CORRECTED_SCENE_IDS = ("02_problem", "05_conclusion")
+CORRECTED_COMPLETED_SCENE_IDS = ("01_hook", "03_test", "04_result")
+_REVISION_CALLBACK_ACTIONS = frozenset({"approve", "technical", "status", "cancel"})
 PACK_STATUS_RU = {
     "awaiting_approval": "ожидает подтверждения",
     "queued": "поставлен в очередь",
@@ -521,6 +536,957 @@ def propose_current_runway_scene_revisions(
         "separate_cost_approval_required": True,
         "provider_calls": 0,
     }
+
+
+def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+
+
+def _digest_value(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _read_closed_json(
+    path: Path, *, schema: str, canonical: bool = False
+) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise story_production.StoryPlanError("corrected scene revision state invalid") from exc
+    if type(payload) is not dict or payload.get("schema") != schema:
+        raise story_production.StoryPlanError("corrected scene revision state invalid")
+    if canonical and raw != _canonical_bytes(payload):
+        raise story_production.StoryPlanError("corrected scene revision state invalid")
+    return payload
+
+
+def _write_exact_private(path: Path, payload: Mapping[str, Any]) -> bool:
+    raw = _canonical_bytes(payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_group_access(path.parent, directory=True)
+    if path.exists():
+        if path.read_bytes() != raw:
+            raise story_production.StoryPlanError("corrected scene revision conflict")
+        return False
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660)
+    except FileExistsError:
+        if path.read_bytes() != raw:
+            raise story_production.StoryPlanError("corrected scene revision conflict")
+        return False
+    try:
+        with os.fdopen(descriptor, "wb") as target:
+            target.write(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        ensure_private_group_access(path, directory=False)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def write_corrected_scene_runtime(path: Path, payload: Mapping[str, Any]) -> None:
+    """Atomically replace only a closed corrected-scene runtime document."""
+    if (
+        type(payload) is not dict
+        or payload.get("schema") != CORRECTED_SCENE_RUNTIME_SCHEMA
+        or path.name != "revision-runtime.json"
+    ):
+        raise story_production.StoryPlanError("corrected scene runtime invalid")
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=".revision-runtime-", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as target:
+            target.write(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        ensure_private_group_access(temporary, directory=False)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_corrected_scene_runtime(path: Path) -> dict[str, Any]:
+    return _read_closed_json(path, schema=CORRECTED_SCENE_RUNTIME_SCHEMA)
+
+
+def _safe_revision_dir(root: Path, revision_plan_id: str) -> Path:
+    return _safe_pack_dir(root, revision_plan_id)
+
+
+def _exact_current_proposal(pack_dir: Path, plan_id: str) -> tuple[Path, dict[str, Any], str]:
+    proposal_root = pack_dir / "recovery-proposals"
+    matches: list[tuple[Path, dict[str, Any], str]] = []
+    for path in sorted(proposal_root.glob("*.json")) if proposal_root.is_dir() else []:
+        if path.is_symlink() or not path.is_file() or not _PLAN_ID_RE.fullmatch(path.stem):
+            continue
+        try:
+            raw = path.read_bytes()
+            value = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (
+            type(value) is dict
+            and value.get("schema") == CORRECTED_SCENE_PROPOSAL_SCHEMA
+            and value.get("plan_id") == plan_id
+            and value.get("scene_ids") == list(CORRECTED_SCENE_IDS)
+            and value.get("failure_category") == "bad_output"
+            and value.get("maximum_new_keyframes") == 2
+            and value.get("maximum_new_videos") == 2
+            and value.get("generation_authorized") is False
+            and value.get("separate_cost_approval_required") is True
+        ):
+            digest = hashlib.sha256(raw).hexdigest()
+            matches.append((path, value, digest))
+    if len(matches) != 1:
+        raise story_production.StoryPlanError("story recovery proposal ambiguous")
+    if matches[0][0].stem != matches[0][2][:24]:
+        raise story_production.StoryPlanError("story recovery proposal ambiguous")
+    return matches[0]
+
+
+def _artifact_path(pack_dir: Path, relative: object) -> Path:
+    if type(relative) is not str or not relative or Path(relative).is_absolute():
+        raise story_production.StoryPlanError("corrected scene asset invalid")
+    candidate = (pack_dir / relative).resolve()
+    if pack_dir.resolve() not in candidate.parents:
+        raise story_production.StoryPlanError("corrected scene asset invalid")
+    return candidate
+
+
+def _completed_asset_inventory(
+    manifest: Mapping[str, Any], pack_dir: Path
+) -> tuple[dict[str, Any], ...]:
+    jobs = {
+        str(job.get("scene_id")): job
+        for job in manifest.get("scene_jobs", [])
+        if isinstance(job, Mapping)
+    }
+    rows: list[dict[str, Any]] = []
+    for scene_id in CORRECTED_COMPLETED_SCENE_IDS:
+        job = jobs.get(scene_id)
+        if not isinstance(job, Mapping) or job.get("state") != "completed":
+            raise story_production.StoryPlanError("completed scene reuse invalid")
+        assets: dict[str, str] = {}
+        for role, path_field, checksum_field in (
+            ("keyframe", "keyframe_path", "keyframe_checksum"),
+            ("clean", "clean_path", "clean_checksum"),
+            ("story", "story_path", "story_checksum"),
+        ):
+            expected = job.get(checksum_field)
+            path = _artifact_path(pack_dir, job.get(path_field))
+            if (
+                type(expected) is not str
+                or not re.fullmatch(r"[a-f0-9]{64}", expected)
+                or path.is_symlink()
+                or not path.is_file()
+                or sha256_file(path, maximum_bytes=1024 * 1024 * 1024) != expected
+            ):
+                raise story_production.StoryPlanError("completed scene reuse invalid")
+            assets[role] = expected
+        rows.append({"scene_id": scene_id, "asset_checksums": assets})
+    return tuple(rows)
+
+
+def _failed_input_inventory(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    jobs = {
+        str(job.get("scene_id")): job
+        for job in manifest.get("scene_jobs", [])
+        if isinstance(job, Mapping)
+    }
+    rows: list[dict[str, Any]] = []
+    for scene_id in CORRECTED_SCENE_IDS:
+        job = jobs.get(scene_id)
+        if (
+            not isinstance(job, Mapping)
+            or job.get("state") != "terminal_failed"
+            or job.get("keyframe_state") != "terminal_failed"
+            or int(job.get("keyframe_attempts", 0)) != 2
+            or int(job.get("attempts", 0)) != 0
+            or job.get("keyframe_checksum")
+            or job.get("clean_checksum")
+            or job.get("story_checksum")
+        ):
+            raise story_production.StoryPlanError("failed scene history invalid")
+        task_ids = [
+            str(value)
+            for value in [
+                *job.get("keyframe_provider_job_history", []),
+                job.get("keyframe_external_job_id"),
+            ]
+            if type(value) is str and value
+        ]
+        intents = [
+            value
+            for value in [
+                *job.get("keyframe_submit_intent_history", []),
+                job.get("keyframe_submit_intent"),
+            ]
+            if isinstance(value, Mapping)
+        ]
+        rows.append({
+            "scene_id": scene_id,
+            "failed_job_digest": _digest_value(job),
+            "failed_task_identity_digests": [
+                hashlib.sha256(value.encode("utf-8")).hexdigest()
+                for value in task_ids
+            ],
+            "failed_input_identity_digests": [_digest_value(value) for value in intents],
+            "keyframe_attempts": 2,
+            "video_attempts": 0,
+            "failure_category": "bad_output",
+        })
+    return tuple(rows)
+
+
+def _corrected_scene_inputs(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    scenes = {
+        str(scene.get("scene_id")): scene
+        for scene in manifest.get("scenes", [])
+        if isinstance(scene, Mapping)
+    }
+    jobs = {
+        str(job.get("scene_id")): job
+        for job in manifest.get("scene_jobs", [])
+        if isinstance(job, Mapping)
+    }
+    definitions = {
+        "02_problem": {
+            "semantic_meaning": "Conversation history exists, but it does not reach answer generation.",
+            "visual_direction": "Object-only memory archive and a visibly disconnected handoff.",
+            "keyframe_prompt": (
+                "Vertical cinematic macro view of a dark physical memory archive holding intact "
+                "luminous modules. One clean signal leaves the archive, reaches a visible empty "
+                "gap before a separate generation chamber, and stops. Pure physical mechanism, "
+                "single clear action, no people, no written symbols, no interface graphics, no logos."
+            ),
+            "provider_prompt": (
+                "A single luminous signal travels from the intact memory archive toward the separate "
+                "generation chamber and stops at the visible gap. Slow controlled push, stable geometry."
+            ),
+        },
+        "05_conclusion": {
+            "semantic_meaning": (
+                "Context transfer is restored while separate user contexts remain isolated, and the "
+                "final response uses the prior context."
+            ),
+            "visual_direction": "Object-only isolated signal lanes with one restored memory handoff.",
+            "keyframe_prompt": (
+                "Vertical cinematic view of two isolated luminous signal lanes that remain physically "
+                "separate. A single bridge reconnects a memory path to a generation path and one stable "
+                "pulse reaches the output without crossing between the lanes. Pure physical mechanism, "
+                "single clear action, no people, no written symbols, no interface graphics, no logos."
+            ),
+            "provider_prompt": (
+                "One stable pulse crosses the restored bridge from memory to generation while two user "
+                "signal lanes remain fully separated. Locked camera with restrained physical motion."
+            ),
+        },
+    }
+    result: list[dict[str, Any]] = []
+    for scene_id in CORRECTED_SCENE_IDS:
+        scene = scenes.get(scene_id)
+        job = jobs.get(scene_id)
+        if not isinstance(scene, Mapping) or not isinstance(job, Mapping):
+            raise story_production.StoryPlanError("corrected scene source invalid")
+        duration = job.get("planned_duration_seconds")
+        if type(duration) not in {int, float} or float(duration) not in {5.0, 10.0}:
+            raise story_production.StoryPlanError("corrected scene duration invalid")
+        base = {
+            "scene_id": scene_id,
+            **definitions[scene_id],
+            "story_overlay": str(scene.get("story_overlay", "")),
+            "text_safe_zone": str(scene.get("text_safe_zone", "center")),
+            "requires_naz_reference": False,
+            "identity_reference": None,
+            "keyframe_model": "gen4_image",
+            "video_model": "gen4_turbo",
+            "video_duration_seconds": int(duration),
+            "visual_exclusions": [
+                "readable_text", "user_interface", "chat_screenshot", "source_code",
+                "database_rows", "labels", "logos", "human_identity",
+            ],
+        }
+        input_digest = _digest_value(base)
+        result.append({
+            **base,
+            "revision_id": hashlib.sha256(
+                f"{manifest.get('plan_id')}|{scene_id}|{input_digest}".encode("utf-8")
+            ).hexdigest()[:24],
+            "keyframe_input_digest": input_digest,
+        })
+    return tuple(result)
+
+
+def _revision_plan_identity_payload(
+    *, proposal_id: str, proposal_digest: str, parent_plan_id: str,
+    parent_manifest_digest: str, immutable_plan_fingerprint: str,
+    completed_assets: tuple[dict[str, Any], ...],
+    failed_inputs: tuple[dict[str, Any], ...],
+    corrected_scenes: tuple[dict[str, Any], ...], admin_id: int,
+) -> dict[str, Any]:
+    keyframe_credits = story_production.RUNWAY_KEYFRAME_CREDITS * len(corrected_scenes)
+    video_credits = sum(
+        int(scene["video_duration_seconds"])
+        * story_production.RUNWAY_VIDEO_CREDITS_PER_SECOND[str(scene["video_model"])]
+        for scene in corrected_scenes
+    )
+    return {
+        "schema": CORRECTED_SCENE_REVISION_SCHEMA,
+        "proposal_id": proposal_id,
+        "proposal_digest": proposal_digest,
+        "parent_plan_id": parent_plan_id,
+        "parent_manifest_digest": parent_manifest_digest,
+        "parent_immutable_plan_fingerprint": immutable_plan_fingerprint,
+        "completed_scenes": list(completed_assets),
+        "failed_scenes": list(failed_inputs),
+        "corrected_scenes": list(corrected_scenes),
+        "revised_scene_set_digest": _digest_value(list(CORRECTED_SCENE_IDS)),
+        "provider_workload": {
+            "maximum_new_keyframes": len(corrected_scenes),
+            "maximum_new_videos": len(corrected_scenes),
+            "old_input_retries": 0,
+            "completed_scene_regenerations": 0,
+        },
+        "credit_estimate": {
+            "keyframe_credits": keyframe_credits,
+            "video_credits": video_credits,
+            "ceiling": keyframe_credits + video_credits,
+        },
+        "approval_status": "awaiting_cost_approval",
+        "generation_authorized": False,
+        "admin_id": admin_id,
+    }
+
+
+def _copy_verified_asset(source: Path, destination: Path, expected_digest: str) -> None:
+    if (
+        source.is_symlink()
+        or not source.is_file()
+        or sha256_file(source, maximum_bytes=1024 * 1024 * 1024) != expected_digest
+    ):
+        raise story_production.StoryPlanError("completed scene reuse invalid")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_group_access(destination.parent, directory=True)
+    if destination.exists():
+        if destination.is_symlink() or sha256_file(
+            destination, maximum_bytes=1024 * 1024 * 1024
+        ) != expected_digest:
+            raise story_production.StoryPlanError("corrected scene asset conflict")
+        return
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660)
+    try:
+        with source.open("rb") as incoming, os.fdopen(descriptor, "wb") as outgoing:
+            while True:
+                chunk = incoming.read(1024 * 1024)
+                if not chunk:
+                    break
+                outgoing.write(chunk)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        ensure_private_group_access(destination, directory=False)
+        if sha256_file(destination, maximum_bytes=1024 * 1024 * 1024) != expected_digest:
+            raise story_production.StoryPlanError("corrected scene asset conflict")
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def _copy_revision_reuse_assets(
+    *, parent_manifest: Mapping[str, Any], parent_dir: Path, child_dir: Path
+) -> None:
+    jobs = {
+        str(job.get("scene_id")): job
+        for job in parent_manifest.get("scene_jobs", [])
+        if isinstance(job, Mapping)
+    }
+    for scene_id in CORRECTED_COMPLETED_SCENE_IDS:
+        job = jobs[scene_id]
+        for path_field, checksum_field in (
+            ("keyframe_path", "keyframe_checksum"),
+            ("clean_path", "clean_checksum"),
+            ("story_path", "story_checksum"),
+        ):
+            source = _artifact_path(parent_dir, job[path_field])
+            destination = _artifact_path(child_dir, job[path_field])
+            _copy_verified_asset(source, destination, str(job[checksum_field]))
+    voice = parent_manifest.get("voice_over_plan")
+    if isinstance(voice, Mapping) and voice.get("status") == "ready":
+        digest = voice.get("audio_digest")
+        if type(digest) is not str or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise story_production.StoryPlanError("corrected scene voice invalid")
+        _copy_verified_asset(
+            _artifact_path(parent_dir, voice.get("path")),
+            _artifact_path(child_dir, voice.get("path")),
+            digest,
+        )
+
+
+def create_corrected_scene_revision_plan(
+    root: Path, plan_id: str, *, admin_id: int, expected_admin_id: int
+) -> dict[str, Any]:
+    """Create or reuse one immutable provider-free corrected-input child plan."""
+    if (
+        type(admin_id) is not int
+        or type(expected_admin_id) is not int
+        or not expected_admin_id
+        or admin_id != expected_admin_id
+    ):
+        raise story_production.StoryPlanError("corrected scene revision admin required")
+    parent_path = manifest_path(root, plan_id)
+    with _manifest_lock(parent_path):
+        parent_raw = parent_path.read_bytes()
+        parent = story_production.read_manifest(parent_path)
+        if not _current_recovery_manifest_supported(parent):
+            raise story_production.StoryPlanError("story_manifest_contract_stale")
+        proposal_path, _proposal, proposal_digest = _exact_current_proposal(
+            parent_path.parent, plan_id
+        )
+        completed = _completed_asset_inventory(parent, parent_path.parent)
+        failed = _failed_input_inventory(parent)
+        corrected = _corrected_scene_inputs(parent)
+        identity = _revision_plan_identity_payload(
+            proposal_id=proposal_path.stem,
+            proposal_digest=proposal_digest,
+            parent_plan_id=plan_id,
+            parent_manifest_digest=hashlib.sha256(parent_raw).hexdigest(),
+            immutable_plan_fingerprint=str(parent.get("immutable_plan_fingerprint", "")),
+            completed_assets=completed,
+            failed_inputs=failed,
+            corrected_scenes=corrected,
+            admin_id=admin_id,
+        )
+        revision_plan_id = hashlib.sha256(_canonical_bytes(identity)).hexdigest()[:24]
+        child_dir = _safe_revision_dir(root, revision_plan_id)
+        plan_path = child_dir / "revision-plan.json"
+        if plan_path.exists():
+            stored = _read_closed_json(
+                plan_path, schema=CORRECTED_SCENE_REVISION_SCHEMA, canonical=True
+            )
+            if {key: value for key, value in stored.items() if key != "created_timestamp"} != {
+                **identity, "revision_plan_id": revision_plan_id
+            }:
+                raise story_production.StoryPlanError("corrected scene revision conflict")
+            plan = stored
+        else:
+            plan = {
+                **identity,
+                "revision_plan_id": revision_plan_id,
+                "created_timestamp": _now(),
+            }
+            _write_exact_private(plan_path, plan)
+        _copy_revision_reuse_assets(
+            parent_manifest=parent,
+            parent_dir=parent_path.parent,
+            child_dir=child_dir,
+        )
+        if parent_path.read_bytes() != parent_raw:
+            raise story_production.StoryPlanError("parent plan changed during revision create")
+    return corrected_scene_revision_summary(root, revision_plan_id)
+
+
+def read_corrected_scene_revision_plan(root: Path, revision_plan_id: str) -> dict[str, Any]:
+    plan_path = _safe_revision_dir(root, revision_plan_id) / "revision-plan.json"
+    plan = _read_closed_json(
+        plan_path, schema=CORRECTED_SCENE_REVISION_SCHEMA, canonical=True
+    )
+    expected_keys = {
+        "schema", "proposal_id", "proposal_digest", "parent_plan_id",
+        "parent_manifest_digest", "parent_immutable_plan_fingerprint",
+        "completed_scenes", "failed_scenes", "corrected_scenes",
+        "revised_scene_set_digest", "provider_workload", "credit_estimate",
+        "approval_status", "generation_authorized", "admin_id",
+        "revision_plan_id", "created_timestamp",
+    }
+    identity = {
+        key: value
+        for key, value in plan.items()
+        if key not in {"revision_plan_id", "created_timestamp"}
+    }
+    corrected_rows = plan.get("corrected_scenes", [])
+    if (
+        set(plan) != expected_keys
+        or plan.get("revision_plan_id") != revision_plan_id
+        or plan.get("parent_plan_id") == revision_plan_id
+        or plan.get("approval_status") != "awaiting_cost_approval"
+        or plan.get("generation_authorized") is not False
+        or plan.get("provider_workload") != {
+            "maximum_new_keyframes": 2,
+            "maximum_new_videos": 2,
+            "old_input_retries": 0,
+            "completed_scene_regenerations": 0,
+        }
+        or [row.get("scene_id") for row in plan.get("corrected_scenes", [])]
+        != list(CORRECTED_SCENE_IDS)
+        or hashlib.sha256(_canonical_bytes(identity)).hexdigest()[:24]
+        != revision_plan_id
+        or any(
+            type(row) is not dict
+            or row.get("keyframe_input_digest")
+            != _digest_value({
+                key: value
+                for key, value in row.items()
+                if key not in {"revision_id", "keyframe_input_digest"}
+            })
+            or row.get("revision_id")
+            != hashlib.sha256(
+                f"{plan.get('parent_plan_id')}|{row.get('scene_id')}|"
+                f"{row.get('keyframe_input_digest')}".encode("utf-8")
+            ).hexdigest()[:24]
+            for row in corrected_rows
+        )
+    ):
+        raise story_production.StoryPlanError("corrected scene revision state invalid")
+    return plan
+
+
+def corrected_scene_revision_callback_token(
+    plan: Mapping[str, Any], *, action: str, admin_id: int
+) -> str:
+    if action not in _REVISION_CALLBACK_ACTIONS or type(admin_id) is not int:
+        raise story_production.StoryPlanError("corrected scene callback invalid")
+    binding = {
+        "action": action,
+        "admin_id": admin_id,
+        "revision_plan_id": plan.get("revision_plan_id"),
+        "proposal_id": plan.get("proposal_id"),
+        "proposal_digest": plan.get("proposal_digest"),
+        "parent_plan_id": plan.get("parent_plan_id"),
+        "parent_manifest_digest": plan.get("parent_manifest_digest"),
+        "revised_scene_set_digest": plan.get("revised_scene_set_digest"),
+        "approved_credit_ceiling": plan.get("credit_estimate", {}).get("ceiling"),
+    }
+    return _digest_value(binding)[:16]
+
+
+def corrected_scene_revision_summary(root: Path, revision_plan_id: str) -> dict[str, Any]:
+    plan = read_corrected_scene_revision_plan(root, revision_plan_id)
+    approval_path = _safe_revision_dir(root, revision_plan_id) / "approval.json"
+    cancelled_path = _safe_revision_dir(root, revision_plan_id) / "cancelled.json"
+    status = (
+        "cancelled" if cancelled_path.exists()
+        else "approved" if approval_path.exists()
+        else "awaiting_cost_approval"
+    )
+    return {
+        "revision_plan_id": revision_plan_id,
+        "proposal_id": str(plan["proposal_id"]),
+        "proposal_digest": str(plan["proposal_digest"]),
+        "parent_plan_id": str(plan["parent_plan_id"]),
+        "corrected_scene_ids": tuple(CORRECTED_SCENE_IDS),
+        "completed_scene_ids": tuple(CORRECTED_COMPLETED_SCENE_IDS),
+        "completed_checksum_count": sum(
+            len(row["asset_checksums"]) for row in plan["completed_scenes"]
+        ),
+        "models": {
+            str(row["scene_id"]): {
+                "keyframe": str(row["keyframe_model"]),
+                "video": str(row["video_model"]),
+            }
+            for row in plan["corrected_scenes"]
+        },
+        "credit_ceiling": int(plan["credit_estimate"]["ceiling"]),
+        "maximum_new_keyframes": 2,
+        "maximum_new_videos": 2,
+        "status": status,
+        "provider_calls": 0,
+        "tts_calls": 0,
+        "publication_calls": 0,
+    }
+
+
+def corrected_scene_revision_card(root: Path, revision_plan_id: str) -> str:
+    summary = corrected_scene_revision_summary(root, revision_plan_id)
+    return (
+        "🎬 План замены двух сцен готов\n\n"
+        f"Исходный план:\n{summary['parent_plan_id']}\n\n"
+        "Сохранены без изменений:\nсцены 1, 3 и 4\n\n"
+        "Новые исправленные версии:\nсцены 2 и 5\n\n"
+        "Сцена 2:\nобъектная визуализация сохранённой памяти и разорванной передачи контекста\n\n"
+        "Сцена 5:\nобъектная визуализация восстановленной передачи и разделённых пользовательских линий\n\n"
+        "Будут созданы:\n- 2 новых ключевых кадра;\n- до 2 новых видеосцен;\n"
+        "- 0 повторов старого input;\n- 0 перегенераций готовых сцен.\n\n"
+        "Маршруты:\n"
+        "- Сцена 2: gen4_image → gen4_turbo;\n"
+        "- Сцена 5: gen4_image → gen4_turbo.\n\n"
+        f"Максимальная дополнительная стоимость:\n{summary['credit_ceiling']} Runway credits\n\n"
+        "Платные вызовы начнутся только после отдельного подтверждения."
+    )
+
+
+def corrected_scene_revision_technical_card(root: Path, revision_plan_id: str) -> str:
+    summary = corrected_scene_revision_summary(root, revision_plan_id)
+    return (
+        f"Технический план {revision_plan_id}\n"
+        f"Статус: {summary['status']}\n"
+        "Сохранённые assets: 9/9\n"
+        "Новые immutable revisions: 02_problem, 05_conclusion\n"
+        "Обе сцены object-only, identity references: none\n"
+        "Лимит: 2 keyframes + 2 videos, без старых input и без hidden retry\n"
+        f"Credit ceiling: {summary['credit_ceiling']}"
+    )
+
+
+def _revision_plan_matches_current_parent(
+    root: Path, plan: Mapping[str, Any]
+) -> tuple[Path, dict[str, Any]]:
+    parent_id = str(plan.get("parent_plan_id", ""))
+    parent_path = manifest_path(root, parent_id)
+    parent_raw = parent_path.read_bytes()
+    if hashlib.sha256(parent_raw).hexdigest() != plan.get("parent_manifest_digest"):
+        raise story_production.StoryPlanError("corrected scene parent stale")
+    parent = story_production.read_manifest(parent_path)
+    if parent.get("immutable_plan_fingerprint") != plan.get(
+        "parent_immutable_plan_fingerprint"
+    ):
+        raise story_production.StoryPlanError("corrected scene parent stale")
+    proposal_path, _proposal, proposal_digest = _exact_current_proposal(
+        parent_path.parent, parent_id
+    )
+    if (
+        proposal_path.stem != plan.get("proposal_id")
+        or proposal_digest != plan.get("proposal_digest")
+        or list(_completed_asset_inventory(parent, parent_path.parent))
+        != plan.get("completed_scenes")
+        or list(_failed_input_inventory(parent)) != plan.get("failed_scenes")
+    ):
+        raise story_production.StoryPlanError("corrected scene binding stale")
+    child_dir = _safe_revision_dir(root, str(plan["revision_plan_id"]))
+    child_jobs = {
+        str(job.get("scene_id")): job
+        for job in parent.get("scene_jobs", [])
+        if isinstance(job, Mapping)
+    }
+    for row in plan["completed_scenes"]:
+        job = child_jobs[str(row["scene_id"])]
+        for role, path_field in (
+            ("keyframe", "keyframe_path"),
+            ("clean", "clean_path"),
+            ("story", "story_path"),
+        ):
+            child_asset = _artifact_path(child_dir, job[path_field])
+            if (
+                child_asset.is_symlink()
+                or not child_asset.is_file()
+                or sha256_file(child_asset, maximum_bytes=1024 * 1024 * 1024)
+                != row["asset_checksums"][role]
+            ):
+                raise story_production.StoryPlanError("corrected scene reused asset stale")
+    return parent_path, parent
+
+
+def _revision_runtime_payload(
+    plan: Mapping[str, Any], parent: Mapping[str, Any], *, approved_at: str
+) -> dict[str, Any]:
+    runtime = deepcopy(dict(parent))
+    runtime.update({
+        "schema": CORRECTED_SCENE_RUNTIME_SCHEMA,
+        "plan_id": plan["revision_plan_id"],
+        "parent_plan_id": plan["parent_plan_id"],
+        "revision_plan_digest": hashlib.sha256(_canonical_bytes(plan)).hexdigest(),
+        "approval": {"status": "approved", "approved_at": approved_at},
+        "pack_status": "queued",
+        "provider": {"name": None, "model": None},
+        "renderer": {"status": "queued", "name": "ffmpeg"},
+        "composer": {"status": "planned", "name": "ffmpeg"},
+        "delivery": {"status": "not_ready", "sent_files": [], "completed_at": None},
+        "updated_at": approved_at,
+    })
+    corrected = {str(row["scene_id"]): row for row in plan["corrected_scenes"]}
+    for scene in runtime["scenes"]:
+        scene_id = str(scene.get("scene_id"))
+        if scene_id not in corrected:
+            continue
+        row = corrected[scene_id]
+        scene.update({
+            "requires_naz_reference": False,
+            "reference_role": "none",
+            "identity_anchor_role": "none",
+            "desired_view_role": "none",
+            "auxiliary_reference_roles": [],
+            "setting": row["visual_direction"],
+            "concrete_action": row["provider_prompt"],
+            "end_state": row["semantic_meaning"],
+            "keyframe_prompt": row["keyframe_prompt"],
+            "provider_prompt": row["provider_prompt"],
+            "story_overlay": row["story_overlay"],
+            "text_safe_zone": row["text_safe_zone"],
+            "corrected_revision_id": row["revision_id"],
+            "corrected_keyframe_input_digest": row["keyframe_input_digest"],
+        })
+    for job in runtime["scene_jobs"]:
+        scene_id = str(job.get("scene_id"))
+        if scene_id not in corrected:
+            continue
+        row = corrected[scene_id]
+        job.update({
+            "state": "queued", "external_job_id": None, "attempts": 0,
+            "submitted_at": None, "provider_status": None, "actual_duration_seconds": None,
+            "media_probe": None, "clean_checksum": None, "story_checksum": None,
+            "technical_qa": {"status": "not_run"}, "failure_code": None,
+            "requires_naz_reference": False, "reference_role": "none",
+            "identity_anchor_role": "none", "desired_view_role": "none",
+            "auxiliary_reference_roles": [], "keyframe_state": "queued",
+            "keyframe_external_job_id": None, "keyframe_attempts": 0,
+            "keyframe_submitted_at": None, "keyframe_provider_status": None,
+            "keyframe_checksum": None, "keyframe_failure_code": None,
+            "keyframe_submit_intent": None, "keyframe_submit_intent_history": [],
+            "keyframe_provider_job_history": [], "submit_intent": None,
+            "submit_intent_history": [], "provider_job_history": [],
+            "corrected_revision_id": row["revision_id"],
+            "corrected_keyframe_input_digest": row["keyframe_input_digest"],
+            "model_route": {
+                "tier": "primary", "primary_model": "gen4_turbo",
+                "secondary_model": "gen4.5", "primary_failure_code": None,
+                "secondary_requested_at": None, "secondary_approved_at": None,
+                "scene_strategy": story_production.HYBRID_MODEL_ROUTE,
+                "selected_model": "gen4_turbo",
+            },
+        })
+    for reel in runtime.get("reel_jobs", []):
+        reel.update({
+            "state": "planned", "media_probe": None, "checksum": None,
+            "failure_code": None,
+        })
+    statuses = {
+        str(job["scene_id"]): (
+            "completed" if job["scene_id"] in CORRECTED_COMPLETED_SCENE_IDS else "queued"
+        )
+        for job in runtime["scene_jobs"]
+    }
+    for output in runtime.get("expected_outputs", {}).get("stories", []):
+        scene_id = Path(str(output.get("clean", ""))).stem.removesuffix("_clean")
+        output["status"] = statuses.get(scene_id, "queued")
+    return runtime
+
+
+def approve_corrected_scene_revision_plan(
+    root: Path, revision_plan_id: str, *, callback_token: str,
+    admin_id: int, expected_admin_id: int,
+) -> str:
+    """Provider-free cost approval for one exact immutable child plan."""
+    plan = read_corrected_scene_revision_plan(root, revision_plan_id)
+    expected_token = corrected_scene_revision_callback_token(
+        plan, action="approve", admin_id=admin_id
+    )
+    if (
+        type(admin_id) is not int
+        or type(expected_admin_id) is not int
+        or admin_id != expected_admin_id
+        or type(callback_token) is not str
+        or callback_token != expected_token
+    ):
+        raise story_production.StoryPlanError("corrected scene approval binding invalid")
+    parent_path = manifest_path(root, str(plan["parent_plan_id"]))
+    with _manifest_lock(parent_path):
+        plan = read_corrected_scene_revision_plan(root, revision_plan_id)
+        if callback_token != corrected_scene_revision_callback_token(
+            plan, action="approve", admin_id=admin_id
+        ):
+            raise story_production.StoryPlanError("corrected scene approval binding invalid")
+        child_dir = _safe_revision_dir(root, revision_plan_id)
+        approval_path = child_dir / "approval.json"
+        runtime_path = child_dir / "revision-runtime.json"
+        cancelled_path = child_dir / "cancelled.json"
+        if cancelled_path.exists():
+            raise story_production.StoryPlanError("corrected scene revision cancelled")
+        parent_before = parent_path.read_bytes()
+        _path, parent = _revision_plan_matches_current_parent(root, plan)
+        if approval_path.exists():
+            approval = _read_closed_json(
+                approval_path,
+                schema=CORRECTED_SCENE_APPROVAL_SCHEMA,
+                canonical=True,
+            )
+            runtime = read_corrected_scene_runtime(runtime_path)
+            if (
+                approval.get("revision_plan_id") != revision_plan_id
+                or approval.get("approved_credit_ceiling")
+                != plan["credit_estimate"]["ceiling"]
+                or runtime.get("revision_plan_digest")
+                != hashlib.sha256(_canonical_bytes(plan)).hexdigest()
+            ):
+                raise story_production.StoryPlanError("corrected scene approval conflict")
+            return "already_approved"
+        if runtime_path.exists():
+            raise story_production.StoryPlanError("corrected scene approval conflict")
+        for job in parent.get("scene_jobs", []):
+            if (
+                isinstance(job, Mapping)
+                and job.get("scene_id") in CORRECTED_SCENE_IDS
+                and job.get("state") != "terminal_failed"
+            ):
+                raise story_production.StoryPlanError("corrected scene provider job active")
+        approved_at = _now()
+        runtime = _revision_runtime_payload(plan, parent, approved_at=approved_at)
+        write_corrected_scene_runtime(runtime_path, runtime)
+        approval = {
+            "schema": CORRECTED_SCENE_APPROVAL_SCHEMA,
+            "revision_plan_id": revision_plan_id,
+            "proposal_id": plan["proposal_id"],
+            "proposal_digest": plan["proposal_digest"],
+            "parent_plan_id": plan["parent_plan_id"],
+            "parent_manifest_digest": plan["parent_manifest_digest"],
+            "revised_scene_set_digest": plan["revised_scene_set_digest"],
+            "approved_credit_ceiling": plan["credit_estimate"]["ceiling"],
+            "approved_by_admin_id": admin_id,
+            "approved_at": approved_at,
+            "generation_authorized": True,
+        }
+        _write_exact_private(approval_path, approval)
+        if parent_path.read_bytes() != parent_before:
+            raise story_production.StoryPlanError("parent plan changed during revision approval")
+    return "approved"
+
+
+def cancel_corrected_scene_revision_plan(
+    root: Path, revision_plan_id: str, *, callback_token: str,
+    admin_id: int, expected_admin_id: int,
+) -> str:
+    plan = read_corrected_scene_revision_plan(root, revision_plan_id)
+    if (
+        type(admin_id) is not int
+        or type(expected_admin_id) is not int
+        or admin_id != expected_admin_id
+        or callback_token != corrected_scene_revision_callback_token(
+            plan, action="cancel", admin_id=admin_id
+        )
+    ):
+        raise story_production.StoryPlanError("corrected scene cancel binding invalid")
+    child_dir = _safe_revision_dir(root, revision_plan_id)
+    if (child_dir / "approval.json").exists() or (child_dir / "revision-runtime.json").exists():
+        raise story_production.StoryPlanError("approved corrected scene revision cannot be cancelled")
+    created = _write_exact_private(child_dir / "cancelled.json", {
+        "schema": CORRECTED_SCENE_CANCEL_SCHEMA,
+        "revision_plan_id": revision_plan_id,
+        "parent_plan_id": plan["parent_plan_id"],
+        "cancelled_by_admin_id": admin_id,
+        "cancelled_at": _now(),
+    })
+    return "cancelled" if created else "already_cancelled"
+
+
+def validate_corrected_scene_revision_for_worker(
+    root: Path, revision_plan_id: str
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    plan = read_corrected_scene_revision_plan(root, revision_plan_id)
+    child_dir = _safe_revision_dir(root, revision_plan_id)
+    approval = _read_closed_json(
+        child_dir / "approval.json",
+        schema=CORRECTED_SCENE_APPROVAL_SCHEMA,
+        canonical=True,
+    )
+    runtime_path = child_dir / "revision-runtime.json"
+    runtime = read_corrected_scene_runtime(runtime_path)
+    _parent_path, parent = _revision_plan_matches_current_parent(root, plan)
+    if (
+        approval.get("revision_plan_id") != revision_plan_id
+        or approval.get("proposal_digest") != plan.get("proposal_digest")
+        or approval.get("approved_credit_ceiling")
+        != plan.get("credit_estimate", {}).get("ceiling")
+        or approval.get("generation_authorized") is not True
+        or runtime.get("plan_id") != revision_plan_id
+        or runtime.get("parent_plan_id") != plan.get("parent_plan_id")
+        or runtime.get("revision_plan_digest")
+        != hashlib.sha256(_canonical_bytes(plan)).hexdigest()
+        or [
+            job.get("scene_id") for job in runtime.get("scene_jobs", [])
+            if job.get("corrected_revision_id")
+        ] != list(CORRECTED_SCENE_IDS)
+    ):
+        raise story_production.StoryPlanError("corrected scene runtime binding invalid")
+    corrected = {str(row["scene_id"]): row for row in plan["corrected_scenes"]}
+    runtime_scenes = {
+        str(row.get("scene_id")): row
+        for row in runtime.get("scenes", [])
+        if isinstance(row, Mapping)
+    }
+    runtime_jobs = {
+        str(row.get("scene_id")): row
+        for row in runtime.get("scene_jobs", [])
+        if isinstance(row, Mapping)
+    }
+    parent_jobs = {
+        str(row.get("scene_id")): row
+        for row in parent.get("scene_jobs", [])
+        if isinstance(row, Mapping)
+    }
+    if (
+        set(runtime_scenes) != set(parent_jobs)
+        or set(runtime_jobs) != set(parent_jobs)
+        or runtime.get("reel_edits") != parent.get("reel_edits")
+        or runtime.get("caption_plan") != parent.get("caption_plan")
+    ):
+        raise story_production.StoryPlanError("corrected scene runtime binding invalid")
+    for scene_id, row in corrected.items():
+        scene = runtime_scenes.get(scene_id, {})
+        job = runtime_jobs.get(scene_id, {})
+        if (
+            scene.get("corrected_revision_id") != row["revision_id"]
+            or scene.get("corrected_keyframe_input_digest")
+            != row["keyframe_input_digest"]
+            or scene.get("keyframe_prompt") != row["keyframe_prompt"]
+            or scene.get("provider_prompt") != row["provider_prompt"]
+            or scene.get("story_overlay") != row["story_overlay"]
+            or scene.get("requires_naz_reference") is not False
+            or job.get("corrected_revision_id") != row["revision_id"]
+            or job.get("corrected_keyframe_input_digest")
+            != row["keyframe_input_digest"]
+            or job.get("requires_naz_reference") is not False
+            or job.get("model_route", {}).get("selected_model") != row["video_model"]
+            or int(job.get("keyframe_attempts", 0)) > 1
+            or int(job.get("attempts", 0)) > 1
+        ):
+            raise story_production.StoryPlanError("corrected scene runtime binding invalid")
+    completed_by_id = {
+        str(row["scene_id"]): row for row in plan["completed_scenes"]
+    }
+    for scene_id, binding in completed_by_id.items():
+        job = runtime_jobs.get(scene_id, {})
+        parent_job = parent_jobs.get(scene_id, {})
+        if (
+            job.get("state") != "completed"
+            or job.get("keyframe_checksum") != binding["asset_checksums"]["keyframe"]
+            or job.get("clean_checksum") != binding["asset_checksums"]["clean"]
+            or job.get("story_checksum") != binding["asset_checksums"]["story"]
+            or job.get("external_job_id") != parent_job.get("external_job_id")
+            or job.get("keyframe_external_job_id")
+            != parent_job.get("keyframe_external_job_id")
+            or job.get("attempts") != parent_job.get("attempts")
+            or job.get("keyframe_attempts") != parent_job.get("keyframe_attempts")
+        ):
+            raise story_production.StoryPlanError("corrected scene reused asset stale")
+    return plan, runtime, runtime_path
+
+
+def queued_corrected_scene_revision_ids(root: Path) -> list[str]:
+    base = Path(root).expanduser().resolve()
+    result: list[str] = []
+    if not base.is_dir():
+        return result
+    for path in sorted(base.glob("*/revision-runtime.json"), key=lambda item: item.stat().st_mtime):
+        revision_plan_id = path.parent.name
+        if not _PLAN_ID_RE.fullmatch(revision_plan_id):
+            continue
+        try:
+            _plan, runtime, _runtime_path = validate_corrected_scene_revision_for_worker(
+                base, revision_plan_id
+            )
+        except (OSError, ValueError, story_production.StoryPlanError):
+            continue
+        if runtime.get("pack_status") not in {"completed", "awaiting_secondary_approval"}:
+            result.append(revision_plan_id)
+    return result
 
 
 def current_frontal_reference_retry_plan(
@@ -1330,7 +2296,11 @@ def safe_summary(payload: Mapping[str, Any]) -> str:
 
 
 def delivery_files(manifest: Path) -> list[Path]:
-    payload = story_production.read_manifest(manifest)
+    payload = (
+        read_corrected_scene_runtime(manifest)
+        if manifest.name == "revision-runtime.json"
+        else story_production.read_manifest(manifest)
+    )
     if payload.get("pack_status") != "completed":
         return []
     root = manifest.parent.resolve()
@@ -1361,9 +2331,17 @@ def delivery_files(manifest: Path) -> list[Path]:
 
 def ready_deliveries(root: Path) -> list[Path]:
     result = []
-    for path in reversed(list_manifests(root)):
+    paths = list_manifests(root) + sorted(
+        Path(root).expanduser().resolve().glob("*/revision-runtime.json"),
+        key=lambda item: item.stat().st_mtime,
+    )
+    for path in reversed(paths):
         try:
-            payload = story_production.read_manifest(path)
+            payload = (
+                read_corrected_scene_runtime(path)
+                if path.name == "revision-runtime.json"
+                else story_production.read_manifest(path)
+            )
         except (OSError, ValueError):
             continue
         if (
@@ -1375,6 +2353,16 @@ def ready_deliveries(root: Path) -> list[Path]:
 
 
 def mark_delivery_file_sent(manifest: Path, filename: str) -> None:
+    if manifest.name == "revision-runtime.json":
+        payload = read_corrected_scene_runtime(manifest)
+        delivery = payload.setdefault("delivery", {})
+        sent = delivery.setdefault("sent_files", [])
+        if filename not in sent:
+            sent.append(filename)
+        delivery["status"] = "delivering"
+        write_corrected_scene_runtime(manifest, payload)
+        return
+
     def mutate(payload: dict[str, Any]) -> None:
         delivery = payload.setdefault("delivery", {})
         sent = delivery.setdefault("sent_files", [])
@@ -1386,6 +2374,14 @@ def mark_delivery_file_sent(manifest: Path, filename: str) -> None:
 
 
 def mark_delivery_complete(manifest: Path) -> None:
+    if manifest.name == "revision-runtime.json":
+        payload = read_corrected_scene_runtime(manifest)
+        payload.setdefault("delivery", {}).update({
+            "status": "completed", "completed_at": _now()
+        })
+        write_corrected_scene_runtime(manifest, payload)
+        return
+
     def mutate(payload: dict[str, Any]) -> None:
         delivery = payload.setdefault("delivery", {})
         delivery.update({"status": "completed", "completed_at": _now()})

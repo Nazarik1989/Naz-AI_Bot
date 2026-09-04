@@ -47,6 +47,7 @@ TEMPLATE_DIRECTOR_VERSION = "reels-template-director-v1"
 MOTION_CONTRACT_VERSION = "bounded-story-arc-v4"
 VIDEO_MOTION_PROMPT_VERSION = "runway-image-to-video-motion-v2"
 HYBRID_MODEL_ROUTE = "naz-human-gen45-object-turbo-v1"
+RUNWAY_KEYFRAME_CREDITS = 5
 RUNWAY_VIDEO_CREDITS_PER_SECOND = {"gen4_turbo": 5, "gen4.5": 12}
 RENDERER_UNAVAILABLE = "unavailable"
 DRAMATURGIC_ROLES = (

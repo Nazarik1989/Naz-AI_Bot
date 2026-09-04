@@ -4510,6 +4510,61 @@ def inbox_scout_runway_failure_keyboard(plan_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def inbox_scout_runway_revision_keyboard(
+    revision_plan_id: str,
+    *,
+    approve_token: str,
+    technical_token: str,
+    status_token: str,
+    cancel_token: str,
+) -> InlineKeyboardMarkup:
+    """Closed proposal-bound cost approval controls under Telegram's 64-byte cap."""
+    if not re.fullmatch(r"[a-f0-9]{24}", revision_plan_id):
+        raise ValueError("invalid corrected revision plan_id")
+    tokens = (approve_token, technical_token, status_token, cancel_token)
+    if any(not re.fullmatch(r"[a-f0-9]{16}", token) for token in tokens):
+        raise ValueError("invalid corrected revision callback token")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "Подтвердить генерацию 2 сцен",
+            callback_data=f"scoutrv:a:{revision_plan_id}:{approve_token}",
+        )],
+        [InlineKeyboardButton(
+            "Показать технический план",
+            callback_data=f"scoutrv:t:{revision_plan_id}:{technical_token}",
+        )],
+        [InlineKeyboardButton(
+            "Обновить статус",
+            callback_data=f"scoutrv:s:{revision_plan_id}:{status_token}",
+        )],
+        [InlineKeyboardButton(
+            "Отменить замену",
+            callback_data=f"scoutrv:c:{revision_plan_id}:{cancel_token}",
+        )],
+    ])
+
+
+def _corrected_revision_keyboard(revision_plan_id: str) -> InlineKeyboardMarkup:
+    plan = story_pack_control.read_corrected_scene_revision_plan(
+        NAZ_STORY_PACK_ROOT, revision_plan_id
+    )
+    return inbox_scout_runway_revision_keyboard(
+        revision_plan_id,
+        approve_token=story_pack_control.corrected_scene_revision_callback_token(
+            plan, action="approve", admin_id=ADMIN_ID
+        ),
+        technical_token=story_pack_control.corrected_scene_revision_callback_token(
+            plan, action="technical", admin_id=ADMIN_ID
+        ),
+        status_token=story_pack_control.corrected_scene_revision_callback_token(
+            plan, action="status", admin_id=ADMIN_ID
+        ),
+        cancel_token=story_pack_control.corrected_scene_revision_callback_token(
+            plan, action="cancel", admin_id=ADMIN_ID
+        ),
+    )
+
+
 def inbox_scout_preview_keyboard(
     selected: content_inbox_scout_reel.SelectedMaterial,
 ) -> InlineKeyboardMarkup:
@@ -4958,7 +5013,7 @@ async def content_inbox_scout_runway_callback(
             )
             return
         if action == "revision":
-            proposal = await asyncio.to_thread(
+            await asyncio.to_thread(
                 story_pack_control.propose_current_runway_scene_revisions,
                 NAZ_STORY_PACK_ROOT,
                 plan_id,
@@ -4966,12 +5021,20 @@ async def content_inbox_scout_runway_callback(
                 admin_id=update.effective_user.id,
                 expected_admin_id=ADMIN_ID,
             )
+            revision = await asyncio.to_thread(
+                story_pack_control.create_corrected_scene_revision_plan,
+                NAZ_STORY_PACK_ROOT,
+                plan_id,
+                admin_id=update.effective_user.id,
+                expected_admin_id=ADMIN_ID,
+            )
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=(
-                    "🧾 План замены сцен 2 и 5 подготовлен без вызовов Runway. "
-                    f"Оценка: около {proposal['additional_credits']} credits. "
-                    "Для генерации потребуется отдельное подтверждение стоимости."
+                text=story_pack_control.corrected_scene_revision_card(
+                    NAZ_STORY_PACK_ROOT, revision["revision_plan_id"]
+                ),
+                reply_markup=_corrected_revision_keyboard(
+                    revision["revision_plan_id"]
                 ),
             )
             return
@@ -5061,6 +5124,101 @@ async def content_inbox_scout_runway_callback(
     except (OSError, RuntimeError, ValueError, story_production.StoryPlanError, content_inbox_scout_runway.ScoutRunwayError) as exc:
         reason = getattr(exc, "reason_code", "content_scout_runway_runtime_failure")
         await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Scout Runway остановлен: {reason}")
+
+
+async def content_inbox_scout_runway_revision_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Resolve compact buttons against the private immutable revision plan."""
+    query = update.callback_query
+    if not query or not update.effective_user or not query.data:
+        return
+    match = re.fullmatch(
+        r"scoutrv:(a|t|s|c):([a-f0-9]{24}):([a-f0-9]{16})",
+        query.data,
+    )
+    if match is None:
+        await query.answer("Недействительная команда замены сцен.", show_alert=True)
+        return
+    if not is_admin(update.effective_user.id):
+        await query.answer("Замена сцен доступна только администратору.", show_alert=True)
+        return
+    action_code, revision_plan_id, token = match.groups()
+    action = {"a": "approve", "t": "technical", "s": "status", "c": "cancel"}[
+        action_code
+    ]
+    try:
+        plan = await asyncio.to_thread(
+            story_pack_control.read_corrected_scene_revision_plan,
+            NAZ_STORY_PACK_ROOT,
+            revision_plan_id,
+        )
+        expected_token = story_pack_control.corrected_scene_revision_callback_token(
+            plan, action=action, admin_id=update.effective_user.id
+        )
+        if token != expected_token:
+            raise story_production.StoryPlanError(
+                "corrected scene callback binding invalid"
+            )
+        await query.answer()
+        if action == "approve":
+            if not NAZ_STORY_RENDER_ENABLED:
+                raise content_inbox_scout_runway.ScoutRunwayError(
+                    "content_scout_runway_render_disabled"
+                )
+            result = await asyncio.to_thread(
+                story_pack_control.approve_corrected_scene_revision_plan,
+                NAZ_STORY_PACK_ROOT,
+                revision_plan_id,
+                callback_token=token,
+                admin_id=update.effective_user.id,
+                expected_admin_id=ADMIN_ID,
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"✅ Стоимость подтверждена: {result}. В очередь поставлены только "
+                    "новые версии сцен 2 и 5; исходный план и сцены 1, 3 и 4 не изменены."
+                ),
+            )
+            return
+        if action == "technical":
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=story_pack_control.corrected_scene_revision_technical_card(
+                    NAZ_STORY_PACK_ROOT, revision_plan_id
+                ),
+            )
+            return
+        if action == "status":
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=story_pack_control.corrected_scene_revision_card(
+                    NAZ_STORY_PACK_ROOT, revision_plan_id
+                ),
+                reply_markup=_corrected_revision_keyboard(revision_plan_id),
+            )
+            return
+        result = await asyncio.to_thread(
+            story_pack_control.cancel_corrected_scene_revision_plan,
+            NAZ_STORY_PACK_ROOT,
+            revision_plan_id,
+            callback_token=token,
+            admin_id=update.effective_user.id,
+            expected_admin_id=ADMIN_ID,
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_ID, text=f"✅ Замена сцен отменена: {result}."
+        )
+    except (content_inbox_scout_runway.ScoutRunwayError, story_production.StoryPlanError) as exc:
+        reason = getattr(exc, "reason_code", str(exc))
+        await query.answer(f"Замена сцен остановлена: {reason}", show_alert=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("corrected Runway scene revision callback failed")
+        await query.answer(
+            "Замена сцен остановлена: corrected_scene_revision_runtime_failure",
+            show_alert=True,
+        )
 
 
 async def publish_agent_content_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7182,7 +7340,12 @@ async def reels_control_response(
         )
         if manifest is None:
             return "Нового плана Reels пока нет.", REELS_KEYBOARD
-        payload = await asyncio.to_thread(story_production.read_manifest, manifest)
+        payload = await asyncio.to_thread(
+            story_pack_control.read_corrected_scene_runtime
+            if manifest.name == "revision-runtime.json"
+            else story_production.read_manifest,
+            manifest,
+        )
         current_plan_id = str(payload.get("plan_id", ""))
         if current_plan_id != manifest.parent.name or (
             plan_id is not None and current_plan_id != plan_id
@@ -10487,6 +10650,12 @@ def build_application() -> Application:
         CallbackQueryHandler(
             content_inbox_scout_runway_callback,
             pattern=r"^scoutrw:(?:confirm|variant|cancel|frontal|status|revision):[a-f0-9]{24}$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            content_inbox_scout_runway_revision_callback,
+            pattern=r"^scoutrv:[atsc]:[a-f0-9]{24}:[a-f0-9]{16}$",
         )
     )
     application.add_handler(

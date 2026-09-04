@@ -70,6 +70,31 @@ terminal keyframe attempts and cannot receive an automatic third attempt.
 proposal, still gated by a later separate cost approval. Its decision card has
 provider-free status, cancel, and proposal controls.
 
+## Corrected-scene child revisions
+
+`naz-runway-corrected-scene-revision-v1` closes the gap between a provider-free
+BAD_OUTPUT proposal and paid generation. The immutable child plan binds the
+exact proposal and parent-manifest digests, all nine reused checksums for
+completed scenes 1/3/4, the two historical failed-input/task digest sets, the
+new object-only inputs for scenes 2/5, their `gen4_image -> gen4_turbo` routes,
+and the code-owned 60-credit ceiling. The parent manifest is never rewritten.
+
+Telegram callbacks carry only the child plan ID and a compact action binding.
+The full admin, proposal, parent, scene-set, and cost binding is resolved from
+private state. Cost approval creates a separate immutable approval record and
+a resumable runtime document under the StoryPack lock; it performs no provider
+or TTS call. Exact duplicate approval is idempotent, while any stale proposal,
+parent digest, completed checksum, failed history, scene set, or ceiling fails
+before mutation.
+
+The existing one-shot story worker discovers only approved child runtimes. It
+reuses checksum-verified copies of scenes 1/3/4, submits at most one new
+keyframe and one new video task for each corrected input, persists task IDs
+before polling, and never treats them as attempt 3 of the failed parent input.
+There is no hidden retry or video-model fallback. Final private composition
+keeps scene order 1-5 and reuses an already valid voice asset without another
+TTS reservation; publication remains a separate disabled boundary.
+
 For future packs, `frontal_identity` is the first canonical identity anchor;
 camera angle is independent and off-axis/full-body references are auxiliary.
 Health is bound to provider, model, reference-set digest and prompt-policy

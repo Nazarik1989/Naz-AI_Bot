@@ -233,6 +233,20 @@ Provider task IDs are persisted immediately after submission. A restart polls
 the same task instead of creating a duplicate. Completed CLEAN and STORY files
 are checksummed and are never regenerated merely to add text.
 
+## Corrected BAD_OUTPUT scenes
+
+The provider-free recovery proposal is not generation authorization. The
+operator first receives a child `naz-runway-corrected-scene-revision-v1` plan
+showing exact routes and a code-owned credit ceiling. Only its bound
+`Подтвердить генерацию 2 сцен` callback may append cost approval and queue the
+two new inputs. Approval itself performs zero Runway and TTS calls.
+
+The child retains immutable links to the failed parent history and uses copied,
+checksum-equal parent assets for completed scenes. A corrected input starts at
+attempt 1 under its own revision identity; the parent attempt count is never
+cleared or incremented. The worker resumes stored task IDs, permits no hidden
+paid retry, preserves order 1-5, and delivers only a private preview.
+
 ## Rollback
 
 Stop invoking the worker, restore `NAZ_STORY_RENDER_ENABLED=false`, and deploy
