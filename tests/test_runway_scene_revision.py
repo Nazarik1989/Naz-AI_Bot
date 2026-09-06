@@ -387,3 +387,263 @@ def test_revision_callback_approval_calls_no_provider_tts_or_publication(tmp_pat
     provider_factory.assert_not_called()
     tts.assert_not_awaited()
     assert "Стоимость подтверждена" in bot.send_message.await_args.kwargs["text"]
+
+
+def test_approved_progress_card_is_distinct_and_has_no_approval_controls(tmp_path):
+    _pack, _path, _proposal, _parent, revision = _setup(tmp_path)
+    revision_id = revision["revision_plan_id"]
+    _approve(tmp_path, revision_id)
+
+    progress = control.corrected_scene_revision_progress(
+        tmp_path / "story-packs", revision_id
+    )
+    card = control.corrected_scene_revision_progress_card(
+        tmp_path / "story-packs", revision_id
+    )
+    with (
+        patch.object(main, "ADMIN_ID", ADMIN),
+        patch.object(main, "NAZ_STORY_PACK_ROOT", tmp_path / "story-packs"),
+    ):
+        keyboard = main._corrected_revision_keyboard(revision_id)
+
+    assert progress["approval_state"] == "approved"
+    assert progress["corrected_keyframes"]["queued"] == 2
+    assert progress["corrected_videos"]["queued"] == 2
+    assert progress["completed_reused_scenes"] == (
+        "01_hook", "03_test", "04_result"
+    )
+    assert progress["completed_technical_units"] == 0
+    assert progress["total_technical_units"] == 5
+    assert "🎬 Замена сцен · прогресс" in card
+    assert "Платные вызовы начнутся" not in card
+    assert button_texts(keyboard) == ["Обновить статус", "Показать технический план"]
+
+
+def test_approved_status_callback_reads_runtime_and_never_uses_static_card(tmp_path):
+    _pack, _path, _proposal, _parent, revision = _setup(tmp_path)
+    revision_id = revision["revision_plan_id"]
+    _approve(tmp_path, revision_id)
+    plan = _plan(tmp_path, revision_id)
+    token = control.corrected_scene_revision_callback_token(
+        plan, action="status", admin_id=ADMIN
+    )
+    query = SimpleNamespace(
+        data=f"scoutrv:s:{revision_id}:{token}", answer=AsyncMock()
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=ADMIN))
+    bot = SimpleNamespace(send_message=AsyncMock(), send_video=AsyncMock())
+    with (
+        patch.object(main, "ADMIN_ID", ADMIN),
+        patch.object(main, "NAZ_STORY_PACK_ROOT", tmp_path / "story-packs"),
+        patch.object(
+            control,
+            "corrected_scene_revision_card",
+            side_effect=AssertionError("static approval card used after approval"),
+        ),
+    ):
+        asyncio.run(
+            main.content_inbox_scout_runway_revision_callback(
+                update, SimpleNamespace(bot=bot)
+            )
+        )
+
+    sent = bot.send_message.await_args.kwargs
+    assert "Замена сцен · прогресс" in sent["text"]
+    assert button_texts(sent["reply_markup"]) == [
+        "Обновить статус", "Показать технический план"
+    ]
+    bot.send_video.assert_not_awaited()
+
+
+def test_inherited_parent_retry_contract_is_removed_from_new_child(tmp_path):
+    _pack, _path, _proposal, _parent, revision = _setup(tmp_path)
+    revision_id = revision["revision_plan_id"]
+    _approve(tmp_path, revision_id)
+    runtime = control.read_corrected_scene_runtime(
+        tmp_path / "story-packs" / revision_id / "revision-runtime.json"
+    )
+    corrected = [
+        job for job in runtime["scene_jobs"] if job.get("corrected_revision_id")
+    ]
+    assert len(corrected) == 2
+    assert all(
+        not any(field in job for field in control._CORRECTED_SCENE_INHERITED_RETRY_FIELDS)
+        for job in corrected
+    )
+
+
+def test_worker_resumes_exact_zero_call_inherited_retry_failure_once(tmp_path):
+    pack, _path, _proposal, parent_before, revision = _setup(tmp_path)
+    revision_id = revision["revision_plan_id"]
+    _approve(tmp_path, revision_id)
+    runtime_path = tmp_path / "story-packs" / revision_id / "revision-runtime.json"
+    runtime = control.read_corrected_scene_runtime(runtime_path)
+    for job in runtime["scene_jobs"]:
+        if job.get("corrected_revision_id"):
+            job.update({
+                "state": "terminal_failed",
+                "failure_code": "keyframe_retry_contract_invalid",
+                "keyframe_state": "terminal_failed",
+                "keyframe_failure_code": "keyframe_retry_contract_invalid",
+                "keyframe_retry_approved_at": "2026-01-01T00:00:00+00:00",
+                "keyframe_retry_model": "gen4_image",
+                "keyframe_retry_phase": "reference_quality",
+                "keyframe_retry_reference_role": "frontal_identity",
+            })
+    runtime["pack_status"] = "partially_blocked"
+    control.write_corrected_scene_runtime(runtime_path, runtime)
+
+    provider = FakeVideoProvider()
+    result = worker.process_pack(
+        revision_id,
+        config=config(tmp_path / "story-packs"),
+        provider=provider,
+        composer=DummyComposer(),
+    )
+    assert result == "queued"
+    assert len(provider.keyframe_submissions) == 1
+    assert provider.keyframe_submissions[0].scene_id == "02_problem"
+    repaired = control.read_corrected_scene_runtime(runtime_path)
+    scene_2 = next(
+        job for job in repaired["scene_jobs"] if job["scene_id"] == "02_problem"
+    )
+    scene_5 = next(
+        job for job in repaired["scene_jobs"] if job["scene_id"] == "05_conclusion"
+    )
+    assert scene_2["keyframe_attempts"] == 1
+    assert scene_2["keyframe_failure_code"] is None
+    assert scene_5["keyframe_attempts"] == 0
+    assert scene_5["keyframe_state"] == "queued"
+    assert not any(
+        field in scene_2 or field in scene_5
+        for field in control._CORRECTED_SCENE_INHERITED_RETRY_FIELDS
+    )
+    assert pack.manifest_path.read_bytes() == parent_before
+
+
+def test_progress_reports_submitted_ready_completed_and_safe_failure(tmp_path):
+    _pack, _path, _proposal, _parent, revision = _setup(tmp_path)
+    revision_id = revision["revision_plan_id"]
+    _approve(tmp_path, revision_id)
+    runtime_path = tmp_path / "story-packs" / revision_id / "revision-runtime.json"
+    runtime = control.read_corrected_scene_runtime(runtime_path)
+    jobs = {job["scene_id"]: job for job in runtime["scene_jobs"]}
+    jobs["02_problem"].update({
+        "keyframe_state": "ready",
+        "state": "completed",
+        "keyframe_attempts": 1,
+        "attempts": 1,
+    })
+    jobs["05_conclusion"].update({
+        "keyframe_state": "submitted",
+        "keyframe_external_job_id": "private-task-id",
+        "keyframe_attempts": 1,
+        "state": "queued",
+        "keyframe_failure_code": None,
+    })
+    runtime["pack_status"] = "in_progress"
+    control.write_corrected_scene_runtime(runtime_path, runtime)
+
+    progress = control.corrected_scene_revision_progress(
+        tmp_path / "story-packs", revision_id
+    )
+    card = control.corrected_scene_revision_progress_card(
+        tmp_path / "story-packs", revision_id
+    )
+    assert progress["corrected_keyframes"]["ready"] == 1
+    assert progress["corrected_keyframes"]["submitted"] == 1
+    assert progress["corrected_videos"]["completed"] == 1
+    assert progress["active_provider_task_count"] == 1
+    assert progress["keyframe_submission_count"] == 2
+    assert progress["video_submission_count"] == 1
+    assert "private-task-id" not in json.dumps(progress)
+    assert "private-task-id" not in card
+
+
+@pytest.mark.parametrize(
+    ("stage", "field", "value"),
+    [
+        ("keyframe", "keyframe_failure_code", "provider_terminal_failure"),
+        ("video", "failure_code", "provider_terminal_failure"),
+    ],
+)
+def test_progress_displays_terminal_failure_without_task_id(tmp_path, stage, field, value):
+    _pack, _path, _proposal, _parent, revision = _setup(tmp_path)
+    revision_id = revision["revision_plan_id"]
+    _approve(tmp_path, revision_id)
+    runtime_path = tmp_path / "story-packs" / revision_id / "revision-runtime.json"
+    runtime = control.read_corrected_scene_runtime(runtime_path)
+    job = next(
+        row for row in runtime["scene_jobs"] if row["scene_id"] == "02_problem"
+    )
+    if stage == "keyframe":
+        job["keyframe_state"] = "terminal_failed"
+        job["state"] = "terminal_failed"
+        job["keyframe_external_job_id"] = "private-keyframe-task"
+    else:
+        job["keyframe_state"] = "ready"
+        job["state"] = "terminal_failed"
+        job["external_job_id"] = "private-video-task"
+    job[field] = value
+    runtime["pack_status"] = "partially_blocked"
+    control.write_corrected_scene_runtime(runtime_path, runtime)
+
+    progress = control.corrected_scene_revision_progress(
+        tmp_path / "story-packs", revision_id
+    )
+    card = control.corrected_scene_revision_progress_card(
+        tmp_path / "story-packs", revision_id
+    )
+    assert progress["failures"]["02_problem"] == {
+        "stage": stage, "category": value
+    }
+    assert "02_problem" in card
+    assert value in card
+    assert "private-keyframe-task" not in card
+    assert "private-video-task" not in card
+
+
+def test_completed_status_delivers_corrected_private_reel_without_publication(tmp_path):
+    _pack, _path, _proposal, _parent, revision = _setup(tmp_path)
+    revision_id = revision["revision_plan_id"]
+    _approve(tmp_path, revision_id)
+    runtime_path = tmp_path / "story-packs" / revision_id / "revision-runtime.json"
+    runtime = control.read_corrected_scene_runtime(runtime_path)
+    for job in runtime["scene_jobs"]:
+        job["keyframe_state"] = "ready"
+        job["state"] = "completed"
+    reel = runtime["reel_jobs"][0]
+    reel_path = runtime_path.parent / reel["path"]
+    reel_path.parent.mkdir(parents=True, exist_ok=True)
+    reel_path.write_bytes(b"private-revision-reel")
+    reel.update({
+        "state": "completed",
+        "checksum": hashlib.sha256(reel_path.read_bytes()).hexdigest(),
+    })
+    runtime["pack_status"] = "completed"
+    runtime["delivery"] = {"status": "ready", "sent_files": [], "completed_at": None}
+    control.write_corrected_scene_runtime(runtime_path, runtime)
+    plan = _plan(tmp_path, revision_id)
+    token = control.corrected_scene_revision_callback_token(
+        plan, action="status", admin_id=ADMIN
+    )
+    query = SimpleNamespace(
+        data=f"scoutrv:s:{revision_id}:{token}", answer=AsyncMock()
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=ADMIN))
+    bot = SimpleNamespace(send_message=AsyncMock(), send_video=AsyncMock())
+    with (
+        patch.object(main, "ADMIN_ID", ADMIN),
+        patch.object(main, "NAZ_STORY_PACK_ROOT", tmp_path / "story-packs"),
+    ):
+        asyncio.run(
+            main.content_inbox_scout_runway_revision_callback(
+                update, SimpleNamespace(bot=bot)
+            )
+        )
+
+    bot.send_video.assert_awaited_once()
+    delivered = control.read_corrected_scene_runtime(runtime_path)
+    assert delivered["delivery"]["status"] == "completed"
+    assert delivered["delivery"]["sent_files"] == [reel["path"]]
+    assert "publication" not in delivered

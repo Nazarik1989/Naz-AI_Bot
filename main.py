@@ -4544,21 +4544,58 @@ def inbox_scout_runway_revision_keyboard(
     ])
 
 
+def inbox_scout_runway_revision_progress_keyboard(
+    revision_plan_id: str,
+    *,
+    technical_token: str,
+    status_token: str,
+) -> InlineKeyboardMarkup:
+    """Controls for an approved runtime; approval and cancellation are absent."""
+    if not re.fullmatch(r"[a-f0-9]{24}", revision_plan_id):
+        raise ValueError("invalid corrected revision plan_id")
+    if any(
+        not re.fullmatch(r"[a-f0-9]{16}", token)
+        for token in (technical_token, status_token)
+    ):
+        raise ValueError("invalid corrected revision callback token")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "Обновить статус",
+            callback_data=f"scoutrv:s:{revision_plan_id}:{status_token}",
+        )],
+        [InlineKeyboardButton(
+            "Показать технический план",
+            callback_data=f"scoutrv:t:{revision_plan_id}:{technical_token}",
+        )],
+    ])
+
+
 def _corrected_revision_keyboard(revision_plan_id: str) -> InlineKeyboardMarkup:
     plan = story_pack_control.read_corrected_scene_revision_plan(
         NAZ_STORY_PACK_ROOT, revision_plan_id
     )
+    summary = story_pack_control.corrected_scene_revision_summary(
+        NAZ_STORY_PACK_ROOT, revision_plan_id
+    )
+    technical_token = story_pack_control.corrected_scene_revision_callback_token(
+        plan, action="technical", admin_id=ADMIN_ID
+    )
+    status_token = story_pack_control.corrected_scene_revision_callback_token(
+        plan, action="status", admin_id=ADMIN_ID
+    )
+    if summary["status"] == "approved":
+        return inbox_scout_runway_revision_progress_keyboard(
+            revision_plan_id,
+            technical_token=technical_token,
+            status_token=status_token,
+        )
     return inbox_scout_runway_revision_keyboard(
         revision_plan_id,
         approve_token=story_pack_control.corrected_scene_revision_callback_token(
             plan, action="approve", admin_id=ADMIN_ID
         ),
-        technical_token=story_pack_control.corrected_scene_revision_callback_token(
-            plan, action="technical", admin_id=ADMIN_ID
-        ),
-        status_token=story_pack_control.corrected_scene_revision_callback_token(
-            plan, action="status", admin_id=ADMIN_ID
-        ),
+        technical_token=technical_token,
+        status_token=status_token,
         cancel_token=story_pack_control.corrected_scene_revision_callback_token(
             plan, action="cancel", admin_id=ADMIN_ID
         ),
@@ -5191,13 +5228,69 @@ async def content_inbox_scout_runway_revision_callback(
             )
             return
         if action == "status":
+            progress = await asyncio.to_thread(
+                story_pack_control.corrected_scene_revision_progress,
+                NAZ_STORY_PACK_ROOT,
+                revision_plan_id,
+            )
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=story_pack_control.corrected_scene_revision_card(
+                text=story_pack_control.corrected_scene_revision_progress_card(
                     NAZ_STORY_PACK_ROOT, revision_plan_id
                 ),
                 reply_markup=_corrected_revision_keyboard(revision_plan_id),
             )
+            if (
+                progress["final_reel_state"] == "ready"
+                and progress["delivery_state"] != "completed"
+            ):
+                runtime_path = (
+                    NAZ_STORY_PACK_ROOT / revision_plan_id / "revision-runtime.json"
+                ).resolve()
+                runtime = story_pack_control.read_corrected_scene_runtime(runtime_path)
+                sent = set(
+                    str(item)
+                    for item in runtime.get("delivery", {}).get("sent_files", [])
+                )
+                bridge = runtime.get("scout_runway_bridge")
+                selection_id = (
+                    str(bridge.get("selection_id", ""))
+                    if isinstance(bridge, Mapping)
+                    else ""
+                )
+                preview_markup = (
+                    InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Опубликовать", callback_data=content_inbox_scout_reel.callback_data("publish", selection_id))],
+                        [InlineKeyboardButton("Переделать", callback_data=content_inbox_scout_reel.callback_data("remake", selection_id))],
+                        [InlineKeyboardButton("Отменить", callback_data=content_inbox_scout_reel.callback_data("cancel", selection_id))],
+                    ])
+                    if re.fullmatch(r"css-[a-f0-9]{24}", selection_id)
+                    else None
+                )
+                for media_path in await asyncio.to_thread(
+                    story_pack_control.delivery_files, runtime_path
+                ):
+                    filename = media_path.relative_to(runtime_path.parent).as_posix()
+                    if filename in sent:
+                        continue
+                    with media_path.open("rb") as media:
+                        await context.bot.send_video(
+                            chat_id=ADMIN_ID,
+                            video=media,
+                            caption=(
+                                "Приватное Runway-превью · 15 секунд · 5 сцен · "
+                                "с озвучкой · без музыки"
+                            ),
+                            reply_markup=preview_markup,
+                        )
+                    await asyncio.to_thread(
+                        story_pack_control.mark_delivery_file_sent,
+                        runtime_path,
+                        filename,
+                    )
+                await asyncio.to_thread(
+                    story_pack_control.mark_delivery_complete, runtime_path
+                )
             return
         result = await asyncio.to_thread(
             story_pack_control.cancel_corrected_scene_revision_plan,

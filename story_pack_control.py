@@ -41,6 +41,22 @@ CORRECTED_SCENE_CANCEL_SCHEMA = "naz-runway-corrected-scene-cancel-v1"
 CORRECTED_SCENE_IDS = ("02_problem", "05_conclusion")
 CORRECTED_COMPLETED_SCENE_IDS = ("01_hook", "03_test", "04_result")
 _REVISION_CALLBACK_ACTIONS = frozenset({"approve", "technical", "status", "cancel"})
+_CORRECTED_SCENE_INHERITED_RETRY_FIELDS = (
+    "keyframe_retry_approved_at",
+    "keyframe_retry_model",
+    "keyframe_retry_phase",
+    "keyframe_retry_reason_code",
+    "keyframe_retry_reference_role",
+    "keyframe_frontal_retry_approved_at",
+    "keyframe_current_frontal_retry_approved_at",
+    "keyframe_concise_retry_approved_at",
+    "keyframe_automatic_fallbacks",
+    "keyframe_fallback_state",
+    "keyframe_retry_not_before",
+    "keyframe_failure_category",
+    "keyframe_provider_failure_code",
+    "keyframe_retry_prompt_mode",
+)
 PACK_STATUS_RU = {
     "awaiting_approval": "ожидает подтверждения",
     "queued": "поставлен в очередь",
@@ -1137,6 +1153,226 @@ def corrected_scene_revision_technical_card(root: Path, revision_plan_id: str) -
     )
 
 
+def _progress_bucket(value: object, *, keyframe: bool) -> str:
+    state = str(value or "")
+    if keyframe:
+        if state in {"planned", "queued"}:
+            return "queued"
+        if state in {"submitting", "submitted"}:
+            return "submitted"
+        if state in {"in_progress", "downloaded"}:
+            return "in_progress"
+        if state == "ready":
+            return "ready"
+        return "failed"
+    if state in {"planned", "queued"}:
+        return "queued"
+    if state in {"submitting", "submitted"}:
+        return "submitted"
+    if state in {"in_progress", "downloaded", "composed"}:
+        return "in_progress"
+    if state == "completed":
+        return "completed"
+    return "failed"
+
+
+def _safe_revision_failure(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if re.fullmatch(r"[a-z0-9_]{1,80}", text) else "provider_failure"
+
+
+def corrected_scene_revision_progress(
+    root: Path, revision_plan_id: str
+) -> dict[str, Any]:
+    """Read one approved child runtime and return a detached safe progress view."""
+    plan, runtime, _runtime_path = validate_corrected_scene_revision_for_worker(
+        root, revision_plan_id
+    )
+    corrected_jobs = [
+        job for job in runtime["scene_jobs"]
+        if str(job.get("scene_id")) in CORRECTED_SCENE_IDS
+    ]
+    keyframes = {name: 0 for name in ("queued", "submitted", "in_progress", "ready", "failed")}
+    videos = {name: 0 for name in ("queued", "submitted", "in_progress", "completed", "failed")}
+    failures: dict[str, dict[str, str] | None] = {}
+    active_provider_tasks = 0
+    for job in corrected_jobs:
+        keyframe_bucket = _progress_bucket(job.get("keyframe_state"), keyframe=True)
+        video_bucket = _progress_bucket(job.get("state"), keyframe=False)
+        keyframes[keyframe_bucket] += 1
+        videos[video_bucket] += 1
+        scene_id = str(job["scene_id"])
+        if keyframe_bucket == "failed":
+            failures[scene_id] = {
+                "stage": "keyframe",
+                "category": _safe_revision_failure(job.get("keyframe_failure_code"))
+                or "provider_failure",
+            }
+        elif video_bucket == "failed":
+            failures[scene_id] = {
+                "stage": "video",
+                "category": _safe_revision_failure(job.get("failure_code"))
+                or "provider_failure",
+            }
+        else:
+            failures[scene_id] = None
+        if job.get("keyframe_external_job_id") and keyframe_bucket in {
+            "submitted", "in_progress"
+        }:
+            active_provider_tasks += 1
+        if job.get("external_job_id") and video_bucket in {"submitted", "in_progress"}:
+            active_provider_tasks += 1
+
+    reel_jobs = runtime.get("reel_jobs", [])
+    reel_states = [str(row.get("state", "")) for row in reel_jobs]
+    if reel_states and all(state == "completed" for state in reel_states):
+        final_reel_state = "ready"
+    elif any(state in {"terminal_failed", "blocked_music", "blocked_voice"} for state in reel_states):
+        final_reel_state = "failed"
+    elif any(state not in {"planned", "queued"} for state in reel_states):
+        final_reel_state = "assembling"
+    else:
+        final_reel_state = "not_started"
+
+    if failures and any(value is not None for value in failures.values()):
+        failed_scene = next(scene for scene, value in failures.items() if value is not None)
+        detail = failures[failed_scene]
+        current_stage = f"scene_{failed_scene}_{detail['stage']}_failed"
+    elif final_reel_state == "ready":
+        current_stage = "private_delivery"
+    elif videos["completed"] == len(CORRECTED_SCENE_IDS):
+        current_stage = "final_composition"
+    elif videos["submitted"] or videos["in_progress"]:
+        current_stage = "corrected_video_generation"
+    elif keyframes["ready"] == len(CORRECTED_SCENE_IDS):
+        current_stage = "corrected_video_queue"
+    elif keyframes["submitted"] or keyframes["in_progress"]:
+        current_stage = "corrected_keyframe_generation"
+    else:
+        current_stage = "corrected_keyframe_queue"
+
+    completed_units = keyframes["ready"] + videos["completed"] + int(
+        final_reel_state == "ready"
+    )
+    total_units = len(CORRECTED_SCENE_IDS) * 2 + 1
+    return {
+        "revision_plan_id": revision_plan_id,
+        "parent_plan_id": str(plan["parent_plan_id"]),
+        "approval_state": str(runtime["approval"]["status"]),
+        "pack_status": str(runtime.get("pack_status", "")),
+        "completed_reused_scenes": tuple(CORRECTED_COMPLETED_SCENE_IDS),
+        "corrected_scene_count": len(CORRECTED_SCENE_IDS),
+        "corrected_keyframes": keyframes,
+        "corrected_videos": videos,
+        "final_reel_state": final_reel_state,
+        "delivery_state": str(runtime.get("delivery", {}).get("status", "not_ready")),
+        "current_stage": current_stage,
+        "failures": failures,
+        "active_provider_task_count": active_provider_tasks,
+        "completed_technical_units": completed_units,
+        "total_technical_units": total_units,
+        "progress_percent": completed_units * 100 // total_units,
+        "keyframe_submission_count": sum(int(job.get("keyframe_attempts", 0)) for job in corrected_jobs),
+        "video_submission_count": sum(int(job.get("attempts", 0)) for job in corrected_jobs),
+    }
+
+
+_REVISION_STAGE_RU = {
+    "corrected_keyframe_queue": "исправленные ключевые кадры стоят в очереди",
+    "corrected_keyframe_generation": "создаются исправленные ключевые кадры",
+    "corrected_video_queue": "исправленные видеосцены стоят в очереди",
+    "corrected_video_generation": "создаются исправленные видеосцены",
+    "final_composition": "собирается итоговый Reel",
+    "private_delivery": "итоговый Reel готов к приватной доставке",
+}
+
+
+def corrected_scene_revision_progress_card(root: Path, revision_plan_id: str) -> str:
+    progress = corrected_scene_revision_progress(root, revision_plan_id)
+    percent = int(progress["progress_percent"])
+    filled = min(10, percent // 10)
+    stage = str(progress["current_stage"])
+    if stage.startswith("scene_") and stage.endswith("_failed"):
+        phase_name = "keyframe" if stage.endswith("_keyframe_failed") else "video"
+        scene = stage.removeprefix("scene_").removesuffix(f"_{phase_name}_failed")
+        phase = "ключевой кадр" if phase_name == "keyframe" else "видеосцена"
+        failure = progress["failures"].get(scene) or {}
+        now = f"сцена {scene}: {phase}, {failure.get('category', 'provider_failure')}"
+    else:
+        now = _REVISION_STAGE_RU.get(stage, "состояние проверено")
+    reel_ru = {
+        "not_started": "не начат", "assembling": "собирается",
+        "ready": "готов", "failed": "ошибка",
+    }[str(progress["final_reel_state"])]
+    return (
+        "🎬 Замена сцен · прогресс\n\n"
+        "Сохранённые сцены:\n1, 3 и 4 — готовы\n\n"
+        "Исправленные сцены:\n2 и 5\n\n"
+        f"Ключевые кадры:\n{progress['corrected_keyframes']['ready']}/2\n\n"
+        f"Видеосцены:\n{progress['corrected_videos']['completed']}/2\n\n"
+        f"Итоговый Reel:\n{reel_ru}\n\n"
+        f"Прогресс:\n[{'█' * filled}{'░' * (10 - filled)}] {percent}%\n\n"
+        f"Сейчас:\n{now}"
+    )
+
+
+def _reset_corrected_scene_job(job: dict[str, Any]) -> None:
+    for field in _CORRECTED_SCENE_INHERITED_RETRY_FIELDS:
+        job.pop(field, None)
+    job.pop("visual_identity_qa", None)
+
+
+def resume_corrected_scene_revision_runtime(
+    root: Path, revision_plan_id: str
+) -> bool:
+    """Repair only the zero-call inherited-retry failure in an approved child."""
+    _plan, runtime, runtime_path = validate_corrected_scene_revision_for_worker(
+        root, revision_plan_id
+    )
+    child_dir = runtime_path.parent
+    resumable: list[dict[str, Any]] = []
+    for job in runtime["scene_jobs"]:
+        if str(job.get("scene_id")) not in CORRECTED_SCENE_IDS:
+            continue
+        exact_failure = (
+            job.get("state") == "terminal_failed"
+            and job.get("keyframe_state") == "terminal_failed"
+            and job.get("failure_code") == "keyframe_retry_contract_invalid"
+            and job.get("keyframe_failure_code") == "keyframe_retry_contract_invalid"
+            and int(job.get("attempts", 0)) == 0
+            and int(job.get("keyframe_attempts", 0)) == 0
+            and not job.get("external_job_id")
+            and not job.get("keyframe_external_job_id")
+            and not job.get("submit_intent")
+            and not job.get("keyframe_submit_intent")
+            and not job.get("submit_intent_history")
+            and not job.get("keyframe_submit_intent_history")
+            and not job.get("provider_job_history")
+            and not job.get("keyframe_provider_job_history")
+            and not _artifact_path(child_dir, job.get("keyframe_path")).exists()
+            and not _artifact_path(child_dir, job.get("clean_path")).exists()
+            and not _artifact_path(child_dir, job.get("story_path")).exists()
+            and any(field in job for field in _CORRECTED_SCENE_INHERITED_RETRY_FIELDS)
+        )
+        if exact_failure:
+            resumable.append(job)
+    if not resumable:
+        return False
+    for job in resumable:
+        _reset_corrected_scene_job(job)
+        job.update({
+            "state": "queued", "failure_code": None,
+            "keyframe_state": "queued", "keyframe_failure_code": None,
+            "provider_status": None, "keyframe_provider_status": None,
+        })
+    runtime["pack_status"] = "queued"
+    write_corrected_scene_runtime(runtime_path, runtime)
+    validate_corrected_scene_revision_for_worker(root, revision_plan_id)
+    return True
+
+
 def _revision_plan_matches_current_parent(
     root: Path, plan: Mapping[str, Any]
 ) -> tuple[Path, dict[str, Any]]:
@@ -1229,6 +1465,7 @@ def _revision_runtime_payload(
         if scene_id not in corrected:
             continue
         row = corrected[scene_id]
+        _reset_corrected_scene_job(job)
         job.update({
             "state": "queued", "external_job_id": None, "attempts": 0,
             "submitted_at": None, "provider_status": None, "actual_duration_seconds": None,

@@ -1903,6 +1903,9 @@ def _process_corrected_scene_revision(
     if config.pack_root not in child_dir.parents:
         raise RuntimeError("unsafe_plan_id")
     with PackLock(child_dir):
+        story_pack_control.resume_corrected_scene_revision_runtime(
+            config.pack_root, revision_plan_id
+        )
         _plan, payload, runtime_path = (
             story_pack_control.validate_corrected_scene_revision_for_worker(
                 config.pack_root, revision_plan_id
